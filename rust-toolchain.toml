@@ -1,0 +1,13 @@
+# Pin the toolchain so local and CI agree on what "clippy clean" means.
+#
+# Without this, CI installs whatever stable is current while a contributor may be months
+# behind, and a newer clippy invents lints the older one cannot see. That happened on this
+# project's very first CI run: local clippy 1.94 reported zero issues while CI's 1.97 failed
+# the build on a `collapsible_if` — a claim of "clippy clean" that was true locally and false
+# on CI.
+#
+# Bump this deliberately, on its own commit, so any new lints arrive as a reviewable change
+# rather than as a mystery red build on someone else's pull request.
+[toolchain]
+channel = "1.97"
+components = ["clippy", "rustfmt"]

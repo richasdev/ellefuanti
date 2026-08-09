@@ -111,10 +111,10 @@ fn collect(root: &Node, range: &Range<usize>, out: &mut Vec<HighlightSpan>) {
         if node.start_byte() >= range.end {
             return;
         }
-        if node.end_byte() > range.start {
-            if let Some(style) = style_for(node.kind()) {
-                out.push(HighlightSpan { range: node.start_byte()..node.end_byte(), style });
-            }
+        if node.end_byte() > range.start
+            && let Some(style) = style_for(node.kind())
+        {
+            out.push(HighlightSpan { range: node.start_byte()..node.end_byte(), style });
         }
 
         if cursor.goto_first_child() {

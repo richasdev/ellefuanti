@@ -221,7 +221,7 @@ impl WorkspaceView {
             .tree
             .as_ref()
             .map(|tree| tree.root().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir());
+            .unwrap_or_else(std::env::temp_dir);
 
         let chosen = cx.prompt_for_new_path(&directory, Some("untitled.php"));
 
@@ -338,7 +338,7 @@ impl WorkspaceView {
                 window.focus(&self.focus_handle);
             }
             None => {
-                let terminal = cx.new(|cx| TerminalView::new(cx));
+                let terminal = cx.new(TerminalView::new);
                 terminal.update(cx, |terminal, cx| {
                     terminal.set_cwd(self.tree.as_ref().map(|tree| tree.root().to_path_buf()));
                     // A panel that opens with no session would just show a placeholder;

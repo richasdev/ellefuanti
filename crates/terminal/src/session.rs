@@ -497,10 +497,10 @@ fn resolve_cwd(requested: Option<&Path>) -> PathBuf {
             return path.to_path_buf();
         }
         // A file (the open document, say) means the user wants its folder.
-        if let Some(parent) = path.parent() {
-            if parent.is_dir() {
-                return parent.to_path_buf();
-            }
+        if let Some(parent) = path.parent()
+            && parent.is_dir()
+        {
+            return parent.to_path_buf();
         }
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
