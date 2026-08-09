@@ -75,6 +75,25 @@ impl Buffer {
         self.dirty = false;
     }
 
+    /// Marks the buffer clean **only if** it still holds the text that was written.
+    ///
+    /// A save serialises the buffer, hands the bytes to a background write, and comes back
+    /// later. Nothing stops the user typing in between — the save panel gpui opens is not
+    /// app-modal, so on save-as that window is as long as the user takes to choose a
+    /// folder. Clearing `dirty` unconditionally at that point claims the file on disk
+    /// matches the buffer when it does not, and since ⌘S on a clean buffer is a no-op those
+    /// keystrokes are then unreachable: silent data loss.
+    ///
+    /// Returns whether the buffer was marked clean, so a caller can tell the difference
+    /// between "saved" and "saved, but there is newer text".
+    pub fn mark_saved_at(&mut self, version: Version) -> bool {
+        let current = self.version == version;
+        if current {
+            self.dirty = false;
+        }
+        current
+    }
+
     pub fn len_bytes(&self) -> usize {
         self.rope.len_bytes()
     }
@@ -414,6 +433,31 @@ mod tests {
         assert_eq!(b.drain_pending().len(), 2);
         assert!(!b.has_pending());
         assert!(b.drain_pending().is_empty());
+    }
+
+    #[test]
+    fn a_save_of_stale_text_does_not_mark_the_buffer_clean() {
+        // The save-as sequence: serialise the buffer, open a non-modal save panel, and the
+        // user keeps typing while it is up. The write lands the *old* bytes, so the buffer
+        // must stay dirty — otherwise ⌘S becomes a no-op and those keystrokes are lost.
+        let mut b = Buffer::new("<?php\n");
+        b.insert(6, "$a = 1;");
+        let saved_version = b.version();
+
+        // Typed while the dialog was open.
+        b.insert(b.len_bytes(), "\n$b = 2;");
+
+        assert!(!b.mark_saved_at(saved_version), "the write is stale, so it cannot mark clean");
+        assert!(b.is_dirty(), "the newer text is not on disk yet");
+    }
+
+    #[test]
+    fn a_save_of_current_text_marks_the_buffer_clean() {
+        let mut b = Buffer::new("<?php\n");
+        b.insert(6, "$a = 1;");
+        let saved_version = b.version();
+        assert!(b.mark_saved_at(saved_version));
+        assert!(!b.is_dirty());
     }
 
     #[test]

@@ -46,6 +46,7 @@ impl Metrics {
     pub const FONT_SIZE: Pixels = px(13.0);
     pub const UI_FONT_SIZE: Pixels = px(12.0);
     pub const LINE_HEIGHT: Pixels = px(20.0);
+    pub const ACTIVITY_BAR_WIDTH: Pixels = px(44.0);
     pub const SIDEBAR_WIDTH: Pixels = px(240.0);
     pub const GUTTER_WIDTH: Pixels = px(52.0);
     pub const TAB_HEIGHT: Pixels = px(32.0);

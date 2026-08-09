@@ -43,6 +43,15 @@ pub struct EditorView {
     /// Visible row range from the last frame, captured because `uniform_list` exposes it
     /// only to the render closure and scroll-into-view needs it outside of one.
     visible_rows: Range<usize>,
+    /// Window x where the text column actually begins, measured at prepaint.
+    ///
+    /// `MouseDownEvent::position` is window-relative, so mapping a click to a column needs
+    /// the text's window-relative origin. That is *not* the gutter width: every row sits
+    /// inside the activity bar and the sidebar too. Guessing it from the constants the
+    /// workspace happens to use today would re-introduce the same class of bug the moment
+    /// a panel is added, resized or collapsed, so it is measured from the laid-out element
+    /// instead. `None` until the first prepaint, which is before any click can arrive.
+    text_origin_x: Option<Pixels>,
 }
 
 impl EditorView {
@@ -52,6 +61,7 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
+            text_origin_x: None,
         }
     }
 
@@ -246,12 +256,11 @@ impl EditorView {
         &mut self,
         event: &MouseDownEvent,
         row: usize,
-        text_origin_x: Pixels,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
         let line = self.document.buffer.line(row);
-        let x = event.position.x - text_origin_x;
+        let x = text_local_x(event.position.x, self.text_origin_x);
 
         let column = if line.is_empty() || x <= px(0.0) {
             0
@@ -367,22 +376,26 @@ impl EditorView {
                     && selection.end > line_start;
                 let entity = entity.clone();
 
+                let measuring_entity = entity.clone();
+
                 div()
+                    // The click handler needs the window x where the text starts, and only
+                    // the layout engine knows it. Children are [gutter, text]; the second
+                    // one's origin is the answer. Registered before `.id()` because
+                    // `on_children_prepainted` is a `Div` method and `.id()` wraps the Div
+                    // in a `Stateful`, which does not forward it.
+                    .on_children_prepainted(move |bounds, _window, cx| {
+                        if let Some(text) = bounds.get(1) {
+                            measuring_entity.update(cx, |editor, _cx| {
+                                editor.text_origin_x = Some(text.origin.x);
+                            });
+                        }
+                    })
                     .id(("row", row))
                     .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         let event = event.clone();
                         entity.update(cx, |editor, cx| {
-                            // The text column starts after the gutter; the event position
-                            // is window-relative, so the gutter width is the offset to
-                            // subtract. Exact enough for click-to-place; a custom Element
-                            // would give true row-local bounds.
-                            editor.on_row_mouse_down(
-                                &event,
-                                row,
-                                Metrics::GUTTER_WIDTH,
-                                window,
-                                cx,
-                            );
+                            editor.on_row_mouse_down(&event, row, window, cx);
                         });
                     })
                     .flex()
@@ -507,6 +520,32 @@ fn line_runs(
     (text, highlights)
 }
 
+/// Turns a window-relative click x into an x relative to the start of the text.
+///
+/// Split out as a free function because the subtraction is the whole bug: the original
+/// version subtracted only [`Metrics::GUTTER_WIDTH`] from a **window**-relative
+/// coordinate, ignoring the activity bar and the sidebar the row sits inside. Every click
+/// therefore resolved a column far to the right of the character under the pointer, and
+/// no click could reach column 0 at all, because the smallest x a row could ever receive
+/// was already well past the gutter.
+///
+/// `origin` is the measured text origin. Until the first prepaint there is none, and
+/// [`fallback_text_origin_x`] stands in — it is the full chrome offset, not the gutter
+/// alone. The result is clamped at zero so a click in the gutter, or anywhere left of the
+/// text, lands on column 0 instead of going negative.
+fn text_local_x(window_x: Pixels, origin: Option<Pixels>) -> Pixels {
+    let origin = origin.unwrap_or_else(fallback_text_origin_x);
+    (window_x - origin).max(px(0.0))
+}
+
+/// Where the text column sits before the first prepaint has measured it.
+///
+/// Activity bar + sidebar + gutter. A guess, but the *right* guess for the default layout,
+/// where the old code's `GUTTER_WIDTH` was out by 284 px.
+fn fallback_text_origin_x() -> Pixels {
+    Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + Metrics::GUTTER_WIDTH
+}
+
 /// Largest char boundary <= `index`.
 fn floor_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
@@ -528,6 +567,67 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- click-to-column arithmetic -------------------------------------------------
+
+    #[test]
+    fn a_click_on_the_first_character_maps_to_the_start_of_the_text() {
+        // The bug this pins: the old code subtracted only GUTTER_WIDTH from a
+        // *window*-relative x. Every row is nested inside the 44 px activity bar and the
+        // 240 px sidebar, so a click on column 0 arrived at window x 336 and resolved to
+        // 336 - 52 = 284 px into the line — roughly 35 columns of Menlo 13 to the right of
+        // where the user actually clicked.
+        let first_char_x =
+            Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + Metrics::GUTTER_WIDTH;
+
+        assert_eq!(
+            text_local_x(first_char_x, None),
+            px(0.0),
+            "a click on the first character must resolve to the start of the line"
+        );
+        assert_eq!(
+            first_char_x - Metrics::GUTTER_WIDTH,
+            px(284.0),
+            "and the old arithmetic put it 284 px into the line instead"
+        );
+    }
+
+    #[test]
+    fn the_measured_origin_wins_over_the_fallback() {
+        // Prepaint reports where the text really is; a collapsed sidebar or an extra panel
+        // changes it, and the fallback constant must not override the measurement.
+        let measured = px(96.0);
+        assert_eq!(text_local_x(px(150.0), Some(measured)), px(54.0));
+        assert_ne!(
+            text_local_x(px(150.0), Some(measured)),
+            text_local_x(px(150.0), None),
+            "the measurement must actually be used"
+        );
+    }
+
+    #[test]
+    fn a_click_left_of_the_text_clamps_to_zero_rather_than_going_negative() {
+        // Clicking the gutter, the sidebar, or the activity bar. `Pixels` is an f32
+        // newtype, so an unclamped subtraction yields a negative x rather than
+        // underflowing — which `closest_index_for_x` would then resolve against, and which
+        // no caller downstream is expecting.
+        for window_x in [px(0.0), px(10.0), px(300.0), fallback_text_origin_x() - px(1.0)] {
+            let x = text_local_x(window_x, None);
+            assert_eq!(x, px(0.0), "x={window_x:?} is left of the text and must clamp to 0");
+            assert!(x >= px(0.0));
+        }
+    }
+
+    #[test]
+    fn the_fallback_origin_is_the_whole_chrome_offset_not_just_the_gutter() {
+        // The regression guard: if someone "simplifies" this back to GUTTER_WIDTH, or adds
+        // a panel to the left of the editor without updating the fallback, this fails.
+        assert_eq!(
+            fallback_text_origin_x(),
+            Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + Metrics::GUTTER_WIDTH
+        );
+        assert!(fallback_text_origin_x() > Metrics::GUTTER_WIDTH);
+    }
 
     #[test]
     fn boundary_helpers_never_split_a_codepoint() {
