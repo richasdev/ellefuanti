@@ -162,21 +162,36 @@ Startup phase breakdown:
 | **window open** | **432 ms** | **152 ms**  |
 | **total**       | **520 ms** | **~200 ms** |
 
-### Startup: cold passes on a warm shader cache, warm still misses
+### Startup: the shader diagnosis was wrong
 
-**The window phase dominates, and it is Metal shader compilation** — the cost of the
-`runtime_shaders` feature, which is what lets the project build without a full Xcode
-install. Verified from both directions: without the feature the build fails outright
-(`xcrun: error: unable to find utility "metal"`), and with it the window phase drops from
-432 ms to 152 ms once the OS has cached the compiled shaders.
+The window phase dominates the first launch, and this document previously stated it **was**
+Metal shader compilation from the `runtime_shaders` feature — named as the prime suspect in
+ADR-0002 before being measured, then treated as confirmed once the numbers fit.
 
-This was named as the prime suspect in [ADR-0002](../docs/adr/0002-gpui-for-ui.md) _before_
-being measured, and the measurement confirmed it rather than surprising us.
+**They fit a theory that turned out to be false.** CI now builds the release binary with
+`--no-default-features`, so its shaders are compiled at build time on a runner with Xcode.
+Running that binary here:
 
-**The fix is a build-pipeline change, not a code change:** compile shaders ahead of time in
-CI (which can have Xcode) and ship the release binary without `runtime_shaders`, while local
-development keeps it. That resolves the cold-start miss without making the project
-unbuildable for contributors. Not done, because there is no release pipeline yet.
+| Precompiled-shader binary | Window phase | Total      |
+| ------------------------- | ------------ | ---------- |
+| first launch              | 496 ms       | **536 ms** |
+| subsequent launches       | 152 ms       | ~195 ms    |
+
+Same 152 ms warm window phase, same ~195 ms warm total, first launch still over budget.
+**Precompiling the shaders changed nothing measurable**, on a binary whose shaders were
+compiled hours earlier on another machine.
+
+The first-launch cost is therefore OS-level first-launch overhead that any new Mach-O pays —
+dyld closure construction, signature validation, page-in of a binary not yet cached — not
+shader compilation. The release split is kept regardless (it is free and keeps the release
+path exercised in CI), but it is a buildability convenience, not the startup fix it was
+introduced as.
+
+**The methodological point, since this is the second time in this file:** a mechanism that
+plausibly explains the numbers is not the mechanism. The only way to tell is to remove the
+suspected cause and re-measure. The first instance was a benchmark harness charging destructor
+time to every sample; this one was a shader theory that survived because nobody had yet built
+the binary that would refute it.
 
 **Warm startup at ~200 ms against a 150 ms target** is the residual after shader caching,
 and would need profiling of gpui init (38 ms) plus the remaining 152 ms of window setup to

@@ -34,29 +34,52 @@ The default build invokes `xcrun metal`, which ships only with full Xcode — no
 Command Line Tools. Enabling `runtime_shaders` compiles shaders at runtime and builds with
 CLT alone, so a fresh checkout builds without a 40 GB install.
 
-**This costs cold-start time, and the cost is now measured rather than assumed.** Both
-sides were verified on this machine:
+Measured on this machine:
 
 |                                        | Result                                                    |
 | -------------------------------------- | --------------------------------------------------------- |
 | Default build, CLT only                | **fails**: `xcrun: error: unable to find utility "metal"` |
-| `runtime_shaders`, first launch        | **520 ms** cold start — 432 ms of it in the window phase  |
+| `runtime_shaders`, first launch        | **520 ms** — 432 ms of it in the window phase             |
 | `runtime_shaders`, subsequent launches | **~200 ms** — 152 ms in the window phase                  |
 
-The 432 ms → 152 ms drop across launches is the OS caching the compiled shaders. So the
-first launch after a build (or after the cache is evicted) **exceeds the 500 ms cold-start
-budget from §21**. Later launches clear that bar, but at ~200 ms they still miss the
-separate **150 ms warm-start** target — shader caching removes most of the cost, not all of
-it, and the residual has not yet been attributed.
+That first-launch spike looked like runtime shader compilation. It is not — see the
+correction below, which is the more important half of this ADR.
 
-**The decision stands, deliberately.** A build that fails for any contributor without a
-40 GB Xcode install is a worse product than a first launch that is 20 ms over budget.
-Recorded as a known deviation rather than quietly dropped from the target.
+## Correction: the shader theory was wrong
 
-**How it gets fixed properly:** ship the release build with shaders precompiled — a CI
-machine has Xcode, so the published binary can drop `runtime_shaders` while a local
-`cargo build` keeps it. That splits the trade instead of paying it. Tracked as a build-and-
-release task; not done yet, because there is no release pipeline to hang it on.
+The paragraph above originally attributed that 432 ms → 152 ms drop to the OS caching
+compiled shaders, and predicted that precompiling them in CI would remove it. **Both claims
+were wrong, and the measurement that settled it is worth recording.**
+
+CI now builds the release binary with `--no-default-features` (no `runtime_shaders`, shaders
+compiled at build time by a runner that has Xcode). Running _that_ binary on this machine:
+
+| Precompiled-shader binary | Window phase | Total      |
+| ------------------------- | ------------ | ---------- |
+| first launch              | 496 ms       | **536 ms** |
+| subsequent launches       | 152 ms       | ~195 ms    |
+
+Identical to the `runtime_shaders` build within noise — same 152 ms warm window phase, same
+~195 ms warm total, and a first launch that is still **over the 500 ms budget**. Precompiling
+the shaders changed nothing measurable.
+
+So the first-launch cost is **not shader compilation**. It is OS-level first-launch overhead
+that any new Mach-O pays — dyld closure construction, code-signature validation, page-in of a
+binary not yet in the file cache. It reproduces on a binary whose shaders were compiled hours
+earlier on a different machine, which shader caching cannot explain.
+
+**What this changes.** Nothing about the decision: `runtime_shaders` still stays on by
+default, because a build that fails without a 40 GB Xcode install is worse than a first launch
+20 ms over budget. But the _reason_ is now honest — it is a buildability convenience, not a
+startup optimisation, and the release split does not buy the 432 ms it was introduced to
+recover. The split is retained anyway: it is free, it keeps the release path exercised in CI,
+and it removes a real if smaller cost.
+
+**The residual is unattributed and will not be guessed at.** Warm startup is ~195 ms against a
+150 ms target, with 152 ms of it inside window creation. Attributing that needs a profiler on
+the gpui window path, not another theory. The lesson from getting this wrong once: a plausible
+mechanism that fits the numbers is not the same as the mechanism, and the way to tell them
+apart is to remove the suspected cause and re-measure.
 
 **The real risk.** GPUI is pre-1.0 and openly warns of breaking changes between versions.
 We accept churn on upgrades in exchange for years of saved work, and we contain it: gpui

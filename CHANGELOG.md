@@ -53,11 +53,12 @@ layer; the parts that need a human at a screen have not been confirmed. Read
 
 **Engineering**
 
-- 258 tests across 17 suites; `cargo clippy --all-targets` clean
+- 276 tests across 17 suites; `cargo clippy --all-targets` clean, gated by CI
 - Layering enforced by test: only `crates/app` may depend on gpui
 - Criterion benchmarks with a recorded baseline (`benchmarks/BASELINE.md`)
 - Startup and frame instrumentation via `ELLE_PERF=1`
-- 8 ADRs recording every irreversible technology decision
+- 8 ADRs recording every irreversible technology decision, including one recording a
+  diagnosis that turned out to be wrong
 
 ### Performance
 
@@ -65,23 +66,28 @@ Measured, not estimated. Full detail and methodology in `benchmarks/BASELINE.md`
 
 | Metric                                     | Target     | Measured                   |
 | ------------------------------------------ | ---------- | -------------------------- |
-| Cold startup (shaders precompiled)         | < 500 ms   | not yet measured, see note |
-| Cold startup (runtime shaders, cold cache) | < 500 ms   | 520 ms                     |
-| Cold startup (runtime shaders, warm cache) | < 500 ms   | **380 ms**                 |
+| Cold startup, first launch of a new binary  | < 500 ms   | 520–536 ms ❌              |
+| Cold startup, later launches               | < 500 ms   | **~195–380 ms**            |
 | Warm startup                               | < 150 ms   | ~200 ms ❌                 |
 | Idle RAM                                   | 100–200 MB | **69 MB**                  |
 | Keystroke → pixel, 55k-line file           | < 8.3 ms   | **2.65 ms**                |
 | Frame render, 55k-line file                | < 8.3 ms   | **0.08–0.77 ms**           |
 | Folder open, 5000 vendor files             | —          | **64 µs**                  |
 
-The release build compiles Metal shaders ahead of time, which should remove the ~432 ms of
-runtime shader compilation that dominates a local build's cold start on a cold cache.
+**A note on the startup numbers, because an earlier draft of this file got them wrong.**
 
-**That improvement is expected, not measured, and the distinction matters.** The precompiled
-path requires full Xcode to build and cannot be compiled on the machine these numbers came
-from — `xcrun metal` is absent, and the build fails outright. So the figure above is left
-blank rather than filled with an estimate. Somebody with Xcode should run `ELLE_PERF=1` on a
-release build and replace it with a real number.
+The release build compiles Metal shaders ahead of time, and we predicted that would remove
+the ~432 ms first-launch spike. It did not. Running the CI-built precompiled binary gives the
+same warm figures (152 ms window phase, ~195 ms total) and a first launch that is still over
+budget at 536 ms.
+
+So the first-launch cost is OS-level overhead every new Mach-O pays — dyld closure
+construction, signature validation, page-in — not shader compilation. **Any launch after the
+first clears the 500 ms budget comfortably**; the first one after downloading does not, and no
+build flag we control changes that.
+
+Warm startup at ~195 ms against a 150 ms target remains missed and unattributed. It will be
+profiled rather than theorised about — see `benchmarks/BASELINE.md`.
 
 ### Known limitations
 
@@ -105,10 +111,10 @@ Stated plainly, because discovering them yourself would be worse.
   so CJK input does not work. Plain typing, including accented Latin characters, does.
 - **macOS only.** The domain crates are portable; the UI layer is not, because GPUI is not.
 
-### Notes on two bugs worth recording
+### Bugs worth recording
 
-Both were found by measurement rather than review, and both are documented in
-`benchmarks/BASELINE.md`:
+Each was found by measurement or adversarial review rather than by reading the code, and each
+had passing tests over it beforehand:
 
 - Viewport-scoped syntax highlighting **was not actually viewport-scoped**. It range-checked
   correctly but scanned every sibling node, so cost grew with file size (50 → 156 µs across
@@ -117,6 +123,16 @@ Both were found by measurement rather than review, and both are documented in
   `iter_batched` charged tree-sitter arena teardown to every sample. The real figure was
   already near budget. The lesson — suspect the measurement before the code — is recorded
   at the top of the baseline document.
+- **Click-to-column was off by 284 px on every click.** The hit-test subtracted only the
+  gutter from a window-relative x, ignoring the activity bar and sidebar the row sits inside,
+  so column 0 was unreachable by any click. The in-code comment claiming it was "exact enough"
+  was simply false.
+- **Save-as could silently lose edits.** gpui's save panel is not app-modal, so the editor
+  keeps accepting keystrokes while the user browses folders. Those edits went nowhere, and
+  marking the buffer clean afterwards made ⌘S a no-op — leaving them unrecoverable. Saves now
+  only mark clean if the buffer still holds the text that was written.
+- **One shared task slot made every async operation cancel the last one.** ⌘O then ⌘S dropped
+  the folder load, so the tree never appeared and no error was shown anywhere.
 
 [unreleased]: https://github.com/richasdev/ellefuanti/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/richasdev/ellefuanti/releases/tag/v0.1.0
