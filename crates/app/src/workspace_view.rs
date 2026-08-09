@@ -26,6 +26,66 @@ struct Tab {
     editor: Entity<EditorView>,
 }
 
+/// The kinds of background work the workspace runs, one slot each.
+///
+/// The slot is the unit of cancellation: starting a second folder load supersedes the
+/// first, and starting a save supersedes an earlier save of the same buffer. Work of a
+/// *different* kind is unrelated and must be left alone.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Job {
+    OpenFolder,
+    OpenFile,
+    Save,
+    QuickOpenIndex,
+    ClosePrompt,
+}
+
+/// One in-flight [`Task`] per [`Job`].
+///
+/// Dropping a gpui `Task` cancels it: `async_task::Task::drop` calls `set_canceled`, so a
+/// future that has not been polled to completion is dropped where it stands and one that
+/// was never scheduled never runs at all. That is the intended cancellation mechanism
+/// (ADR-0007) — but it only means what it should if the task being dropped is the task the
+/// new work supersedes.
+///
+/// A single shared slot made every operation cancel every other one: ⌘S then ⌘O dropped
+/// the save (either the write never started, or it finished and the buffer was never
+/// marked clean); ⌘O on a large project then ⌘S dropped the folder load so the tree never
+/// appeared; a quick-open walk was dropped by any file open, leaving its blocking walk
+/// running with nothing left to consume it. Keying by job is what makes "a new request
+/// drops the old one" true of the *same* request rather than of whatever ran last.
+///
+/// Generic over the handle so the eviction rule — the part that can actually be wrong —
+/// is testable with a payload whose drops are observable. `Task<()>` is not: gpui gives no
+/// way to ask a task whether it was cancelled.
+struct JobSlots<T> {
+    slots: Vec<(Job, T)>,
+}
+
+/// The workspace's slots, holding real gpui tasks.
+type Jobs = JobSlots<Task<()>>;
+
+impl<T> Default for JobSlots<T> {
+    fn default() -> Self {
+        Self { slots: Vec::new() }
+    }
+}
+
+impl<T> JobSlots<T> {
+    /// Starts `task` as the current work for `job`, cancelling only that job's predecessor.
+    fn start(&mut self, job: Job, task: T) {
+        match self.slots.iter_mut().find(|(slot, _)| *slot == job) {
+            Some(entry) => entry.1 = task,
+            None => self.slots.push((job, task)),
+        }
+    }
+
+    /// Drops the task for `job`, if any, cancelling it.
+    fn cancel(&mut self, job: Job) {
+        self.slots.retain(|(slot, _)| *slot != job);
+    }
+}
+
 pub struct WorkspaceView {
     focus_handle: FocusHandle,
     registry: Arc<CommandRegistry>,
@@ -38,19 +98,13 @@ pub struct WorkspaceView {
     terminal: Option<Entity<TerminalView>>,
     /// Transient message for the status bar (a failed save, mostly).
     status: Option<SharedString>,
-    /// In-flight *cancellable* background work — loading a folder, opening a file, walking
-    /// the project for quick open. Held rather than detached so a new request drops the old
-    /// one, which is how ADR-0007's cancellation actually happens.
-    ///
-    /// **Writes must never live here.** Dropping a `Task` cancels it, so a save parked in
-    /// this slot could be abandoned between the bytes reaching disk and `mark_saved()`
-    /// running — leaving a file saved but its tab still marked dirty, and the
-    /// unsaved-changes prompt warning about changes that are already on disk. Saves are
-    /// detached instead; see `save` and `save_as`.
-    pending: Option<Task<()>>,
+    /// In-flight background work, one slot per [`Job`]. Held rather than detached so a new
+    /// request of the same kind drops the old one, which is how ADR-0007's cancellation
+    /// actually happens — see [`JobSlots`] for why a single shared slot was wrong.
+    jobs: Jobs,
     /// Frame pacing, measured at the window root so it sees every repaint.
     frames: FrameTimer,
-    /// Cancels an in-flight quick-open walk. Separate from `pending` because dropping a
+    /// Cancels an in-flight quick-open walk. Separate from the task slot because dropping a
     /// Task stops the await, not the blocking walk behind it.
     quick_open_cancel: Option<CancelFlag>,
 }
@@ -66,7 +120,7 @@ impl WorkspaceView {
             palette: None,
             terminal: None,
             status: None,
-            pending: None,
+            jobs: Jobs::default(),
             frames: FrameTimer::new(),
             quick_open_cancel: None,
         }
@@ -103,7 +157,7 @@ impl WorkspaceView {
             prompt: None,
         });
 
-        self.pending = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             let Some(root) = paths.into_iter().next() else { return };
 
@@ -122,7 +176,8 @@ impl WorkspaceView {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.jobs.start(Job::OpenFolder, task);
     }
 
     fn toggle_hidden_files(
@@ -160,7 +215,7 @@ impl WorkspaceView {
         }
 
         let load_path = path.clone();
-        self.pending = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let loaded = cx.background_spawn(async move { read_file(&load_path) }).await;
 
             this.update(cx, |this, cx| {
@@ -181,7 +236,8 @@ impl WorkspaceView {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.jobs.start(Job::OpenFile, task);
     }
 
     // --- saving ------------------------------------------------------------------
@@ -194,21 +250,19 @@ impl WorkspaceView {
         };
 
         let editor = tab.editor.clone();
-        let text = editor.read(cx).document.text_for_save();
+        let snapshot = editor.read(cx).document.snapshot_for_save();
+        let (text, version) = (snapshot.text, snapshot.version);
 
-        // Detached, NOT parked in `self.pending`. A save must run to completion: parking it
-        // there means the next folder open or quick-open walk drops it, and if that happens
-        // after write_file succeeds but before mark_saved runs, the file is on disk while
-        // its tab still reads dirty — and the close prompt then warns about changes that
-        // were already saved.
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let written = cx.background_spawn(async move { write_file(&path, &text) }).await;
 
             this.update(cx, |this, cx| {
                 match written {
                     Ok(()) => {
-                        // Only clear dirty state after the write actually succeeded.
-                        editor.update(cx, |editor, _| editor.document.buffer.mark_saved());
+                        // Only clear dirty state after the write actually succeeded, and
+                        // only for the text that was actually written.
+                        editor
+                            .update(cx, |editor, _| editor.document.buffer.mark_saved_at(version));
                         this.status = None;
                     }
                     // The buffer is untouched on failure, so the user loses nothing.
@@ -217,8 +271,8 @@ impl WorkspaceView {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.jobs.start(Job::Save, task);
     }
 
     /// Asks for a location, then saves a buffer that has no path yet.
@@ -228,7 +282,6 @@ impl WorkspaceView {
     fn save_as(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active_tab) else { return };
         let editor = tab.editor.clone();
-        let text = editor.read(cx).document.text_for_save();
 
         let directory = self
             .tree
@@ -238,14 +291,23 @@ impl WorkspaceView {
 
         let chosen = cx.prompt_for_new_path(&directory, Some("untitled.php"));
 
-        // Detached for the same reason as `save`, and the stakes here are higher: this task
-        // also adopts the new path. Dropping it after the write could leave a file on disk
-        // that the editor still believes has no path, so the next ⌘S would reopen the dialog
-        // for a file that was already saved.
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             // Same three nested layers as prompt_for_paths: channel dropped, IO error,
             // user cancelled. All three mean "do nothing".
             let Ok(Ok(Some(path))) = chosen.await else { return };
+
+            // Serialise *after* the dialog closes, not before. gpui's save panel is not
+            // app-modal (`beginWithCompletionHandler:`), so the editor keeps accepting
+            // keystrokes for however long the user browses for a folder — a snapshot taken
+            // before the prompt would write text the user has already moved past, and the
+            // version guard below would then correctly refuse to clear the dirty flag,
+            // leaving a file on disk that silently lags the buffer.
+            let Ok(snapshot) =
+                editor.read_with(cx, |editor, _| editor.document.snapshot_for_save())
+            else {
+                return;
+            };
+            let (text, version) = (snapshot.text, snapshot.version);
 
             let write_path = path.clone();
             let written = cx.background_spawn(async move { write_file(&write_path, &text) }).await;
@@ -254,7 +316,7 @@ impl WorkspaceView {
                 match written {
                     Ok(()) => {
                         editor.update(cx, |editor, _| {
-                            editor.document.buffer.mark_saved();
+                            editor.document.buffer.mark_saved_at(version);
                             // The document now has a home: adopt the path so the next ⌘S
                             // writes straight through, and so a buffer saved as `.php`
                             // starts highlighting as PHP. A grammar that fails to load
@@ -278,8 +340,8 @@ impl WorkspaceView {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.jobs.start(Job::Save, task);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -317,10 +379,7 @@ impl WorkspaceView {
             cx,
         );
 
-        // Detached: a dialog the user is looking at must not be abandoned because some
-        // unrelated background work started. Parked in `pending`, answering "Discard
-        // Changes" could do nothing at all — the tab would simply refuse to close.
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             // A dropped receiver means the dialog vanished without an answer; treat that
             // as Cancel, because the safe default is to keep the buffer.
             let Ok(choice) = answer.await else { return };
@@ -328,13 +387,16 @@ impl WorkspaceView {
                 return;
             }
             this.update(cx, |this, cx| {
+                // Re-resolve by entity handle: indices shift and titles are not unique, so
+                // matching on either could close the wrong file. A tab that has gone away
+                // in the meantime resolves to None and this is a no-op, which is right.
                 if let Some(current) = this.tabs.iter().position(|tab| tab.editor == editor) {
                     this.remove_tab(current, cx);
                 }
             })
             .ok();
-        })
-        .detach();
+        });
+        self.jobs.start(Job::ClosePrompt, task);
     }
 
     fn remove_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -414,6 +476,11 @@ impl WorkspaceView {
             return;
         }
 
+        // Swapping modes replaces the palette entity, so a Files walk still running has
+        // lost its consumer just as surely as a dismissal would have. ⌘P then ⌘⇧P used to
+        // leave that walk grinding through `vendor/` with nowhere to put the result.
+        self.cancel_quick_open_walk();
+
         let items = match mode {
             PaletteMode::Commands => self
                 .registry
@@ -457,13 +524,11 @@ impl WorkspaceView {
         // Cancel a walk still running from a previous open. Dropping the Task stops us
         // awaiting it, but the blocking walk on the background thread would run to
         // completion regardless — the flag is what actually stops it (ADR-0007).
-        if let Some(previous) = self.quick_open_cancel.take() {
-            previous.cancel();
-        }
+        self.cancel_quick_open_walk();
         let cancel = CancelFlag::new();
         self.quick_open_cancel = Some(cancel.clone());
 
-        self.pending = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let walk_cancel = cancel.clone();
             let files = cx.background_spawn(async move { index_files(&root, &walk_cancel) }).await;
 
@@ -480,14 +545,24 @@ impl WorkspaceView {
 
             palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
             this.update(cx, |_, cx| cx.notify()).ok();
-        }));
+        });
+        self.jobs.start(Job::QuickOpenIndex, task);
+    }
+
+    /// Stops any quick-open walk. Called whenever the palette that would consume its
+    /// results goes away — dismissed *or* replaced by a different mode.
+    fn cancel_quick_open_walk(&mut self) {
+        if let Some(cancel) = self.quick_open_cancel.take() {
+            cancel.cancel();
+        }
+        // The flag stops the blocking walk; dropping the task stops us awaiting it. Both
+        // are needed, and only doing the first leaves a task holding the old palette alive.
+        self.jobs.cancel(Job::QuickOpenIndex);
     }
 
     fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A walk still running is now pure waste — nothing will consume its results.
-        if let Some(cancel) = self.quick_open_cancel.take() {
-            cancel.cancel();
-        }
+        self.cancel_quick_open_walk();
         self.palette = None;
         window.focus(&self.focus_handle);
         cx.notify();
@@ -611,7 +686,7 @@ impl WorkspaceView {
         ];
 
         div()
-            .w(px(44.0))
+            .w(Metrics::ACTIVITY_BAR_WIDTH)
             .flex_none()
             .flex()
             .flex_col()
@@ -856,5 +931,143 @@ impl WorkspaceView {
             .child(SharedString::from(terminals))
             .child(SharedString::from(position))
             .child(SharedString::from(language))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Stands in for a `Task`, recording its own cancellation.
+    ///
+    /// A dropped gpui `Task` *is* a cancelled task (`async_task::Task::drop` calls
+    /// `set_canceled`), but gpui offers no way to observe that, so the eviction rule is
+    /// tested against a handle whose drop is visible.
+    struct FakeTask {
+        job: Job,
+        cancelled: Rc<RefCell<Vec<Job>>>,
+    }
+
+    impl Drop for FakeTask {
+        fn drop(&mut self) {
+            self.cancelled.borrow_mut().push(self.job);
+        }
+    }
+
+    struct Harness {
+        slots: JobSlots<FakeTask>,
+        cancelled: Rc<RefCell<Vec<Job>>>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self { slots: JobSlots::default(), cancelled: Rc::new(RefCell::new(Vec::new())) }
+        }
+
+        fn start(&mut self, job: Job) {
+            let task = FakeTask { job, cancelled: self.cancelled.clone() };
+            self.slots.start(job, task);
+        }
+
+        fn cancelled(&self) -> Vec<Job> {
+            self.cancelled.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn starting_a_save_does_not_cancel_an_in_flight_folder_load() {
+        // The headline bug. `pending` was one slot, so ⌘O on a large project followed by
+        // ⌘S dropped the folder-load task: the walk finished on the background pool and
+        // its result was thrown away, so the sidebar stayed on "NO FOLDER OPEN" forever
+        // with no error shown anywhere.
+        let mut h = Harness::new();
+        h.start(Job::OpenFolder);
+        h.start(Job::Save);
+
+        assert!(h.cancelled().is_empty(), "unrelated work must survive: {:?}", h.cancelled());
+    }
+
+    #[test]
+    fn starting_a_folder_load_does_not_cancel_an_in_flight_save() {
+        // The same bug in the direction that loses data. A save in flight that gets
+        // dropped either never runs its write at all, or completes the write while
+        // `mark_saved` never runs — leaving a saved file the editor still reports as dirty,
+        // and a close prompt for changes that are already on disk.
+        let mut h = Harness::new();
+        h.start(Job::Save);
+        h.start(Job::OpenFolder);
+
+        assert!(h.cancelled().is_empty(), "the save must survive: {:?}", h.cancelled());
+    }
+
+    #[test]
+    fn opening_a_file_does_not_cancel_a_quick_open_walk() {
+        // ⌘P starts a walk; clicking a file in the tree used to drop that task while
+        // leaving its CancelFlag unset, so the blocking walk ground on with nothing left
+        // to consume it.
+        let mut h = Harness::new();
+        h.start(Job::QuickOpenIndex);
+        h.start(Job::OpenFile);
+
+        assert!(h.cancelled().is_empty());
+    }
+
+    #[test]
+    fn a_close_prompt_survives_every_other_operation() {
+        // A dialog awaiting an answer is the worst thing to drop: the await is abandoned,
+        // the answer is discarded, and "Discard Changes" silently does nothing.
+        let mut h = Harness::new();
+        h.start(Job::ClosePrompt);
+        h.start(Job::Save);
+        h.start(Job::OpenFolder);
+        h.start(Job::OpenFile);
+        h.start(Job::QuickOpenIndex);
+
+        assert!(h.cancelled().is_empty(), "{:?}", h.cancelled());
+    }
+
+    #[test]
+    fn a_second_request_of_the_same_kind_cancels_the_first() {
+        // The behaviour that must be *kept*: superseding work of the same kind is exactly
+        // what ADR-0007 asks for. Two folder loads in a row means the second one wins.
+        let mut h = Harness::new();
+        h.start(Job::OpenFolder);
+        h.start(Job::OpenFolder);
+
+        assert_eq!(h.cancelled(), vec![Job::OpenFolder]);
+    }
+
+    #[test]
+    fn cancelling_a_job_drops_only_that_job() {
+        let mut h = Harness::new();
+        h.start(Job::QuickOpenIndex);
+        h.start(Job::Save);
+
+        h.slots.cancel(Job::QuickOpenIndex);
+
+        assert_eq!(h.cancelled(), vec![Job::QuickOpenIndex]);
+    }
+
+    #[test]
+    fn cancelling_a_job_that_is_not_running_is_a_no_op() {
+        let mut h = Harness::new();
+        h.slots.cancel(Job::QuickOpenIndex);
+        assert!(h.cancelled().is_empty());
+    }
+
+    #[test]
+    fn every_job_gets_its_own_slot() {
+        // Guards against a slot count regression: if two distinct jobs ever collided the
+        // whole point of keying by job is gone.
+        let mut h = Harness::new();
+        let all =
+            [Job::OpenFolder, Job::OpenFile, Job::Save, Job::QuickOpenIndex, Job::ClosePrompt];
+        for job in all {
+            h.start(job);
+        }
+        assert_eq!(h.slots.slots.len(), all.len());
+        assert!(h.cancelled().is_empty());
     }
 }

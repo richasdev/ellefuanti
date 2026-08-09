@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use elle_syntax::{Language, SyntaxTree, language_for_path};
-use elle_text::{Buffer, Point};
+use elle_text::{Buffer, Point, Version};
 
 /// A cursor with an optional selection anchor.
 ///
@@ -36,6 +36,14 @@ impl Selection {
     pub fn range(&self) -> Range<usize> {
         if self.anchor <= self.head { self.anchor..self.head } else { self.head..self.anchor }
     }
+}
+
+/// Bytes destined for disk, plus the buffer version they were taken from.
+///
+/// See [`Document::snapshot_for_save`] for why the version rides along.
+pub struct SaveSnapshot {
+    pub text: String,
+    pub version: Version,
 }
 
 /// One open document: text, parse state, cursor, and where it came from.
@@ -118,6 +126,17 @@ impl Document {
             text.push('\n');
         }
         text
+    }
+
+    /// The bytes to write, tagged with the buffer version they came from.
+    ///
+    /// The two travel together deliberately. A save serialises here and finishes much
+    /// later — after a background write, and on save-as after a file dialog the user may
+    /// sit in for a minute — and the buffer can move in between. Handing the caller a
+    /// bare `String` invites it to clear the dirty flag for text that is already stale;
+    /// carrying the version makes that mistake impossible to write.
+    pub fn snapshot_for_save(&self) -> SaveSnapshot {
+        SaveSnapshot { text: self.text_for_save(), version: self.buffer.version() }
     }
 
     /// Pushes buffer edits into the parse tree. Called after any mutation.
@@ -452,6 +471,37 @@ mod tests {
     }
 
     #[test]
+    fn typing_while_the_save_dialog_is_open_keeps_the_buffer_dirty() {
+        // Save-as: ⌘S on an untitled buffer opens gpui's save panel, which is *not*
+        // app-modal (`beginWithCompletionHandler:`, not `runModal`), so the editor keeps
+        // taking keystrokes for as long as the user browses for a folder. The write lands
+        // the snapshot taken before the panel opened.
+        let mut d = Document::new(None, "<?php\n", false).unwrap();
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert("$a = 1;");
+
+        let snapshot = d.snapshot_for_save();
+
+        // ...panel is up, user keeps typing...
+        d.insert("\n$b = 2;");
+
+        // The write succeeded, but for `snapshot.text`, not for what the buffer holds now.
+        assert!(!d.buffer.mark_saved_at(snapshot.version));
+        assert!(d.buffer.is_dirty(), "the newer text has never reached disk");
+        assert_ne!(snapshot.text, d.text_for_save());
+    }
+
+    #[test]
+    fn a_snapshot_saved_with_no_intervening_edit_marks_the_buffer_clean() {
+        let mut d = doc("<?php\n");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert("$a = 1;");
+        let snapshot = d.snapshot_for_save();
+        assert!(d.buffer.mark_saved_at(snapshot.version));
+        assert!(!d.buffer.is_dirty());
+    }
+
+    #[test]
     fn title_falls_back_to_untitled() {
         assert_eq!(Document::new(None, "", false).unwrap().title(), "untitled");
         assert_eq!(doc("").title(), "t.php");
@@ -491,6 +541,50 @@ mod tests {
         d.set_path(PathBuf::from("/tmp/notes.txt")).unwrap();
         assert_eq!(d.language(), Language::PlainText);
         assert!(d.syntax.tree().is_none());
+    }
+
+    /// `set_path` swaps the `SyntaxTree` for a freshly built one. That is only safe because
+    /// the edit log is empty at the time: a fresh tree has never seen any edit, so replaying
+    /// already-applied edits into it afterwards would shift byte ranges that were never
+    /// stale and desync highlighting from the text.
+    ///
+    /// The invariant that makes it safe is that every mutating method on `Document` drains
+    /// the log through `sync_syntax` before returning, so no caller can reach `set_path`
+    /// with edits outstanding. `Document::buffer` is public, so nothing in the type system
+    /// enforces that — this test does.
+    #[test]
+    fn a_path_swap_never_happens_with_edits_outstanding() {
+        let mut d = Document::new(None, "<?php\n", false).unwrap();
+
+        // Exercise every mutating path, checking the log is drained after each. The text is
+        // left as valid PHP so the parse assertion below is about sync, not about syntax.
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert("$a = 1;X");
+        assert!(!d.buffer.has_pending(), "insert must drain");
+        d.backspace();
+        assert!(!d.buffer.has_pending(), "backspace must drain");
+        d.insert("Y");
+        d.move_to(d.buffer.len_bytes() - 1, false);
+        d.delete_forward();
+        assert!(!d.buffer.has_pending(), "delete_forward must drain");
+        d.undo();
+        assert!(!d.buffer.has_pending(), "undo must drain");
+        d.redo();
+        assert!(!d.buffer.has_pending(), "redo must drain");
+        assert_eq!(d.buffer.text(), "<?php\n$a = 1;", "fixture must end as valid PHP");
+
+        // Save-as onto a .php name now swaps in a PHP tree over the current text.
+        let before = d.buffer.text();
+        d.set_path(PathBuf::from("/tmp/Adopted.php")).unwrap();
+        assert_eq!(d.language(), Language::Php);
+        assert!(!d.buffer.has_pending(), "the swap itself must not leave edits behind");
+
+        // And the new tree agrees with the text it was built from: keep editing and the
+        // incremental reparse stays valid rather than working from shifted coordinates.
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert("\nclass A {}\n");
+        assert!(!d.syntax.has_error(), "the swapped-in tree must be in sync with the buffer");
+        assert!(d.buffer.text().starts_with(&before));
     }
 
     #[test]

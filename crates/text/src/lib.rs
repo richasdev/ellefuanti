@@ -17,5 +17,5 @@
 mod buffer;
 mod edit;
 
-pub use buffer::{Buffer, Point};
+pub use buffer::{Buffer, Point, Version};
 pub use edit::Edit;
