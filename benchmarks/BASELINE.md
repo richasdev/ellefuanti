@@ -99,18 +99,49 @@ it by dropping the `fsync`; that trades a user's file for milliseconds they neve
 
 ---
 
-## Not yet measured
+## Application — measured with `ELLE_PERF=1`
 
-The §21 targets that need the full app, not a microbenchmark:
+Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefuanti`).
 
-| Metric            | Target     | Status                                           |
-| ----------------- | ---------- | ------------------------------------------------ |
-| Cold startup      | < 500 ms   | not measured                                     |
-| Warm startup      | < 150 ms   | not measured                                     |
-| Idle RAM          | 100–200 MB | **~65 MB** observed at idle with no project open |
-| Frame time        | < 8.3 ms   | not measured                                     |
-| Cached completion | < 50 ms    | no completion engine yet (Milestone 2)           |
+| Metric                                  | Target (§21) | Measured                                   | Verdict            |
+| --------------------------------------- | ------------ | ------------------------------------------ | ------------------ |
+| Cold startup (first launch after build) | < 500 ms     | **520 ms**                                 | ❌ **20 ms over**  |
+| Warm startup                            | < 150 ms     | **191–213 ms**                             | ❌ **~50 ms over** |
+| Idle RAM (no project open)              | 100–200 MB   | **65 MB**                                  | ✅ well under      |
+| Idle CPU                                | —            | **0.0%**                                   | ✅                 |
+| Frame time                              | < 8.3 ms     | instrumented, not yet exercised under load | —                  |
+| Cached completion                       | < 50 ms      | no completion engine (Milestone 2)         | —                  |
 
-Startup and frame time need `tracing` span instrumentation in the app — the remainder of
-issue #16. Watch item: `runtime_shaders` compiles Metal shaders at process start and is the
-prime suspect if cold start misses budget. Measure before blaming it.
+Startup phase breakdown:
+
+| Phase           | Cold       | Warm        |
+| --------------- | ---------- | ----------- |
+| logging init    | 0.3 ms     | 0.3 ms      |
+| gpui init       | 87 ms      | ~38 ms      |
+| keymap          | 0.2 ms     | 0.2 ms      |
+| **window open** | **432 ms** | **152 ms**  |
+| **total**       | **520 ms** | **~200 ms** |
+
+### Both startup targets are currently missed, and the cause is identified
+
+**The window phase dominates, and it is Metal shader compilation** — the cost of the
+`runtime_shaders` feature, which is what lets the project build without a full Xcode
+install. Verified from both directions: without the feature the build fails outright
+(`xcrun: error: unable to find utility "metal"`), and with it the window phase drops from
+432 ms to 152 ms once the OS has cached the compiled shaders.
+
+This was named as the prime suspect in [ADR-0002](../docs/adr/0002-gpui-for-ui.md) _before_
+being measured, and the measurement confirmed it rather than surprising us.
+
+**The fix is a build-pipeline change, not a code change:** compile shaders ahead of time in
+CI (which can have Xcode) and ship the release binary without `runtime_shaders`, while local
+development keeps it. That resolves the cold-start miss without making the project
+unbuildable for contributors. Not done, because there is no release pipeline yet.
+
+**Warm startup at ~200 ms against a 150 ms target** is the residual after shader caching,
+and would need profiling of gpui init (38 ms) plus the remaining 152 ms of window setup to
+attribute further. Not yet investigated — and per §21 it will not be optimised by guessing.
+
+Frame timing is instrumented (worst-of-120-frames, reported against the 8.3 ms budget) but
+the honest status is that no one has yet scrolled a 50k-line file to exercise it. That is
+the remaining part of issue #10.

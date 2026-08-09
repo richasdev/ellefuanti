@@ -139,6 +139,8 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("editor.close", "Close Tab"),
     Command::new("palette.toggle", "Command Palette"),
     Command::new("palette.quick_open", "Quick Open File"),
+    Command::new("terminal.new", "New Terminal"),
+    Command::new("terminal.toggle", "Toggle Terminal"),
 ];
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ use crate::theme::{Metrics, Theme};
 /// and a missing family does not error: gpui's `resolve_font` silently falls back to a
 /// proportional font, which would break every column calculation below in a way that
 /// looks like a layout bug rather than a missing font.
-const FONT_FAMILY: &str = "Menlo";
+pub const FONT_FAMILY: &str = "Menlo";
 
 /// How much text may be measured to map a click to a column.
 ///

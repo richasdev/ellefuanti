@@ -6,6 +6,8 @@ members = [
     "crates/text",
     "crates/syntax",
     "crates/workspace",
+    "crates/terminal",
+    "crates/lsp",
     "benchmarks",
 ]
 
@@ -21,6 +23,8 @@ elle-core = { path = "crates/core" }
 elle-text = { path = "crates/text" }
 elle-syntax = { path = "crates/syntax" }
 elle-workspace = { path = "crates/workspace" }
+elle-terminal = { path = "crates/terminal" }
+elle-lsp = { path = "crates/lsp" }
 
 # UI. runtime_shaders avoids needing full Xcode to compile Metal shaders (see ADR-0002).
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
@@ -29,6 +33,11 @@ ropey = "1.6"
 tree-sitter = "0.26"
 tree-sitter-php = "0.24"
 ignore = "0.4"
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+lsp-types = "0.97"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 notify = "8"
 
 anyhow = "1"

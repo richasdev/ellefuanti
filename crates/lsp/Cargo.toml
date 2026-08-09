@@ -1,0 +1,17 @@
+[package]
+name = "elle-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+elle-text.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Real OS pipes for the mock server, so the tests exercise the actual framing path.
+os_pipe = "1"
