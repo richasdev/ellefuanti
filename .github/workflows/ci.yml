@@ -81,3 +81,32 @@ jobs:
         run: |
           test -x target/release/ellefuanti
           ls -lh target/release/ellefuanti
+
+      - name: Report startup phases
+        # Issue #38: startup with shaders *precompiled* is the one performance figure that
+        # cannot be measured on a machine without Xcode, which is where every other number
+        # in benchmarks/BASELINE.md came from. This runner has Xcode, so it is the only place
+        # the number can come from honestly.
+        #
+        # ELLE_PERF prints each phase to stderr before the window opens, so the timings up to
+        # that point are real even here. Treat the total with suspicion: a headless runner has
+        # no display, so window creation may fail or take an atypical path — which is exactly
+        # why this step never fails the build and is labelled indicative rather than
+        # authoritative.
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          # Redirect to a file rather than piping: a pipe through grep/head inside a
+          # backgrounded job buffers, and killing the app can discard everything it wrote.
+          ELLE_PERF=1 ./target/release/ellefuanti > startup.log 2>&1 &
+          APP=$!
+          # The app has no reason to exit on its own; give it time to print, then stop it.
+          sleep 20
+          kill $APP 2>/dev/null || true
+          wait $APP 2>/dev/null || true
+
+          echo "--- startup phases (precompiled shaders) ---"
+          grep '\[perf\]' startup.log || echo "no [perf] output — see the raw log below"
+          echo "--- raw ---"
+          head -40 startup.log
+          echo "Note: indicative only — headless runner, no display. See issue #38."
