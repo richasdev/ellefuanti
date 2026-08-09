@@ -38,8 +38,15 @@ pub struct WorkspaceView {
     terminal: Option<Entity<TerminalView>>,
     /// Transient message for the status bar (a failed save, mostly).
     status: Option<SharedString>,
-    /// In-flight background work. Held rather than detached so a new request drops the
-    /// old one, which is how ADR-0007's cancellation actually happens.
+    /// In-flight *cancellable* background work — loading a folder, opening a file, walking
+    /// the project for quick open. Held rather than detached so a new request drops the old
+    /// one, which is how ADR-0007's cancellation actually happens.
+    ///
+    /// **Writes must never live here.** Dropping a `Task` cancels it, so a save parked in
+    /// this slot could be abandoned between the bytes reaching disk and `mark_saved()`
+    /// running — leaving a file saved but its tab still marked dirty, and the
+    /// unsaved-changes prompt warning about changes that are already on disk. Saves are
+    /// detached instead; see `save` and `save_as`.
     pending: Option<Task<()>>,
     /// Frame pacing, measured at the window root so it sees every repaint.
     frames: FrameTimer,
@@ -189,7 +196,12 @@ impl WorkspaceView {
         let editor = tab.editor.clone();
         let text = editor.read(cx).document.text_for_save();
 
-        self.pending = Some(cx.spawn(async move |this, cx| {
+        // Detached, NOT parked in `self.pending`. A save must run to completion: parking it
+        // there means the next folder open or quick-open walk drops it, and if that happens
+        // after write_file succeeds but before mark_saved runs, the file is on disk while
+        // its tab still reads dirty — and the close prompt then warns about changes that
+        // were already saved.
+        cx.spawn(async move |this, cx| {
             let written = cx.background_spawn(async move { write_file(&path, &text) }).await;
 
             this.update(cx, |this, cx| {
@@ -205,7 +217,8 @@ impl WorkspaceView {
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
     /// Asks for a location, then saves a buffer that has no path yet.
@@ -225,7 +238,11 @@ impl WorkspaceView {
 
         let chosen = cx.prompt_for_new_path(&directory, Some("untitled.php"));
 
-        self.pending = Some(cx.spawn(async move |this, cx| {
+        // Detached for the same reason as `save`, and the stakes here are higher: this task
+        // also adopts the new path. Dropping it after the write could leave a file on disk
+        // that the editor still believes has no path, so the next ⌘S would reopen the dialog
+        // for a file that was already saved.
+        cx.spawn(async move |this, cx| {
             // Same three nested layers as prompt_for_paths: channel dropped, IO error,
             // user cancelled. All three mean "do nothing".
             let Ok(Ok(Some(path))) = chosen.await else { return };
@@ -261,7 +278,8 @@ impl WorkspaceView {
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -299,7 +317,10 @@ impl WorkspaceView {
             cx,
         );
 
-        self.pending = Some(cx.spawn(async move |this, cx| {
+        // Detached: a dialog the user is looking at must not be abandoned because some
+        // unrelated background work started. Parked in `pending`, answering "Discard
+        // Changes" could do nothing at all — the tab would simply refuse to close.
+        cx.spawn(async move |this, cx| {
             // A dropped receiver means the dialog vanished without an answer; treat that
             // as Cancel, because the safe default is to keep the buffer.
             let Ok(choice) = answer.await else { return };
@@ -312,7 +333,8 @@ impl WorkspaceView {
                 }
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
     fn remove_tab(&mut self, index: usize, cx: &mut Context<Self>) {
