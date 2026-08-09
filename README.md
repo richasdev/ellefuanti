@@ -5,10 +5,14 @@ generic editor that happens to support them.
 
 Written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
 
-> **Status: early.** Milestone 1 (the editor foundation) is in progress. The domain layers
-> — text buffer, incremental parsing, highlighting, file tree, command system — are built
-> and tested; the UI is being assembled on top. See [docs/MILESTONE-1.md](docs/MILESTONE-1.md)
-> for exactly what works and what does not.
+> **Status: preparing 0.1.0.** The editor foundation is built — rope buffer, incremental
+> parsing, highlighting, file tree, tabs, palette, quick open, multi-session terminal, and a
+> generic LSP client. 258 tests, clippy clean.
+>
+> **The UI has not been visually verified** ([#35](https://github.com/richasdev/ellefuanti/issues/35)),
+> and that is the main thing standing between this and a release. See
+> [CHANGELOG.md](CHANGELOG.md) for the honest limitations list and
+> [docs/MILESTONE-1.md](docs/MILESTONE-1.md) for what works.
 
 ## Why
 
@@ -34,13 +38,22 @@ Requires Rust stable (1.85+ for edition 2024; developed on 1.94) and macOS.
 cargo run
 ```
 
-Full Xcode is **not** required — the workspace enables GPUI's `runtime_shaders` feature so
-Metal shaders compile at runtime rather than needing `xcrun metal` from a full Xcode
-install. See [ADR-0002](docs/adr/0002-gpui-for-ui.md).
+Full Xcode is **not** required. GPUI's build script shells out to `xcrun metal`, which ships
+only with Xcode — so `runtime-shaders` is on by default and shaders compile at launch
+instead.
+
+That default costs startup time, so release builds turn it off and precompile:
 
 ```sh
-cargo test        # domain layers: buffer, parsing, highlighting, file tree, commands
-cargo bench       # performance baselines (Milestone 1, task 16)
+cargo build --release -p ellefuanti --no-default-features   # needs full Xcode
+```
+
+CI does this on every push, precisely because the release path can break while `cargo build`
+keeps working locally. See [ADR-0002](docs/adr/0002-gpui-for-ui.md).
+
+```sh
+cargo test        # 258 tests across every crate
+cargo bench       # performance baselines — see benchmarks/BASELINE.md
 ```
 
 ## Architecture
@@ -54,10 +67,12 @@ crates/
 ├── core/        command registry
 ├── text/        rope buffer, undo/redo, edit log
 ├── syntax/      tree-sitter incremental parsing, highlighting
-└── workspace/   filesystem, lazy file tree, safe file IO
+├── workspace/   filesystem, lazy file tree, project index, safe file IO
+├── terminal/    PTY sessions, VT/ANSI emulation
+└── lsp/         generic LSP client with substitutable backends
 ```
 
-Five crates, not the eighteen the spec sketches. Crates are added when there is code to put
+Seven crates, not the eighteen the spec sketches. Crates are added when there is code to put
 in them.
 
 Read next:
@@ -70,16 +85,17 @@ Read next:
 
 ## Roadmap
 
-| Milestone | Scope                                                                                        |
-| --------- | -------------------------------------------------------------------------------------------- |
-| **1**     | Editor: window, file tree, tabs, custom rope editor, PHP/Blade highlighting, command palette |
-| **2**     | PHP: generic LSP client, completion, diagnostics, hover, definition, references              |
-| **3**     | Laravel: project index, models, migrations, routes, Artisan, Laravel panel                   |
-| **4**     | Livewire/Blade: component indexing, PHP ⇄ Blade navigation, `wire:` completion               |
-| **5**     | Tools: Git, database explorer, Docker, tests, log viewer                                     |
-| **6**     | Advanced: Composer UI, queues, HTTP client, Xdebug debugger                                  |
-| **7**     | Extensibility: plugin system, opt-in provider-agnostic AI completion                         |
-| **8**     | Embedded browser preview                                                                     |
+| Milestone | Scope                                                                                   |
+| --------- | --------------------------------------------------------------------------------------- |
+| **0.1.0** | Editor foundation, shippable: open a project, browse, edit, save, run a terminal        |
+| **1**     | ✅ Editor: window, file tree, tabs, custom rope editor, PHP/Blade highlighting, palette |
+| **2**     | PHP: generic LSP client, completion, diagnostics, hover, definition, references         |
+| **3**     | Laravel: project index, models, migrations, routes, Artisan, Laravel panel              |
+| **4**     | Livewire/Blade: component indexing, PHP ⇄ Blade navigation, `wire:` completion          |
+| **5**     | Tools: Git, database explorer, Docker, tests, log viewer                                |
+| **6**     | Advanced: Composer UI, queues, HTTP client, Xdebug debugger                             |
+| **7**     | Extensibility: plugin system, opt-in provider-agnostic AI completion                    |
+| **8**     | Embedded browser preview                                                                |
 
 Every tool integration is a leaf in the dependency graph: a broken Docker daemon cannot
 break the editor, and a broken LSP cannot stop you typing.
