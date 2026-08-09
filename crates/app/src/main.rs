@@ -30,8 +30,16 @@ fn main() {
         .init();
     startup.phase("logging");
 
-    Application::new().run(move |cx: &mut App| {
-        startup.phase("gpui_init");
+    // Split so the phase names mean what they say. `Application::new()` constructs the
+    // platform (on macOS: NSApplication, the Metal device, the text system), while `run`
+    // starts the event loop and calls back. Measuring only inside the closure attributed
+    // both to one "gpui_init" bucket, which is the sort of label that sends someone
+    // optimising the wrong half.
+    let app = Application::new();
+    startup.phase("platform_init");
+
+    app.run(move |cx: &mut App| {
+        startup.phase("event_loop_start");
 
         let registry = Arc::new(actions::init(cx));
 

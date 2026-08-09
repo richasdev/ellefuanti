@@ -124,17 +124,17 @@ it by dropping the `fsync`; that trades a user's file for milliseconds they neve
 
 Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefuanti`).
 
-| Metric                           | Target (§21) | Measured                           | Verdict                   |
-| -------------------------------- | ------------ | ---------------------------------- | ------------------------- |
-| Cold startup (warm shader cache) | < 500 ms     | **380 ms**                         | ✅                        |
-| Cold startup (cold shader cache) | < 500 ms     | **520 ms**                         | ❌ worst case — see below |
-| Warm startup                     | < 150 ms     | **191–213 ms**                     | ❌ **~50 ms over**        |
-| Idle RAM (no project open)       | 100–200 MB   | **69 MB**                          | ✅ well under             |
-| Idle CPU                         | —            | **0.0%**                           | ✅                        |
-| Frame render, 55k-line file      | < 8.3 ms     | **0.08–0.77 ms**                   | ✅                        |
-| Keystroke → pixel, 55k-line file | < 8.3 ms     | **2.6–5.3 ms** †                   | ✅                        |
-| Sustained typing, 55k-line file  | < 8.3 ms     | **~4.3 ms** †                      | ✅                        |
-| Cached completion                | < 50 ms      | no completion engine (Milestone 2) | —                         |
+| Metric                                | Target (§21) | Measured                           | Verdict                   |
+| ------------------------------------- | ------------ | ---------------------------------- | ------------------------- |
+| Startup, first launch of a new binary | < 500 ms     | **520–536 ms**                     | ❌ worst case — see below |
+| Startup, later launches               | < 500 ms     | **~195–380 ms**                    | ✅                        |
+| Warm startup                          | < 150 ms     | **191–213 ms**                     | ❌ **~50 ms over**        |
+| Idle RAM (no project open)            | 100–200 MB   | **69 MB**                          | ✅ well under             |
+| Idle CPU                              | —            | **0.0%**                           | ✅                        |
+| Frame render, 55k-line file           | < 8.3 ms     | **0.08–0.77 ms**                   | ✅                        |
+| Keystroke → pixel, 55k-line file      | < 8.3 ms     | **2.6–5.3 ms** †                   | ✅                        |
+| Sustained typing, 55k-line file       | < 8.3 ms     | **~4.3 ms** †                      | ✅                        |
+| Cached completion                     | < 50 ms      | no completion engine (Milestone 2) | —                         |
 
 **† Do not read these as precise figures.** The same code measured 5.28 ms on a loaded
 machine and 2.65 ms on a quiet one — a 2× spread from machine conditions alone. If you run
@@ -154,13 +154,48 @@ diff two separate `cargo bench` invocations.
 
 Startup phase breakdown:
 
-| Phase           | Cold       | Warm        |
-| --------------- | ---------- | ----------- |
-| logging init    | 0.3 ms     | 0.3 ms      |
-| gpui init       | 87 ms      | ~38 ms      |
-| keymap          | 0.2 ms     | 0.2 ms      |
-| **window open** | **432 ms** | **152 ms**  |
-| **total**       | **520 ms** | **~200 ms** |
+| Phase           | Cold       | Warm        | CI (headless) |
+| --------------- | ---------- | ----------- | ------------- |
+| logging init    | 0.3 ms     | 0.3 ms      | 0.2 ms        |
+| gpui init       | 87 ms      | ~38 ms      | 92 ms         |
+| keymap          | 0.2 ms     | 0.2 ms      | 0.5 ms        |
+| **window open** | **432 ms** | **152 ms**  | **765 ms** ⚠  |
+| **total**       | **520 ms** | **~200 ms** | **858 ms** ⚠  |
+
+The CI column comes from the `release-build` job (`ELLE_PERF=1` on the precompiled-shader
+binary) and is **reported but not trusted**. A GitHub macOS runner has no display, so window
+creation there takes a path no user ever exercises — 765 ms against 432 ms locally, on the same
+build. What the column is good for is the phases _before_ the window, which match the local
+figures closely and are therefore display-independent.
+
+It is wired up (rather than left to a human with Xcode) so the figure appears on every run and
+a regression in the early phases would be visible. The step is `continue-on-error` and cannot
+fail the build, precisely because its headline number is untrustworthy.
+
+### Where the warm-startup miss actually is
+
+The original `gpui_init` phase was measured *inside* `Application::run`'s closure, so it lumped
+platform construction together with starting the event loop — the kind of label that sends
+someone optimising the wrong half. Split apart, a warm launch decomposes as:
+
+| Phase              | Warm       | What it is                                                      |
+| ------------------ | ---------- | --------------------------------------------------------------- |
+| logging init       | 0.05 ms    | our `tracing_subscriber` setup                                  |
+| `platform_init`    | **48 ms**  | `Application::new()` — NSApplication, Metal device, text system  |
+| `event_loop_start` | **16 ms**  | `run()` reaching our callback                                   |
+| keymap             | 0.1 ms     | our action and keybinding registration                          |
+| `window` open      | **152 ms** | `open_window` plus first paint                                  |
+| **total**          | **216 ms** |                                                                 |
+
+**Effectively all of it is inside gpui.** Our own code — logging setup plus the keymap — is
+under 0.2 ms combined. No application-level change moves the 150 ms target; it would take
+either a change in how gpui initialises the platform and opens a window, or deferring window
+creation until after something the user can see, which trades a real property (the window
+appears immediately) for a better number.
+
+The miss is therefore recorded as **attributed but not actionable at this layer** — a more
+useful state than "unattributed", and a reason not to keep poking at it. Revisit if gpui's
+startup path changes.
 
 ### Startup: the shader diagnosis was wrong
 
