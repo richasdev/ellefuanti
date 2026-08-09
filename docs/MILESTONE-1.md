@@ -16,25 +16,32 @@ Tasks are small and independently verifiable. Each states its **done** condition
 
 ## Status
 
-| #   | Task                                | State          |
-| --- | ----------------------------------- | -------------- |
-| 1   | Cargo workspace and build baseline  | ✅ done        |
-| 2   | Rope text buffer with undo/redo     | ✅ done        |
-| 3   | Command registry and palette search | ✅ done        |
-| 4   | Lazy file tree                      | ✅ done        |
-| 5   | Safe file read/write                | ✅ done        |
-| 6   | Tree-sitter incremental parsing     | ✅ done        |
-| 7   | Syntax highlighting (PHP + Blade)   | ✅ done        |
-| 8   | Cursor, selection and motion        | ✅ done        |
-| 9   | GPUI window and workspace shell     | ⬜ in progress |
-| 10  | Virtualised editor view             | ⬜ in progress |
-| 11  | Keyboard and text input             | ⬜ in progress |
-| 12  | Tabs and multiple open files        | ⬜ todo        |
-| 13  | Command palette and quick open UI   | ⬜ todo        |
-| 14  | Native open-folder dialog           | ⬜ todo        |
-| 15  | Save, dirty state and status bar    | ⬜ todo        |
-| 16  | Benchmarks                          | 🟡 partial     |
-| 17  | Basic terminal panel                | ⬜ deferred    |
+| #   | Task                                | State                               |
+| --- | ----------------------------------- | ----------------------------------- |
+| 1   | Cargo workspace and build baseline  | ✅ done                             |
+| 2   | Rope text buffer with undo/redo     | ✅ done                             |
+| 3   | Command registry and palette search | ✅ done                             |
+| 4   | Lazy file tree                      | ✅ done                             |
+| 5   | Safe file read/write                | ✅ done                             |
+| 6   | Tree-sitter incremental parsing     | ✅ done                             |
+| 7   | Syntax highlighting (PHP + Blade)   | ✅ done                             |
+| 8   | Cursor, selection and motion        | ✅ done                             |
+| 9   | GPUI window and workspace shell     | 🟡 built, unverified visually       |
+| 10  | Virtualised editor view             | 🟡 built, unverified visually       |
+| 11  | Keyboard and text input             | 🟡 built, unverified visually       |
+| 12  | Tabs and multiple open files        | 🟡 built, unverified visually       |
+| 13  | Command palette and quick open UI   | 🟡 built, unverified visually       |
+| 14  | Native open-folder dialog           | 🟡 built, unverified visually       |
+| 15  | Save, dirty state and status bar    | 🟡 built, unverified visually       |
+| 16  | Benchmarks                          | ✅ done                             |
+| 17  | Basic terminal panel                | ✅ done (multi-session, via PR #34) |
+
+Tasks 9–15 share one blocker: **the UI has never been seen on a screen**
+([#35](https://github.com/richasdev/ellefuanti/issues/35)). Everything is implemented,
+unit-tested at the logic layer, and gated by CI; what is missing is a human confirming the
+pixels. That is also the main blocker for the
+[0.1.0 release milestone](https://github.com/richasdev/ellefuanti/milestone/9), which now
+tracks these tasks.
 
 ---
 
