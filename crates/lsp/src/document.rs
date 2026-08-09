@@ -261,7 +261,11 @@ mod tests {
         let original = "// 😀 fim\nx";
         let mut document = doc(original);
         let offset = original.find('x').unwrap();
-        let events = document.apply(&edit(offset..offset + 1, "y", "x"), SyncKind::Incremental, OffsetEncoding::Utf16);
+        let events = document.apply(
+            &edit(offset..offset + 1, "y", "x"),
+            SyncKind::Incremental,
+            OffsetEncoding::Utf16,
+        );
 
         assert_eq!(events[0].range.unwrap().start, lsp_types::Position { line: 1, character: 0 });
         assert_eq!(document.text(), "// 😀 fim\ny");

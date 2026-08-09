@@ -188,7 +188,20 @@ fn uri() -> lsp_types::Uri {
     "file:///srv/app/Model.php".parse().unwrap()
 }
 
-fn open_client(capabilities: Value, respond: impl Fn(&str, &Value) -> Reply + Send + 'static) -> (Client, MockServer) {
+/// A serialised `initialize` reply advertising the full capability set.
+fn initialize_reply(id: &RequestId) -> Vec<u8> {
+    let result = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "capabilities": full_capabilities() }
+    });
+    serde_json::to_vec(&result).unwrap()
+}
+
+fn open_client(
+    capabilities: Value,
+    respond: impl Fn(&str, &Value) -> Reply + Send + 'static,
+) -> (Client, MockServer) {
     let (connection, server) = mock(capabilities, respond);
     let client = Client::connect(&config(), connection).expect("handshake should succeed");
     (client, server)
@@ -556,8 +569,7 @@ fn diagnostics_notifications_become_events() {
                 continue;
             };
             if method == "initialize" {
-                let result = json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": full_capabilities() } });
-                write_frame(&mut writer, &serde_json::to_vec(&result).unwrap()).unwrap();
+                write_frame(&mut writer, &initialize_reply(&id)).unwrap();
 
                 // Push diagnostics unprompted, the way a real server does after
                 // indexing a file.
@@ -618,8 +630,7 @@ fn a_server_that_dies_mid_request_reports_rather_than_hangs() {
                 continue;
             };
             if method == "initialize" {
-                let result = json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": full_capabilities() } });
-                write_frame(&mut writer, &serde_json::to_vec(&result).unwrap()).unwrap();
+                write_frame(&mut writer, &initialize_reply(&id)).unwrap();
             } else {
                 // Die mid-request: drop both streams without answering.
                 return;
@@ -679,8 +690,7 @@ fn garbage_from_the_server_does_not_end_the_session() {
                 write_frame(&mut writer, br#"{"jsonrpc":"2.0","nonsense":true}"#).unwrap();
                 write_frame(&mut writer, b"not json at all").unwrap();
 
-                let result = json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": full_capabilities() } });
-                write_frame(&mut writer, &serde_json::to_vec(&result).unwrap()).unwrap();
+                write_frame(&mut writer, &initialize_reply(&id)).unwrap();
             }
         }
     });
@@ -708,8 +718,7 @@ fn a_server_request_is_answered_so_it_does_not_stall() {
         while let Ok(Some(body)) = read_frame(&mut reader) {
             match Incoming::parse(&body) {
                 Some(Incoming::Request { id, method, .. }) if method == "initialize" => {
-                    let result = json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": full_capabilities() } });
-                    write_frame(&mut writer, &serde_json::to_vec(&result).unwrap()).unwrap();
+                    write_frame(&mut writer, &initialize_reply(&id)).unwrap();
 
                     // Ask the client something, as servers do at startup.
                     let request = json!({

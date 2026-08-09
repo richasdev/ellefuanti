@@ -46,15 +46,20 @@ ellefuanti (bin, gpui)
 ├── elle-workspace ──── ignore
 ├── elle-syntax ─────── tree-sitter, tree-sitter-php
 │   └── elle-text ───── ropey
+├── elle-lsp ────────── lsp-types, serde_json
+│   └── elle-text      (consumes `Edit` for incremental didChange)
 ├── elle-text
 └── elle-core          (no deps beyond error types)
 ```
 
-Five crates, not the eighteen sketched in §4. That sketch is a direction, and §4 says so
+Six crates, not the eighteen sketched in §4. That sketch is a direction, and §4 says so
 explicitly ("não crie dezenas de crates sem necessidade atual"). Crates are added when
-code exists to put in them: `elle-lsp` at Milestone 2, `elle-laravel` and
+code exists to put in them: `elle-lsp` arrived with Milestone 2, `elle-laravel` and
 `elle-project-index` at Milestone 3, and so on. An empty crate is a maintenance cost with
 no reader.
+
+`elle-lsp` is not yet wired into the app: it is a library with its own test suite, and the
+UI integration is deliberately a separate change so that each is reviewable on its own.
 
 ### Where the later subsystems attach
 
