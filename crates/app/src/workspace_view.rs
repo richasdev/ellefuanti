@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use elle_core::CommandRegistry;
-use elle_workspace::{FileTree, read_file, write_file};
+use elle_workspace::{CancelFlag, FileTree, index_files, read_file, write_file};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions, SharedString,
     Task, Window, div, prelude::*, px, uniform_list,
@@ -43,6 +43,9 @@ pub struct WorkspaceView {
     pending: Option<Task<()>>,
     /// Frame pacing, measured at the window root so it sees every repaint.
     frames: FrameTimer,
+    /// Cancels an in-flight quick-open walk. Separate from `pending` because dropping a
+    /// Task stops the await, not the blocking walk behind it.
+    quick_open_cancel: Option<CancelFlag>,
 }
 
 impl WorkspaceView {
@@ -58,6 +61,7 @@ impl WorkspaceView {
             status: None,
             pending: None,
             frames: FrameTimer::new(),
+            quick_open_cancel: None,
         }
     }
 
@@ -287,7 +291,8 @@ impl WorkspaceView {
                 .iter()
                 .map(|command| (command.title.to_string(), command.id.0.to_string()))
                 .collect(),
-            PaletteMode::Files => self.tree_file_items(),
+            // Files arrive asynchronously — the palette opens empty and fills in.
+            PaletteMode::Files => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -302,29 +307,61 @@ impl WorkspaceView {
         .detach();
 
         window.focus(&palette.read(cx).focus_handle(cx));
-        self.palette = Some(palette);
+        self.palette = Some(palette.clone());
+
+        if mode == PaletteMode::Files {
+            self.load_quick_open_items(palette, cx);
+        }
+
         cx.notify();
     }
 
-    /// Files currently *visible* in the tree, as quick-open candidates.
+    /// Walks the project on the background executor and fills the palette when it lands.
     ///
-    /// ponytail: only expanded rows, not a recursive walk of the project. A real quick
-    /// open needs a background, cancellable directory walk feeding an index — that is
-    /// Milestone 1 task 13, and doing it here would block the UI on a large project.
-    fn tree_file_items(&self) -> Vec<(String, String)> {
-        self.tree
-            .as_ref()
-            .map(|tree| {
-                tree.entries()
-                    .iter()
-                    .filter(|entry| !entry.is_dir())
-                    .map(|entry| (entry.name.clone(), entry.path.display().to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// The palette opens immediately with an empty list rather than waiting: on a large
+    /// project the walk takes long enough that blocking on it would be the difference
+    /// between an instant palette and a visible stall (§13, §22).
+    fn load_quick_open_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        // Cancel a walk still running from a previous open. Dropping the Task stops us
+        // awaiting it, but the blocking walk on the background thread would run to
+        // completion regardless — the flag is what actually stops it (ADR-0007).
+        if let Some(previous) = self.quick_open_cancel.take() {
+            previous.cancel();
+        }
+        let cancel = CancelFlag::new();
+        self.quick_open_cancel = Some(cancel.clone());
+
+        self.pending = Some(cx.spawn(async move |this, cx| {
+            let walk_cancel = cancel.clone();
+            let files = cx
+                .background_spawn(async move { index_files(&root, &walk_cancel) })
+                .await;
+
+            // A cancelled walk returns whatever it had; showing a partial list for a
+            // palette the user already closed would be noise.
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            let items = files
+                .into_iter()
+                .map(|file| (file.relative, file.path.display().to_string()))
+                .collect();
+
+            palette
+                .update(cx, |palette, cx| palette.set_items(items, cx))
+                .ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
     }
 
     fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A walk still running is now pure waste — nothing will consume its results.
+        if let Some(cancel) = self.quick_open_cancel.take() {
+            cancel.cancel();
+        }
         self.palette = None;
         window.focus(&self.focus_handle);
         cx.notify();

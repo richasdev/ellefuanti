@@ -5,8 +5,10 @@
 //! these calls in `cx.background_spawn` (ADR-0007). Keeping the async choice out of
 //! here is what makes the tree testable without a runtime.
 
+mod file_index;
 mod file_tree;
 mod fs;
 
+pub use file_index::{CancelFlag, IndexedFile, MAX_INDEXED_FILES, index_files};
 pub use file_tree::{Entry, EntryKind, FileTree};
 pub use fs::{ReadFile, read_file, write_file};
