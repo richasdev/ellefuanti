@@ -22,7 +22,11 @@ pub struct Edit {
 }
 
 impl Edit {
-    pub fn new(range: Range<usize>, new_text: impl Into<Arc<str>>, old_text: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        range: Range<usize>,
+        new_text: impl Into<Arc<str>>,
+        old_text: impl Into<Arc<str>>,
+    ) -> Self {
         Self { range, new_text: new_text.into(), old_text: old_text.into() }
     }
 

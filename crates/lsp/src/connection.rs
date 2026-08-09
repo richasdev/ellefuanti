@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::jsonrpc::{Incoming, Notification, Request, RequestId, Response, ResponseError, error_codes};
+use crate::jsonrpc::{
+    Incoming, Notification, Request, RequestId, Response, ResponseError, error_codes,
+};
 use crate::transport::{read_message, write_message};
 
 /// The outcome of a request.
@@ -231,7 +233,12 @@ impl Connection {
     }
 
     /// Convenience: send and wait.
-    pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<RequestOutcome> {
+    pub fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<RequestOutcome> {
         let id = self.send(method, params)?;
         self.wait(&id, timeout)
     }

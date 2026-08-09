@@ -134,13 +134,7 @@ mod tests {
 fn no_backend_name_appears_in_the_clients_logic() {
     // Every PHP language server this crate might be pointed at. If a name shows up in
     // code, someone has started special-casing.
-    const BACKENDS: [&str; 5] = [
-        "intelephense",
-        "phpactor",
-        "psalm",
-        "phpstan",
-        "serenata",
-    ];
+    const BACKENDS: [&str; 5] = ["intelephense", "phpactor", "psalm", "phpstan", "serenata"];
 
     let mut violations = Vec::new();
 
@@ -195,10 +189,8 @@ fn the_crate_does_not_depend_on_gpui_or_tokio() {
     // test in crates/app covers gpui across all crates; this one also catches tokio,
     // which is the live temptation for an LSP client specifically — every LSP example
     // on the internet is async, and `async-lsp` would have brought tokio with it.
-    let manifest = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
-    )
-    .unwrap();
+    let manifest =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
 
     for forbidden in ["gpui", "tokio", "async-lsp", "tower-lsp"] {
         assert!(

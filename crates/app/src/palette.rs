@@ -107,7 +107,10 @@ impl Palette {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.function {
+        if keystroke.modifiers.platform
+            || keystroke.modifiers.control
+            || keystroke.modifiers.function
+        {
             return;
         }
         // Navigation, confirm and dismiss are actions; only text reaches the query.
@@ -235,14 +238,17 @@ impl Render for Palette {
                                         .cursor_pointer()
                                         .when(index == selected, |el| el.bg(theme.selected))
                                         .hover(|el| el.bg(theme.hover))
-                                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                                            entity.update(cx, |palette, cx| {
-                                                palette.selected = index;
-                                                cx.emit(PaletteEvent::Confirmed(
-                                                    palette.filtered[index].id.clone(),
-                                                ));
-                                            });
-                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, _window, cx| {
+                                                entity.update(cx, |palette, cx| {
+                                                    palette.selected = index;
+                                                    cx.emit(PaletteEvent::Confirmed(
+                                                        palette.filtered[index].id.clone(),
+                                                    ));
+                                                });
+                                            },
+                                        )
                                         .child(item.label.clone())
                                         .into_any_element(),
                                 )

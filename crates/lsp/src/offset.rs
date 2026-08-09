@@ -165,14 +165,24 @@ impl LineIndex {
         offset
     }
 
-    pub fn range(&self, text: &str, range: std::ops::Range<usize>, encoding: OffsetEncoding) -> Range {
+    pub fn range(
+        &self,
+        text: &str,
+        range: std::ops::Range<usize>,
+        encoding: OffsetEncoding,
+    ) -> Range {
         Range {
             start: self.position(text, range.start, encoding),
             end: self.position(text, range.end, encoding),
         }
     }
 
-    pub fn byte_range(&self, text: &str, range: Range, encoding: OffsetEncoding) -> std::ops::Range<usize> {
+    pub fn byte_range(
+        &self,
+        text: &str,
+        range: Range,
+        encoding: OffsetEncoding,
+    ) -> std::ops::Range<usize> {
         let start = self.offset(text, range.start, encoding);
         let end = self.offset(text, range.end, encoding);
         // Servers occasionally emit inverted ranges; normalising beats slicing panics.

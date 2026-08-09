@@ -366,7 +366,10 @@ impl Client {
     }
 
     pub fn completion(&self, uri: &Uri, offset: usize) -> Result<Option<CompletionResponse>> {
-        self.request(lsp_types::request::Completion::METHOD, self.text_document_position(uri, offset)?)
+        self.request(
+            lsp_types::request::Completion::METHOD,
+            self.text_document_position(uri, offset)?,
+        )
     }
 
     /// Issues a completion request without waiting, for the cancel-on-keystroke path.
@@ -439,7 +442,11 @@ impl Client {
 
     /// Blocks until the server pushes something, or the timeout elapses.
     pub fn wait_for_events(&self, timeout: Duration) -> Vec<ServerEvent> {
-        self.connection.wait_for_inbox(timeout).into_iter().filter_map(|m| self.to_event(m)).collect()
+        self.connection
+            .wait_for_inbox(timeout)
+            .into_iter()
+            .filter_map(|m| self.to_event(m))
+            .collect()
     }
 
     fn to_event(&self, message: ServerMessage) -> Option<ServerEvent> {
@@ -523,9 +530,15 @@ impl Client {
         }
 
         // A hung server must not hold the shutdown open; the kill below is the backstop.
-        match self.connection.request(lsp_types::request::Shutdown::METHOD, Value::Null, SHUTDOWN_TIMEOUT) {
+        match self.connection.request(
+            lsp_types::request::Shutdown::METHOD,
+            Value::Null,
+            SHUTDOWN_TIMEOUT,
+        ) {
             Ok(_) => {}
-            Err(err) => tracing::debug!(%err, server = %self.name, "shutdown request failed; exiting anyway"),
+            Err(err) => {
+                tracing::debug!(%err, server = %self.name, "shutdown request failed; exiting anyway")
+            }
         }
 
         let _ = self.connection.notify(lsp_types::notification::Exit::METHOD, Value::Null);
@@ -612,10 +625,21 @@ fn client_capabilities() -> ClientCapabilities {
 /// Something the server pushed at us.
 #[derive(Debug)]
 pub enum ServerEvent {
-    Diagnostics { uri: Uri, version: Option<i32>, diagnostics: Vec<Diagnostic> },
+    Diagnostics {
+        uri: Uri,
+        version: Option<i32>,
+        diagnostics: Vec<Diagnostic>,
+    },
     /// Any other notification, passed through rather than dropped so a caller can act
     /// on `window/logMessage` and friends without this crate growing a case per method.
-    Notification { method: String, params: Value },
+    Notification {
+        method: String,
+        params: Value,
+    },
     /// A server-initiated request. Already answered; surfaced for visibility.
-    Request { id: RequestId, method: String, params: Value },
+    Request {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
 }

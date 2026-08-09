@@ -24,7 +24,8 @@ fn php_source(classes: usize) -> String {
     text
 }
 
-const SIZES: [(&str, usize); 3] = [("10_classes", 10), ("100_classes", 100), ("1000_classes", 1000)];
+const SIZES: [(&str, usize); 3] =
+    [("10_classes", 10), ("100_classes", 100), ("1000_classes", 1000)];
 
 fn cold_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_parse");

@@ -175,7 +175,9 @@ mod tests {
         // desynchronise the stream permanently on the first accented identifier.
         let body = r#"{"s":"ação"}"#;
         let out = framed(body);
-        let header = String::from_utf8(out[..out.iter().position(|&b| b == b'\r').unwrap()].to_vec()).unwrap();
+        let header =
+            String::from_utf8(out[..out.iter().position(|&b| b == b'\r').unwrap()].to_vec())
+                .unwrap();
         assert_eq!(header, format!("Content-Length: {}", body.len()));
         assert_eq!(read_all(out, 1024), vec![body]);
     }

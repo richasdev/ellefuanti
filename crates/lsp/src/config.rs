@@ -43,7 +43,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn new(name: impl Into<String>, command: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             name: name.into(),
             command: command.into(),

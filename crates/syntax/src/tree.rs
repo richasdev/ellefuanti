@@ -125,7 +125,14 @@ fn input_edit(buffer: &Buffer, edit: &Edit) -> InputEdit {
     // over the text that was deleted.
     let old_end_position = advance(start_position, &edit.old_text);
 
-    InputEdit { start_byte, old_end_byte, new_end_byte, start_position, old_end_position, new_end_position }
+    InputEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte,
+        start_position,
+        old_end_position,
+        new_end_position,
+    }
 }
 
 fn to_ts_point(buffer: &Buffer, offset: usize) -> TsPoint {
@@ -171,7 +178,8 @@ mod tests {
         // would produce. If InputEdit coordinates are wrong, these sexps diverge.
         let (mut buffer, mut tree) = php("<?php\nclass User {\n    public $a;\n}\n");
 
-        let edit = buffer.insert(buffer.point_to_offset(elle_text::Point::new(2, 14)), "\n    public $b;");
+        let edit =
+            buffer.insert(buffer.point_to_offset(elle_text::Point::new(2, 14)), "\n    public $b;");
         tree.apply_edits(&buffer, &[edit]);
         let incremental = tree.tree().unwrap().root_node().to_sexp();
 

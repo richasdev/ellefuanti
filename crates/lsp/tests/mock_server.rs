@@ -259,10 +259,8 @@ fn dropping_the_client_shuts_the_server_down() {
 
 #[test]
 fn capabilities_are_read_from_the_server_not_assumed() {
-    let (client, _server) = open_client(
-        json!({ "textDocumentSync": 1, "hoverProvider": true }),
-        |_, _| Reply::Silence,
-    );
+    let (client, _server) =
+        open_client(json!({ "textDocumentSync": 1, "hoverProvider": true }), |_, _| Reply::Silence);
 
     let capabilities = client.capabilities();
     assert!(capabilities.hover);
@@ -295,12 +293,7 @@ fn a_server_omitting_sync_capability_gets_full_documents() {
 fn a_server_that_dies_during_startup_is_reported_not_panicked() {
     // §24: a server that never starts must leave the editor working, which means
     // `connect` returns an error rather than panicking or blocking for 30 seconds.
-    let Pipes {
-        client_reader,
-        client_writer,
-        server_reader,
-        server_writer,
-    } = Pipes::new();
+    let Pipes { client_reader, client_writer, server_reader, server_writer } = Pipes::new();
 
     // Drop both server ends immediately: the client sees EOF where a reply should be.
     drop(server_reader);
@@ -322,12 +315,7 @@ fn a_server_that_dies_during_startup_is_reported_not_panicked() {
 fn a_server_refusing_to_initialize_is_reported() {
     // A licence-gated server declining to start is exactly this case, and it must be a
     // clear message rather than a crash.
-    let Pipes {
-        client_reader,
-        client_writer,
-        server_reader,
-        server_writer,
-    } = Pipes::new();
+    let Pipes { client_reader, client_writer, server_reader, server_writer } = Pipes::new();
 
     let handle = std::thread::spawn(move || {
         let mut reader = BufReader::new(server_reader);
@@ -362,9 +350,10 @@ fn responses_are_matched_to_their_request_by_id() {
     // overtake a slow completion. Matching by arrival order instead of by id would
     // hand each caller the other's answer.
     let (mut client, _server) = open_client(full_capabilities(), |method, _| match method {
-        "textDocument/completion" => {
-            Reply::Delayed(Duration::from_millis(120), json!({ "isIncomplete": false, "items": [] }))
-        }
+        "textDocument/completion" => Reply::Delayed(
+            Duration::from_millis(120),
+            json!({ "isIncomplete": false, "items": [] }),
+        ),
         "textDocument/hover" => Reply::Result(json!({ "contents": "fast" })),
         _ => Reply::Silence,
     });
@@ -697,7 +686,8 @@ fn garbage_from_the_server_does_not_end_the_session() {
 
     let connection = Connection::new(client_reader, client_writer, "mock".into());
     // The handshake still completes despite the garbage that preceded the reply.
-    let client = Client::connect(&config(), connection).expect("garbage must not break the handshake");
+    let client =
+        Client::connect(&config(), connection).expect("garbage must not break the handshake");
     assert!(client.is_alive());
 
     drop(client);
@@ -766,18 +756,11 @@ fn document_lifecycle_notifications_reach_the_server_in_order() {
     client.stop().unwrap();
     server.join();
 
-    let methods: Vec<String> = server
-        .methods()
-        .into_iter()
-        .filter(|m| m.starts_with("textDocument/"))
-        .collect();
+    let methods: Vec<String> =
+        server.methods().into_iter().filter(|m| m.starts_with("textDocument/")).collect();
     assert_eq!(
         methods,
-        [
-            "textDocument/didOpen",
-            "textDocument/didChange",
-            "textDocument/didClose"
-        ]
+        ["textDocument/didOpen", "textDocument/didChange", "textDocument/didClose"]
     );
 }
 
@@ -791,9 +774,7 @@ fn incremental_changes_carry_utf16_ranges() {
     client.did_open(uri(), "php", text).unwrap();
 
     let offset = text.len();
-    client
-        .did_change(&uri(), &elle_text::Edit::new(offset..offset, "$x = 1;", ""))
-        .unwrap();
+    client.did_change(&uri(), &elle_text::Edit::new(offset..offset, "$x = 1;", "")).unwrap();
 
     let changes = wait_for_params(&_server, "textDocument/didChange");
     let range = &changes[0]["contentChanges"][0]["range"];
@@ -815,9 +796,7 @@ fn a_utf8_server_receives_byte_columns() {
     let text = "// ação";
     client.did_open(uri(), "php", text).unwrap();
     let offset = text.len();
-    client
-        .did_change(&uri(), &elle_text::Edit::new(offset..offset, "!", ""))
-        .unwrap();
+    client.did_change(&uri(), &elle_text::Edit::new(offset..offset, "!", "")).unwrap();
 
     let changes = wait_for_params(&server, "textDocument/didChange");
     // 9 bytes, versus 7 UTF-16 code units.
@@ -834,9 +813,7 @@ fn the_same_edit_differs_between_encodings() {
         capabilities["positionEncoding"] = json!(encoding);
         let (mut client, server) = open_client(capabilities, |_, _| Reply::Silence);
         client.did_open(uri(), "php", text).unwrap();
-        client
-            .did_change(&uri(), &elle_text::Edit::new(offset..offset, "!", ""))
-            .unwrap();
+        client.did_change(&uri(), &elle_text::Edit::new(offset..offset, "!", "")).unwrap();
         let changes = wait_for_params(&server, "textDocument/didChange");
         changes[0]["contentChanges"][0]["range"]["start"]["character"].as_i64().unwrap()
     };
@@ -853,9 +830,7 @@ fn a_full_sync_server_receives_whole_documents() {
 
     let (mut client, server) = open_client(capabilities, |_, _| Reply::Silence);
     client.did_open(uri(), "php", "<?php\n").unwrap();
-    client
-        .did_change(&uri(), &elle_text::Edit::new(6..6, "$x = 1;", ""))
-        .unwrap();
+    client.did_change(&uri(), &elle_text::Edit::new(6..6, "$x = 1;", "")).unwrap();
 
     let changes = wait_for_params(&server, "textDocument/didChange");
     let change = &changes[0]["contentChanges"][0];
@@ -868,9 +843,7 @@ fn document_versions_increase_with_each_change() {
     let (mut client, server) = open_client(full_capabilities(), |_, _| Reply::Silence);
     client.did_open(uri(), "php", "a").unwrap();
     for _ in 0..3 {
-        client
-            .did_change(&uri(), &elle_text::Edit::new(0..0, "x", ""))
-            .unwrap();
+        client.did_change(&uri(), &elle_text::Edit::new(0..0, "x", "")).unwrap();
     }
 
     let changes = wait_for_n_params(&server, "textDocument/didChange", 3);

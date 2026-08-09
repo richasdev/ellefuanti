@@ -398,22 +398,16 @@ impl EditorView {
                             .flex_none()
                             .justify_end()
                             .pr_3()
-                            .text_color(if is_cursor_row {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            })
+                            .text_color(if is_cursor_row { theme.text } else { theme.text_muted })
                             .child(SharedString::from((row + 1).to_string())),
                     )
-                    .child(
-                        div().flex_1().child(styled_line(
-                            &line,
-                            line_start,
-                            &spans,
-                            &theme,
-                            if is_cursor_row { Some(cursor.column) } else { None },
-                        )),
-                    )
+                    .child(div().flex_1().child(styled_line(
+                        &line,
+                        line_start,
+                        &spans,
+                        &theme,
+                        if is_cursor_row { Some(cursor.column) } else { None },
+                    )))
                     .into_any_element()
             })
             .collect()
@@ -612,7 +606,8 @@ mod tests {
         // A block comment opening on an earlier line and closing on a later one: the
         // visible part must still colour, clipped at both ends rather than overflowing.
         let line = "still inside";
-        let (text, runs) = line_runs(line, 100, &[span(50..200, HighlightStyle::Comment)], &theme, None);
+        let (text, runs) =
+            line_runs(line, 100, &[span(50..200, HighlightStyle::Comment)], &theme, None);
 
         assert_eq!(coloured(&runs, &theme), vec![0..line.len()]);
         assert!(runs.iter().all(|(r, _)| r.end <= text.len()), "no run may exceed the text");
@@ -624,7 +619,8 @@ mod tests {
         // "ção" — the span deliberately ends mid-codepoint, which StyledText
         // debug-asserts against. It must snap to a boundary instead of panicking.
         let line = "$mensagem = 'ação';";
-        let (text, runs) = line_runs(line, 0, &[span(13..17, HighlightStyle::String)], &theme, None);
+        let (text, runs) =
+            line_runs(line, 0, &[span(13..17, HighlightStyle::String)], &theme, None);
 
         for (range, _) in &runs {
             assert!(
@@ -639,18 +635,11 @@ mod tests {
         let theme = Theme::dark();
         // Cursor inside a keyword: it must win the overlap, or it becomes invisible
         // exactly where the user is looking.
-        let (_, runs) = line_runs(
-            "return $x;",
-            0,
-            &[span(0..6, HighlightStyle::Keyword)],
-            &theme,
-            Some(2),
-        );
+        let (_, runs) =
+            line_runs("return $x;", 0, &[span(0..6, HighlightStyle::Keyword)], &theme, Some(2));
 
-        let cursor: Vec<_> = runs
-            .iter()
-            .filter(|(_, s)| s.background_color == Some(theme.cursor))
-            .collect();
+        let cursor: Vec<_> =
+            runs.iter().filter(|(_, s)| s.background_color == Some(theme.cursor)).collect();
         assert_eq!(cursor.len(), 1, "exactly one cursor run");
         assert_eq!(cursor[0].0, 2..3);
 

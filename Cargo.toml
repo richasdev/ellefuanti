@@ -26,8 +26,9 @@ elle-workspace = { path = "crates/workspace" }
 elle-terminal = { path = "crates/terminal" }
 elle-lsp = { path = "crates/lsp" }
 
-# UI. runtime_shaders avoids needing full Xcode to compile Metal shaders (see ADR-0002).
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# UI. The runtime_shaders feature is selected by crates/app, not here, so a release build
+# can turn it off and precompile shaders instead (see ADR-0002 and crates/app/Cargo.toml).
+gpui = { version = "0.2.2", default-features = true }
 
 ropey = "1.6"
 tree-sitter = "0.26"

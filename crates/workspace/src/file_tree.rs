@@ -278,6 +278,9 @@ mod tests {
     fn root_name_is_the_folder_name() {
         let dir = fixture();
         let tree = FileTree::new(dir.path()).unwrap();
-        assert_eq!(tree.root_name(), dir.path().canonicalize().unwrap().file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            tree.root_name(),
+            dir.path().canonicalize().unwrap().file_name().unwrap().to_string_lossy()
+        );
     }
 }

@@ -250,10 +250,7 @@ fn scrollback_retains_lines_that_scrolled_off() {
     session.scroll(50);
     let scrolled = session.snapshot();
     assert!(scrolled.display_offset > 0, "scrolling up must move the viewport");
-    assert!(
-        scrolled.cursor.is_none(),
-        "a scrolled-back viewport has no live cursor to draw"
-    );
+    assert!(scrolled.cursor.is_none(), "a scrolled-back viewport has no live cursor to draw");
     assert_ne!(scrolled.to_string_trimmed(), live.to_string_trimmed());
 
     session.scroll_to_bottom();
@@ -344,13 +341,8 @@ fn writing_to_a_dead_shell_returns_an_error_rather_than_panicking() {
 
 #[test]
 fn a_pty_that_cannot_spawn_reports_an_error() {
-    let result = Session::spawn(
-        SessionId(1),
-        None,
-        Some("/nonexistent/definitely-not-a-shell"),
-        24,
-        80,
-    );
+    let result =
+        Session::spawn(SessionId(1), None, Some("/nonexistent/definitely-not-a-shell"), 24, 80);
 
     // Matched rather than `expect_err`, which would require `Session: Debug` and so a
     // derive that exposes the crate's internals purely to satisfy a test.

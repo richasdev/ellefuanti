@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run irrelevant. Without this, a series of
+# fixup commits queues several minutes-long macOS builds that nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI without making local development miserable. clippy is currently
+  # completely clean, so this is a gate that holds rather than a wall of pre-existing noise.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    # macOS because gpui's Metal backend only builds here (ADR-0002). Not a preference —
+    # a Linux runner cannot compile this project at all today.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # A cold gpui build takes minutes. An uncached CI is a CI people learn to ignore.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Feature selection changes the build graph, so keep separate cache entries.
+          key: default-features
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      - name: Build
+        run: cargo build --workspace
+
+      # The terminal tests spawn real PTYs and the LSP tests spawn real subprocesses over
+      # pipes. Both are intentional — they are what makes those crates trustworthy — but
+      # they make the suite sensitive to a saturated runner, hence the retry logic already
+      # in crates/terminal/tests/pty.rs.
+      - name: Test
+        run: cargo test --workspace
+
+  # Proves the release configuration compiles, which the default build does not cover:
+  # --no-default-features drops runtime_shaders, so gpui compiles Metal shaders at build
+  # time via `xcrun metal`. That needs full Xcode, which this runner has and a contributor's
+  # machine may not (ADR-0002). If this job breaks, releases break — while `cargo build`
+  # keeps working locally and hides it.
+  release-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: no-default-features
+
+      - name: Build with shaders precompiled
+        run: cargo build --release -p ellefuanti --no-default-features
+
+      - name: Confirm the binary runs
+        # Launching a GPU app on a headless runner is not meaningful, so this only asserts
+        # the artifact exists and is executable. Whether it renders is issue #35, and no CI
+        # job can answer that.
+        run: |
+          test -x target/release/ellefuanti
+          ls -lh target/release/ellefuanti

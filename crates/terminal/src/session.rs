@@ -48,7 +48,9 @@ pub struct SessionId(pub u64);
 pub enum SessionStatus {
     Running,
     /// The shell exited on its own (the user typed `exit`, or it crashed).
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
     /// The PTY or the reader failed. The message is shown in the panel.
     Failed(String),
 }
@@ -105,16 +107,10 @@ impl Session {
         // Zero in either axis makes the kernel reject the winsize, and alacritty indexes
         // a zero-column grid out of bounds. Clamp rather than propagate: a panel laid out
         // at zero height during the first frame is normal, not an error worth surfacing.
-        let size = PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        };
+        let size =
+            PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 };
 
-        let pty = native_pty_system()
-            .openpty(size)
-            .context("opening a pty")?;
+        let pty = native_pty_system().openpty(size).context("opening a pty")?;
 
         let mut command = match shell {
             Some(shell) => CommandBuilder::new(shell),
@@ -129,10 +125,7 @@ impl Session {
         // xterm-256color is the safe lowest common denominator that still gets colour.
         command.env("TERM", "xterm-256color");
 
-        let child = pty
-            .slave
-            .spawn_command(command)
-            .context("spawning the shell")?;
+        let child = pty.slave.spawn_command(command).context("spawning the shell")?;
 
         // The slave fd must be closed in this process, or the master never sees EOF when
         // the shell exits and the reader thread blocks forever.
@@ -140,14 +133,8 @@ impl Session {
 
         let killer = child.clone_killer();
 
-        let reader = pty
-            .master
-            .try_clone_reader()
-            .context("cloning the pty reader")?;
-        let writer = pty
-            .master
-            .take_writer()
-            .context("taking the pty writer")?;
+        let reader = pty.master.try_clone_reader().context("cloning the pty reader")?;
+        let writer = pty.master.take_writer().context("taking the pty writer")?;
 
         let term = Term::new(
             Config { scrolling_history: SCROLLBACK_LINES, ..Config::default() },
@@ -328,8 +315,7 @@ fn spawn_reader(shared: Arc<Shared>, mut reader: Box<dyn Read + Send>) -> JoinHa
                         // Scoped so the lock is released before the next blocking read;
                         // holding it across `read` would stall every frame on a quiet PTY.
                         {
-                            let mut term =
-                                shared.term.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut term = shared.term.lock().unwrap_or_else(|e| e.into_inner());
                             parser.advance(&mut *term, &buffer[..n]);
                         }
                         let mut generation =

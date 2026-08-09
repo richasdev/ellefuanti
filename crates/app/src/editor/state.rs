@@ -53,8 +53,7 @@ pub struct Document {
 
 impl Document {
     pub fn new(path: Option<PathBuf>, text: &str, trailing_newline: bool) -> anyhow::Result<Self> {
-        let language =
-            path.as_deref().map(language_for_path).unwrap_or(Language::PlainText);
+        let language = path.as_deref().map(language_for_path).unwrap_or(Language::PlainText);
         let buffer = Buffer::new(text);
         let syntax = SyntaxTree::new(language, &buffer)?;
         Ok(Self {
@@ -434,7 +433,10 @@ mod tests {
         d.move_to(d.buffer.len_bytes(), false);
         d.insert("class B {}\n");
         assert!(!d.syntax.has_error(), "incremental reparse should still be valid PHP");
-        assert!(d.syntax.tree().unwrap().root_node().to_sexp().matches("class_declaration").count() >= 2);
+        assert!(
+            d.syntax.tree().unwrap().root_node().to_sexp().matches("class_declaration").count()
+                >= 2
+        );
     }
 
     #[test]

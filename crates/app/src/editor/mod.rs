@@ -4,4 +4,4 @@ mod state;
 mod view;
 
 pub use state::Document;
-pub use view::{FONT_FAMILY, EditorView};
+pub use view::{EditorView, FONT_FAMILY};

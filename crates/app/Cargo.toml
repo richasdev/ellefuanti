@@ -9,6 +9,24 @@ description = "A native, GPU-accelerated IDE built for PHP, Laravel, Livewire an
 name = "ellefuanti"
 path = "src/main.rs"
 
+[features]
+# Compile Metal shaders at runtime instead of at build time.
+#
+# On by default because the alternative requires **full Xcode**: gpui's build script shells
+# out to `xcrun metal`, which the Command Line Tools do not ship, and the build fails
+# outright without it. Defaulting to buildability means `cargo build` works on a fresh
+# checkout with no 40 GB install.
+#
+# The cost is startup: compiling shaders at launch is ~432 ms on a cold shader cache, which
+# is most of the 520 ms cold start recorded in benchmarks/BASELINE.md against a 500 ms
+# budget. Release builds therefore turn this OFF — CI has Xcode — via:
+#
+#     cargo build --release --no-default-features
+#
+# See ADR-0002 for the full trade-off.
+default = ["runtime-shaders"]
+runtime-shaders = ["gpui/runtime_shaders"]
+
 [dependencies]
 elle-core.workspace = true
 elle-text.workspace = true

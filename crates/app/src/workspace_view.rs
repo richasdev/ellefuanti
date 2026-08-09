@@ -118,7 +118,12 @@ impl WorkspaceView {
         }));
     }
 
-    fn toggle_hidden_files(&mut self, _: &ToggleHiddenFiles, _w: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_hidden_files(
+        &mut self,
+        _: &ToggleHiddenFiles,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(tree) = self.tree.as_mut() {
             let show = !tree.show_hidden();
             if let Err(err) = tree.set_show_hidden(show) {
@@ -149,9 +154,7 @@ impl WorkspaceView {
 
         let load_path = path.clone();
         self.pending = Some(cx.spawn(async move |this, cx| {
-            let loaded = cx
-                .background_spawn(async move { read_file(&load_path) })
-                .await;
+            let loaded = cx.background_spawn(async move { read_file(&load_path) }).await;
 
             this.update(cx, |this, cx| {
                 match loaded {
@@ -187,9 +190,7 @@ impl WorkspaceView {
         let text = editor.read(cx).document.text_for_save();
 
         self.pending = Some(cx.spawn(async move |this, cx| {
-            let written = cx
-                .background_spawn(async move { write_file(&path, &text) })
-                .await;
+            let written = cx.background_spawn(async move { write_file(&path, &text) }).await;
 
             this.update(cx, |this, cx| {
                 match written {
@@ -230,9 +231,7 @@ impl WorkspaceView {
             let Ok(Ok(Some(path))) = chosen.await else { return };
 
             let write_path = path.clone();
-            let written = cx
-                .background_spawn(async move { write_file(&write_path, &text) })
-                .await;
+            let written = cx.background_spawn(async move { write_file(&write_path, &text) }).await;
 
             this.update(cx, |this, cx| {
                 match written {
@@ -244,14 +243,15 @@ impl WorkspaceView {
                             // starts highlighting as PHP. A grammar that fails to load
                             // leaves it as plain text rather than failing the save.
                             if let Err(err) = editor.document.set_path(path.clone()) {
-                                tracing::warn!("saved, but no grammar for {}: {err:#}", path.display());
+                                tracing::warn!(
+                                    "saved, but no grammar for {}: {err:#}",
+                                    path.display()
+                                );
                             }
                         });
                         // Keep the tab's own record in step, or a later save would open
                         // this dialog again for a file that now has a path.
-                        if let Some(tab) =
-                            this.tabs.iter_mut().find(|tab| tab.editor == editor)
-                        {
+                        if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.editor == editor) {
                             tab.path = Some(path);
                         }
                         this.status = None;
@@ -376,7 +376,12 @@ impl WorkspaceView {
         self.toggle_palette(PaletteMode::Commands, window, cx);
     }
 
-    fn toggle_quick_open(&mut self, _: &ToggleQuickOpen, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_quick_open(
+        &mut self,
+        _: &ToggleQuickOpen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.toggle_palette(PaletteMode::Files, window, cx);
     }
 
@@ -438,9 +443,7 @@ impl WorkspaceView {
 
         self.pending = Some(cx.spawn(async move |this, cx| {
             let walk_cancel = cancel.clone();
-            let files = cx
-                .background_spawn(async move { index_files(&root, &walk_cancel) })
-                .await;
+            let files = cx.background_spawn(async move { index_files(&root, &walk_cancel) }).await;
 
             // A cancelled walk returns whatever it had; showing a partial list for a
             // palette the user already closed would be noise.
@@ -453,9 +456,7 @@ impl WorkspaceView {
                 .map(|file| (file.relative, file.path.display().to_string()))
                 .collect();
 
-            palette
-                .update(cx, |palette, cx| palette.set_items(items, cx))
-                .ok();
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
             this.update(cx, |_, cx| cx.notify()).ok();
         }));
     }
@@ -486,9 +487,7 @@ impl WorkspaceView {
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
                     Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
-                    Dispatch::ToggleTerminal => {
-                        self.toggle_terminal(&ToggleTerminal, window, cx)
-                    }
+                    Dispatch::ToggleTerminal => self.toggle_terminal(&ToggleTerminal, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -570,14 +569,7 @@ impl Render for WorkspaceView {
             .children(self.palette.clone().map(|palette| {
                 // The overlay is absolutely positioned over everything, so it does not
                 // reflow the layout underneath while it is open.
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .flex()
-                    .justify_center()
-                    .child(palette)
+                div().absolute().top_0().left_0().size_full().flex().justify_center().child(palette)
             }))
     }
 }
@@ -703,7 +695,11 @@ impl WorkspaceView {
                                     });
                                 })
                                 .child(SharedString::from(if is_dir {
-                                    format!("{} {}", if entry.expanded { "▾" } else { "▸" }, entry.name)
+                                    format!(
+                                        "{} {}",
+                                        if entry.expanded { "▾" } else { "▸" },
+                                        entry.name
+                                    )
                                 } else {
                                     format!("  {}", entry.name)
                                 }))

@@ -227,9 +227,10 @@ mod tests {
     #[test]
     fn classifies_a_server_initiated_request() {
         // Distinguished from a notification only by the presence of `id`.
-        let message =
-            parse(r#"{"jsonrpc":"2.0","id":"abc","method":"window/showMessageRequest","params":{}}"#)
-                .unwrap();
+        let message = parse(
+            r#"{"jsonrpc":"2.0","id":"abc","method":"window/showMessageRequest","params":{}}"#,
+        )
+        .unwrap();
         match message {
             Incoming::Request { id, method, .. } => {
                 assert_eq!(id, RequestId::String("abc".into()));
@@ -256,7 +257,8 @@ mod tests {
 
     #[test]
     fn requests_serialise_to_the_wire_format() {
-        let request = Request::new(RequestId::Number(3), "textDocument/hover", serde_json::json!({}));
+        let request =
+            Request::new(RequestId::Number(3), "textDocument/hover", serde_json::json!({}));
         let json: Value = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
         assert_eq!(json["id"], 3);
@@ -266,7 +268,8 @@ mod tests {
     #[test]
     fn notifications_carry_no_id() {
         let notification = Notification::new("initialized", serde_json::json!({}));
-        let json: Value = serde_json::from_str(&serde_json::to_string(&notification).unwrap()).unwrap();
+        let json: Value =
+            serde_json::from_str(&serde_json::to_string(&notification).unwrap()).unwrap();
         assert!(json.get("id").is_none(), "a notification must not carry an id");
     }
 

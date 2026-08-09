@@ -20,12 +20,7 @@ impl Pipes {
         let (server_reader, client_writer) = os_pipe::pipe().expect("pipe");
         // server → client
         let (client_reader, server_writer) = os_pipe::pipe().expect("pipe");
-        Self {
-            client_reader,
-            client_writer,
-            server_reader,
-            server_writer,
-        }
+        Self { client_reader, client_writer, server_reader, server_writer }
     }
 }
 

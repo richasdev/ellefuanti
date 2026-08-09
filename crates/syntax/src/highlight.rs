@@ -64,9 +64,7 @@ impl SyntaxTree {
 /// node is the meaningful one ("this is a variable", not "this is a dollar sign").
 fn flatten(mut spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
     // Widest-first at a shared start, so the outer span is seen before its children.
-    spans.sort_by(|a, b| {
-        a.range.start.cmp(&b.range.start).then(b.range.end.cmp(&a.range.end))
-    });
+    spans.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(b.range.end.cmp(&a.range.end)));
 
     let mut out: Vec<HighlightSpan> = Vec::with_capacity(spans.len());
     for span in spans {
@@ -140,7 +138,10 @@ fn style_for(kind: &str) -> Option<HighlightStyle> {
         "variable_name" | "$" => Variable,
         "name" => return None, // too generic on its own; parent context decides
         "php_tag" | "text_interpolation" | "?>" => Tag,
-        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" => {
+        "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
+        | "enum_declaration" => {
             return None;
         }
         "named_type" | "primitive_type" | "optional_type" | "cast_type" => Type,
@@ -152,11 +153,11 @@ fn style_for(kind: &str) -> Option<HighlightStyle> {
         "abstract" | "and" | "array" | "as" | "break" | "callable" | "case" | "catch" | "class"
         | "clone" | "const" | "continue" | "declare" | "default" | "do" | "echo" | "else"
         | "elseif" | "enum" | "extends" | "final" | "finally" | "fn" | "for" | "foreach"
-        | "function" | "global" | "if" | "implements" | "include" | "include_once" | "instanceof"
-        | "insteadof" | "interface" | "match" | "namespace" | "new" | "or" | "print" | "private"
-        | "protected" | "public" | "readonly" | "require" | "require_once" | "return" | "static"
-        | "switch" | "throw" | "trait" | "try" | "use" | "var" | "while" | "yield" | "xor"
-        | "null" | "true" | "false" => Keyword,
+        | "function" | "global" | "if" | "implements" | "include" | "include_once"
+        | "instanceof" | "insteadof" | "interface" | "match" | "namespace" | "new" | "or"
+        | "print" | "private" | "protected" | "public" | "readonly" | "require"
+        | "require_once" | "return" | "static" | "switch" | "throw" | "trait" | "try" | "use"
+        | "var" | "while" | "yield" | "xor" | "null" | "true" | "false" => Keyword,
         _ => return None,
     })
 }

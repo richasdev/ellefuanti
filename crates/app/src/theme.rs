@@ -124,13 +124,10 @@ impl Theme {
             // Defensive index: the slot comes off the wire as a u8. A malformed SGR must
             // not panic the render (§24), so an out-of-range slot falls back to text.
             CellColor::Ansi(slot) => *self.ansi.get(slot as usize).unwrap_or(&self.text),
-            CellColor::Rgb(r, g, b) => Rgba {
-                r: r as f32 / 255.0,
-                g: g as f32 / 255.0,
-                b: b as f32 / 255.0,
-                a: 1.0,
+            CellColor::Rgb(r, g, b) => {
+                Rgba { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
+                    .into()
             }
-            .into(),
         }
     }
 

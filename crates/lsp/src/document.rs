@@ -172,7 +172,11 @@ mod tests {
     /// Replays the change events the way a server would, so a divergence between our
     /// copy and the server's shows up as a failing assertion rather than as mysterious
     /// off-by-one completions weeks later.
-    fn replay(original: &str, events: &[TextDocumentContentChangeEvent], encoding: OffsetEncoding) -> String {
+    fn replay(
+        original: &str,
+        events: &[TextDocumentContentChangeEvent],
+        encoding: OffsetEncoding,
+    ) -> String {
         let mut text = original.to_string();
         for event in events {
             match event.range {
@@ -199,7 +203,11 @@ mod tests {
     #[test]
     fn an_insert_becomes_an_empty_range_change() {
         let mut document = doc("<?php\n");
-        let events = document.apply(&edit(6..6, "$x = 1;", ""), SyncKind::Incremental, OffsetEncoding::Utf16);
+        let events = document.apply(
+            &edit(6..6, "$x = 1;", ""),
+            SyncKind::Incremental,
+            OffsetEncoding::Utf16,
+        );
 
         assert_eq!(events.len(), 1);
         let range = events[0].range.unwrap();
@@ -212,7 +220,11 @@ mod tests {
     #[test]
     fn a_delete_becomes_an_empty_text_change() {
         let mut document = doc("<?php\n$x = 1;");
-        let events = document.apply(&edit(6..13, "", "$x = 1;"), SyncKind::Incremental, OffsetEncoding::Utf16);
+        let events = document.apply(
+            &edit(6..13, "", "$x = 1;"),
+            SyncKind::Incremental,
+            OffsetEncoding::Utf16,
+        );
         assert_eq!(events[0].text, "");
         assert_eq!(document.text(), "<?php\n");
     }
@@ -224,10 +236,7 @@ mod tests {
         let original = "<?php\n// ação\n$coração = 'não';\n";
         let mut document = doc(original);
 
-        let edits = [
-            edit(6..6, "// olá 😀\n", ""),
-            edit(0..5, "<?PHP", "<?php"),
-        ];
+        let edits = [edit(6..6, "// olá 😀\n", ""), edit(0..5, "<?PHP", "<?php")];
 
         let mut all_events = Vec::new();
         for e in &edits {

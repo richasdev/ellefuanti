@@ -24,12 +24,8 @@ fn php_source(target_bytes: usize) -> String {
     text
 }
 
-const SIZES: [(&str, usize); 4] = [
-    ("1KB", 1_024),
-    ("100KB", 100 * 1_024),
-    ("1MB", 1_024 * 1_024),
-    ("10MB", 10 * 1_024 * 1_024),
-];
+const SIZES: [(&str, usize); 4] =
+    [("1KB", 1_024), ("100KB", 100 * 1_024), ("1MB", 1_024 * 1_024), ("10MB", 10 * 1_024 * 1_024)];
 
 fn insert_positions(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert");
@@ -40,9 +36,7 @@ fn insert_positions(c: &mut Criterion) {
 
         // Start, middle and end: a String would show a huge spread here (memmove of the
         // tail), a rope should not.
-        for (position_label, offset) in
-            [("start", 0), ("middle", len / 2), ("end", len)]
-        {
+        for (position_label, offset) in [("start", 0), ("middle", len / 2), ("end", len)] {
             group.bench_with_input(
                 BenchmarkId::new(position_label, label),
                 &offset,

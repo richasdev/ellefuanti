@@ -262,9 +262,8 @@ impl TerminalView {
     fn sync_size(&mut self, width: gpui::Pixels, height: gpui::Pixels) {
         let cell_width = Metrics::FONT_SIZE * CELL_WIDTH_RATIO;
         let cols = (f32::from(width) / f32::from(cell_width)).floor().max(1.0) as u16;
-        let rows = (f32::from(height) / f32::from(Metrics::TERMINAL_LINE_HEIGHT))
-            .floor()
-            .max(1.0) as u16;
+        let rows =
+            (f32::from(height) / f32::from(Metrics::TERMINAL_LINE_HEIGHT)).floor().max(1.0) as u16;
 
         if (rows, cols) != self.grid_size {
             self.grid_size = (rows, cols);
@@ -319,45 +318,37 @@ impl TerminalView {
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .gap_1()
-                    .overflow_hidden()
-                    .children(self.manager.sessions().iter().enumerate().map(|(index, session)| {
-                        let entity = entity.clone();
-                        let is_active = index == active;
-                        // A dead session keeps its tab so its output stays readable; the
-                        // marker is what tells the user it is no longer live.
-                        let dead = !statuses
-                            .get(index)
-                            .map(|(_, status)| status.is_running())
-                            .unwrap_or(true);
+            .child(div().flex().flex_1().items_center().gap_1().overflow_hidden().children(
+                self.manager.sessions().iter().enumerate().map(|(index, session)| {
+                    let entity = entity.clone();
+                    let is_active = index == active;
+                    // A dead session keeps its tab so its output stays readable; the
+                    // marker is what tells the user it is no longer live.
+                    let dead =
+                        !statuses.get(index).map(|(_, status)| status.is_running()).unwrap_or(true);
 
-                        div()
-                            .id(("terminal-tab", index))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .h(px(22.0))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(is_active, |el| el.bg(theme.selected).text_color(theme.text))
-                            .when(!is_active, |el| el.text_color(theme.text_muted))
-                            .hover(|el| el.bg(theme.hover))
-                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                                entity.update(cx, |this, cx| this.activate(index, cx));
-                            })
-                            .child(SharedString::from(format!(
-                                "{}{}",
-                                if dead { "✗ " } else { "" },
-                                session.title()
-                            )))
-                    })),
-            )
+                    div()
+                        .id(("terminal-tab", index))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .h(px(22.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(is_active, |el| el.bg(theme.selected).text_color(theme.text))
+                        .when(!is_active, |el| el.text_color(theme.text_muted))
+                        .hover(|el| el.bg(theme.hover))
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            entity.update(cx, |this, cx| this.activate(index, cx));
+                        })
+                        .child(SharedString::from(format!(
+                            "{}{}",
+                            if dead { "✗ " } else { "" },
+                            session.title()
+                        )))
+                }),
+            ))
             .child(self.render_strip_button("+", "terminal-new", theme, cx, |this, cx| {
                 this.open_session(cx)
             }))
@@ -398,9 +389,10 @@ impl TerminalView {
         // An error replaces the grid only when there is no session to show; a write error
         // on a live terminal belongs beside its output, not instead of it.
         if self.manager.is_empty() {
-            let message = self.error.clone().unwrap_or_else(|| {
-                SharedString::from("No terminal. Press ⌃` to open one.")
-            });
+            let message = self
+                .error
+                .clone()
+                .unwrap_or_else(|| SharedString::from("No terminal. Press ⌃` to open one."));
             let is_error = self.error.is_some();
 
             return div()
@@ -457,7 +449,9 @@ impl TerminalView {
     ) -> Option<impl IntoElement> {
         let message = match status {
             Some(SessionStatus::Exited { code }) => match code {
-                Some(code) => format!("Process exited with code {code}. Press + for a new terminal."),
+                Some(code) => {
+                    format!("Process exited with code {code}. Press + for a new terminal.")
+                }
                 None => "Process exited. Press + for a new terminal.".to_string(),
             },
             Some(SessionStatus::Failed(err)) => format!("Terminal failed: {err}"),
@@ -487,22 +481,18 @@ fn banner(message: SharedString, theme: &Theme) -> gpui::Div {
 /// and gpui shapes each row once. The cost is that a per-cell *background* needs its own
 /// pass — see `row_backgrounds`.
 fn render_grid(snapshot: &GridSnapshot, theme: &Theme) -> impl IntoElement {
-    div()
-        .flex_1()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .children(snapshot.lines.iter().enumerate().map(|(index, line)| {
-            let cursor_column = snapshot
-                .cursor
-                .filter(|cursor| cursor.line == index)
-                .map(|cursor| cursor.column);
+    div().flex_1().flex().flex_col().overflow_hidden().children(
+        snapshot.lines.iter().enumerate().map(|(index, line)| {
+            let cursor_column =
+                snapshot.cursor.filter(|cursor| cursor.line == index).map(|cursor| cursor.column);
 
-            div()
-                .h(Metrics::TERMINAL_LINE_HEIGHT)
-                .flex_none()
-                .child(styled_row(line, cursor_column, theme))
-        }))
+            div().h(Metrics::TERMINAL_LINE_HEIGHT).flex_none().child(styled_row(
+                line,
+                cursor_column,
+                theme,
+            ))
+        }),
+    )
 }
 
 /// Builds one row as a single text element with colour and attribute runs.
@@ -517,11 +507,7 @@ fn styled_row(cells: &[Cell], cursor_column: Option<usize>, theme: &Theme) -> St
 }
 
 /// The text and colour runs for one row.
-fn row_runs(
-    cells: &[Cell],
-    cursor_column: Option<usize>,
-    theme: &Theme,
-) -> (String, Vec<TextRun>) {
+fn row_runs(cells: &[Cell], cursor_column: Option<usize>, theme: &Theme) -> (String, Vec<TextRun>) {
     // A cursor past the last column (end of line) has no cell to invert, so the row is
     // padded with one blank. Doing it up front keeps the run loop single-path.
     let pad = cursor_column.is_some_and(|column| column >= cells.len());
@@ -554,16 +540,8 @@ fn row_runs(
                 family: FONT_FAMILY.into(),
                 features: Default::default(),
                 fallbacks: None,
-                weight: if cell.bold {
-                    gpui::FontWeight::BOLD
-                } else {
-                    gpui::FontWeight::NORMAL
-                },
-                style: if cell.italic {
-                    gpui::FontStyle::Italic
-                } else {
-                    gpui::FontStyle::Normal
-                },
+                weight: if cell.bold { gpui::FontWeight::BOLD } else { gpui::FontWeight::NORMAL },
+                style: if cell.italic { gpui::FontStyle::Italic } else { gpui::FontStyle::Normal },
             },
             color: foreground,
             background_color: background,

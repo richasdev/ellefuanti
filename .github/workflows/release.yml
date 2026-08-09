@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual runs are for rehearsing the workflow without minting a tag, which is the only
+  # way to find a broken release pipeline before it matters.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Gate the release on the tests. A tag is not a promise that something compiles.
+      - name: Test
+        run: cargo test --workspace
+
+      # --no-default-features drops runtime_shaders, so shaders are compiled here rather
+      # than on the user's machine at every launch. This runner has full Xcode; that is the
+      # whole reason the release build differs from the local one (ADR-0002).
+      - name: Build release
+        run: cargo build --release -p ellefuanti --no-default-features
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # workflow_dispatch has no tag, so fall back to something identifiable rather
+          # than producing an artifact named after a branch.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+          NAME="ellefuanti-${VERSION}-macos-$(uname -m)"
+
+          mkdir -p "dist/${NAME}"
+          cp target/release/ellefuanti "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+
+          # Gatekeeper will block an unsigned binary downloaded from the internet. Saying so
+          # in the archive is more honest than letting the user discover it as a crash.
+          cat > "dist/${NAME}/RUNNING.md" <<'EOF'
+          # Running ellefuanti
+
+          This build is **not code-signed or notarised**, so macOS Gatekeeper will refuse to
+          open it on first launch. That is expected for a 0.1.0 development release.
+
+          To run it anyway:
+
+          ```sh
+          xattr -d com.apple.quarantine ./ellefuanti
+          ./ellefuanti
+          ```
+
+          Only do that because you trust where this archive came from. Signing and
+          notarisation need an Apple Developer account and are deliberately out of scope for
+          this release — see the release notes.
+          EOF
+
+          cd dist && zip -r "${NAME}.zip" "${NAME}" >/dev/null
+          echo "artifact=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.artifact }}
+
+      # Only a real tag becomes a GitHub release; a dispatch run stops at the artifact.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.artifact }}
+          body_path: CHANGELOG.md
+          # Prerelease: 0.1.0 has unverified UI rendering (issue #35) and is not something
+          # to present as production-ready.
+          prerelease: true
+          fail_on_unmatched_files: true

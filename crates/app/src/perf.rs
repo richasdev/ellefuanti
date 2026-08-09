@@ -41,10 +41,7 @@ impl Startup {
         self.last = now;
 
         if enabled() {
-            eprintln!(
-                "[perf] startup/{name:<16} +{:>8.2?}  (total {:>8.2?})",
-                since_last, total
-            );
+            eprintln!("[perf] startup/{name:<16} +{:>8.2?}  (total {:>8.2?})", since_last, total);
         }
         tracing::debug!(phase = name, ?since_last, ?total, "startup phase");
     }
@@ -119,7 +116,10 @@ impl FrameTimer {
                 } else {
                     "DROPPED"
                 };
-                eprintln!("[perf] frame/worst-of-{:<3}     {worst:>8.2?}  ({verdict})", self.window);
+                eprintln!(
+                    "[perf] frame/worst-of-{:<3}     {worst:>8.2?}  ({verdict})",
+                    self.window
+                );
             }
             if worst > Duration::from_micros(16_667) {
                 tracing::warn!(?worst, "a frame missed even the 60fps budget");

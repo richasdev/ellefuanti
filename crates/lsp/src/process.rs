@@ -57,10 +57,7 @@ pub fn spawn(config: &ServerConfig) -> Result<(ServerProcess, ServerPipes)> {
     }
 
     let mut child = command.spawn().with_context(|| {
-        format!(
-            "could not start the {} language server ({})",
-            config.name, config.command
-        )
+        format!("could not start the {} language server ({})", config.name, config.command)
     })?;
 
     // `take` rather than `unwrap` on the option each time: both were piped above, so
@@ -82,9 +79,7 @@ pub fn spawn(config: &ServerConfig) -> Result<(ServerProcess, ServerPipes)> {
 /// Linux, say), swap this for the `percent-encoding` crate rather than extending the
 /// match arm by arm.
 pub fn path_to_uri(path: &Path) -> Result<lsp_types::Uri> {
-    let path = path
-        .to_str()
-        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    let path = path.to_str().with_context(|| format!("{} is not valid UTF-8", path.display()))?;
 
     let mut encoded = String::with_capacity(path.len() + 8);
     for byte in path.bytes() {
@@ -104,8 +99,7 @@ pub fn path_to_uri(path: &Path) -> Result<lsp_types::Uri> {
         format!("file:///{encoded}")
     };
 
-    uri.parse()
-        .with_context(|| format!("could not build a file URI for {path}"))
+    uri.parse().with_context(|| format!("could not build a file URI for {path}"))
 }
 
 #[cfg(test)]
@@ -115,11 +109,7 @@ mod tests {
 
     /// The path a URI actually denotes, after percent-decoding.
     fn decoded_path(uri: &lsp_types::Uri) -> String {
-        uri.path()
-            .as_estr()
-            .decode()
-            .into_string_lossy()
-            .to_string()
+        uri.path().as_estr().decode().into_string_lossy().to_string()
     }
 
     /// `spawn`'s success value holds live OS pipe handles, which have no useful `Debug`

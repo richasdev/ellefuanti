@@ -27,7 +27,8 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Rejects binary files (NUL byte in the first 8 KiB, the same heuristic git uses) so
 /// the editor never renders garbage or corrupts a binary by saving it back as text.
 pub fn read_file(path: &Path) -> Result<ReadFile> {
-    let meta = fs::metadata(path).with_context(|| format!("reading metadata of {}", path.display()))?;
+    let meta =
+        fs::metadata(path).with_context(|| format!("reading metadata of {}", path.display()))?;
     if meta.is_dir() {
         bail!("{} is a directory", path.display());
     }
@@ -45,8 +46,8 @@ pub fn read_file(path: &Path) -> Result<ReadFile> {
         bail!("{} looks like a binary file", path.display());
     }
 
-    let mut text =
-        String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    let mut text = String::from_utf8(bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
 
     // Strip a UTF-8 BOM so it does not show up as a stray glyph at 0,0. It is not
     // written back — a BOM in a PHP file breaks output, and Laravel files never carry one.
