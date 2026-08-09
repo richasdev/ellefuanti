@@ -179,10 +179,7 @@ impl WorkspaceView {
     fn save(&mut self, _: &Save, _w: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active_tab) else { return };
         let Some(path) = tab.path.clone() else {
-            // ponytail: no save-as dialog yet. `prompt_for_new_path` exists; wire it when
-            // creating new files is a real flow (nothing creates an untitled buffer today).
-            self.status = Some("this buffer has no path".into());
-            cx.notify();
+            self.save_as(cx);
             return;
         };
 
@@ -210,13 +207,119 @@ impl WorkspaceView {
         }));
     }
 
-    fn close_tab(&mut self, _: &CloseTab, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.is_empty() {
+    /// Asks for a location, then saves a buffer that has no path yet.
+    ///
+    /// Suggests the project root, so a new file lands somewhere sensible instead of
+    /// wherever the process happens to be running.
+    fn save_as(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let editor = tab.editor.clone();
+        let text = editor.read(cx).document.text_for_save();
+
+        let directory = self
+            .tree
+            .as_ref()
+            .map(|tree| tree.root().to_path_buf())
+            .unwrap_or_else(|| std::env::temp_dir());
+
+        let chosen = cx.prompt_for_new_path(&directory, Some("untitled.php"));
+
+        self.pending = Some(cx.spawn(async move |this, cx| {
+            // Same three nested layers as prompt_for_paths: channel dropped, IO error,
+            // user cancelled. All three mean "do nothing".
+            let Ok(Ok(Some(path))) = chosen.await else { return };
+
+            let write_path = path.clone();
+            let written = cx
+                .background_spawn(async move { write_file(&write_path, &text) })
+                .await;
+
+            this.update(cx, |this, cx| {
+                match written {
+                    Ok(()) => {
+                        editor.update(cx, |editor, _| {
+                            editor.document.buffer.mark_saved();
+                            // The document now has a home: adopt the path so the next ⌘S
+                            // writes straight through, and so a buffer saved as `.php`
+                            // starts highlighting as PHP. A grammar that fails to load
+                            // leaves it as plain text rather than failing the save.
+                            if let Err(err) = editor.document.set_path(path.clone()) {
+                                tracing::warn!("saved, but no grammar for {}: {err:#}", path.display());
+                            }
+                        });
+                        // Keep the tab's own record in step, or a later save would open
+                        // this dialog again for a file that now has a path.
+                        if let Some(tab) =
+                            this.tabs.iter_mut().find(|tab| tab.editor == editor)
+                        {
+                            tab.path = Some(path);
+                        }
+                        this.status = None;
+                    }
+                    Err(err) => this.status = Some(format!("save failed: {err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_at(self.active_tab, window, cx);
+    }
+
+    /// Closes the tab at `index`, asking first if it has unsaved changes.
+    ///
+    /// Losing a user's edits silently is not a simplification worth making, so this is the
+    /// one place in the app that deliberately interrupts. Uses the platform dialog rather
+    /// than a custom modal: it is native, focus-correct and accessible for free, and an
+    /// in-app modal would be more code for a worse result.
+    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else { return };
+
+        if !tab.editor.read(cx).is_dirty() {
+            self.remove_tab(index, cx);
             return;
         }
-        // ponytail: closes a dirty tab without prompting. Add the confirm dialog when
-        // there is a modal system to host it (Milestone 1 task 13 brings the overlay).
-        self.tabs.remove(self.active_tab);
+
+        let title = tab.editor.read(cx).document.title();
+        // The entity handle identifies the tab across the await below. Titles are not
+        // unique (`app/Models/User.php` and `tests/User.php` share one) and indices shift,
+        // so matching on either could close the wrong file — precisely the data loss this
+        // prompt exists to prevent.
+        let editor = tab.editor.clone();
+
+        // Button order matters: index 0 is the default on macOS, so Cancel sits there.
+        // A stray Return must not be the keystroke that discards someone's work.
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("{title} has unsaved changes."),
+            Some("Closing this tab will discard them."),
+            &["Cancel", "Discard Changes"],
+            cx,
+        );
+
+        self.pending = Some(cx.spawn(async move |this, cx| {
+            // A dropped receiver means the dialog vanished without an answer; treat that
+            // as Cancel, because the safe default is to keep the buffer.
+            let Ok(choice) = answer.await else { return };
+            if choice != 1 {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if let Some(current) = this.tabs.iter().position(|tab| tab.editor == editor) {
+                    this.remove_tab(current, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn remove_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(index);
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
         cx.notify();
     }
@@ -629,6 +732,7 @@ impl WorkspaceView {
                 let dirty = tab.editor.read(cx).is_dirty();
                 let title = tab.editor.read(cx).document.title();
                 let entity = entity.clone();
+                let close_entity = entity.clone();
 
                 div()
                     .id(("tab", index))
@@ -650,9 +754,28 @@ impl WorkspaceView {
                     })
                     .child(SharedString::from(title))
                     .child(
+                        // One slot for both the dirty marker and the close button, so the
+                        // tab width never shifts as the pointer crosses it. A dirty tab
+                        // still shows ✕ on hover — hiding the close affordance on exactly
+                        // the tabs where closing matters most would be backwards.
                         div()
+                            .id(("close", index))
+                            .w(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
                             .text_color(if dirty { theme.accent } else { theme.text_muted })
-                            .child(if dirty { "•" } else { "" }),
+                            .child(if dirty { "•" } else { "✕" })
+                            .hover(|el| el.bg(theme.hover).text_color(theme.text))
+                            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                close_entity.update(cx, |this, cx| {
+                                    this.close_tab_at(index, window, cx);
+                                });
+                                // Without this the tab's own handler also fires and
+                                // activates the tab being closed.
+                                cx.stop_propagation();
+                            }),
                     )
             }))
     }

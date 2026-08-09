@@ -103,6 +103,32 @@ fn spawn(rows: u16, cols: u16) -> Session {
     );
 }
 
+/// `TerminalManager::open_with_shell` with the same PTY-exhaustion retry as [`spawn`].
+///
+/// The manager allocates a PTY too, so it hits the same finite global limit under a
+/// parallel test run. An earlier fix covered only the direct `Session::spawn` path, which
+/// left the tests that open several sessions at once — the ones most likely to exhaust the
+/// table — still able to fail spuriously.
+fn open_session(manager: &mut TerminalManager) -> SessionId {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut last_error = None;
+
+    while Instant::now() < deadline {
+        match manager.open_with_shell(Some(test_shell())) {
+            Ok(id) => return id,
+            Err(err) => {
+                last_error = Some(format!("{err:#}"));
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+
+    panic!(
+        "could not open a session within {TIMEOUT:?}; last error: {}",
+        last_error.unwrap_or_else(|| "none recorded".into())
+    );
+}
+
 #[test]
 fn spawns_a_shell_and_reports_it_running() {
     let session = spawn(24, 80);
@@ -237,9 +263,9 @@ fn scrollback_retains_lines_that_scrolled_off() {
 #[test]
 fn multiple_sessions_are_independent() {
     let mut manager = TerminalManager::new();
-    let first = manager.open_with_shell(Some(test_shell())).unwrap();
-    let second = manager.open_with_shell(Some(test_shell())).unwrap();
-    let third = manager.open_with_shell(Some(test_shell())).unwrap();
+    let first = open_session(&mut manager);
+    let second = open_session(&mut manager);
+    let third = open_session(&mut manager);
     assert_eq!(manager.len(), 3);
 
     // Each gets a marker only it should ever show.
@@ -263,8 +289,8 @@ fn multiple_sessions_are_independent() {
 #[test]
 fn sessions_resize_independently_of_each_other() {
     let mut manager = TerminalManager::new();
-    let first = manager.open_with_shell(Some(test_shell())).unwrap();
-    let second = manager.open_with_shell(Some(test_shell())).unwrap();
+    let first = open_session(&mut manager);
+    let second = open_session(&mut manager);
 
     manager.resize_all(20, 60);
     for session in manager.sessions() {
@@ -485,8 +511,8 @@ fn open_fd_count() -> usize {
 #[test]
 fn closing_one_of_several_sessions_leaves_the_others_working() {
     let mut manager = TerminalManager::new();
-    let first = manager.open_with_shell(Some(test_shell())).unwrap();
-    let second = manager.open_with_shell(Some(test_shell())).unwrap();
+    let first = open_session(&mut manager);
+    let second = open_session(&mut manager);
 
     assert!(manager.close(first));
     assert_eq!(manager.len(), 1);

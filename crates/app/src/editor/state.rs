@@ -67,6 +67,34 @@ impl Document {
         })
     }
 
+    /// Gives the document a path, re-detecting its language.
+    ///
+    /// Used by save-as: a buffer saved as `User.php` must start highlighting as PHP, which
+    /// means a fresh parse tree — the old one has no grammar at all if the buffer began as
+    /// plain text. Returns an error only if the new language's grammar fails to load, in
+    /// which case the path is still adopted and the document falls back to plain text
+    /// rather than losing the save.
+    pub fn set_path(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        let language = language_for_path(&path);
+        self.path = Some(path);
+
+        if language == self.syntax.language() {
+            return Ok(());
+        }
+
+        match SyntaxTree::new(language, &self.buffer) {
+            Ok(syntax) => {
+                self.syntax = syntax;
+                Ok(())
+            }
+            Err(err) => {
+                self.syntax = SyntaxTree::new(Language::PlainText, &self.buffer)
+                    .expect("plain text needs no grammar");
+                Err(err)
+            }
+        }
+    }
+
     pub fn language(&self) -> Language {
         self.syntax.language()
     }
@@ -425,6 +453,42 @@ mod tests {
     fn title_falls_back_to_untitled() {
         assert_eq!(Document::new(None, "", false).unwrap().title(), "untitled");
         assert_eq!(doc("").title(), "t.php");
+    }
+
+    #[test]
+    fn set_path_adopts_the_path_and_redetects_the_language() {
+        // Save-as on an untitled buffer: it starts as plain text with no grammar, and must
+        // begin highlighting as PHP once it has a .php name.
+        let mut d = Document::new(None, "<?php\nclass A {}\n", false).unwrap();
+        assert_eq!(d.language(), Language::PlainText);
+        assert!(d.syntax.tree().is_none(), "plain text has no parse tree");
+
+        d.set_path(PathBuf::from("/tmp/User.php")).unwrap();
+
+        assert_eq!(d.language(), Language::Php);
+        assert_eq!(d.title(), "User.php");
+        assert!(d.syntax.tree().is_some(), "adopting a .php path must produce a parse tree");
+        assert!(!d.syntax.has_error());
+    }
+
+    #[test]
+    fn set_path_to_the_same_language_keeps_working() {
+        let mut d = doc("<?php $x = 1;");
+        d.set_path(PathBuf::from("/tmp/Other.php")).unwrap();
+        assert_eq!(d.language(), Language::Php);
+        assert_eq!(d.title(), "Other.php");
+        // Still editable and still parsing after the swap.
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert(" // note");
+        assert!(!d.syntax.has_error());
+    }
+
+    #[test]
+    fn set_path_to_an_unknown_extension_falls_back_to_plain_text() {
+        let mut d = doc("<?php $x = 1;");
+        d.set_path(PathBuf::from("/tmp/notes.txt")).unwrap();
+        assert_eq!(d.language(), Language::PlainText);
+        assert!(d.syntax.tree().is_none());
     }
 
     #[test]
