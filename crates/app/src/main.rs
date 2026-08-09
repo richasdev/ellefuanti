@@ -3,6 +3,7 @@
 mod actions;
 mod editor;
 mod palette;
+mod perf;
 mod theme;
 mod workspace_view;
 
@@ -13,23 +14,30 @@ use gpui::{
 };
 
 use crate::actions::Quit;
-use crate::theme::Theme;
 use crate::workspace_view::WorkspaceView;
 
 fn main() {
+    // First statement, so the startup clock includes everything — including the runtime
+    // Metal shader compilation that `runtime_shaders` moves from build time to startup.
+    let mut startup = perf::Startup::begin();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ellefuanti=info".into()),
         )
         .init();
+    startup.phase("logging");
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
+        startup.phase("gpui_init");
+
         let registry = Arc::new(actions::init(cx));
 
         // Quit has no key context, so it works before anything has focus.
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        startup.phase("keymap");
 
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         let window = cx.open_window(
@@ -63,11 +71,20 @@ fn main() {
             tracing::error!("could not focus the workspace: {err:#}");
         }
 
-        // Touch the theme once at startup so a bad colour or font choice fails loudly here
-        // rather than on the first frame.
-        let _ = Theme::dark();
+        // A missing font family does NOT error in gpui: text layout falls back to a
+        // proportional font and every column calculation in the editor silently goes
+        // wrong, which presents as a layout bug rather than a missing font. Check once,
+        // loudly, at startup.
+        if !cx.text_system().all_font_names().iter().any(|name| name == editor::FONT_FAMILY) {
+            tracing::error!(
+                font = editor::FONT_FAMILY,
+                "monospace font not found; text will fall back to a proportional font and \
+                 column positions will be wrong"
+            );
+        }
 
         cx.activate(true);
-        tracing::info!("ellefuanti {} ready", env!("CARGO_PKG_VERSION"));
+        startup.phase("window");
+        startup.ready();
     });
 }

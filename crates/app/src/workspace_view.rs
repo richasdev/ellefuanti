@@ -16,6 +16,7 @@ use crate::actions::{
 };
 use crate::editor::{Document, EditorView};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
+use crate::perf::FrameTimer;
 use crate::theme::{Metrics, Theme};
 
 /// An open tab.
@@ -36,6 +37,8 @@ pub struct WorkspaceView {
     /// In-flight background work. Held rather than detached so a new request drops the
     /// old one, which is how ADR-0007's cancellation actually happens.
     pending: Option<Task<()>>,
+    /// Frame pacing, measured at the window root so it sees every repaint.
+    frames: FrameTimer,
 }
 
 impl WorkspaceView {
@@ -49,6 +52,7 @@ impl WorkspaceView {
             palette: None,
             status: None,
             pending: None,
+            frames: FrameTimer::new(),
         }
     }
 
@@ -329,6 +333,8 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frames.tick();
+
         let theme = Theme::dark();
         window.set_window_title(&self.title(cx));
 
