@@ -38,3 +38,12 @@ gpui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# gpui's own test harness, which can open a window and run a full layout/paint pass with no
+# display attached. That is the only way a machine can check that a view renders at all
+# rather than merely that its inputs were computed correctly (issue #35).
+#
+# It was previously believed unusable here because the feature pulls in `wayland` and `x11`.
+# It does pull them in — and it compiles and runs on macOS anyway, verified before adding it.
+gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }

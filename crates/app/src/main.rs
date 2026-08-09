@@ -4,6 +4,8 @@ mod actions;
 mod editor;
 mod palette;
 mod perf;
+#[cfg(test)]
+mod render_tests;
 mod terminal_view;
 mod theme;
 mod workspace_view;

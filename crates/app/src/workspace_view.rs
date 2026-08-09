@@ -206,6 +206,20 @@ impl WorkspaceView {
 
     // --- file opening ------------------------------------------------------------
 
+    /// Puts an already-built document into a tab, synchronously.
+    ///
+    /// `open_path` reads from disk on the background executor, which a render test cannot
+    /// drive without a real file and a real await. This is the same tail of that function
+    /// with the IO removed, so the view under test reaches the state a real open produces.
+    #[cfg(test)]
+    pub fn open_document_for_test(&mut self, document: Document, cx: &mut Context<Self>) {
+        let path = document.path.clone();
+        let editor = cx.new(|cx| EditorView::new(document, cx));
+        self.tabs.push(Tab { path, editor });
+        self.active_tab = self.tabs.len() - 1;
+        cx.notify();
+    }
+
     /// Opens a file in a tab, or activates the tab already showing it.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
