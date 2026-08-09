@@ -14,6 +14,7 @@ elle-core.workspace = true
 elle-text.workspace = true
 elle-syntax.workspace = true
 elle-workspace.workspace = true
+elle-terminal.workspace = true
 
 gpui.workspace = true
 anyhow.workspace = true

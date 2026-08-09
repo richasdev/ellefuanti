@@ -41,6 +41,8 @@ actions!(
         Cut,
         Paste,
         ToggleHiddenFiles,
+        NewTerminal,
+        ToggleTerminal,
     ]
 );
 
@@ -50,6 +52,7 @@ pub mod context {
     pub const WORKSPACE: &str = "Workspace";
     pub const EDITOR: &str = "Editor";
     pub const PALETTE: &str = "Palette";
+    pub const TERMINAL: &str = "Terminal";
 }
 
 /// Registers the default keymap and the palette's command list.
@@ -65,6 +68,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-shift-p", ToggleCommandPalette, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-p", ToggleQuickOpen, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some(context::WORKSPACE)),
+        // ctrl-` is the conventional terminal toggle. It is bound workspace-wide so it
+        // also *closes* the panel while the terminal itself has focus.
+        KeyBinding::new("ctrl-`", ToggleTerminal, Some(context::WORKSPACE)),
+        KeyBinding::new("ctrl-shift-`", NewTerminal, Some(context::WORKSPACE)),
         // Overlay
         KeyBinding::new("escape", Cancel, Some(context::PALETTE)),
         KeyBinding::new("enter", Confirm, Some(context::PALETTE)),
@@ -115,6 +122,8 @@ pub enum Dispatch {
     CloseTab,
     QuickOpen,
     Quit,
+    NewTerminal,
+    ToggleTerminal,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -127,6 +136,8 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "editor.save" => Dispatch::Save,
         "editor.close" => Dispatch::CloseTab,
         "palette.quick_open" => Dispatch::QuickOpen,
+        "terminal.new" => Dispatch::NewTerminal,
+        "terminal.toggle" => Dispatch::ToggleTerminal,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

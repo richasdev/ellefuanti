@@ -5,7 +5,8 @@
 //! this out later touches one file.
 
 use elle_syntax::HighlightStyle;
-use gpui::{Hsla, Pixels, px, rgb};
+use elle_terminal::CellColor;
+use gpui::{Hsla, Pixels, Rgba, px, rgb};
 
 pub struct Theme {
     pub background: Hsla,
@@ -29,6 +30,13 @@ pub struct Theme {
     pub comment: Hsla,
     pub tag: Hsla,
     pub blade: Hsla,
+
+    /// The sixteen ANSI slots the terminal renders: 0-7 normal, 8-15 bright.
+    ///
+    /// An array rather than sixteen named fields because the terminal indexes it
+    /// numerically — `Ansi(9)` comes straight off the wire — and naming each one would
+    /// mean a sixteen-arm match that does nothing but arithmetic.
+    pub ansi: [Hsla; 16],
 }
 
 /// Editor metrics. Line height is derived from font size so zoom stays consistent.
@@ -43,6 +51,14 @@ impl Metrics {
     pub const TAB_HEIGHT: Pixels = px(32.0);
     pub const STATUS_HEIGHT: Pixels = px(24.0);
     pub const ROW_HEIGHT: Pixels = px(22.0);
+
+    /// Height of the terminal panel, including its tab strip.
+    /// ponytail: fixed, not draggable. A splitter needs a drag-handle element and a
+    /// persisted layout; both arrive with the settings crate.
+    pub const TERMINAL_HEIGHT: Pixels = px(260.0);
+    /// Line height inside the terminal grid. Tighter than the editor's, which is what
+    /// makes a terminal look like a terminal rather than a document.
+    pub const TERMINAL_LINE_HEIGHT: Pixels = px(16.0);
 }
 
 impl Theme {
@@ -70,6 +86,51 @@ impl Theme {
             comment: rgb(0x5c6370).into(),
             tag: rgb(0x8b93a5).into(),
             blade: rgb(0xff9e64).into(),
+
+            // Tuned to this theme rather than the hardware VT100 palette: a literal
+            // 0x0000ff blue is unreadable on a dark background, and `ls` uses it for
+            // directories on every Laravel project.
+            ansi: [
+                rgb(0x3b4048).into(), // 0 black — lifted off the background so it is visible
+                rgb(0xff5c8a).into(), // 1 red
+                rgb(0xa3d977).into(), // 2 green
+                rgb(0xffb86c).into(), // 3 yellow
+                rgb(0x82aaff).into(), // 4 blue
+                rgb(0xc77dff).into(), // 5 magenta
+                rgb(0x7dd3fc).into(), // 6 cyan
+                rgb(0xd7dae0).into(), // 7 white
+                rgb(0x5c6370).into(), // 8 bright black
+                rgb(0xff8fab).into(), // 9 bright red
+                rgb(0xbdea9a).into(), // 10 bright green
+                rgb(0xffd29b).into(), // 11 bright yellow
+                rgb(0xa8c4ff).into(), // 12 bright blue
+                rgb(0xdcaaff).into(), // 13 bright magenta
+                rgb(0xa9e4fd).into(), // 14 bright cyan
+                rgb(0xffffff).into(), // 15 bright white
+            ],
+        }
+    }
+
+    /// Colour for a terminal cell.
+    ///
+    /// The terminal crate resolves the 256-colour cube and palette overrides itself and
+    /// hands back either a literal RGB or a symbolic slot; only the symbolic ones reach
+    /// the theme, which is what lets a theme restyle `ls` output without the parser
+    /// knowing about themes.
+    pub fn terminal(&self, color: CellColor) -> Hsla {
+        match color {
+            CellColor::Foreground => self.text,
+            CellColor::Background => self.background,
+            // Defensive index: the slot comes off the wire as a u8. A malformed SGR must
+            // not panic the render (§24), so an out-of-range slot falls back to text.
+            CellColor::Ansi(slot) => *self.ansi.get(slot as usize).unwrap_or(&self.text),
+            CellColor::Rgb(r, g, b) => Rgba {
+                r: r as f32 / 255.0,
+                g: g as f32 / 255.0,
+                b: b as f32 / 255.0,
+                a: 1.0,
+            }
+            .into(),
         }
     }
 
