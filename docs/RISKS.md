@@ -125,21 +125,30 @@ are features.** If the editor is not excellent, no amount of Docker integration 
 Current versions are known but nothing has been compiled against them yet, because no code
 needs them before Milestone 2:
 
-| Crate                | Version | For                                                            |
-| -------------------- | ------- | -------------------------------------------------------------- |
-| `sqlx`               | 0.9.0   | Database explorer (§14)                                        |
-| `rusqlite`           | 0.40.2  | Project index (§12)                                            |
-| `git2`               | 0.21.0  | Git (§15)                                                      |
-| `portable-pty`       | 0.9.0   | Terminal (§17)                                                 |
-| `alacritty_terminal` | 0.26.0  | Terminal emulation (§17)                                       |
-| `lsp-types`          | 0.97.0  | LSP client (§8)                                                |
-| `async-lsp`          | 0.2.4   | LSP transport — preferred over the less-maintained `tower-lsp` |
-| `notify`             | 8.2.0   | File watcher (§12)                                             |
-| `grep` / `ignore`    | 0.4.x   | Search (§8)                                                    |
+| Crate                | Version | For                      |
+| -------------------- | ------- | ------------------------ |
+| `sqlx`               | 0.9.0   | Database explorer (§14)  |
+| `rusqlite`           | 0.40.2  | Project index (§12)      |
+| `git2`               | 0.21.0  | Git (§15)                |
+| `portable-pty`       | 0.9.0   | Terminal (§17)           |
+| `alacritty_terminal` | 0.26.0  | Terminal emulation (§17) |
+| `notify`             | 8.2.0   | File watcher (§12)       |
+| `grep` / `ignore`    | 0.4.x   | Search (§8)              |
 
 **Mitigation.** Validate by compiling a spike at the start of the milestone that needs it —
 the same method that caught the `xcrun metal` and ropey boundary problems before they cost
 a day of debugging.
+
+**Now validated (`elle-lsp`, Milestone 2).** `lsp-types` 0.97.0 compiles and is in use.
+The spike found that 0.97 replaced `Url` with its own `Uri` type (backed by `fluent-uri`),
+which has no path-to-URI constructor — so `path_to_uri` is ours, and percent-encoding is
+tested rather than assumed.
+
+`async-lsp` 0.2.4 was **rejected** after inspection, not adopted. It is a tower-based
+framework and brings tokio, which ADR-0007 rules out; the transport is a hand-rolled
+`Content-Length` framing layer instead (~110 lines, 16 tests covering split reads and
+multi-byte boundaries). The trade is deliberate: framing is small and easily tested,
+whereas a second async runtime is a structural commitment.
 
 ---
 
