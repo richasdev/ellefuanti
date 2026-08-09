@@ -27,7 +27,7 @@ impl SyntaxTree {
             parser
                 .set_language(&grammar)
                 .with_context(|| format!("loading {} grammar", language.name()))?;
-            tree = parser.parse(buffer.text(), None);
+            tree = parse_rope(&mut parser, buffer, None);
         }
 
         Ok(Self { language, parser, tree })
@@ -59,11 +59,14 @@ impl SyntaxTree {
             }
         }
 
-        // ponytail: reparse from the full text string. tree-sitter can read a rope
-        // through parse_with_options to avoid this allocation; measure first — for the
-        // file sizes M1 targets the copy is far cheaper than the parse it feeds, and
-        // the callback version is easy to swap in behind this same method.
-        self.tree = self.parser.parse(buffer.text(), self.tree.as_ref());
+        // Reparse by reading the rope chunk-by-chunk instead of flattening it into a
+        // String. The measurement the old comment asked for: on a 1 MB / 55k-line file
+        // `buffer.text()` costs ~0.22 ms against a ~1.95 ms reparse, so the copy was
+        // ~10% of this call, not the bottleneck it was once blamed for (that was
+        // benchmark teardown — see benchmarks/benches/frame.rs). It is still pure waste
+        // on the hot per-keystroke path and it scales with file size rather than edit
+        // size, so it is gone.
+        self.tree = parse_rope(&mut self.parser, buffer, self.tree.as_ref());
     }
 
     /// Full reparse, discarding incremental state. For when a buffer is replaced
@@ -72,13 +75,40 @@ impl SyntaxTree {
         if self.language.grammar().is_none() {
             return;
         }
-        self.tree = self.parser.parse(buffer.text(), None);
+        self.tree = parse_rope(&mut self.parser, buffer, None);
     }
 
     /// Whether the tree contains a syntax error. Cheap: a flag on the root node.
     pub fn has_error(&self) -> bool {
         self.tree.as_ref().is_some_and(|t| t.root_node().has_error())
     }
+}
+
+/// Reparses `buffer` by feeding tree-sitter the rope's own chunks.
+///
+/// tree-sitter pulls text through a callback: given a byte offset it wants a slice
+/// *starting at that offset*, and an empty slice means end of input. Ropey's
+/// `chunk_at_byte` returns the containing chunk plus that chunk's start offset, so the
+/// requested byte is somewhere inside it — the slice has to be trimmed to begin at the
+/// offset, otherwise tree-sitter re-reads bytes it already consumed and the parse is
+/// silently wrong.
+fn parse_rope(parser: &mut Parser, buffer: &Buffer, old_tree: Option<&Tree>) -> Option<Tree> {
+    let rope = buffer.rope();
+    let len_bytes = rope.len_bytes();
+
+    parser.parse_with_options(
+        &mut |offset: usize, _position: TsPoint| -> &[u8] {
+            if offset >= len_bytes {
+                return &[];
+            }
+            let (chunk, chunk_start, _, _) = rope.chunk_at_byte(offset);
+            // `offset` is a char boundary (tree-sitter only asks for boundaries it was
+            // given) and lies within this chunk, so the subtraction cannot underflow.
+            &chunk.as_bytes()[offset - chunk_start..]
+        },
+        old_tree,
+        None,
+    )
 }
 
 /// Translates one of our edits into tree-sitter's coordinate change.
@@ -180,6 +210,84 @@ mod tests {
             tree.tree().unwrap().root_node().to_sexp(),
             cold.tree().unwrap().root_node().to_sexp()
         );
+    }
+
+    /// The rope-callback parse must agree with a parse of the flattened string on a file
+    /// big enough to span many rope chunks (ropey chunks are ~1 KiB, so a single-chunk
+    /// fixture would never exercise the offset trimming in `parse_rope`). An off-by-one
+    /// there duplicates or drops bytes at every chunk seam, which this catches.
+    #[test]
+    fn rope_callback_parse_matches_flat_string_across_chunk_boundaries() {
+        let mut text = String::from("<?php\n");
+        for i in 0..400 {
+            text.push_str(&format!(
+                "class Model{i} extends Model {{\n    protected $table = 'model_{i}';\n}}\n"
+            ));
+        }
+        let buffer = Buffer::new(&text);
+        assert!(buffer.len_bytes() > 16_000, "fixture must span many rope chunks");
+        assert!(
+            buffer.rope().chunks().count() > 1,
+            "fixture must be more than one rope chunk to be meaningful"
+        );
+
+        let rope_parsed = SyntaxTree::new(Language::Php, &buffer).unwrap();
+        assert!(!rope_parsed.has_error());
+
+        // Reference: hand tree-sitter one contiguous &str, the pre-fix behaviour.
+        let mut parser = Parser::new();
+        parser.set_language(&Language::Php.grammar().unwrap()).unwrap();
+        let flat = parser.parse(&text, None).unwrap();
+
+        assert_eq!(rope_parsed.tree().unwrap().root_node().to_sexp(), flat.root_node().to_sexp());
+    }
+
+    /// Multi-byte characters straddling a chunk seam are the case most likely to break
+    /// byte-offset arithmetic, so parse a large file dense with them.
+    #[test]
+    fn rope_callback_parse_handles_multibyte_across_chunks() {
+        let mut text = String::from("<?php\n");
+        for i in 0..400 {
+            text.push_str(&format!("$var{i} = 'ação-José-日本語-{i}';\n"));
+        }
+        let buffer = Buffer::new(&text);
+        assert!(buffer.rope().chunks().count() > 1);
+
+        let tree = SyntaxTree::new(Language::Php, &buffer).unwrap();
+        assert!(!tree.has_error());
+
+        let mut parser = Parser::new();
+        parser.set_language(&Language::Php.grammar().unwrap()).unwrap();
+        let flat = parser.parse(&text, None).unwrap();
+        assert_eq!(tree.tree().unwrap().root_node().to_sexp(), flat.root_node().to_sexp());
+    }
+
+    /// Incremental reparse must stay correct on a multi-chunk file too: this is the
+    /// actual per-keystroke path that `parse_rope` now serves.
+    #[test]
+    fn incremental_edit_on_large_file_matches_full_reparse() {
+        let mut text = String::from("<?php\n");
+        for i in 0..400 {
+            text.push_str(&format!("class Model{i} {{\n    public $a{i};\n}}\n"));
+        }
+        let mut buffer = Buffer::new(&text);
+        let mut tree = SyntaxTree::new(Language::Php, &buffer).unwrap();
+
+        // Type into the middle of the file, one character at a time.
+        let row = buffer.len_lines() / 2;
+        for _ in 0..8 {
+            let offset = buffer.point_to_offset(elle_text::Point::new(row, 0));
+            let edit = buffer.insert(offset, "//x\n");
+            tree.apply_edits(&buffer, &[edit]);
+        }
+
+        let mut cold = SyntaxTree::new(Language::Php, &buffer).unwrap();
+        cold.reparse(&buffer);
+        assert_eq!(
+            tree.tree().unwrap().root_node().to_sexp(),
+            cold.tree().unwrap().root_node().to_sexp()
+        );
+        assert!(!tree.has_error());
     }
 
     #[test]

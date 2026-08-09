@@ -77,24 +77,58 @@ fn frame_on_50k_lines(c: &mut Criterion) {
 fn keystroke_on_50k_lines(c: &mut Criterion) {
     let text = big_php(5000);
 
+    // `iter_batched_ref`, not `iter_batched`: the fixture must be *borrowed* by the
+    // routine. Taking `(Buffer, SyntaxTree)` by value moves them into the closure, so
+    // criterion charges their destructors to the sample — and `drop(SyntaxTree)` on a
+    // 1 MB file is ~8-10 ms of arena teardown, three times the keystroke itself. That
+    // measured "24.8 ms per keystroke" and pointed the blame at the reparse; the editor
+    // never destroys a buffer per keystroke, so the teardown must stay outside the clock.
     c.bench_function("keystroke_and_frame/55k_lines", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let buffer = Buffer::new(&text);
                 let tree = SyntaxTree::new(Language::Php, &buffer).unwrap();
                 (buffer, tree)
             },
-            |(mut buffer, mut tree)| {
+            |(buffer, tree)| {
                 let row = buffer.len_lines() / 2;
                 let offset = buffer.point_to_offset(Point::new(row, 0));
                 let edit = buffer.insert(offset, "x");
-                tree.apply_edits(&buffer, &[edit]);
-                frame_at(&buffer, &tree, row.saturating_sub(40))
+                tree.apply_edits(buffer, &[edit]);
+                frame_at(buffer, tree, row.saturating_sub(40))
             },
             criterion::BatchSize::LargeInput,
         )
     });
 }
 
-criterion_group!(benches, frame_on_50k_lines, keystroke_on_50k_lines);
+/// Sustained typing: many consecutive keystrokes against one long-lived buffer and tree,
+/// which is what actually happens when someone types a word into a large file. No fixture
+/// is built or destroyed inside the clock, so every sample is pure keystroke-to-pixel work.
+fn sustained_typing_on_50k_lines(c: &mut Criterion) {
+    let text = big_php(5000);
+
+    c.bench_function("sustained_typing/55k_lines", |b| {
+        let mut buffer = Buffer::new(&text);
+        let mut tree = SyntaxTree::new(Language::Php, &buffer).unwrap();
+        let row = buffer.len_lines() / 2;
+
+        b.iter(|| {
+            // Column 5 keeps the insertion inside a declaration, so the file stays
+            // parseable — typing that produces a transient syntax error is measured by
+            // the keystroke_and_frame bench above.
+            let offset = buffer.point_to_offset(Point::new(row, 5));
+            let edit = buffer.insert(offset, "x");
+            tree.apply_edits(&buffer, &[edit]);
+            frame_at(&buffer, &tree, row.saturating_sub(40))
+        })
+    });
+}
+
+criterion_group!(
+    benches,
+    frame_on_50k_lines,
+    keystroke_on_50k_lines,
+    sustained_typing_on_50k_lines
+);
 criterion_main!(benches);
