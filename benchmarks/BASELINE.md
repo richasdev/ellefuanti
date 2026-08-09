@@ -12,6 +12,27 @@ Reproduce with:
 cargo bench -p elle-benchmarks
 ```
 
+## How to read a disagreement
+
+The most expensive mistake made in this file's history was not a slow function — it was
+**trusting a benchmark**. A reported 24.8 ms per keystroke (#27) turned out to be criterion
+charging destructor time to every sample; the code was already near budget.
+
+What surfaced it was not profiling. It was noticing that two measurements of the same thing
+disagreed, and treating that disagreement as evidence about the **harness** rather than as
+noise to average away. Twice:
+
+1. A fresh reading of 62.6 ms contradicted the recorded 24.8 ms → the harness was suspect →
+   found the teardown being timed.
+2. Two runs of identical code differed by 2× → absolute numbers here are not comparable
+   across runs → built an interleaved A/B in one process, which is the only figure worth
+   quoting for a before/after.
+
+So: **when a number surprises you, suspect the measurement before the code.** If two runs of
+the same code disagree, that is a fact about the measurement, and averaging it away destroys
+the only signal you had. Optimising against a number you have not interrogated is how a
+codebase acquires complexity that buys nothing.
+
 ---
 
 ## Text buffer — `benches/text.rs`
