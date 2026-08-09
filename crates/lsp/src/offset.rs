@@ -118,9 +118,13 @@ impl LineIndex {
     /// `elle-text` applies, so the two layers never disagree about where a character
     /// begins.
     pub fn position(&self, text: &str, offset: usize, encoding: OffsetEncoding) -> Position {
-        let offset = snap_down(text, offset.min(self.len_bytes));
+        // Clamp against `text`, not just the cached `len_bytes`. The index and the text are
+        // separate parameters, so nothing prevents a caller from passing text that has since
+        // shrunk — a server replying about a document version the buffer has already moved
+        // past. Trusting the cached length there indexes out of range and panics.
+        let offset = snap_down(text, offset.min(self.len_bytes).min(text.len()));
         let line = self.line_of(offset);
-        let line_start = self.line_start(line);
+        let line_start = self.line_start(line).min(offset);
 
         // Count only within the line, so cost is proportional to the column rather
         // than to the file.
@@ -138,10 +142,17 @@ impl LineIndex {
     pub fn offset(&self, text: &str, position: Position, encoding: OffsetEncoding) -> usize {
         let line = position.line as usize;
         if line >= self.line_starts.len() {
-            return self.len_bytes;
+            // `len_bytes` is the index's idea of the end, which may exceed the text it is
+            // being applied to. Return an offset that is valid for `text`.
+            return snap_down(text, self.len_bytes.min(text.len()));
         }
 
-        let range = self.line_range(line);
+        // Clamp to `text` for the same reason as `position`: the index may describe a
+        // longer, older version of the document, and slicing on its word would panic.
+        let mut range = self.line_range(line);
+        range.start = snap_down(text, range.start.min(text.len()));
+        range.end = snap_down(text, range.end.min(text.len())).max(range.start);
+
         // Exclude the line terminator: a column may not address it, and counting it
         // would let a large `character` walk into the next line.
         let line_text = trim_terminator(&text[range.clone()]);
@@ -332,6 +343,37 @@ mod tests {
         // Start of line 2 ("$ç = 'não';").
         let line2 = PT.find("$\u{e7}").unwrap();
         assert_eq!(index.position(PT, line2, OffsetEncoding::Utf16), pos(2, 0));
+    }
+
+    #[test]
+    fn a_stale_index_against_shorter_text_does_not_panic() {
+        // `LineIndex::new` caches line starts and a length, but `position`/`offset` take
+        // `text` as a separate parameter — so nothing structurally prevents a caller from
+        // passing text that has since shrunk. A document edited between building the index
+        // and converting a position (a server replying about a version the buffer has moved
+        // past) hits exactly this.
+        //
+        // Before the clamp against `text.len()`, this panicked on an out-of-range slice.
+        let index = LineIndex::new("line one\nline two\nline three\n");
+        let shrunk = "short";
+
+        // Offsets valid for the old text but past the end of the new one.
+        for offset in [6, 12, 25, 999] {
+            let position = index.position(shrunk, offset, OffsetEncoding::Utf16);
+            // The answer is necessarily approximate — the index is stale — but it must be
+            // in range and must not crash.
+            assert!(position.line as usize <= index.line_count());
+        }
+
+        // The reverse direction too: a position from the old document against new text.
+        for (line, character) in [(0, 99), (2, 0), (99, 0)] {
+            let offset = index.offset(shrunk, pos(line, character), OffsetEncoding::Utf16);
+            assert!(
+                offset <= shrunk.len(),
+                "offset {offset} escapes text of length {}",
+                shrunk.len()
+            );
+        }
     }
 
     #[test]

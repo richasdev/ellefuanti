@@ -467,15 +467,30 @@ fn closing_sessions_does_not_leak_file_descriptors() {
         drop(spawn_for_leak_check(i));
     }
 
-    let after = open_fd_count();
+    // Wait for the count to settle rather than sampling immediately.
+    //
+    // `Drop` detaches the child-waiter thread (deliberately — joining it blocked the UI for
+    // ~600 ms while `/bin/sh` died on SIGHUP), so descriptors come back on that thread's
+    // schedule, not at the drop site. Sampling right away measures teardown in flight: this
+    // passed 5/5 locally and failed on a slower CI runner at +6, which is a fact about
+    // scheduling rather than about `Drop`.
+    //
+    // Polling for the settled value is what makes the test measure a *leak*. Simply widening
+    // the threshold would have made CI green while blinding the test to a real regression —
+    // a leak of two fds per session is +20, and this still catches that, because a genuine
+    // leak never settles no matter how long we wait.
+    let deadline = Instant::now() + TIMEOUT;
+    let allowance = baseline + 4;
+    let mut after = open_fd_count();
+    while after > allowance && Instant::now() < deadline {
+        std::thread::sleep(POLL);
+        after = open_fd_count();
+    }
 
-    // An exact match is too strict — the detached child-waiter threads from the loop above
-    // may still be finishing. A leak of two fds per session would show as +20 here, so a
-    // small allowance separates "leaked" from "still winding down" without hiding a bug.
     assert!(
-        after <= baseline + 4,
-        "fd count grew from {baseline} to {after} across 10 open/close cycles, \
-         which means Drop is not returning the pty descriptors"
+        after <= allowance,
+        "fd count settled at {after} from a baseline of {baseline} across 10 open/close \
+         cycles, which means Drop is not returning the pty descriptors"
     );
 }
 
