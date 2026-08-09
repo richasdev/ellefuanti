@@ -25,3 +25,8 @@ harness = false
 [[bench]]
 name = "workspace"
 harness = false
+
+[[bench]]
+name = "frame"
+harness = false
+
