@@ -444,6 +444,24 @@ fn styled_line(
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> StyledText {
+    let (text, highlights) = line_runs(line, line_start, spans, theme, cursor_column);
+    StyledText::new(SharedString::from(text)).with_highlights(highlights)
+}
+
+/// The text and colour runs for one rendered line.
+///
+/// Split out from [`styled_line`] because `StyledText` is opaque once built — there is no
+/// way to ask it what it will paint. Returning the runs first makes the part that can
+/// actually be wrong (clipping, rebasing, cursor placement, char boundaries) assertable
+/// without a GPU, which is the only slice of "does it render correctly" a machine can check
+/// here. See `crates/app/tests/render.rs`.
+fn line_runs(
+    line: &str,
+    line_start: usize,
+    spans: &[HighlightSpan],
+    theme: &Theme,
+    cursor_column: Option<usize>,
+) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
     let line_end = line_start + line.len();
 
     // A cursor at end-of-line has no character to paint under, so pad with one space.
@@ -492,7 +510,7 @@ fn styled_line(
     }
 
     highlights.sort_by_key(|(range, _)| range.start);
-    StyledText::new(SharedString::from(text)).with_highlights(highlights)
+    (text, highlights)
 }
 
 /// Largest char boundary <= `index`.
@@ -529,5 +547,188 @@ mod tests {
             assert!(s.is_char_boundary(floor_boundary(s, i)));
             assert!(s.is_char_boundary(ceil_boundary(s, i)));
         }
+    }
+
+    // --- what actually gets painted -------------------------------------------------
+    //
+    // `StyledText` is opaque once constructed, so these test `line_runs`, which is the
+    // same computation one step earlier. This is the largest slice of "does it render
+    // correctly" that a machine can check without a GPU: whether the right bytes get the
+    // right colour. What it cannot check is whether those runs reach the screen at the
+    // right pixels — that is issue #35, and it needs a human.
+
+    use elle_syntax::{HighlightSpan, HighlightStyle};
+
+    fn span(range: Range<usize>, style: HighlightStyle) -> HighlightSpan {
+        HighlightSpan { range, style }
+    }
+
+    /// Byte ranges carrying a foreground colour, ignoring the cursor's inverted run.
+    fn coloured(runs: &[(Range<usize>, GpuiHighlight)], theme: &Theme) -> Vec<Range<usize>> {
+        runs.iter()
+            .filter(|(_, style)| style.background_color != Some(theme.cursor))
+            .map(|(range, _)| range.clone())
+            .collect()
+    }
+
+    #[test]
+    fn spans_are_rebased_onto_line_local_offsets() {
+        let theme = Theme::dark();
+        // Line 3 of a document, starting at byte 100. A span at document byte 104..108
+        // must paint at line-local 4..8, not 104..108 — getting this wrong paints the
+        // wrong word, or panics past the end of a short line.
+        let (text, runs) = line_runs(
+            "    return $this;",
+            100,
+            &[span(104..110, HighlightStyle::Keyword)],
+            &theme,
+            None,
+        );
+
+        assert_eq!(text, "    return $this;");
+        assert_eq!(coloured(&runs, &theme), vec![4..10]);
+        assert_eq!(&text[4..10], "return");
+    }
+
+    #[test]
+    fn spans_outside_the_line_are_dropped() {
+        let theme = Theme::dark();
+        let (_, runs) = line_runs(
+            "middle line",
+            100,
+            &[
+                span(0..50, HighlightStyle::Comment),    // entirely before
+                span(200..250, HighlightStyle::Comment), // entirely after
+            ],
+            &theme,
+            None,
+        );
+        assert!(coloured(&runs, &theme).is_empty());
+    }
+
+    #[test]
+    fn a_span_straddling_the_line_is_clipped_to_it() {
+        let theme = Theme::dark();
+        // A block comment opening on an earlier line and closing on a later one: the
+        // visible part must still colour, clipped at both ends rather than overflowing.
+        let line = "still inside";
+        let (text, runs) = line_runs(line, 100, &[span(50..200, HighlightStyle::Comment)], &theme, None);
+
+        assert_eq!(coloured(&runs, &theme), vec![0..line.len()]);
+        assert!(runs.iter().all(|(r, _)| r.end <= text.len()), "no run may exceed the text");
+    }
+
+    #[test]
+    fn runs_never_split_a_multibyte_character() {
+        let theme = Theme::dark();
+        // "ção" — the span deliberately ends mid-codepoint, which StyledText
+        // debug-asserts against. It must snap to a boundary instead of panicking.
+        let line = "$mensagem = 'ação';";
+        let (text, runs) = line_runs(line, 0, &[span(13..17, HighlightStyle::String)], &theme, None);
+
+        for (range, _) in &runs {
+            assert!(
+                text.is_char_boundary(range.start) && text.is_char_boundary(range.end),
+                "run {range:?} splits a codepoint in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_paints_over_the_syntax_colour_beneath_it() {
+        let theme = Theme::dark();
+        // Cursor inside a keyword: it must win the overlap, or it becomes invisible
+        // exactly where the user is looking.
+        let (_, runs) = line_runs(
+            "return $x;",
+            0,
+            &[span(0..6, HighlightStyle::Keyword)],
+            &theme,
+            Some(2),
+        );
+
+        let cursor: Vec<_> = runs
+            .iter()
+            .filter(|(_, s)| s.background_color == Some(theme.cursor))
+            .collect();
+        assert_eq!(cursor.len(), 1, "exactly one cursor run");
+        assert_eq!(cursor[0].0, 2..3);
+
+        // And nothing else may overlap it.
+        for (range, style) in &runs {
+            if style.background_color != Some(theme.cursor) {
+                assert!(range.end <= 2 || range.start >= 3, "run {range:?} overlaps the cursor");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_of_the_line_still_has_something_to_paint() {
+        let theme = Theme::dark();
+        // At end-of-line there is no character under the cursor, so the line is padded.
+        // Without this the cursor silently vanishes at the end of every line.
+        let (text, runs) = line_runs("ab", 0, &[], &theme, Some(2));
+
+        assert_eq!(text, "ab ", "padded so the cursor has a cell");
+        let cursor = runs.iter().find(|(_, s)| s.background_color == Some(theme.cursor));
+        assert_eq!(cursor.expect("a cursor run").0, 2..3);
+    }
+
+    #[test]
+    fn the_cursor_lands_on_a_whole_multibyte_character() {
+        let theme = Theme::dark();
+        // Cursor on "ç" (2 bytes). A 1-byte cursor run would split it and panic.
+        let line = "ação";
+        let (text, runs) = line_runs(line, 0, &[], &theme, Some(1));
+
+        let (range, _) = runs
+            .iter()
+            .find(|(_, s)| s.background_color == Some(theme.cursor))
+            .expect("a cursor run");
+        assert_eq!(&text[range.clone()], "ç");
+    }
+
+    #[test]
+    fn runs_are_sorted_and_non_overlapping() {
+        let theme = Theme::dark();
+        // gpui expects ordered, disjoint runs; overlapping ones paint unpredictably.
+        let (_, runs) = line_runs(
+            "public function name() { return 'x'; }",
+            0,
+            &[
+                span(0..6, HighlightStyle::Keyword),
+                span(7..15, HighlightStyle::Keyword),
+                span(32..35, HighlightStyle::String),
+            ],
+            &theme,
+            Some(8),
+        );
+
+        for pair in runs.windows(2) {
+            assert!(
+                pair[0].range_end() <= pair[1].0.start,
+                "runs must be sorted and disjoint: {:?} then {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    /// Small helper so the window assertion above reads cleanly.
+    trait RangeEnd {
+        fn range_end(&self) -> usize;
+    }
+    impl RangeEnd for (Range<usize>, GpuiHighlight) {
+        fn range_end(&self) -> usize {
+            self.0.end
+        }
+    }
+
+    #[test]
+    fn an_empty_line_produces_no_runs() {
+        let theme = Theme::dark();
+        let (text, runs) = line_runs("", 0, &[], &theme, None);
+        assert_eq!(text, "");
+        assert!(runs.is_empty());
     }
 }
