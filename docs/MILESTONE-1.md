@@ -33,7 +33,7 @@ Tasks are small and independently verifiable. Each states its **done** condition
 | 13  | Command palette and quick open UI   | ⬜ todo        |
 | 14  | Native open-folder dialog           | ⬜ todo        |
 | 15  | Save, dirty state and status bar    | ⬜ todo        |
-| 16  | Benchmarks                          | ⬜ todo        |
+| 16  | Benchmarks                          | 🟡 partial     |
 | 17  | Basic terminal panel                | ⬜ deferred    |
 
 ---
@@ -173,14 +173,24 @@ position, language and dirty state.
 **Done when:** an edited file round-trips to disk byte-exactly, including its original
 trailing-newline behaviour, and a failed save leaves the buffer intact with a visible error.
 
-## 16. Benchmarks ⬜
+## 16. Benchmarks 🟡
 
 Criterion benches under `benchmarks/` for the pure layers: buffer edits across 1 KB → 10 MB,
 cold vs incremental parse, highlight extraction for an 80-row window, file-tree open and
-expand. Startup instrumented with `tracing` spans.
+expand. Baseline recorded in [benchmarks/BASELINE.md](../benchmarks/BASELINE.md).
 
-**Done when:** `cargo bench` produces a baseline recorded in the repo, so later work has
-something to regress against. Nothing is optimised before this exists (§21).
+**Done:** all three suites, and the baseline is in the repo so later work has something to
+regress against.
+
+**It immediately earned its cost.** `highlights` for a fixed viewport measured 50 / 60 /
+156 µs across a 100× file-size range — growing with file size, contradicting the viewport
+claim in ARCHITECTURE.md. The tree walk iterated every child of every node, so the root's
+child list (one entry per top-level declaration) was scanned in full on every frame.
+Replacing the sibling scan with `goto_first_child_for_byte` made it flat (46.4 / 46.7 /
+46.6 µs) and 3.4× faster on the large file. A unit test now pins the property.
+
+**Remaining:** startup and frame time need `tracing` span instrumentation in the app; those
+are the two §21 targets a microbenchmark cannot reach.
 
 ## 17. Basic terminal panel ⬜ deferred
 

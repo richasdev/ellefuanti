@@ -6,6 +6,7 @@ members = [
     "crates/text",
     "crates/syntax",
     "crates/workspace",
+    "benchmarks",
 ]
 
 [workspace.package]

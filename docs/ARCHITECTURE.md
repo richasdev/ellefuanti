@@ -244,6 +244,13 @@ known ceiling, the code says so in a `ponytail:` comment naming the upgrade path
 instance, reparsing from a full text copy instead of reading the rope through a callback.
 That is a measured decision to revisit, not an oversight.
 
+The baseline is recorded in [benchmarks/BASELINE.md](../benchmarks/BASELINE.md), and it
+earned its cost on the first run: the viewport-scoped highlighter was measurably **not**
+viewport-scoped. It range-checked correctly but iterated every sibling to find the visible
+ones, so cost grew with file size (50 → 156 µs across a 100× range) while reading as
+correct. Seeking with `goto_first_child_for_byte` made it flat at ~46 µs. The lesson is the
+reason §21 exists: a walk that _looks_ bounded is not evidence that it is.
+
 ---
 
 ## 7. Fault isolation

@@ -1,0 +1,27 @@
+[package]
+name = "elle-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+elle-text.workspace = true
+elle-syntax.workspace = true
+elle-workspace.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "text"
+harness = false
+
+[[bench]]
+name = "syntax"
+harness = false
+
+[[bench]]
+name = "workspace"
+harness = false
