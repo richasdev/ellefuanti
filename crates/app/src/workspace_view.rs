@@ -206,6 +206,12 @@ impl WorkspaceView {
 
     // --- file opening ------------------------------------------------------------
 
+    /// The active tab's editor handle, for render tests that need to inspect it.
+    #[cfg(test)]
+    pub fn active_editor_for_test(&self) -> Option<Entity<EditorView>> {
+        self.active_editor().cloned()
+    }
+
     /// Puts an already-built document into a tab, synchronously.
     ///
     /// `open_path` reads from disk on the background executor, which a render test cannot

@@ -65,6 +65,16 @@ impl EditorView {
         }
     }
 
+    /// Where the text column starts, as measured at prepaint.
+    ///
+    /// Exposed for the render tests: the click arithmetic depends on this being a *measured*
+    /// value rather than a constant, and a test that cannot read it can only check that
+    /// clicking does not crash.
+    #[cfg(test)]
+    pub fn text_origin_x_for_test(&self) -> Option<Pixels> {
+        self.text_origin_x
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.document.buffer.is_dirty()
     }

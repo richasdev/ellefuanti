@@ -29,6 +29,7 @@ use gpui::{TestAppContext, VisualTestContext, px, size};
 
 use crate::editor::{Document, EditorView};
 use crate::palette::{Palette, PaletteMode};
+use crate::theme::Metrics;
 use crate::workspace_view::WorkspaceView;
 
 /// A window big enough that the sidebar, tab bar and status bar all have room; a cramped
@@ -122,6 +123,107 @@ async fn the_editor_renders_an_empty_document(cx: &mut TestAppContext) {
     });
 
     draw(cx);
+}
+
+#[gpui::test]
+async fn the_editor_measures_its_text_origin_during_layout(cx: &mut TestAppContext) {
+    // The click-to-column fix depends on `text_origin_x` being filled in by the layout
+    // engine at prepaint — guessing it from the chrome constants is what produced the
+    // 284 px error, where a window-relative x was treated as row-relative.
+    //
+    // This asserts the mechanism actually fires: after a real layout pass the field must
+    // hold the gutter's width relative to the row, not `None` and not zero.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("origin.php")),
+            "<?php\n$a = 1;\n$b = 2;\n",
+            true,
+        )
+        .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    draw(cx);
+
+    let origin = view.read_with(cx, |editor, _cx| editor.text_origin_x_for_test());
+    let origin = origin.expect("prepaint must record where the text column starts");
+
+    // The editor is rendered standalone here, so the text begins after the gutter and
+    // nothing else. If this ever reads ~0, `on_children_prepainted` stopped firing and the
+    // click handler is back to guessing.
+    assert!(
+        origin >= Metrics::GUTTER_WIDTH,
+        "text should start at or after the gutter, measured {origin:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut TestAppContext) {
+    // End-to-end on the bug PR #39 fixed. It must run **inside the workspace**, not against a
+    // standalone editor: the defect was that a window-relative x had only the gutter
+    // subtracted, ignoring the 44 px activity bar and 240 px sidebar the row sits inside.
+    //
+    // A first attempt at this test rendered the editor alone, where there is no chrome — so
+    // the buggy guess and the measured origin were the same number and the test passed even
+    // with the bug reintroduced. Verified by mutation: with the editor standalone the old
+    // arithmetic survives; inside the chrome it does not.
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    let editor = workspace.update(cx, |workspace, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("click.php")),
+            "<?php\n$first = 1;\n$second = 2;\n$third = 3;\n",
+            true,
+        )
+        .expect("php grammar loads");
+        workspace.open_document_for_test(document, cx);
+        workspace.active_editor_for_test().expect("the opened document is active")
+    });
+
+    draw(cx);
+
+    // The measured origin now includes the chrome, so it is far to the right of the gutter.
+    // That gap *is* the bug: anything that guesses `GUTTER_WIDTH` lands ~284 px into the line.
+    let origin = editor
+        .read_with(cx, |editor, _cx| editor.text_origin_x_for_test())
+        .expect("prepaint records the text origin");
+    assert!(
+        origin > Metrics::GUTTER_WIDTH + px(100.0),
+        "inside the chrome the text origin must be well right of the gutter; got {origin:?}"
+    );
+
+    // Click a few pixels into the text of a row, which must resolve to an early column.
+    let y = Metrics::TAB_HEIGHT + Metrics::LINE_HEIGHT * 2.5;
+    cx.simulate_click(gpui::point(origin + px(4.0), y), gpui::Modifiers::default());
+
+    let after = editor.read_with(cx, |editor, _cx| editor.document.cursor_point());
+    assert!(
+        after.column <= 2,
+        "a click at the left edge of the text must give an early column, got {} — the old \
+         arithmetic put it tens of columns in",
+        after.column
+    );
+}
+
+#[gpui::test]
+async fn typing_reaches_the_document(cx: &mut TestAppContext) {
+    // The full input path: keystroke → gpui dispatch → key_char → Document::insert. Every
+    // piece of that is covered in isolation; nothing until now proved they are connected.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(None, "", false).expect("plain text needs no grammar");
+        EditorView::new(document, cx)
+    });
+
+    draw(cx);
+    cx.update(|window, cx| {
+        window.focus(&gpui::Focusable::focus_handle(view.read(cx), cx));
+    });
+
+    cx.simulate_input("ação");
+
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(text, "ação", "typed multibyte text must reach the buffer intact");
 }
 
 #[gpui::test]
