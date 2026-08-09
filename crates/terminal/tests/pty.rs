@@ -71,9 +71,36 @@ fn wait_for_text(session: &Session, needle: &str) -> String {
     wait_for_screen(session, &format!("{needle:?}"), |screen| screen.contains(needle))
 }
 
+/// Spawns a session, retrying while the OS is temporarily out of PTYs.
+///
+/// `cargo test` runs these in parallel and every one of them allocates a real PTY, which
+/// on macOS is a finite global resource: once the harness has enough tests in flight,
+/// `openpty` starts failing with `Os { code: -6 }`. That is the machine being saturated,
+/// not the code under test being wrong — the same test passes every time in isolation —
+/// so retrying on that failure is what makes this suite honest rather than flaky.
+///
+/// ponytail: a retry loop, not a global semaphore limiting concurrent PTYs across tests.
+/// A semaphore would serialise the suite to eliminate the contention entirely; the retry
+/// keeps the tests parallel and simply waits out a transient limit. Swap it if the retries
+/// start dominating the runtime.
 fn spawn(rows: u16, cols: u16) -> Session {
-    Session::spawn(SessionId(1), None, Some(test_shell()), rows, cols)
-        .expect("a pty and /bin/sh should be available")
+    let deadline = Instant::now() + TIMEOUT;
+    let mut last_error = None;
+
+    while Instant::now() < deadline {
+        match Session::spawn(SessionId(1), None, Some(test_shell()), rows, cols) {
+            Ok(session) => return session,
+            Err(err) => {
+                last_error = Some(format!("{err:#}"));
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+
+    panic!(
+        "could not open a pty within {TIMEOUT:?}; last error: {}",
+        last_error.unwrap_or_else(|| "none recorded".into())
+    );
 }
 
 #[test]
@@ -402,16 +429,57 @@ fn process_exists(pid: i32) -> bool {
 
 #[test]
 fn closing_sessions_does_not_leak_file_descriptors() {
-    // Each session holds a master fd plus a reader clone. If Drop leaked them, opening and
-    // closing many sessions would climb until the process hit its fd limit. Rather than
-    // count fds (which is platform-specific and noisy), open far more sessions in sequence
-    // than the default 256-fd limit allows to be simultaneously live — this only completes
-    // if each one's descriptors are actually returned.
-    for i in 0..150 {
-        let session = Session::spawn(SessionId(i), None, Some(test_shell()), 24, 80)
-            .unwrap_or_else(|err| panic!("session {i} failed to spawn: {err:#} (leaked fds?)"));
-        drop(session);
+    // Each session holds a master fd plus a cloned reader fd. A leak shows up as the
+    // process's open-fd count climbing across open/close cycles.
+    //
+    // Counting fds directly rather than spawning until something breaks: exhausting the
+    // fd limit would also exhaust the *system-wide* pty device table, which is shared with
+    // every other test running in parallel — that made this test fail intermittently in
+    // whichever test happened to spawn next, rather than in the one at fault.
+
+    // A few cycles first, so any one-off allocation (thread pool, lazy statics) has
+    // already happened and does not read as a leak.
+    for i in 0..3 {
+        drop(spawn_for_leak_check(i));
     }
+
+    let baseline = open_fd_count();
+
+    for i in 3..13 {
+        drop(spawn_for_leak_check(i));
+    }
+
+    let after = open_fd_count();
+
+    // An exact match is too strict — the detached child-waiter threads from the loop above
+    // may still be finishing. A leak of two fds per session would show as +20 here, so a
+    // small allowance separates "leaked" from "still winding down" without hiding a bug.
+    assert!(
+        after <= baseline + 4,
+        "fd count grew from {baseline} to {after} across 10 open/close cycles, \
+         which means Drop is not returning the pty descriptors"
+    );
+}
+
+fn spawn_for_leak_check(id: u64) -> Session {
+    Session::spawn(SessionId(id), None, Some(test_shell()), 24, 80)
+        .unwrap_or_else(|err| panic!("session {id} failed to spawn: {err:#}"))
+}
+
+/// Number of file descriptors this process has open.
+///
+/// ponytail: shells out to `lsof` because counting fds portably needs either libc or
+/// /dev/fd, and a libc dependency in a domain crate would be the first platform dependency
+/// in this layer (the architecture test forbids `target_os` here). Reading /dev/fd would be
+/// cheaper; `lsof -p` is the version that is obviously correct.
+fn open_fd_count() -> usize {
+    let pid = std::process::id();
+    let output = std::process::Command::new("lsof")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .expect("lsof should be available on macOS and Linux");
+
+    String::from_utf8_lossy(&output.stdout).lines().skip(1).count()
 }
 
 #[test]
