@@ -111,9 +111,25 @@ Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefu
 | Idle RAM (no project open)       | 100–200 MB   | **69 MB**                          | ✅ well under             |
 | Idle CPU                         | —            | **0.0%**                           | ✅                        |
 | Frame render, 55k-line file      | < 8.3 ms     | **0.08–0.77 ms**                   | ✅                        |
-| Keystroke → pixel, 55k-line file | < 8.3 ms     | **2.65 ms**                        | ✅                        |
-| Sustained typing, 55k-line file  | < 8.3 ms     | **~4.3 ms**                        | ✅                        |
+| Keystroke → pixel, 55k-line file | < 8.3 ms     | **2.6–5.3 ms** †                   | ✅                        |
+| Sustained typing, 55k-line file  | < 8.3 ms     | **~4.3 ms** †                      | ✅                        |
 | Cached completion                | < 50 ms      | no completion engine (Milestone 2) | —                         |
+
+**† Do not read these as precise figures.** The same code measured 5.28 ms on a loaded
+machine and 2.65 ms on a quiet one — a 2× spread from machine conditions alone. If you run
+this on a busy laptop and see ~5 ms, that is **not** a regression against the 2.65 ms above.
+
+Absolute single-run numbers on this fixture are not comparable across runs, which is exactly
+the trap that produced the bogus 24.8 ms in the first place, pointed the other way. The
+durable claims are the **relative** ones, which held in both environments:
+
+- the removed allocation cost ~1.55 ms/keystroke (~29% of the reparse), measured with both
+  arms interleaved **in one process**
+- `drop(SyntaxTree)` was 8–10 ms and was never editor work
+- the reparse itself is ~2 ms, so the 8.3 ms budget has genuine headroom
+
+To compare a change against this baseline, run an interleaved A/B in a single process. Do not
+diff two separate `cargo bench` invocations.
 
 Startup phase breakdown:
 
