@@ -1,0 +1,9 @@
+[package]
+name = "elle-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ropey.workspace = true
+anyhow.workspace = true

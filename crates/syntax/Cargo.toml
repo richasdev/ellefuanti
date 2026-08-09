@@ -1,0 +1,11 @@
+[package]
+name = "elle-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+elle-text.workspace = true
+tree-sitter.workspace = true
+tree-sitter-php.workspace = true
+anyhow.workspace = true

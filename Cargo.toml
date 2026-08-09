@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/text",
+    "crates/syntax",
+    "crates/workspace",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/uemuradev/ellefuanti"
+
+[workspace.dependencies]
+# ellefuanti crates
+elle-core = { path = "crates/core" }
+elle-text = { path = "crates/text" }
+elle-syntax = { path = "crates/syntax" }
+elle-workspace = { path = "crates/workspace" }
+
+# UI. runtime_shaders avoids needing full Xcode to compile Metal shaders (see ADR-0002).
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+
+ropey = "1.6"
+tree-sitter = "0.26"
+tree-sitter-php = "0.24"
+ignore = "0.4"
+notify = "8"
+
+anyhow = "1"
+thiserror = "2"
+smol = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+# Startup and typing latency are features, not later work: unoptimized rope/tree-sitter
+# is too slow to feel the product during development.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

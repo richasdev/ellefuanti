@@ -1,0 +1,21 @@
+[package]
+name = "ellefuanti"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A native, GPU-accelerated IDE built for PHP, Laravel, Livewire and Blade"
+
+[[bin]]
+name = "ellefuanti"
+path = "src/main.rs"
+
+[dependencies]
+elle-core.workspace = true
+elle-text.workspace = true
+elle-syntax.workspace = true
+elle-workspace.workspace = true
+
+gpui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
