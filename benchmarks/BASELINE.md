@@ -103,14 +103,17 @@ it by dropping the `fsync`; that trades a user's file for milliseconds they neve
 
 Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefuanti`).
 
-| Metric                                  | Target (§21) | Measured                                   | Verdict            |
-| --------------------------------------- | ------------ | ------------------------------------------ | ------------------ |
-| Cold startup (first launch after build) | < 500 ms     | **520 ms**                                 | ❌ **20 ms over**  |
-| Warm startup                            | < 150 ms     | **191–213 ms**                             | ❌ **~50 ms over** |
-| Idle RAM (no project open)              | 100–200 MB   | **65 MB**                                  | ✅ well under      |
-| Idle CPU                                | —            | **0.0%**                                   | ✅                 |
-| Frame time                              | < 8.3 ms     | instrumented, not yet exercised under load | —                  |
-| Cached completion                       | < 50 ms      | no completion engine (Milestone 2)         | —                  |
+| Metric                           | Target (§21) | Measured                           | Verdict                   |
+| -------------------------------- | ------------ | ---------------------------------- | ------------------------- |
+| Cold startup (warm shader cache) | < 500 ms     | **380 ms**                         | ✅                        |
+| Cold startup (cold shader cache) | < 500 ms     | **520 ms**                         | ❌ worst case — see below |
+| Warm startup                     | < 150 ms     | **191–213 ms**                     | ❌ **~50 ms over**        |
+| Idle RAM (no project open)       | 100–200 MB   | **69 MB**                          | ✅ well under             |
+| Idle CPU                         | —            | **0.0%**                           | ✅                        |
+| Frame render, 55k-line file      | < 8.3 ms     | **0.08–0.77 ms**                   | ✅                        |
+| Keystroke → pixel, 55k-line file | < 8.3 ms     | **2.65 ms**                        | ✅                        |
+| Sustained typing, 55k-line file  | < 8.3 ms     | **~4.3 ms**                        | ✅                        |
+| Cached completion                | < 50 ms      | no completion engine (Milestone 2) | —                         |
 
 Startup phase breakdown:
 
@@ -122,7 +125,7 @@ Startup phase breakdown:
 | **window open** | **432 ms** | **152 ms**  |
 | **total**       | **520 ms** | **~200 ms** |
 
-### Both startup targets are currently missed, and the cause is identified
+### Startup: cold passes on a warm shader cache, warm still misses
 
 **The window phase dominates, and it is Metal shader compilation** — the cost of the
 `runtime_shaders` feature, which is what lets the project build without a full Xcode
@@ -142,6 +145,33 @@ unbuildable for contributors. Not done, because there is no release pipeline yet
 and would need profiling of gpui init (38 ms) plus the remaining 152 ms of window setup to
 attribute further. Not yet investigated — and per §21 it will not be optimised by guessing.
 
-Frame timing is instrumented (worst-of-120-frames, reported against the 8.3 ms budget) but
-the honest status is that no one has yet scrolled a 50k-line file to exercise it. That is
-the remaining part of issue #10.
+### The keystroke measurement that was wrong
+
+`benches/frame.rs` originally reported **24.8 ms** for keystroke-to-pixel on a 55k-line file
+and I filed it as a 3×-over-budget defect (#27). **Most of it was the benchmark's fault.**
+
+`iter_batched` hands the fixture to the routine **by value**, so its destructors run inside
+the timed region — and freeing a 1 MB file's tree-sitter node arena costs 8–10 ms. A real
+editor never destroys the buffer and tree on each keystroke, so that cost does not exist in
+the product. `iter_batched_ref` borrows instead, and drops after `measurement.end()`
+(confirmed in criterion 0.7's `bencher.rs`).
+
+The underlying allocation fix was real but secondary: an interleaved A/B in one process
+measured it at **1.55 ms/keystroke (~29%)**, against the 24.6 ms originally attributed. It
+was worth removing — it scaled with file size rather than edit size on the hot path — but
+the honest story is that the alarming number was measurement error.
+
+Two lessons, both worth more than the fix: a benchmark can be wrong in the _expensive_
+direction and still look plausible, and single bench runs on a loaded machine were too noisy
+to trust here (a pre-fix rerun read 2.74 ms, a post-fix one 5.28 ms — pure load drift).
+Interleaved A/B in a single process is what produced a number worth believing.
+
+### Frame timing in the running app
+
+Instrumented as worst-of-120-frames against the 8.3 ms budget (`ELLE_PERF=1`).
+
+The microbenchmarks above cover the domain-layer work per frame, and it is comfortably
+inside budget. What remains unmeasured is gpui's own layout and GPU submission — the part
+this bench deliberately excludes, so that a fast number here cannot be mistaken for proof
+that scrolling feels smooth. Exercising that needs someone to actually scroll a large file in
+the running app, which is the remaining part of issue #10.
