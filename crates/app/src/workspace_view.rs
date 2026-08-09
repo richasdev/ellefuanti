@@ -11,12 +11,13 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, Dispatch, OpenFolder, Save, ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen,
-    context, dispatch_for,
+    CloseTab, Dispatch, NewTerminal, OpenFolder, Save, ToggleCommandPalette, ToggleHiddenFiles,
+    ToggleQuickOpen, ToggleTerminal, context, dispatch_for,
 };
 use crate::editor::{Document, EditorView};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
+use crate::terminal_view::TerminalView;
 use crate::theme::{Metrics, Theme};
 
 /// An open tab.
@@ -32,6 +33,9 @@ pub struct WorkspaceView {
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
+    /// The bottom terminal panel. `Some` only while it is open — a panel that is closed is
+    /// absent, not hidden, so its poll timer and its shells stop existing with it.
+    terminal: Option<Entity<TerminalView>>,
     /// Transient message for the status bar (a failed save, mostly).
     status: Option<SharedString>,
     /// In-flight background work. Held rather than detached so a new request drops the
@@ -50,6 +54,7 @@ impl WorkspaceView {
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
+            terminal: None,
             status: None,
             pending: None,
             frames: FrameTimer::new(),
@@ -212,6 +217,47 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    // --- terminal ----------------------------------------------------------------
+
+    /// Opens the panel with one session, or closes it if it is already open.
+    ///
+    /// Closing drops the `TerminalView`, which drops its sessions, which kills the shells.
+    /// That is the intended meaning of closing the panel: §24's isolation works because a
+    /// terminal owns nothing the editor needs.
+    fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        match self.terminal.take() {
+            Some(_) => {
+                // Focus returns to the workspace, or the editor keymap stays dead.
+                window.focus(&self.focus_handle);
+            }
+            None => {
+                let terminal = cx.new(|cx| TerminalView::new(cx));
+                terminal.update(cx, |terminal, cx| {
+                    terminal.set_cwd(self.tree.as_ref().map(|tree| tree.root().to_path_buf()));
+                    // A panel that opens with no session would just show a placeholder;
+                    // the user asked for a terminal, so start one.
+                    terminal.open_session(cx);
+                });
+                window.focus(&terminal.read(cx).focus_handle(cx));
+                self.terminal = Some(terminal);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Adds a session, opening the panel first if it was closed.
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        match self.terminal.clone() {
+            Some(terminal) => {
+                terminal.update(cx, |terminal, cx| terminal.open_session(cx));
+                window.focus(&terminal.read(cx).focus_handle(cx));
+                cx.notify();
+            }
+            // Opening the panel already creates a session, so this is the same path.
+            None => self.toggle_terminal(&ToggleTerminal, window, cx),
+        }
+    }
+
     // --- palette -----------------------------------------------------------------
 
     fn toggle_command_palette(
@@ -299,6 +345,10 @@ impl WorkspaceView {
                     Dispatch::Save => self.save(&Save, window, cx),
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
+                    Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
+                    Dispatch::ToggleTerminal => {
+                        self.toggle_terminal(&ToggleTerminal, window, cx)
+                    }
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -347,6 +397,8 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
             .on_action(cx.listener(Self::toggle_hidden_files))
+            .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::new_terminal))
             .relative()
             .size_full()
             .flex()
@@ -368,7 +420,10 @@ impl Render for WorkspaceView {
                             .flex_1()
                             .overflow_hidden()
                             .child(self.render_tab_bar(&theme, cx))
-                            .child(self.render_editor_area(&theme)),
+                            .child(self.render_editor_area(&theme))
+                            // Below the editor and inside its column, so the sidebar keeps
+                            // its full height — the layout every other IDE uses.
+                            .children(self.terminal.clone()),
                     ),
             )
             .child(self.render_status_bar(&theme, cx))
@@ -592,6 +647,16 @@ impl WorkspaceView {
             None => (String::new(), String::new()),
         };
 
+        // Only shown while the panel is open, so it reads as state rather than chrome.
+        let terminals = self
+            .terminal
+            .as_ref()
+            .map(|terminal| match terminal.read(cx).session_count() {
+                1 => "1 terminal".to_string(),
+                count => format!("{count} terminals"),
+            })
+            .unwrap_or_default();
+
         div()
             .h(Metrics::STATUS_HEIGHT)
             .flex_none()
@@ -610,6 +675,7 @@ impl WorkspaceView {
                     .when(self.status.is_some(), |el| el.text_color(theme.accent))
                     .child(self.status.clone().unwrap_or_default()),
             )
+            .child(SharedString::from(terminals))
             .child(SharedString::from(position))
             .child(SharedString::from(language))
     }

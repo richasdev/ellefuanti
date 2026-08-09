@@ -4,6 +4,7 @@ mod actions;
 mod editor;
 mod palette;
 mod perf;
+mod terminal_view;
 mod theme;
 mod workspace_view;
 
