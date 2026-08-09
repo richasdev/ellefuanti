@@ -21,6 +21,14 @@
 //! layout failures; they are blind to a wrong-but-well-formed element tree. Anything
 //! asserting *which* rows appear has to assert on the row range directly, which is what the
 //! unit tests beside `line_runs` do.
+//!
+//! **Fonts and text metrics cannot be tested here at all.** gpui's test platform installs
+//! `NoopTextSystem`, whose `font_id` returns `FontId(1)` for *every* descriptor and whose
+//! `advance` is a fixed formula. A test asserting "the editor font is monospaced" therefore
+//! passes with `Helvetica` — I wrote that test, watched it pass under a proportional family,
+//! and deleted it. Column alignment and whether `Menlo` actually resolves are verifiable only
+//! on a real display, which is why the startup check in `main` logs a warning and why they
+//! stay on issue #35's human list.
 
 use std::sync::Arc;
 
