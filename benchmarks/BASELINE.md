@@ -1,6 +1,7 @@
 # Performance baseline
 
 Recorded 2026-08-09 on an Apple Silicon Mac, `cargo bench` (release, `lto = "thin"`).
+Idle RSS, binary size and startup re-measured 2026-08-10 on `0d39a99` (#84).
 
 These are the numbers later work regresses against. **Nothing is optimised without a
 profile**, and no benchmark here claims to measure something it does not — where a number
@@ -9,8 +10,14 @@ is dominated by something other than our code, that is stated.
 Reproduce with:
 
 ```sh
-cargo bench -p elle-benchmarks
+cargo bench -p elle-benchmarks   # the microbenchmarks below
+scripts/perf-gate.sh             # idle RSS and binary size, and it fails if they regress
 ```
+
+The application-level numbers (idle RSS, binary size, startup) were re-measured on `0d39a99`
+and are **gated** — see [Idle memory is now gated](#idle-memory-is-now-gated--scriptsperf-gatesh-84).
+The rest of this file is still recorded-but-unenforced, which is how the idle figure managed
+to be wrong by 50% for twenty PRs.
 
 ## How to read a disagreement
 
@@ -274,8 +281,8 @@ Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefu
 | Startup, first launch of a new binary | < 500 ms     | **520–536 ms**                     | ❌ worst case — see below |
 | Startup, later launches               | < 500 ms     | **~195–380 ms**                    | ✅                        |
 | Warm startup                          | < 150 ms     | **191–213 ms**                     | ❌ **~50 ms over**        |
-| Idle RAM (no project open)            | 100–200 MB   | **69 MB**                          | ✅ well under             |
-| Idle CPU                              | —            | **0.0%**                           | ✅                        |
+| Idle RAM (no project open)            | 100–200 MB   | **100–103 MB** (was 69 MB)         | ✅ at the low edge        |
+| Idle CPU                              | —            | **0.7–0.9%** (was 0.0%)            | ⚠ see #79                 |
 | Frame render, 55k-line file           | < 8.3 ms     | **0.08–0.77 ms**                   | ✅                        |
 | Keystroke → pixel, 55k-line file      | < 8.3 ms     | **2.6–5.3 ms** †                   | ✅                        |
 | Sustained typing, 55k-line file       | < 8.3 ms     | **~4.3 ms** †                      | ✅                        |
@@ -296,6 +303,52 @@ durable claims are the **relative** ones, which held in both environments:
 
 To compare a change against this baseline, run an interleaved A/B in a single process. Do not
 diff two separate `cargo bench` invocations.
+
+### Idle memory is now gated — `scripts/perf-gate.sh` (#84)
+
+The idle-RAM row above read **69 MB** until this commit, while the real number had reached
+105 MB. It drifted across roughly twenty PRs, each of which measured its own viewport cost
+and none of which measured the aggregate (#79). **Per-feature measurement does not catch
+aggregate drift**, so the aggregate now has its own check:
+
+```sh
+scripts/perf-gate.sh            # measures an existing release binary
+scripts/perf-gate.sh --build    # builds it first
+```
+
+Re-measured on `0d39a99`, release build, no project open, machine otherwise quiet:
+
+| Metric      | Measured                    | Limit  | Blocking |
+| ----------- | --------------------------- | ------ | -------- |
+| Idle RSS    | **100–103 MB**              | 125 MB | yes      |
+| Binary size | **14.53 MB** (15,236,048 B) | 17 MB  | yes      |
+| Startup     | 216–737 ms                  | —      | **no**   |
+
+**Why those two block and startup does not.** Across six runs of the same binary, idle RSS
+stayed inside 100–103 MB and the binary is byte-identical every time, while startup measured
+737 ms on the first launch of the freshly-linked binary and 216–236 ms on every launch after
+— a **3.4× move with no code change**, purely dyld and page-cache state. Gating that would
+produce a check that fails on the first CI run after every build and passes thereafter, which
+is the definition of a gate people learn to ignore. It is printed on every run instead.
+
+The limits sit ~20% above the measured value. Tighter would flap; looser would let another
+#79 through. They are ceilings to hold, not targets to grow into — a change that legitimately
+needs more should raise the number in the same commit, so it is a decision with a reviewer
+rather than a silent drift.
+
+**One measurement disagreed, and per the top of this file that is worth recording rather than
+averaging away.** One run of six read **81.8 MB** against a 100–103 MB cluster. It was taken
+as a sibling build was spinning up, and the reading is a ~20% _under_-count, so the plausible
+story is that it sampled before the process had finished allocating — a machine under load
+takes longer to settle, and 20 s is tuned for a quiet one. That is unconfirmed. What follows
+from it is already in the script: it refuses to run at all while a compiler is running, since
+the first RSS figure taken for #79 was wrong for exactly that reason, and it samples three
+times over 30 s and keeps the **worst** rather than the mean — an under-count is the failure
+mode that would let a regression pass, so averaging it in is the one thing not to do.
+
+The startup line is also why the gate cannot be trusted from a headless CI runner: with no
+display the window never opens, so the process measured is not the one a user runs and its
+RSS omits whatever the window allocates. CI runs it as a floor; the local run is authoritative.
 
 Startup phase breakdown:
 

@@ -9,6 +9,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- **A performance gate**, `scripts/perf-gate.sh`, blocking on idle RSS and binary size (#84).
+  Idle memory drifted 69 → 105 MB over roughly twenty PRs and nothing noticed (#79); each of
+  those PRs measured its own viewport cost and was cheap in isolation, so the lesson is that
+  per-feature measurement does not catch aggregate drift and the aggregate needs its own check.
+
+  **Only the deterministic numbers block.** Across six runs of one binary, idle RSS held
+  inside 100–103 MB while startup measured 737 ms on the first launch of the freshly-linked
+  binary and 216–236 ms afterwards — a 3.4× move with no code change, from dyld and page-cache
+  state alone. Startup is printed on every run and never fails the build; gating it would
+  produce a check that fails once after every build and passes thereafter, which is how a gate
+  gets disabled.
+
+  Runs locally as the primary path, because GitHub Actions is currently blocked on billing and
+  a gate that only ever ran in CI would be a gate nobody has run. Wired into `ci.yml` as well,
+  where it is a floor rather than the real figure: a headless runner opens no window, so the
+  process it measures is not the one a user runs.
+
+  The script refuses to run while a compiler is — the first RSS number taken for #79 was wrong
+  because a parallel `cargo` build contaminated it — and it samples three times over 30 s
+  keeping the worst, since an under-count is the failure mode that lets a regression through.
+  `benchmarks/BASELINE.md` records the re-measured numbers, including the one run of six that
+  disagreed at 81.8 MB and what is and is not known about why.
+
 - **Navigation**: go to definition (F12, ⌘click), find usages (⇧F12), go to symbol in file
   (⌘⇧O) and back/forward (⌃- / ⌃⇧-). `elle-lsp` has had the typed methods since #45 and #74
   wired a real server; none of them was called by anything, so this is the UI over work that
