@@ -7,7 +7,8 @@ several attempts to learn, and would otherwise be re-derived at the same price. 
 summary of the git log; anything you can get from `git log --oneline` in thirty seconds is
 deliberately absent.
 
-Written at `64c7871` (#111), 965 tests passing, v0.1.0 untagged.
+Written at `64c7871` (#111), 965 tests passing, v0.1.0 untagged. Amended at `4e66dbc`:
+#114 landed after this was drafted and closed #108 — see that entry below.
 
 ---
 
@@ -338,7 +339,12 @@ This is the general lesson: issue comments are dated snapshots. The repo is the 
 
 ### Open and unblocked
 
-- **#108** indent guides as 1 px rules (see the correction above).
+- ~~**#108** indent guides as 1 px rules~~ — **closed by #114**, and the prediction made
+  while drafting this document was right: the blocks *had* returned. #110 removed the
+  character-background path they used, so they vanished as a side effect; #111 restored
+  `paint_background` for the terminal cursor and brought them back with it. They are now
+  quads drawn by `Line` at a measured x. #114 also ported Zed's backspace-to-tab-stop rule
+  (`editor.rs:5010`): `((column - 1) / width) * width`, not a jump to column zero.
 - **#112** decide the rendering-verification story.
 - **#53** grammars for the remaining languages. Nine exist; `.rs`, `.md` and others still
   open with no colour, which is a coverage gap, not a bug.
