@@ -1224,9 +1224,24 @@ fn row_runs(
     let mut runs: Vec<TextRun> = Vec::new();
 
     for (column, cell) in cells.iter().enumerate() {
-        // The trailing half of a wide glyph is already covered by the glyph itself;
-        // emitting anything here would shift the rest of the row right by one column.
+        // The trailing half of a wide glyph gets a space, not nothing.
+        //
+        // Skipping it was right while the row was laid out by the text system, which gave
+        // an emoji its natural two-cell advance. `force_width` (added so a grid stays a
+        // grid) overrides that: every glyph now occupies exactly one cell, so a skipped
+        // spacer left the row one column short and everything after the emoji slid left —
+        // which is what "descolado" was in the report. A space keeps the column count and
+        // the glyph overhangs it, which is what a terminal does anyway.
         if cell.wide_spacer {
+            text.push(' ');
+            runs.push(TextRun {
+                len: 1,
+                font: gpui::font(family.clone()),
+                color: theme.terminal(cell.fg),
+                background_color: background_for(cell, theme),
+                underline: None,
+                strikethrough: None,
+            });
             continue;
         }
 
@@ -1343,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_spacers_are_skipped_so_columns_do_not_shift() {
+    fn a_wide_glyph_keeps_its_second_column() {
         let theme = Theme::dark();
         let cells = vec![
             Cell { c: '漢', ..Cell::default() },
@@ -1351,9 +1366,16 @@ mod tests {
             cell('x'),
         ];
 
-        // The spacer must contribute no character, or every later column moves right.
+        // This asserted the opposite until the grid gained `force_width`, and the change is
+        // a consequence of that rather than a correction.
+        //
+        // While rows went through the text system a wide glyph advanced two cells on its
+        // own, so emitting anything for the spacer would have pushed the row right by one.
+        // `force_width` pins *every* glyph to one cell — which is what makes a grid a grid —
+        // so the second column has to come from somewhere, and a skipped spacer left the row
+        // a column short. Everything after an emoji slid left, which is how this surfaced.
         let (text, runs) = row_runs(&cells, None, 0..0, &theme, &Fonts::default().family);
-        assert_eq!(text, "漢x");
+        assert_eq!(text, "漢 x", "the spacer holds the wide glyph's second column");
         // The multibyte case is where a run length in *chars* rather than bytes would
         // panic inside gpui.
         assert_runs_cover_text(&text, &runs);

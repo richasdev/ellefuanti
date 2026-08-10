@@ -141,6 +141,17 @@ impl Element for Line {
         cx: &mut App,
     ) {
         let Some(shaped) = shaped else { return };
+        // Backgrounds first, and as a separate call: `ShapedLine::paint` draws glyphs only.
+        // Every background a run carries — the terminal cursor, a selection, a search match,
+        // a diagnostic — lives in `decoration_runs` and is drawn by `paint_background`.
+        //
+        // Missing this is why the terminal cursor vanished after rows moved to this element:
+        // the cursor is an *inverted cell*, so its glyph is painted in the background colour
+        // and is only visible against the cursor's own background. With that background
+        // never drawn, the character under the cursor read as a hole — which is what "não
+        // vejo cursor nenhum, só a lacuna" was.
+        let _ = shaped.paint_background(bounds.origin, self.line_height, window, cx);
+
         // `line_height` is passed, not inherited. gpui centres the glyphs within it, so the
         // text sits in the middle of exactly the box `request_layout` asked for.
         let _ = shaped.paint(bounds.origin, self.line_height, window, cx);
