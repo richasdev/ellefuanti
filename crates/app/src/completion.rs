@@ -262,9 +262,28 @@ impl CompletionPopup {
         {
             return;
         }
+        // The same list the editor's own `on_key_down` rejects, and it has to be the same
+        // list: these are keys that can arrive carrying a `key_char` on some layouts, and a
+        // shorter list here means one of them is forwarded to the buffer as text. `delete`,
+        // `home`, `end`, `pageup` and `pagedown` are the five that were missing — none is
+        // bound in `context::COMPLETION`, so with the popup focused they reach this handler
+        // rather than an action, and End would have inserted a character instead of moving
+        // the caret.
         if matches!(
             keystroke.key.as_str(),
-            "enter" | "escape" | "up" | "down" | "backspace" | "tab" | "left" | "right"
+            "backspace"
+                | "delete"
+                | "enter"
+                | "tab"
+                | "escape"
+                | "left"
+                | "right"
+                | "up"
+                | "down"
+                | "home"
+                | "end"
+                | "pageup"
+                | "pagedown"
         ) {
             return;
         }

@@ -129,6 +129,15 @@ enum Job {
     /// completion supersedes *completion*, and sharing would make a keystroke in the popup
     /// cancel a find-references sweep the user is still waiting on.
     Completion,
+    /// The popup's route-name lookup (#61).
+    ///
+    /// Deliberately *not* `RouteIndex`, which the route palette uses. Sharing was justified
+    /// by "only one of the two can be open at a time" — a claim about UI state that nothing
+    /// enforces, and `JobSlots::start` replaces an occupied slot by assignment, so the loser
+    /// is cancelled silently. The popup would then never receive its items while the LSP
+    /// side had already called `mark_loaded`, settling on "No completions": a false claim,
+    /// which is the exact thing `loaded` was introduced to prevent.
+    CompletionRoutes,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -505,7 +514,23 @@ pub struct WorkspaceView {
     /// Held rather than recomputed on accept because the buffer is the thing being written
     /// to, and recomputing would re-read a document that may have moved underneath. It is
     /// still re-validated at the point of the edit, since holding it does not make it true.
-    completion_word_start: Option<usize>,
+    ///
+    /// Paired with the editor it is an offset *into*. An offset with no document attached is
+    /// only meaningful while the active tab cannot change, and it can: clicking a tab sets
+    /// `active_tab` directly. Resolving the target through `active_editor()` at accept time
+    /// therefore wrote the completion into whichever file was frontmost *then*, at a byte
+    /// offset that meant something in a different file — and the bounds check could not
+    /// catch it, because a longer buffer accepts the offset happily.
+    ///
+    /// The handle is the same fix `close_tab_at` already uses for the same reason: indices
+    /// shift and titles are not unique, so a tab is identified by its `Entity`.
+    completion_word_start: Option<(Entity<EditorView>, usize)>,
+    /// Keeps the popup's focus-out listener alive for exactly as long as the popup.
+    ///
+    /// A `Subscription` dropped is a subscription cancelled, so clearing this in
+    /// `dismiss_completion` is what stops the listener — and holding it here is what keeps
+    /// it registered while the popup is open.
+    completion_focus_out: Option<gpui::Subscription>,
     /// The completion request currently in flight, so the next keystroke can cancel it.
     ///
     /// **A separate slot from [`Self::in_flight_query`] deliberately.** That one is shared
@@ -553,6 +578,7 @@ impl WorkspaceView {
             window_activation: None,
             completion: None,
             completion_word_start: None,
+            completion_focus_out: None,
             completion_query: None,
         }
     }
@@ -890,6 +916,17 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn close_tab_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_tab(&CloseTab, window, cx);
+    }
+
+    /// The ✕ button's path, which reaches `close_tab_at` without going through ⌘W.
+    #[cfg(test)]
+    pub fn close_tab_at_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_tab_at(index, window, cx);
     }
 
     #[cfg(test)]
@@ -1359,16 +1396,6 @@ impl WorkspaceView {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        // ⌘W is workspace-scoped, so it fires while the completion popup holds focus. The
-        // popup is anchored to a cursor in the tab about to disappear and its
-        // `completion_word_start` is an offset into that buffer — both meaningless
-        // afterwards, and the offset is the dangerous half: left standing, the next accept
-        // would write into whatever document had inherited the active slot.
-        //
-        // Closed first rather than inside `remove_tab`, because the dirty path below is
-        // asynchronous: the popup must go now, when the user pressed the key, not when they
-        // answer a dialog that may itself be Cancel.
-        self.dismiss_completion(window, cx);
         self.close_tab_at(self.active_tab, window, cx);
     }
 
@@ -1379,6 +1406,17 @@ impl WorkspaceView {
     /// than a custom modal: it is native, focus-correct and accessible for free, and an
     /// in-app modal would be more code for a worse result.
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Here rather than in `close_tab`, because ⌘W is not the only way in: the ✕ on a tab
+        // calls this directly, and that is the more common gesture. A popup left standing
+        // over a closed document keeps `completion_word_start` — a byte offset into a buffer
+        // that is gone — and the next accept would write it into whichever tab inherited the
+        // active slot.
+        //
+        // Before the dirty-file prompt below rather than after, because that path is
+        // asynchronous: the popup must go when the user asks to close, not when they answer
+        // a dialog whose answer may be Cancel.
+        self.dismiss_completion(window, cx);
+
         let Some(tab) = self.tabs.get(index) else { return };
 
         if !tab.editor.read(cx).is_dirty() {
@@ -1443,6 +1481,10 @@ impl WorkspaceView {
     /// That is the intended meaning of closing the panel: §24's isolation works because a
     /// terminal owns nothing the editor needs.
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        // Takes focus, so the completion popup must not be left behind unfocused and
+        // therefore undismissable. Stated here as well as in the popup's focus-out listener
+        // — see `open_find` for why both.
+        self.dismiss_completion(window, cx);
         match self.terminal.take() {
             Some(_) => {
                 // Focus returns to the workspace, or the editor keymap stays dead.
@@ -1714,6 +1756,12 @@ impl WorkspaceView {
             return;
         }
 
+        // ⌘F is workspace-scoped, so it arrives with the completion popup holding focus.
+        // See `open_completion` for why this is stated at each focus-taking command as well
+        // as in the popup's own focus-out listener: the listener is the general rule and
+        // cannot be exercised headlessly, and these are the specific paths a test can pin.
+        self.dismiss_completion(window, cx);
+
         if let Some(bar) = self.find.clone() {
             bar.update(cx, |bar, cx| bar.reopen(replacing, cx));
             window.focus(&bar.read(cx).focus_handle(cx));
@@ -1868,6 +1916,10 @@ impl WorkspaceView {
     /// for the same reason: ⌘⇧F after clicking into the editor must not send the user back
     /// to the tree when what they meant was "put me in the search field".
     fn find_in_project(&mut self, _: &FindInProject, window: &mut Window, cx: &mut Context<Self>) {
+        // Takes focus, so the completion popup must not be left behind unfocused and
+        // therefore undismissable. Stated here as well as in the popup's focus-out listener
+        // — see `open_find` for why both.
+        self.dismiss_completion(window, cx);
         self.toggle_search_panel(window, cx);
     }
 
@@ -2148,9 +2200,29 @@ impl WorkspaceView {
         // Focus moves to the popup, which is what activates its key context and therefore
         // what makes `up`/`down` reach the list. Typing is forwarded back to the editor by
         // `completion_typed`, so the buffer still receives every character.
-        window.focus(&popup.read(cx).focus_handle(cx));
+        let handle = popup.read(cx).focus_handle(cx);
+        window.focus(&handle);
+
+        // Anything that takes focus away closes the popup. The failure this prevents is a
+        // popup left on screen *unfocused*: its key context is then inactive, so Escape no
+        // longer reaches it and it cannot be dismissed at all, while it still holds an
+        // offset a later accept would write at.
+        //
+        // Belt and braces, deliberately. This subscription is the general rule and covers
+        // panels nobody has written yet, but it fires from gpui's focus *path*, which is
+        // assembled during paint — so it cannot be exercised by a headless test, and a rule
+        // that cannot be tested should not be the only thing holding. The specific commands
+        // that take focus (⌘F, ⌃`, ⌘⇧F, the palette, closing a tab) therefore each dismiss
+        // explicitly too, and those calls are what the tests pin.
+        //
+        // The subscription is dropped with the popup, so it costs nothing while none is open.
+        let this = cx.entity().downgrade();
+        let subscription = window.on_focus_out(&handle, cx, move |_event, window, cx| {
+            this.update(cx, |this, cx| this.dismiss_completion(window, cx)).ok();
+        });
+        self.completion_focus_out = Some(subscription);
         self.completion = Some(popup.clone());
-        self.completion_word_start = Some(word_start);
+        self.completion_word_start = Some((editor.clone(), word_start));
 
         self.request_route_completions(popup.clone(), cx);
         self.request_lsp_completions(popup, offset, cx);
@@ -2197,8 +2269,9 @@ impl WorkspaceView {
     /// "this route does not exist" would be a false claim about working code (RISKS.md #4).
     /// The `route` badge is what keeps that honest at the point the user reads the list.
     ///
-    /// Shares `Job::RouteIndex` with the route palette: both parse the same files for the
-    /// same reason, and only one of the two can be open at a time.
+    /// Runs in `Job::CompletionRoutes`, its *own* slot — see that variant for why sharing
+    /// the route palette's was a silent way for the popup to end up claiming there were no
+    /// completions when it had simply lost its task.
     fn request_route_completions(
         &mut self,
         popup: Entity<CompletionPopup>,
@@ -2208,8 +2281,9 @@ impl WorkspaceView {
         let Some(tab) = self.tabs.get(self.active_tab) else { return };
         let Some(path) = tab.path.clone() else { return };
         let Some(blade) = laravel_dialect(&path) else { return };
+        let tab_editor = tab.editor.clone();
 
-        let document = &tab.editor.read(cx).document;
+        let document = &tab_editor.read(cx).document;
         let source = document.buffer.text();
         let offset = document.selection.head;
 
@@ -2226,11 +2300,15 @@ impl WorkspaceView {
         // beginning at `u`, giving `users.users.show` — an off-by-one-word that only shows
         // up on names with a dot, which is most of them.
         //
-        // Guarded on the reference actually starting at or before the cursor: `reference_at`
-        // answers about the literal the cursor is *in*, so this holds, but a range that
-        // began after the cursor would produce a backwards replace at accept time.
-        if reference.range.start <= offset {
-            self.completion_word_start = Some(reference.range.start);
+        // The cursor must be *inside* the literal, both ends. `reference_at` matches
+        // inclusively on `start..=end`, so ⌃space with the caret mid-name — after `users.`
+        // in an existing `route('users.show')` — is reachable, and there the text after the
+        // cursor is not part of what the accept replaces. Taking the whole literal as the
+        // query while replacing only `start..cursor` gives `users.showshow`: the same
+        // doubling, from the other side. Declining leaves the generic word scan in charge,
+        // which is narrower but never wrong.
+        if reference.range.start <= offset && reference.range.end <= offset {
+            self.completion_word_start = Some((tab_editor.clone(), reference.range.start));
             let typed = source[reference.range.start..offset].to_string();
             popup.update(cx, |popup, cx| popup.set_query(typed, cx));
         }
@@ -2246,7 +2324,7 @@ impl WorkspaceView {
                 .collect();
             popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
         });
-        self.jobs.start(Job::RouteIndex, task);
+        self.jobs.start(Job::CompletionRoutes, task);
     }
 
     /// Asks the language server, without blocking, and cancels whatever it supersedes.
@@ -2267,6 +2345,13 @@ impl WorkspaceView {
             popup.update(cx, |popup, cx| popup.mark_loaded(cx));
             return;
         };
+        // Cancelled *before* the new request goes out, not after. Issuing first left a
+        // window in which the previous request's task could resolve, clear the shared slot,
+        // and make the cancel that followed find `None` and send nothing — leaking one
+        // uncancelled request per keystroke, which is precisely what this design exists to
+        // prevent.
+        self.cancel_completion_query();
+
         let Some(client) = self.lsp.client_mut() else {
             popup.update(cx, |popup, cx| popup.mark_loaded(cx));
             return;
@@ -2284,7 +2369,15 @@ impl WorkspaceView {
         let query = id.clone();
         let task = cx.spawn(async move |this, cx| {
             let found = Self::poll_query::<CompletionResponse>(&this, &query, cx).await;
-            this.update(cx, |this, _| this.completion_query = None).ok();
+            // Compare before clearing. An unconditional clear lets a slow task wipe the slot
+            // belonging to the request that *superseded* it, after which the next keystroke
+            // cancels nothing and that newer request leaks instead.
+            this.update(cx, |this, _| {
+                if this.completion_query.as_ref() == Some(&query) {
+                    this.completion_query = None;
+                }
+            })
+            .ok();
 
             let items = match found {
                 Ok(Some(response)) => completion_items(response),
@@ -2305,7 +2398,7 @@ impl WorkspaceView {
                 .ok();
         });
 
-        self.cancel_completion_query();
+        // The cancel already happened, above, before the request went out.
         self.completion_query = Some(id);
         self.jobs.start(Job::Completion, task);
     }
@@ -2331,7 +2424,17 @@ impl WorkspaceView {
     /// building.
     fn completion_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor().cloned() else { return };
-        editor.update(cx, |editor, cx| editor.insert_typed(text, cx));
+        let landed_as_typed = editor.update(cx, |editor, cx| editor.insert_typed(text, cx));
+
+        // The keystroke did something other than insert its own character — typed over an
+        // auto-inserted closer, or opened a pair and wrote two. Mirroring it into the filter
+        // anyway would leave the query describing a span the buffer does not have, and an
+        // accept would then overwrite the bracket. Closing is the honest response: whatever
+        // the user is doing with brackets, it is not finishing the word this list is about.
+        if !landed_as_typed {
+            self.dismiss_completion(window, cx);
+            return;
+        }
 
         let Some(popup) = self.completion.clone() else { return };
         // Nothing matches any more: the user has typed past the list, so it closes rather
@@ -2403,12 +2506,21 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let start = self.completion_word_start;
+        let target = self.completion_word_start.clone();
         // Taken before dismissing, which clears it — the same ordering trap #83 documents.
         self.dismiss_completion(window, cx);
 
-        let Some(start) = start else { return };
-        let Some(editor) = self.active_editor().cloned() else { return };
+        // The editor the popup was *opened on*, not whatever is frontmost now. Clicking a
+        // tab changes the active one without touching the popup, and resolving the target
+        // here through `active_editor()` is how a completion ends up written into the wrong
+        // file at an offset that meant something in another one.
+        let Some((editor, start)) = target else { return };
+
+        // And it must still be an open tab: accepting into a document that has been closed
+        // would edit a buffer nothing is showing.
+        if !self.tabs.iter().any(|tab| tab.editor == editor) {
+            return;
+        }
 
         editor.update(cx, |editor, cx| {
             let document = &mut editor.document;
@@ -2433,6 +2545,12 @@ impl WorkspaceView {
         if self.completion.take().is_none() {
             return;
         }
+        // Dropped *first*, and that ordering is the whole reason this is not re-entrant:
+        // the focus move at the end of this function is itself a focus-out on the popup's
+        // handle, so a live subscription would call straight back into here. The `take`
+        // above already guards it — the second entry finds no popup and returns — but
+        // dropping the listener means the second entry never happens at all.
+        self.completion_focus_out = None;
         self.completion_word_start = None;
         // The answer has nowhere to go now, so the server must stop computing it.
         self.cancel_completion_query();
@@ -3606,8 +3724,12 @@ impl Render for WorkspaceView {
             // coordinates the editor measured.
             //
             // After the palette, so if both were somehow open the completion would draw on
-            // top. In practice they are mutually exclusive: opening the palette moves focus
-            // away from the popup, and the popup dismisses on losing it.
+            // top. They are kept mutually exclusive by every path that takes focus calling
+            // `dismiss_completion` — **not** by a focus-out handler, which does not exist.
+            // An earlier version of this comment claimed the latter, which was a description
+            // of an invariant nothing enforced: with the popup unable to see focus leave, a
+            // ⌘F would have left it on screen, unfocused, its key context inactive and so
+            // undismissable, still holding an offset to write at.
             .children(
                 self.completion
                     .clone()

@@ -631,11 +631,24 @@ impl EditorView {
     /// then `after_edit` for the search rescan, the scroll and the blink. Splicing the
     /// buffer directly instead would give a completion-time keystroke different undo and
     /// bracket behaviour from the identical keystroke a second later with the popup closed.
-    pub fn insert_typed(&mut self, text: &str, cx: &mut Context<Self>) {
-        if !self.document.insert_with_pairs(text) {
+    /// Returns whether the character landed in the buffer *as typed*.
+    ///
+    /// `false` means `insert_with_pairs` did something other than a plain insertion, and the
+    /// caller must not assume the buffer grew by `text`. Two branches do that: typing over
+    /// a closer moves the caret and inserts **nothing**, and auto-closing inserts **two**
+    /// characters for one keystroke.
+    ///
+    /// The completion popup is why this is reported rather than swallowed. It mirrors each
+    /// keystroke into its filter, and a filter that grew by `)` when the buffer did not
+    /// leaves the replaced range and the query describing different spans — the same class
+    /// of divergence as the dotted-route-name bug, whose rule was "both, or neither".
+    pub fn insert_typed(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let plain = !self.document.insert_with_pairs(text);
+        if plain {
             self.document.insert(text);
         }
         self.after_edit(cx);
+        plain
     }
 
     /// Deletes backwards for a backspace the popup received, for the same reason.
