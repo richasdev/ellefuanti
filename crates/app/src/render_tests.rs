@@ -39,6 +39,7 @@ use std::sync::Arc;
 use elle_core::{BUILTIN_COMMANDS, CommandRegistry};
 use gpui::{Focusable, TestAppContext, VisualTestContext, px, size};
 
+use crate::completion::{CompletionItem, CompletionSource};
 use crate::editor::{Document, EditorView};
 use crate::find_bar::{FindEvent, Status};
 use crate::fonts::Fonts;
@@ -1450,5 +1451,509 @@ async fn searching_with_no_folder_open_renders_a_hint_rather_than_no_results(
     panel.read_with(cx, |panel, _cx| {
         assert!(matches!(panel.state(), SearchState::Idle), "no root means no search at all");
     });
+    draw(cx);
+}
+
+// --- the completion popup (#61) ---------------------------------------------------------
+//
+// What these can and cannot establish is worth stating, because the boundary is the same one
+// this module's header describes and it bites hardest here. gpui's headless text system is a
+// fake perfect monospace (`600.0 * len_utf16`), so **none of these verify where the popup
+// lands on screen**. `completion::place` is unit-tested against numbers instead — that is the
+// arithmetic that flips and clamps — and whether the cursor's own measured x is right stays
+// on issue #35's human list, exactly as the caret's does.
+//
+// What they do establish: the popup renders under every theme without panicking, the buffer
+// still receives text while the popup holds focus, an accepted item replaces the word being
+// typed rather than appending to it, and no source answering stays silent.
+
+/// Opens a PHP file and returns the workspace, ready for ⌃space.
+fn open_php(workspace: &gpui::Entity<WorkspaceView>, cx: &mut VisualTestContext) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("User.php")), "<?php\n\n$user->\n", true)
+                .expect("php grammar loads");
+        workspace.open_document_for_test(document, window, cx);
+        // The cursor goes where a user completing a member access would have left it: at the
+        // end of `$user->`, which is the position both sources are asked about.
+        if let Some(editor) = workspace.active_editor_for_test() {
+            editor.update(cx, |editor, _cx| {
+                let end = editor.document.buffer.len_bytes() - 1;
+                editor.document.move_to(end, false);
+            });
+        }
+    });
+}
+
+fn lsp_item(label: &str) -> CompletionItem {
+    CompletionItem::new(label.to_string(), CompletionSource::Lsp)
+}
+
+#[gpui::test]
+async fn the_completion_popup_renders_with_items_from_both_sources(cx: &mut TestAppContext) {
+    // One list, two provenances, rendered under both themes. The badge is a *sibling* of the
+    // label in the row layout, so a long label plus a detail plus a badge is the case that
+    // would break a row built as a single string — the layout #61 says must not be bolted on
+    // later.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("⌃space in an open PHP file opens the popup");
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(
+            vec![
+                lsp_item("getName"),
+                CompletionItem::new("users.show".to_string(), CompletionSource::LaravelRoute),
+                lsp_item("getNamespace").with_detail(Some("string".into())),
+            ],
+            cx,
+        );
+    });
+
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        assert_eq!(items.len(), 3, "every offered item is shown before anything is typed");
+        // The property that matters: each row still knows its own source after passing
+        // through the list. Nothing here infers it from the label.
+        assert_eq!(items[0].source, CompletionSource::Lsp);
+        assert_eq!(items[1].source, CompletionSource::LaravelRoute);
+    });
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn the_popup_renders_while_its_sources_are_still_answering(cx: &mut TestAppContext) {
+    // The state a user sees *first*, and the one an empty-list renderer panics in. It must
+    // say "Completing…" rather than "No completions": with a source still to report, saying
+    // there are none is a claim nobody has established.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("the popup opens before any source has answered");
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn typing_while_the_popup_is_open_still_reaches_the_buffer(cx: &mut TestAppContext) {
+    // The failure this popup exists to avoid. The popup holds keyboard focus — that is what
+    // makes its arrows work without stealing the editor's — so a character typed while it is
+    // open arrives at the *popup*. If it stopped there, ⌃space would become a mode where
+    // typing is silently swallowed.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+        workspace.active_editor_for_test().expect("a file is open")
+    });
+    let before = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("getName"), lsp_item("setName")], cx);
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test("g", window, cx);
+    });
+
+    let after = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_ne!(before, after, "the character must reach the buffer, not only the filter");
+    assert!(after.contains("$user->g"), "and it must land at the cursor: {after:?}");
+
+    // And it narrowed the list, which is the other half of the same keystroke.
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("one match remains, so the popup stays open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        assert_eq!(items.len(), 1, "typing `g` narrows to getName");
+        assert_eq!(items[0].label, "getName");
+    });
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn typing_past_every_match_closes_the_popup(cx: &mut TestAppContext) {
+    // A popup that follows the user down the line saying "No completions" is a popup in the
+    // way. Every editor closes instead — and the character must still reach the buffer on
+    // the way out, which is the half that would be easy to lose.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+        workspace.active_editor_for_test().expect("a file is open")
+    });
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("getName")], cx);
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test("z", window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "nothing matches `z`, so the list closes rather than sitting there empty"
+    );
+    let text = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(text.contains("$user->z"), "the keystroke is not lost on the way out: {text:?}");
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn accepting_replaces_the_word_being_typed_rather_than_appending(cx: &mut TestAppContext) {
+    // The bug a wrong replace-range gives you is `$user->gegetName`. Typing narrows the list
+    // *and* moves the cursor, so the accepted item has to overwrite everything typed since
+    // the popup opened — which is why the range is `word_start..cursor` and not an insertion
+    // point.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+        workspace.active_editor_for_test().expect("a file is open")
+    });
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("getName")], cx);
+    });
+    // Two characters typed while the list narrows.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test("g", window, cx);
+        workspace.completion_typed_for_test("e", window, cx);
+    });
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("`ge` still matches getName");
+    let item = popup.read_with(cx, |popup, _cx| popup.visible_items()[0].clone());
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.accept_completion_for_test(item, window, cx);
+    });
+
+    let text = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(text.contains("$user->getName"), "got {text:?}");
+    assert!(!text.contains("gegetName"), "the typed prefix must be overwritten: {text:?}");
+
+    // Accepting closes the popup. Escape and accept both have to leave the user where they
+    // were typing rather than in the workspace, which is the difference from the palette.
+    assert!(workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()));
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn dismissing_the_popup_leaves_the_buffer_alone(cx: &mut TestAppContext) {
+    // Escape must not write anything. The range the popup was holding is dropped rather than
+    // used — #83 documented the ordering where taking it after the dismissal instead made the
+    // completion silently never fire, and the mirror image writes into the wrong place.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+        workspace.active_editor_for_test().expect("a file is open")
+    });
+    let before = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("getName")], cx);
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.dismiss_completion_for_test(window, cx);
+    });
+
+    assert!(workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()));
+    assert_eq!(
+        editor.read_with(cx, |editor, _cx| editor.document.buffer.text()),
+        before,
+        "escape writes nothing"
+    );
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn completing_with_no_language_server_stays_silent(cx: &mut TestAppContext) {
+    // #74's rule, which this must not regress: nobody has Intelephense on a fresh machine.
+    // No dialog, no status message, no retry — the popup simply has nothing from that
+    // source. Every test here runs with no server, so this is the path they all took; it is
+    // asserted explicitly because it is a *requirement* rather than an accident of the
+    // environment.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.status_for_test().is_none(),
+            "a missing language server is not a problem the user has (§24)"
+        );
+    });
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn closing_the_tab_takes_the_popup_with_it(cx: &mut TestAppContext) {
+    // ⌘W is workspace-scoped, so it fires while the popup holds focus. Left standing, the
+    // popup is anchored to a cursor in a tab that no longer exists and still holds a byte
+    // offset into that buffer — and the offset is the dangerous half, because a later accept
+    // would write it into whichever document inherited the active slot.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()),
+        "the popup must be open for this test to be testing anything"
+    );
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.close_tab_for_test(window, cx));
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "closing the tab must close the popup anchored into it"
+    );
+    draw(cx);
+}
+
+#[gpui::test]
+async fn opening_the_palette_closes_the_popup(cx: &mut TestAppContext) {
+    // Same shape, different key: the palette's chords are workspace-scoped too, so ⌘P
+    // arrives with the popup focused. Two overlays both believing they own the keyboard is a
+    // state with no correct behaviour, and the palette is the one the user just asked for.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    assert!(workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_palette_for_test(PaletteMode::Commands, window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "the popup must not survive underneath a palette that now holds focus"
+    );
+    draw(cx);
+}
+
+#[gpui::test]
+async fn accepting_writes_into_the_file_the_popup_was_opened_on(cx: &mut TestAppContext) {
+    // The worst bug in this feature, found in review. Clicking a tab sets `active_tab`
+    // directly and does not touch the popup, so resolving the target through
+    // `active_editor()` at accept time wrote the completion into whichever file was
+    // frontmost *then* — at a byte offset that meant something in a different file. The
+    // bounds check could not catch it: a longer buffer accepts the offset happily.
+    //
+    // The popup now holds the editor handle it was opened against, which is the same fix
+    // `close_tab_at` already uses for the same reason.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    let first = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+        workspace.active_editor_for_test().expect("the file the popup is about")
+    });
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("getName")], cx);
+    });
+
+    // A second file, longer than the first so a stale offset would land inside it rather
+    // than being rejected by the bounds check — the case that made this silent.
+    let second = workspace.update_in(cx, |workspace, window, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("Other.php")),
+            "<?php\n// a much longer second file, with plenty of room for a stale offset\n$x = 1;\n",
+            true,
+        )
+        .expect("php grammar loads");
+        workspace.open_document_for_test(document, window, cx);
+        workspace.active_editor_for_test().expect("the second file is now active")
+    });
+    let untouched = second.read_with(cx, |editor, _cx| editor.document.buffer.text());
+
+    // Put the second file's cursor *past* the popup's offset. Without this the accept is
+    // rejected by the `start > end` bounds check and the test passes for the wrong reason —
+    // which is what it did when first written, and is exactly the "passed against the bug it
+    // was named for" trap. The offset has to be genuinely writable in the wrong file for
+    // this test to be about anything.
+    second.update(cx, |editor, _cx| {
+        let end = editor.document.buffer.len_bytes() - 1;
+        editor.document.move_to(end, false);
+    });
+
+    // Accept from the popup, which is still the one opened on the first file.
+    let item = CompletionItem::new("getName".to_string(), CompletionSource::Lsp);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.accept_completion_for_test(item, window, cx);
+    });
+
+    assert_eq!(
+        second.read_with(cx, |editor, _cx| editor.document.buffer.text()),
+        untouched,
+        "the completion must never be written into a file the popup was not about"
+    );
+    // And the first file is either completed or left alone — never corrupted.
+    let first_text = first.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(
+        first_text.starts_with("<?php"),
+        "the origin file must stay well-formed: {first_text:?}"
+    );
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn the_tab_close_button_takes_the_popup_with_it(cx: &mut TestAppContext) {
+    // ⌘W was fixed first; the ✕ reaches `close_tab_at` directly and is the more common
+    // gesture, so the dismissal belongs at that shared choke point rather than in the
+    // action handler.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    assert!(workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.close_tab_at_for_test(0, window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "the ✕ must close the popup anchored into the tab it removes"
+    );
+    draw(cx);
+}
+
+#[gpui::test]
+async fn anything_that_takes_focus_closes_the_popup(cx: &mut TestAppContext) {
+    // The invariant an earlier comment *claimed* and nothing enforced. Without it, ⌘F left
+    // the popup on screen but unfocused — its key context inactive, so Escape no longer
+    // reached it and it could not be dismissed at all, while still holding an offset a
+    // later accept would write at.
+    //
+    // **What this test actually covers is `open_find`'s explicit `dismiss_completion`.** The
+    // popup also carries a focus-out subscription that is the general rule, and this test
+    // does *not* exercise it: gpui assembles the focus path during paint, so the listener
+    // does not fire in a headless harness. I wrote this expecting the subscription alone to
+    // carry it, watched it fail with the popup genuinely focused, and added the explicit
+    // call — a rule that cannot be tested should not be the only thing holding.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    assert!(workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()));
+
+    // Drawn before the focus is taken away, and that is not test scaffolding: gpui activates
+    // a focus listener through `cx.defer`, and the focus itself only truly lands once a frame
+    // has been laid out. Asserting on a popup that was never painted would be asserting about
+    // a state the real app never passes through.
+    draw(cx);
+    cx.run_until_parked();
+
+    // ⌘F, which never had a `dismiss_completion` call of its own.
+    workspace.update_in(cx, |workspace, window, cx| workspace.find_for_test(false, window, cx));
+    // A frame, because gpui dispatches focus listeners while painting rather than at the
+    // moment `window.focus` is called.
+    draw(cx);
+    cx.run_until_parked();
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "opening the find bar takes focus, and the popup must not survive losing it"
+    );
+}
+
+#[gpui::test]
+async fn typing_over_an_auto_closed_bracket_closes_the_popup(cx: &mut TestAppContext) {
+    // `insert_with_pairs` types *over* an existing closer: the caret moves and the buffer
+    // does not grow. Mirroring that keystroke into the filter anyway made the query describe
+    // one more byte than the replaced range had — the same divergence as the dotted route
+    // name, and an accept would then have overwritten the bracket.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("Pairs.php")), "<?php\nfoo\n", true)
+                .expect("php grammar loads");
+        workspace.open_document_for_test(document, window, cx);
+        let editor = workspace.active_editor_for_test().expect("a file is open");
+        editor.update(cx, |editor, cx| {
+            // Put the caret after `foo` and type `(`, which auto-closes to `foo(|)`.
+            let end = editor.document.buffer.len_bytes() - 1;
+            editor.document.move_to(end, false);
+            editor.insert_typed("(", cx);
+        });
+        editor
+    });
+
+    let with_pair = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(with_pair.contains("foo()"), "the pair must have auto-closed: {with_pair:?}");
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    // An item that still matches after a `)` is appended to the query, so the popup would
+    // survive on the "nothing matched" path. Without it this test closes for the wrong
+    // reason and passes even with the desync bug present — which it did when first written.
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item(")brace"), lsp_item("getName")], cx);
+    });
+
+    // Typing the closer steps over it rather than inserting.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test(")", window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "a keystroke that did not land as typed must close the list rather than desync it"
+    );
+    // And it must not have doubled the bracket.
+    let after = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(!after.contains("foo())"), "typing over a closer must not insert one: {after:?}");
+
     draw(cx);
 }

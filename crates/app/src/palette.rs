@@ -14,12 +14,6 @@ pub enum PaletteMode {
     Commands,
     Files,
     Routes,
-    /// Route *names* to complete a `route('…')` with, rather than places to jump to (#83).
-    ///
-    /// A separate mode from [`PaletteMode::Routes`] because confirming does something else
-    /// entirely — it writes into the buffer instead of opening a file — and the row content
-    /// differs too: a bare name is what gets typed, where a route row shows verb and URI.
-    RouteNames,
     /// Symbols in the active file, from the language server.
     Symbols,
     /// Where a symbol is used, from the language server.
@@ -32,7 +26,6 @@ impl PaletteMode {
             PaletteMode::Commands => "Run a command…",
             PaletteMode::Files => "Open a file…",
             PaletteMode::Routes => "Go to a route…",
-            PaletteMode::RouteNames => "Insert a route name…",
             PaletteMode::Symbols => "Go to a symbol…",
             PaletteMode::References => "Go to a usage…",
         }

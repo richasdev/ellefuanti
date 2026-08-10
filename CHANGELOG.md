@@ -40,6 +40,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   `render_activity_bar` zips it positionally and `zip` stops at the shorter side, so an
   insertion among the first seven would have shifted every panel's glyph with nothing
   failing. Both guards were mutation-checked by performing that insertion.
+- **The completion popup, at the cursor, with visible provenance** (#61). `crates/app/src/completion.rs`
+  is a list anchored to the caret that filters as you type, moves with the arrows, accepts on
+  Enter or Tab and dismisses on Escape. Two real sources feed it: the language server, via
+  `request_completion` — which had existed since #45 and **had never been called by anything** —
+  and #83's Laravel route names. ⌃space moved off #83's palette stopgap and onto this.
+
+  **Provenance is carried in the type, not attached at render time.** `CompletionItem.source`
+  is a non-optional `CompletionSource`, stamped where the item is *born*: LSP items get theirs
+  at the point the response is decoded, route names at the point they come back from the route
+  parser. This is #20's requirement — "a column derived from a migration is a different kind of
+  claim than a guess from a method name" — and the reason it is a field rather than a badge
+  chosen by the row renderer is that a renderer would have to *infer* it from the label, which
+  is precisely the confident wrongness RISKS.md #4 is about. Two items with the same label from
+  different sources are different claims, and `a_completion_carries_its_source_rather_than_inferring_it`
+  is that stated as a test.
+
+  **Cancellation, not queueing, and it is real rather than nominal.** Every keystroke that
+  narrows the list supersedes the request in flight: the task is dropped *and* `$/cancelRequest`
+  goes out, which is the half that stops the server computing and reclaims its pending slot.
+  Measured against a real Intelephense — a cancelled request resolves in **334 ns** where the
+  wait would otherwise have run its full two seconds. `Job::Completion` is deliberately a
+  separate slot from `LspQuery`: completion supersedes completion, and sharing would have made
+  a keystroke in the popup cancel a find-references sweep the user was still waiting on.
+
+  **The popup does not steal the keymap.** Arrows, Enter, Tab and Escape are bound in
+  `context::COMPLETION`, which no element carries unless a popup is on screen — so with nothing
+  open every arrow reaches the editor exactly as before, by construction rather than by a guard
+  inside a handler. `the_completion_popups_navigation_keys_are_scoped_to_its_own_context` reads
+  the keymap source and fails if list navigation is ever bound where a document has focus.
+
+  **The popup holds focus, so typing is forwarded rather than swallowed.** Focus has to be on
+  the popup for its key context to be active; a character typed there is reported to the
+  workspace, inserted into the buffer through the ordinary `insert_with_pairs` path, and *then*
+  used to narrow the list. Handling it in the popup would have left the character in the filter
+  and never in the file.
+
+  **Positioning is measured, not computed.** `EditorView::cursor_position` returns a
+  window-absolute point built from the shaped line (`x_for_index`, the same measurement the
+  caret uses) and from the cursor row's own prepainted origin. Nothing adds up a tab bar and a
+  find bar from constants — the find bar's height varies with its replace field, and that
+  arithmetic is the bug `text_origin_x` already exists because someone wrote once.
+
+  **What is not tested, stated plainly.** gpui's headless text system is a fake perfect
+  monospace, so no test here verifies where the popup lands on screen. The flip-above-the-cursor
+  and clamp-at-the-right-edge arithmetic is unit-tested against numbers; whether the measured
+  cursor x is correct against real glyphs stays on #35's human list, exactly as the caret's does.
+
+  Not #20's merge-and-rank engine, which is still ahead: both sources go into one list in the
+  order they were asked, and filtering preserves that order rather than quietly sorting.
 
 - **A real caret: thin, between characters, blinking** (#98). The block cursor — a background
   highlight on the character _under_ the cursor — is gone. `crates/app/src/editor/caret.rs`
