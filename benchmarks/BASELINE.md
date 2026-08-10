@@ -281,12 +281,30 @@ Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefu
 | Startup, first launch of a new binary | < 500 ms     | **520–536 ms**                     | ❌ worst case — see below |
 | Startup, later launches               | < 500 ms     | **~195–380 ms**                    | ✅                        |
 | Warm startup                          | < 150 ms     | **191–213 ms**                     | ❌ **~50 ms over**        |
-| Idle RAM (no project open)            | 100–200 MB   | **100–103 MB** (was 69 MB)         | ✅ at the low edge        |
-| Idle CPU                              | —            | **0.7–0.9%** (was 0.0%)            | ⚠ see #79                 |
+| Idle memory (no project open)         | 100–200 MB   | **76–79 MB** footprint             | ✅ gated at 95 MB         |
+| Idle CPU                              | —            | **0.75%**, gpui's display link     | ✅ gated at 2%            |
 | Frame render, 55k-line file           | < 8.3 ms     | **0.08–0.77 ms**                   | ✅                        |
 | Keystroke → pixel, 55k-line file      | < 8.3 ms     | **2.6–5.3 ms** †                   | ✅                        |
 | Sustained typing, 55k-line file       | < 8.3 ms     | **~4.3 ms** †                      | ✅                        |
 | Cached completion                     | < 50 ms      | no completion engine (Milestone 2) | —                         |
+
+**The idle memory and CPU rows changed metric, not value.** They previously read 69 MB and
+0.0%, taken with `ps rss` and `ps %cpu`. Both were wrong to gate on, and #79 was opened,
+argued for three rounds and closed on the strength of them:
+
+- `ps rss` varies 83.9–102.5 MB across five launches of **one unchanged binary**, while
+  `vmmap` Physical footprint holds at 75.7–78.8 MB. The rss spread is wider than the
+  "regression" #79 reported.
+- `ps %cpu` is a **decaying lifetime average**, not a rate. Sampled once after a settle it
+  reports where you happen to be on the decay curve — which is why the same build read 8.7%,
+  then 0.0%, then 0.7% across the session with nothing changing. The commit that recorded
+  **0.0% here has never been below 0.7%** when measured as a cumulative-time delta.
+
+The real ~0.75% is gpui's `CVDisplayLink`, started after the first paint and never stopped.
+Upstream, not ours, which is why the gate sits at 2% rather than near zero.
+
+Both are now enforced by `scripts/perf-gate.sh`, so the next drift is caught rather than
+noticed by accident.
 
 **† Do not read these as precise figures.** The same code measured 5.28 ms on a loaded
 machine and 2.65 ms on a quiet one — a 2× spread from machine conditions alone. If you run
