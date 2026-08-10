@@ -41,6 +41,7 @@ elle-theme.workspace = true
 
 gpui.workspace = true
 anyhow.workspace = true
+regex.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

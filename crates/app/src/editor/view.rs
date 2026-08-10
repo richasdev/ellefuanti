@@ -439,6 +439,11 @@ impl EditorView {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
+        // Typing with the find bar open moves every match after the caret. A stale list
+        // paints a highlight over bytes that have shifted, so the rescan happens here
+        // rather than in `render` — a render pass should not mutate domain state, and the
+        // version check inside makes this a comparison when nothing has changed.
+        self.document.refresh_search();
         self.scroll_cursor_into_view();
         cx.notify();
     }
@@ -446,6 +451,19 @@ impl EditorView {
     fn after_move(&mut self, cx: &mut Context<Self>) {
         self.scroll_cursor_into_view();
         cx.notify();
+    }
+
+    /// ⌘G / ⌘⇧G, driven by the find bar (#80).
+    ///
+    /// On the view rather than only on `Document` because jumping to a match off-screen
+    /// has to scroll — the whole point of "next match" is arriving somewhere you can see.
+    /// Returns whether a match was found.
+    pub fn select_match(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let found = self.document.select_match(forward);
+        if found {
+            self.after_move(cx);
+        }
+        found
     }
 
     /// Maps a click inside a row to a text offset and moves the cursor there.
@@ -608,7 +626,23 @@ impl EditorView {
         // Highlight once for the whole visible band rather than per row: one tree walk
         // instead of N, and the spans are already sorted so slicing per row is cheap.
         let band = self.visible_byte_range(&range);
-        let spans = self.document.syntax.highlights(&self.document.buffer, band);
+        let spans = self.document.syntax.highlights(&self.document.buffer, band.clone());
+
+        // Search matches, sliced to the band the same way, and for the same reason (#80).
+        // `Matches::in_range` is two binary searches over a sorted list, so this costs
+        // `O(log n + visible)` no matter how many matches the file has — the property
+        // `match_lookup_cost_does_not_grow_with_file_size` pins down in `editor/find.rs`.
+        // Collected into a small `Vec` once rather than re-sliced per row: the band holds
+        // a screenful of hits, so the per-row filter below runs over tens of entries.
+        let current_match = self.document.search.current_range();
+        let band_matches: Vec<(Range<usize>, bool)> = self
+            .document
+            .search
+            .matches()
+            .in_range(band)
+            .iter()
+            .map(|range| (range.clone(), Some(range) == current_match.as_ref()))
+            .collect();
 
         let entity = cx.entity();
 
@@ -623,6 +657,12 @@ impl EditorView {
                 // A file with hundreds of problems is exactly when that starts to matter.
                 let row_diagnostics: Vec<_> = self
                     .diagnostics
+                    .iter()
+                    .filter(|(range, _)| range.start < line_end && range.end > line_start)
+                    .cloned()
+                    .collect();
+
+                let row_matches: Vec<_> = band_matches
                     .iter()
                     .filter(|(range, _)| range.start < line_end && range.end > line_start)
                     .cloned()
@@ -678,6 +718,7 @@ impl EditorView {
                         &spans,
                         &row_diagnostics,
                         brackets,
+                        &row_matches,
                         &theme,
                         if is_cursor_row { Some(cursor.column) } else { None },
                     )))
@@ -710,11 +751,12 @@ fn styled_line(
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
     brackets: Option<(usize, usize)>,
+    matches: &[(Range<usize>, bool)],
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> StyledText {
     let (text, highlights) =
-        line_runs(line, line_start, spans, diagnostics, brackets, theme, cursor_column);
+        line_runs(line, line_start, spans, diagnostics, brackets, matches, theme, cursor_column);
     StyledText::new(SharedString::from(text)).with_highlights(highlights)
 }
 
@@ -725,12 +767,16 @@ fn styled_line(
 /// actually be wrong (clipping, rebasing, cursor placement, char boundaries) assertable
 /// without a GPU, which is the only slice of "does it render correctly" a machine can check
 /// here. See `crates/app/tests/render.rs`.
+///
+/// `matches` is `(range, is_current)`: search hits touching this line, already sliced to
+/// the viewport by the caller (#80).
 fn line_runs(
     line: &str,
     line_start: usize,
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
     brackets: Option<(usize, usize)>,
+    matches: &[(Range<usize>, bool)],
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
@@ -790,6 +836,35 @@ fn line_runs(
         highlights = merge_underline(highlights, start..end, underline);
     }
 
+    // Search matches paint a *background* and leave the foreground alone, for the same
+    // reason diagnostics only underline: a match over a keyword must still look like a
+    // keyword. `merge_background` splits the runs underneath rather than replacing them,
+    // so a match that covers half a token keeps that half's colour.
+    //
+    // First of the four overlays below, and the order of all four is deliberate (#80 and
+    // #87 both added one, and they interact):
+    //
+    //   matches → guides → bracket → cursor
+    //
+    // Matches go first because they *merge* rather than replace, so everything after can
+    // still win its own bytes. The guides come next and are dropped where any run already
+    // exists — which now includes a match, so a hit on an indented line hides the guide
+    // under it rather than fighting it, and that is the right way round. The bracket and
+    // the cursor both win outright over what is beneath.
+    for (range, is_current) in matches {
+        if range.end <= line_start || range.start >= line_end {
+            continue;
+        }
+        let start = floor_boundary(&text, range.start.max(line_start) - line_start);
+        let end = ceil_boundary(&text, range.end.min(line_end) - line_start);
+        if start >= end {
+            continue;
+        }
+        let background =
+            if *is_current { theme.current_search_match() } else { theme.search_match() };
+        highlights = merge_background(highlights, start..end, background);
+    }
+
     // Indent guides and the trailing-whitespace tint, both computed from this line's own
     // bytes and nothing else — no buffer scan, no state carried between rows. That is what
     // keeps them viewport-scoped: `render_rows` calls this once per *visible* row, so the
@@ -830,8 +905,22 @@ fn line_runs(
 
     // The matching pair. Unlike the guides this one *must* win over the syntax colour
     // underneath it — a bracket is nearly always inside a coloured node, so dropping it on
-    // overlap would mean never drawing it at all. Same `retain`-then-push shape the cursor
-    // uses below, and for the same reason.
+    // overlap would mean never drawing it at all.
+    //
+    // Two things here changed when #80 landed on top of #87, and both were reachable bugs
+    // rather than tidying:
+    //
+    // 1. `bracket_match()` rather than `theme.selection` written inline. The *current*
+    //    search match is also `theme.selection`, so a bracket inside the hit ⌘G is on
+    //    would have been invisible — and searching for `function foo(` puts the cursor
+    //    beside a bracket by definition.
+    //
+    // 2. `merge_over` first, then a `retain` bounded to the bracket's own byte. The plain
+    //    `retain`-then-push the cursor uses drops **any** run straddling the bracket
+    //    rather than splitting it. With one-token syntax spans underneath that costs a
+    //    token's colour and nobody notices; with a search match spanning several
+    //    characters it wipes the whole match's background off the line. Splitting first
+    //    means the bracket takes its one byte and the match keeps the rest.
     if let Some((a, b)) = brackets {
         for at in [a, b] {
             if at < line_start || at >= line_end {
@@ -842,10 +931,14 @@ fn line_runs(
             if start >= end {
                 continue;
             }
+            highlights = merge_over(highlights, start..end, |style| style);
             highlights.retain(|(range, _)| range.end <= start || range.start >= end);
             highlights.push((
                 start..end,
-                GpuiHighlight { background_color: Some(theme.selection), ..Default::default() },
+                GpuiHighlight {
+                    background_color: Some(theme.bracket_match()),
+                    ..Default::default()
+                },
             ));
         }
     }
@@ -919,24 +1012,50 @@ fn trailing_whitespace_range(line: &str) -> Option<Range<usize>> {
 }
 
 /// Adds an underline over `span`, splitting any colour runs it partly covers.
-///
-/// gpui requires sorted, non-overlapping runs, so an underline cannot simply be pushed on
-/// top of the syntax colours — a run half-covered by a diagnostic has to become two runs,
-/// one underlined and one not. That splitting is the whole function, and it is why
-/// diagnostics could not be expressed as "one more span" alongside the highlight spans:
-/// those carry a colour each and never overlap, where a diagnostic overlaps by nature.
-///
-/// Bytes not covered by any existing run still need the underline, so the gaps inside
-/// `span` become runs of their own with no colour — they inherit the element's text colour,
-/// which is what an uncoloured character already renders as.
 fn merge_underline(
     runs: Vec<(Range<usize>, GpuiHighlight)>,
     span: Range<usize>,
     underline: Option<gpui::UnderlineStyle>,
 ) -> Vec<(Range<usize>, GpuiHighlight)> {
+    merge_over(runs, span, |style| GpuiHighlight { underline, ..style })
+}
+
+/// Adds a background colour over `span`, splitting any colour runs it partly covers.
+///
+/// This is how a search match composes with syntax colours (#80): the match paints a
+/// background and the token underneath keeps its foreground, so highlighting a match does
+/// not turn a keyword the colour of a string.
+fn merge_background(
+    runs: Vec<(Range<usize>, GpuiHighlight)>,
+    span: Range<usize>,
+    background: gpui::Hsla,
+) -> Vec<(Range<usize>, GpuiHighlight)> {
+    merge_over(runs, span, move |style| GpuiHighlight {
+        background_color: Some(background),
+        ..style
+    })
+}
+
+/// Applies `restyle` to the part of `runs` covered by `span`, splitting where needed.
+///
+/// gpui requires sorted, non-overlapping runs, so an extra attribute cannot simply be
+/// pushed on top of the syntax colours — a run half-covered by a diagnostic or a search
+/// match has to become two runs, one with the attribute and one without. That splitting is
+/// the whole function, and it is why neither diagnostics nor matches could be expressed as
+/// "one more span" alongside the highlight spans: those carry a colour each and never
+/// overlap, where a diagnostic or a match overlaps by nature.
+///
+/// Bytes not covered by any existing run still need the attribute, so the gaps inside
+/// `span` become runs of their own with no colour — they inherit the element's text colour,
+/// which is what an uncoloured character already renders as.
+fn merge_over(
+    runs: Vec<(Range<usize>, GpuiHighlight)>,
+    span: Range<usize>,
+    restyle: impl Fn(GpuiHighlight) -> GpuiHighlight,
+) -> Vec<(Range<usize>, GpuiHighlight)> {
     let mut merged: Vec<(Range<usize>, GpuiHighlight)> = Vec::with_capacity(runs.len() + 2);
     // Where inside `span` the next uncovered byte starts, so gaps between existing runs
-    // get an underline-only run rather than being skipped.
+    // get an attribute-only run rather than being skipped.
     let mut uncovered = span.start;
 
     for (range, style) in runs {
@@ -945,23 +1064,21 @@ fn merge_underline(
             continue;
         }
 
-        // The part of this run before the diagnostic keeps its style unchanged.
+        // The part of this run before the span keeps its style unchanged.
         if range.start < span.start {
             merged.push((range.start..span.start, style));
         }
 
-        // Any gap since the last run, inside the diagnostic, is underline only.
+        // Any gap since the last run, inside the span, gets the attribute alone.
         if uncovered < range.start.max(span.start) {
-            merged.push((
-                uncovered..range.start.max(span.start),
-                GpuiHighlight { underline, ..Default::default() },
-            ));
+            merged
+                .push((uncovered..range.start.max(span.start), restyle(GpuiHighlight::default())));
         }
 
-        // The overlap keeps the colour and gains the underline.
+        // The overlap keeps the colour and gains the attribute.
         let overlap = range.start.max(span.start)..range.end.min(span.end);
         if overlap.start < overlap.end {
-            merged.push((overlap.clone(), GpuiHighlight { underline, ..style }));
+            merged.push((overlap.clone(), restyle(style)));
             uncovered = overlap.end;
         }
 
@@ -971,9 +1088,9 @@ fn merge_underline(
         }
     }
 
-    // Trailing bytes of the diagnostic that no run covered.
+    // Trailing bytes of the span that no run covered.
     if uncovered < span.end {
-        merged.push((uncovered..span.end, GpuiHighlight { underline, ..Default::default() }));
+        merged.push((uncovered..span.end, restyle(GpuiHighlight::default())));
     }
 
     merged.sort_by_key(|(range, _)| range.start);
@@ -1141,11 +1258,12 @@ mod tests {
         HighlightSpan { range, style }
     }
 
-    /// `line_runs` with no diagnostics, which is what every pre-existing test means.
+    /// `line_runs` with no diagnostics and no search matches, which is what every
+    /// pre-existing test means.
     ///
     /// A wrapper rather than `&[]` threaded through nine call sites: those tests are about
-    /// syntax colours and the cursor, and an empty diagnostics argument in each would be
-    /// noise in the one place their arguments should read as the thing under test.
+    /// syntax colours and the cursor, and empty diagnostics and match arguments in each
+    /// would be noise in the one place their arguments should read as the thing under test.
     fn line_runs(
         line: &str,
         line_start: usize,
@@ -1153,7 +1271,19 @@ mod tests {
         theme: &Theme,
         cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, theme, cursor_column)
+        super::line_runs(line, line_start, spans, &[], None, &[], theme, cursor_column)
+    }
+
+    /// `line_runs` with search matches, spelled out.
+    fn line_runs_matching(
+        line: &str,
+        line_start: usize,
+        spans: &[HighlightSpan],
+        matches: &[(Range<usize>, bool)],
+        theme: &Theme,
+        cursor_column: Option<usize>,
+    ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
+        super::line_runs(line, line_start, spans, &[], None, matches, theme, cursor_column)
     }
 
     /// Byte ranges carrying a foreground colour.
@@ -1466,7 +1596,7 @@ mod tests {
         let theme = Theme::dark();
         // Both ends on the same line, rebased from document offsets like any other range.
         let (_, runs) = line_runs_with_brackets("f(1)", 0, Some((1, 3)), &theme);
-        assert_eq!(backgrounds(&runs, theme.selection), vec![1..2, 3..4]);
+        assert_eq!(backgrounds(&runs, theme.bracket_match()), vec![1..2, 3..4]);
     }
 
     #[test]
@@ -1475,7 +1605,7 @@ mod tests {
         // row must paint its own end and clip the other, exactly as a syntax span does.
         let theme = Theme::dark();
         let (_, runs) = line_runs_with_brackets("}", 500, Some((12, 500)), &theme);
-        assert_eq!(backgrounds(&runs, theme.selection), vec![0..1]);
+        assert_eq!(backgrounds(&runs, theme.bracket_match()), vec![0..1]);
     }
 
     #[test]
@@ -1489,11 +1619,12 @@ mod tests {
             &[span(0..4, HighlightStyle::Function)],
             &[],
             Some((1, 3)),
+            &[],
             &theme,
             None,
         );
 
-        assert_eq!(backgrounds(&runs, theme.selection), vec![1..2, 3..4]);
+        assert_eq!(backgrounds(&runs, theme.bracket_match()), vec![1..2, 3..4]);
         for pair in runs.windows(2) {
             assert!(pair[0].0.end <= pair[1].0.start, "runs must stay disjoint");
         }
@@ -1506,7 +1637,7 @@ mod tests {
         brackets: Option<(usize, usize)>,
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, &[], &[], brackets, theme, None)
+        super::line_runs(line, line_start, &[], &[], brackets, &[], theme, None)
     }
 
     // --- diagnostics ----------------------------------------------------------------
@@ -1717,6 +1848,237 @@ mod tests {
         theme: &Theme,
         cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, diagnostics, None, theme, cursor_column)
+        super::line_runs(line, line_start, spans, diagnostics, None, &[], theme, cursor_column)
+    }
+
+    // --- search match highlighting (#80) --------------------------------------------
+    //
+    // The property that matters: a match paints a *background* and leaves the syntax
+    // foreground alone. Getting that backwards would make every hit on a keyword look
+    // like a string, which is the exact failure the diagnostics underline was designed
+    // around and would be a regression of the same lesson.
+
+    /// Byte ranges carrying `background`, which is how a match is expressed.
+    fn backgrounded(
+        runs: &[(Range<usize>, GpuiHighlight)],
+        background: gpui::Hsla,
+    ) -> Vec<Range<usize>> {
+        runs.iter()
+            .filter(|(_, style)| style.background_color == Some(background))
+            .map(|(range, _)| range.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_match_paints_a_background_without_touching_the_syntax_colour() {
+        let theme = Theme::dark();
+        let line = "return $user;";
+        let (_, runs) = line_runs_matching(
+            line,
+            0,
+            &[span(0..6, HighlightStyle::Keyword)],
+            &[(7..12, false)],
+            &theme,
+            None,
+        );
+
+        assert_eq!(backgrounded(&runs, theme.search_match()), vec![7..12]);
+        // The keyword still has its own colour, and no background.
+        let keyword = runs.iter().find(|(r, _)| *r == (0..6)).expect("keyword run survived");
+        assert_eq!(keyword.1.color, Some(theme.syntax(HighlightStyle::Keyword)));
+        assert_eq!(keyword.1.background_color, None);
+    }
+
+    #[test]
+    fn a_match_over_a_token_keeps_the_tokens_colour() {
+        // The composition the issue calls for: the match background and the syntax
+        // foreground on the *same* run, not one replacing the other.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_matching(
+            "return x;",
+            0,
+            &[span(0..6, HighlightStyle::Keyword)],
+            &[(0..6, false)],
+            &theme,
+            None,
+        );
+
+        let run = runs.iter().find(|(r, _)| *r == (0..6)).expect("the covered run exists");
+        assert_eq!(run.1.color, Some(theme.syntax(HighlightStyle::Keyword)), "colour survived");
+        assert_eq!(run.1.background_color, Some(theme.search_match()), "and gained a background");
+    }
+
+    #[test]
+    fn a_match_covering_half_a_token_splits_it() {
+        // A run half-covered has to become two, or gpui gets overlapping runs.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_matching(
+            "returned",
+            0,
+            &[span(0..8, HighlightStyle::Keyword)],
+            &[(0..6, false)],
+            &theme,
+            None,
+        );
+
+        assert_eq!(backgrounded(&runs, theme.search_match()), vec![0..6]);
+        let tail = runs.iter().find(|(r, _)| *r == (6..8)).expect("the uncovered half exists");
+        assert_eq!(tail.1.color, Some(theme.syntax(HighlightStyle::Keyword)));
+        assert_eq!(tail.1.background_color, None);
+        assert_sorted_and_disjoint(&runs);
+    }
+
+    #[test]
+    fn the_current_match_is_a_different_colour_from_the_others() {
+        // Otherwise ⌘G moves an invisible cursor through identical-looking hits.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_matching(
+            "a a a",
+            0,
+            &[],
+            &[(0..1, false), (2..3, true), (4..5, false)],
+            &theme,
+            None,
+        );
+
+        assert_eq!(backgrounded(&runs, theme.search_match()), vec![0..1, 4..5]);
+        assert_eq!(backgrounded(&runs, theme.current_search_match()), vec![2..3]);
+        assert_ne!(theme.search_match(), theme.current_search_match());
+    }
+
+    #[test]
+    fn a_match_is_clipped_and_rebased_like_a_span() {
+        // A match straddling the line — the common case for a regex — must paint only the
+        // visible part, in line-local coordinates.
+        let theme = Theme::dark();
+        let line = "middle";
+        let (_, runs) = line_runs_matching(line, 100, &[], &[(95..103, false)], &theme, None);
+        assert_eq!(backgrounded(&runs, theme.search_match()), vec![0..3]);
+
+        // And one entirely outside is dropped rather than painting at a clamped offset.
+        let (_, runs) = line_runs_matching(line, 100, &[], &[(0..50, false)], &theme, None);
+        assert!(backgrounded(&runs, theme.search_match()).is_empty());
+    }
+
+    #[test]
+    fn a_multibyte_match_never_splits_a_character() {
+        // `ação` is bytes 8..14 (ç and ã are two bytes each). `Matches` only ever produces
+        // boundaries, but a *clipped* match can still land mid-codepoint the same way a
+        // clipped syntax span does, and `StyledText` debug-asserts on that. Feeding a
+        // deliberately mid-codepoint 12 here checks the snap rather than trusting it.
+        let theme = Theme::dark();
+        let line = "$msg = 'ação';";
+        assert!(!line.is_char_boundary(12), "12 must be inside ã for this test to mean anything");
+
+        let (text, runs) = line_runs_matching(line, 0, &[], &[(8..12, false)], &theme, None);
+        for (range, _) in &runs {
+            assert!(text.is_char_boundary(range.start), "{range:?} starts mid-codepoint");
+            assert!(text.is_char_boundary(range.end), "{range:?} ends mid-codepoint");
+        }
+        // Snapped outward to the end of the character it landed inside, never inward.
+        assert_eq!(backgrounded(&runs, theme.search_match()), vec![8..13]);
+        assert_eq!(&text[8..13], "açã");
+
+        // And an exact, unclipped match paints exactly itself.
+        let (_, runs) = line_runs_matching(line, 0, &[], &[(8..14, false)], &theme, None);
+        assert_eq!(backgrounded(&runs, theme.search_match()), vec![8..14]);
+    }
+
+    #[test]
+    fn the_cursor_still_wins_over_a_match_underneath_it() {
+        // The current match *is* the selection, so the caret sits inside it. If the match
+        // background won, the caret would vanish exactly where the user is looking.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_matching("needle", 0, &[], &[(0..6, true)], &theme, Some(2));
+        let cursor = runs
+            .iter()
+            .find(|(_, style)| style.background_color == Some(theme.cursor))
+            .expect("the cursor run survived the match");
+        assert_eq!(cursor.0, 2..3);
+        assert_sorted_and_disjoint(&runs);
+    }
+
+    #[test]
+    fn a_match_over_a_diagnostic_keeps_the_squiggle() {
+        // Two overlays on the same bytes. Losing the underline here would mean a search
+        // hides errors, which is a worse outcome than either feature alone.
+        let theme = Theme::dark();
+        let (_, runs) = super::line_runs(
+            "bad",
+            0,
+            &[],
+            &[(0..3, Severity::Error)],
+            None,
+            &[(0..3, false)],
+            &theme,
+            None,
+        );
+        let run = runs.iter().find(|(r, _)| *r == (0..3)).expect("the covered run exists");
+        assert!(run.1.underline.is_some(), "the diagnostic underline survived the match");
+        assert_eq!(run.1.background_color, Some(theme.search_match()));
+    }
+
+    #[test]
+    fn no_matches_produces_exactly_what_it_did_before() {
+        // The regression guard, mirroring `no_diagnostics_produces_exactly_what_it_did_before`.
+        // Every editor without an open find bar is permanently in this state, so adding
+        // search must not change a single run there.
+        let theme = Theme::dark();
+        let spans = [span(0..6, HighlightStyle::Keyword)];
+        let (text, with) = line_runs_matching("return $x;", 0, &spans, &[], &theme, Some(2));
+        let (plain_text, without) = line_runs("return $x;", 0, &spans, &theme, Some(2));
+
+        assert_eq!(text, plain_text);
+        assert_eq!(with.len(), without.len());
+        for (a, b) in with.iter().zip(&without) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.color, b.1.color);
+            assert_eq!(a.1.background_color, b.1.background_color);
+        }
+    }
+
+    /// gpui requires sorted, non-overlapping runs; violating that is a paint-time panic
+    /// rather than a wrong colour, so it is worth asserting directly.
+    fn assert_sorted_and_disjoint(runs: &[(Range<usize>, GpuiHighlight)]) {
+        for pair in runs.windows(2) {
+            assert!(
+                pair[0].0.end <= pair[1].0.start,
+                "runs must be sorted and disjoint: {:?} then {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn a_bracket_inside_the_current_match_is_still_visible() {
+        // The collision the rebase surfaced. #87 painted the bracket pair as
+        // `theme.selection`, and #80's *current* match is also `theme.selection`; #87 also
+        // used the cursor's plain `retain`-then-push, which drops any run straddling the
+        // bracket instead of splitting it. Together those two meant a bracket inside the
+        // hit ⌘G is on vanished *and* took the match's whole background with it. Searching
+        // for `function foo(` puts the cursor beside a bracket by definition, so this was
+        // reachable rather than theoretical.
+        let theme = Theme::dark();
+        assert_ne!(
+            theme.bracket_match(),
+            theme.current_search_match(),
+            "a bracket inside the current match would be invisible"
+        );
+
+        let (_, runs) =
+            super::line_runs("f(1)", 0, &[], &[], Some((1, 3)), &[(0..4, true)], &theme, None);
+
+        assert_eq!(
+            backgrounds(&runs, theme.bracket_match()),
+            vec![1..2, 3..4],
+            "the brackets win their own bytes back from the match"
+        );
+        assert_eq!(
+            backgrounds(&runs, theme.current_search_match()),
+            vec![0..1, 2..3],
+            "and the match keeps every byte the brackets did not take"
+        );
+        assert_sorted_and_disjoint(&runs);
     }
 }

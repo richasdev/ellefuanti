@@ -115,6 +115,17 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 Item::system("Select All", |label| {
                     MenuItem::os_action(label, SelectAll, OsAction::SelectAll)
                 }),
+                // #80. Unlike the motions below, these two belong in a menu: find is what
+                // someone reaches for by name in an editor they do not know yet, and Edit
+                // is where every other application puts it. Plain `action`, not
+                // `os_action` — macOS's `performFindPanelAction:` drives *its* find panel,
+                // which is not this one.
+                Item::command("Find…", "editor.find", |label| {
+                    MenuItem::action(label, crate::actions::Find)
+                }),
+                Item::command("Replace…", "editor.replace", |label| {
+                    MenuItem::action(label, crate::actions::Replace)
+                }),
                 // ponytail: the #73 motions (Move Line Up, Duplicate Line, Delete Line,
                 // Indent/Outdent) are deliberately not here. They are keyboard verbs used
                 // mid-flow — reaching for a menu to duplicate a line is not a thing anyone

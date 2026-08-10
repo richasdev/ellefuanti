@@ -83,6 +83,17 @@ actions!(
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
+        // Find and replace (#80). `Find` and `Replace` open the bar; the rest act on it.
+        Find,
+        Replace,
+        FindNext,
+        FindPrev,
+        ReplaceOne,
+        ReplaceAll,
+        ToggleCaseSensitive,
+        ToggleWholeWord,
+        ToggleRegex,
+        FocusReplaceField,
     ]
 );
 
@@ -93,6 +104,11 @@ pub mod context {
     pub const EDITOR: &str = "Editor";
     pub const PALETTE: &str = "Palette";
     pub const TERMINAL: &str = "Terminal";
+    /// The find bar (#80). Its own context, not `Palette`: `enter` there means "next
+    /// match" rather than "confirm and close", `escape` returns focus to the editor
+    /// instead of dismissing an overlay, and the bar has toggles a palette has no
+    /// concept of. Sharing the context would have meant a mode check in every handler.
+    pub const FIND: &str = "Find";
 }
 
 /// Registers the default keymap and the palette's command list.
@@ -140,6 +156,30 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-+", IncreaseFontSize, Some(context::WORKSPACE)),
         KeyBinding::new("cmd--", DecreaseFontSize, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-0", ResetFontSize, Some(context::WORKSPACE)),
+        //
+        // Find and replace (#80). Workspace-scoped so ⌘F works with the editor, the tree
+        // or nothing focused — the bar belongs to the active tab, not to whatever has
+        // keyboard focus at the moment. ⌘G is macOS's find-again since long before it was
+        // an IDE convention, and it must work with focus back in the editor, which is the
+        // whole reason it is not bound in the FIND context.
+        KeyBinding::new("cmd-f", Find, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-alt-f", Replace, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-g", FindNext, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-shift-g", FindPrev, Some(context::WORKSPACE)),
+        // Inside the bar. `enter` advances rather than confirming-and-closing: the find
+        // bar is not a modal, and every editor keeps it open so the next press advances
+        // again.
+        KeyBinding::new("escape", Cancel, Some(context::FIND)),
+        KeyBinding::new("enter", FindNext, Some(context::FIND)),
+        KeyBinding::new("shift-enter", FindPrev, Some(context::FIND)),
+        KeyBinding::new("backspace", Backspace, Some(context::FIND)),
+        // ⇥ moves between the find and replace fields, which is the only reason the bar
+        // needs two focus targets rather than two entities.
+        KeyBinding::new("tab", FocusReplaceField, Some(context::FIND)),
+        KeyBinding::new("cmd-enter", ReplaceAll, Some(context::FIND)),
+        KeyBinding::new("cmd-alt-c", ToggleCaseSensitive, Some(context::FIND)),
+        KeyBinding::new("cmd-alt-w", ToggleWholeWord, Some(context::FIND)),
+        KeyBinding::new("cmd-alt-r", ToggleRegex, Some(context::FIND)),
         //
         // Overlay
         KeyBinding::new("escape", Cancel, Some(context::PALETTE)),
@@ -239,6 +279,8 @@ pub enum Dispatch {
     ToggleTheme,
     ToggleHiddenFiles,
     OpenSettings,
+    Find,
+    Replace,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -263,6 +305,8 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "theme.toggle" => Dispatch::ToggleTheme,
         "workspace.toggle_hidden_files" => Dispatch::ToggleHiddenFiles,
         "workspace.open_settings" => Dispatch::OpenSettings,
+        "editor.find" => Dispatch::Find,
+        "editor.replace" => Dispatch::Replace,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

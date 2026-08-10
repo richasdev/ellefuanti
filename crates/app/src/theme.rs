@@ -914,6 +914,50 @@ impl Theme {
             Severity::Hint => self.hint,
         }
     }
+
+    /// Background for a search match that is not the current one (#80).
+    ///
+    /// **Derived rather than a field.** Two more `Hsla`s would mean two more lines in each
+    /// of the five variants, two more keys in `elle-theme`'s on-disk format, two more
+    /// mappings in the VS Code importer, and a default for every theme file already
+    /// written — a lot of surface for a colour that has exactly one correct answer in
+    /// terms of colours the theme already picked.
+    ///
+    /// `selected` is that answer: it is defined per variant as "one step away from the
+    /// background", light themes running darker and dark themes lighter, which is exactly
+    /// what a match highlight needs and is the reason a hardcoded tint fails. A wash that
+    /// reads on `#282c34` is invisible on `#ffffff`; `selected` is never invisible on its
+    /// own background because that is what it was chosen for.
+    pub fn search_match(&self) -> Hsla {
+        self.selected
+    }
+
+    /// Background for the *current* match — the one ⌘G is sitting on.
+    ///
+    /// `selection` rather than `accent`: the current match becomes the document selection
+    /// (`Document::select_match`), so painting it as anything else would show two
+    /// different colours for one thing. The other matches then read as "the same, but not
+    /// where you are", which is the distinction that matters.
+    pub fn current_search_match(&self) -> Hsla {
+        self.selection
+    }
+
+    /// Background for the bracket under the cursor and its partner (#87).
+    ///
+    /// #87 painted this as `theme.selection` inline. That was fine on its own and stopped
+    /// being fine the moment #80 landed: `current_search_match` is *also* `selection`, so
+    /// a bracket inside the hit ⌘G is sitting on would have been invisible against it —
+    /// and searching for something like `function foo(` puts the cursor beside a bracket
+    /// by definition, so it is a case people would hit rather than a theoretical one.
+    ///
+    /// `pressed` is the answer for the same reason `selected` was right for a match: it is
+    /// defined per variant as one step further along the ramp away from the background,
+    /// running darker on light themes and lighter on dark ones. Naming it here also means
+    /// the renderer no longer picks a theme colour by hand, which is the rule everywhere
+    /// else in this file.
+    pub fn bracket_match(&self) -> Hsla {
+        self.pressed
+    }
 }
 
 #[cfg(test)]
@@ -1201,6 +1245,43 @@ mod tests {
         for variant in ALL_VARIANTS {
             let theme = variant.build();
             assert_eq!(theme.terminal(CellColor::Ansi(200)), theme.text);
+        }
+    }
+
+    #[test]
+    fn every_theme_can_show_a_search_match() {
+        // The failure the issue names: a tint chosen against `#282c34` is invisible on
+        // `#ffffff`. Deriving both colours from per-variant values is what avoids it, and
+        // this is what keeps that true for a sixth theme nobody has written yet.
+        for variant in ALL_VARIANTS {
+            let theme = variant.build();
+            assert_ne!(
+                theme.search_match(),
+                theme.background,
+                "{} paints a match the colour of the page it sits on",
+                variant.label()
+            );
+            assert_ne!(
+                theme.current_search_match(),
+                theme.background,
+                "{} paints the current match the colour of the page it sits on",
+                variant.label()
+            );
+            assert_ne!(
+                theme.search_match(),
+                theme.current_search_match(),
+                "{} cannot show which match ⌘G is on",
+                variant.label()
+            );
+            // #87's bracket pair and #80's current match were both `selection` until the
+            // two landed together. A bracket inside the hit ⌘G is on has to stay visible,
+            // and searching for `function foo(` puts one there by definition.
+            assert_ne!(
+                theme.bracket_match(),
+                theme.current_search_match(),
+                "{} hides a bracket inside the current search match",
+                variant.label()
+            );
         }
     }
 }

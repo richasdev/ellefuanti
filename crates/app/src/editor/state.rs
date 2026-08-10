@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use elle_syntax::{Language, SyntaxTree, language_for_path};
 use elle_text::{Buffer, Point, Version};
 
+use crate::editor::find::{Matches, SearchQuery};
+
 /// What kind of run of text a character belongs to, for word motion.
 ///
 /// Three classes, not two. `$user->name` has to stop at `$user`, `->` and `name`, which
@@ -84,6 +86,43 @@ pub struct SaveSnapshot {
     pub version: Version,
 }
 
+/// Find state for one document (#80).
+///
+/// Lives beside the cursor rather than in the find bar because the *matches* are a fact
+/// about the buffer, not about the widget: they have to survive the bar losing focus, and
+/// they have to be invalidated when the text changes underneath them. A find bar owning
+/// them would have to be told about every edit.
+#[derive(Default)]
+pub struct Search {
+    pub query: SearchQuery,
+    matches: Matches,
+    /// Buffer version `matches` was computed from. A mismatch means a rescan is due, which
+    /// is what makes typing in the *document* while the find bar is open still correct.
+    version: Version,
+    /// Which match is the "current" one, for `3 of 17` and for ⌘G. `None` before the first
+    /// next/prev, so opening the bar highlights every hit without claiming one is selected.
+    current: Option<usize>,
+}
+
+impl Search {
+    pub fn matches(&self) -> &Matches {
+        &self.matches
+    }
+
+    /// The `(current, total)` a find bar shows, 1-based. `None` when there is nothing to
+    /// count — an empty query — so the bar can render nothing rather than "0 of 0".
+    pub fn position(&self) -> Option<(Option<usize>, usize)> {
+        if self.query.pattern.is_empty() {
+            return None;
+        }
+        Some((self.current.map(|index| index + 1), self.matches.len()))
+    }
+
+    pub fn current_range(&self) -> Option<Range<usize>> {
+        self.matches.get(self.current?).cloned()
+    }
+}
+
 /// One open document: text, parse state, cursor, and where it came from.
 pub struct Document {
     pub path: Option<PathBuf>,
@@ -95,6 +134,9 @@ pub struct Document {
     goal_column: Option<usize>,
     /// Whether the file had a trailing newline when loaded; preserved on save.
     pub trailing_newline: bool,
+    /// Find and replace state. Empty query means find is off, so this costs nothing until
+    /// ⌘F is pressed.
+    pub search: Search,
 }
 
 impl Document {
@@ -109,6 +151,7 @@ impl Document {
             selection: Selection::at(0),
             goal_column: None,
             trailing_newline,
+            search: Search::default(),
         })
     }
 
@@ -564,6 +607,208 @@ impl Document {
         // The block stays selected, so ⇥⇥ indents twice instead of replacing the text.
         self.replace_as_one_step(span, &out);
         self.select_rows(first, last);
+    }
+
+    // --- find and replace (#80) --------------------------------------------------------
+
+    /// Sets the find query, rescanning if it or the buffer changed.
+    ///
+    /// Called on every keystroke in the find field. The rescan is the whole cost of
+    /// search (see `editor/find.rs` for the measurement and why it is eager); the guard
+    /// below means retyping the same query, or asking again for a buffer that has not
+    /// moved, costs a comparison.
+    ///
+    /// Returns whether it actually rescanned, so a caller can repaint only then. That
+    /// return value is what lets `WorkspaceView::render` call this every frame without
+    /// notifying itself into an infinite repaint loop.
+    pub fn set_search_query(&mut self, query: SearchQuery) -> bool {
+        let unchanged = query == self.search.query && self.search.version == self.buffer.version();
+        if unchanged {
+            return false;
+        }
+        // The current match index is an index into a list that is about to be replaced.
+        // Keeping it would make "3 of 17" point at a different hit than the highlight.
+        self.search.current = None;
+        self.search.query = query;
+        self.rescan();
+        true
+    }
+
+    /// Recomputes matches if the buffer has moved since the last scan.
+    ///
+    /// Separate from [`Document::set_search_query`] so the view can call it before reading
+    /// matches for a frame: an edit invalidates the list, and a stale range painted over
+    /// edited text is a highlight in the wrong place at best and an out-of-bounds slice at
+    /// worst. Cheap when nothing changed, which is the common case.
+    pub fn refresh_search(&mut self) {
+        if self.search.version != self.buffer.version() {
+            self.rescan();
+        }
+    }
+
+    fn rescan(&mut self) {
+        self.search.matches = Matches::new(&self.buffer.text(), &self.search.query);
+        self.search.version = self.buffer.version();
+        // An edit can delete the match the user was on. Clamp rather than clear, so a
+        // replace-then-next sequence keeps its place in the list.
+        if let Some(current) = self.search.current
+            && current >= self.search.matches.len()
+        {
+            self.search.current = None;
+        }
+    }
+
+    /// Clears the query, which turns highlighting off. Called when the find bar closes.
+    pub fn clear_search(&mut self) {
+        self.search = Search::default();
+        // A fresh `Search` has version 0, which would look current for an untouched
+        // buffer and skip the first rescan after reopening. Not a problem: the query is
+        // empty, so `set_search_query` sees a *different* query and rescans anyway.
+    }
+
+    /// ⌘G / ⌘⇧G: moves the cursor to the next or previous match, wrapping.
+    ///
+    /// The match becomes the selection, which is what makes typing over it replace it and
+    /// ⌘C copy it — the behaviour every editor has, and the answer to "how does a match
+    /// interact with an existing selection": it *becomes* the selection.
+    ///
+    /// Returns whether a match was found, so the caller can say "no results" rather than
+    /// silently doing nothing.
+    pub fn select_match(&mut self, forward: bool) -> bool {
+        self.refresh_search();
+
+        // Search from the far edge of the current selection, so repeated ⌘G advances
+        // instead of re-finding the match the cursor is already sitting inside. Backwards
+        // uses the low edge for the mirror reason.
+        let selection = self.selection.range();
+        let index = if forward {
+            self.search.matches.index_at_or_after(selection.end.max(selection.start))
+        } else {
+            self.search.matches.index_before(selection.start)
+        };
+
+        let Some(index) = index else { return false };
+        let Some(range) = self.search.matches.get(index).cloned() else { return false };
+
+        self.search.current = Some(index);
+        self.select_range(range);
+        true
+    }
+
+    /// Replaces the current match, then advances to the next one.
+    ///
+    /// Advancing is what makes ⌘⌥F, replace, replace, replace a usable loop rather than
+    /// something that needs an alternating ⌘G. If nothing is current yet, the first press
+    /// selects a match instead of editing — pressing "Replace" should never edit a hit the
+    /// user has not been shown.
+    pub fn replace_current(&mut self, replacement: &str) -> bool {
+        self.refresh_search();
+        if self.search.matches.is_invalid() {
+            return false;
+        }
+
+        let Some(range) = self.search.current_range() else {
+            return self.select_match(true);
+        };
+
+        // Regex mode expands `$1` against *this* match's captures, so it cannot reuse a
+        // precomputed string. `replacements` re-runs the regex and finds the entry whose
+        // range is the one being replaced.
+        let text = self.buffer.text();
+        let replacement = if self.search.query.regex {
+            match self
+                .search
+                .matches
+                .replacements(&text, &self.search.query, replacement)
+                .into_iter()
+                .find(|(candidate, _)| *candidate == range)
+            {
+                Some((_, expanded)) => expanded,
+                None => return false,
+            }
+        } else {
+            replacement.to_string()
+        };
+
+        self.replace_as_one_step(range.clone(), &replacement);
+        self.rescan();
+
+        // Land on the match after the text just inserted, not inside it: replacing `a`
+        // with `aa` would otherwise find the replacement itself, forever.
+        let after = range.start + replacement.len();
+        self.search.current = self.search.matches.index_at_or_after(after);
+        if let Some(range) = self.search.current_range() {
+            self.select_range(range);
+        }
+        true
+    }
+
+    /// Replaces every match as **exactly one undo step**.
+    ///
+    /// One ⌘Z must undo the whole operation (#73). A loop over
+    /// [`Document::replace_current`] cannot do that, and neither can a loop over
+    /// `Buffer::replace` inside a `break_undo_group` sandwich — I wrote that version
+    /// first and the test caught it. `Buffer::replace` only coalesces when `Edit::extends`
+    /// holds, and that is deliberately true *only* for contiguous typing with nothing
+    /// deleted (`crates/text/src/edit.rs`). Twenty replacements are twenty deletions, so
+    /// they are twenty groups no matter where the breaks go.
+    ///
+    /// So this is **one** `replace` over the span from the first match to the last, with
+    /// the replacements spliced into a copy of that span — the same shape
+    /// [`Document::indent_lines`] already uses for the same reason, and it gives the
+    /// syntax tree one edit instead of N. The rewritten span is bounded by the matches,
+    /// not by the file: replacing in the last two lines of a 10 MB file rewrites two lines.
+    ///
+    /// Returns how many were replaced.
+    pub fn replace_all(&mut self, replacement: &str) -> usize {
+        self.refresh_search();
+        if self.search.matches.is_invalid() || self.search.matches.is_empty() {
+            return 0;
+        }
+
+        let text = self.buffer.text();
+        // Reverse order from `replacements`; the splice below wants them front to back.
+        let mut edits = self.search.matches.replacements(&text, &self.search.query, replacement);
+        edits.reverse();
+        let (Some(first), Some(last)) = (edits.first(), edits.last()) else { return 0 };
+
+        let span = first.0.start..last.0.end;
+        let mut spliced = String::with_capacity(span.len());
+        // Where in `text` the untouched run before the next match begins.
+        let mut cursor = span.start;
+        for (range, text_for_match) in &edits {
+            spliced.push_str(&text[cursor..range.start]);
+            spliced.push_str(text_for_match);
+            cursor = range.end;
+        }
+        // `cursor == span.end` after the loop, so there is no tail to append — the span
+        // ends at the last match by construction.
+
+        let count = edits.len();
+        // The cursor lands at the end of the *first* replacement, at the top of the
+        // affected region, rather than wherever the rewrite happened to end.
+        let cursor_target = span.start + edits[0].1.len();
+        self.replace_as_one_step(span, &spliced);
+        self.selection = Selection::at(cursor_target);
+
+        self.rescan();
+        self.search.current = None;
+        count
+    }
+
+    /// Selects `range`, for a render test seeding the find bar from a selection.
+    #[cfg(test)]
+    pub fn select_range_for_test(&mut self, range: Range<usize>) {
+        self.select_range(range);
+    }
+
+    /// Selects `range`, with the cursor at its end.
+    fn select_range(&mut self, range: Range<usize>) {
+        // `break_undo_group` for the same reason `move_to` does it: a jump ends a typing
+        // run so ⌘Z after ⌘G does not merge the two.
+        self.buffer.break_undo_group();
+        self.selection = Selection { anchor: range.start, head: range.end };
+        self.goal_column = None;
     }
 
     /// The rows the selection touches, inclusive.
@@ -2440,5 +2685,321 @@ mod tests {
         assert_eq!(d.text_for_save(), "<?php");
         assert_eq!(d.title(), "untitled");
         assert!(d.path.is_none(), "an untitled buffer must have no path, or ⌘S skips save-as");
+    }
+
+    // --- find and replace (#80) --------------------------------------------------------
+
+    fn search(d: &mut Document, pattern: &str) {
+        d.set_search_query(SearchQuery::literal(pattern));
+    }
+
+    #[test]
+    fn setting_a_query_counts_matches_without_moving_the_cursor() {
+        let mut d = doc("$user = 1;\n$user = 2;\n$other = 3;");
+        search(&mut d, "$user");
+
+        assert_eq!(d.search.position(), Some((None, 2)), "no match is current until ⌘G");
+        assert_eq!(d.selection.head, 0, "opening find must not move the cursor");
+        assert!(d.search.current_range().is_none());
+    }
+
+    #[test]
+    fn setting_the_same_query_twice_does_not_rescan() {
+        // The return value is load-bearing: `WorkspaceView::render` calls
+        // `set_search_query` every frame and notifies only when this says `true`. A
+        // version that always returned `true` would be an infinite repaint loop, which is
+        // a hang rather than a wrong pixel.
+        let mut d = doc("$user = 1;");
+        assert!(d.set_search_query(SearchQuery::literal("$user")), "the first call scans");
+        assert!(
+            !d.set_search_query(SearchQuery::literal("$user")),
+            "an identical query on an unchanged buffer must not rescan"
+        );
+        assert!(d.set_search_query(SearchQuery::literal("$other")), "a new query scans");
+
+        // An edit invalidates it even when the query is byte-identical.
+        d.insert("x");
+        assert!(
+            d.set_search_query(SearchQuery::literal("$other")),
+            "the buffer moved, so the cached matches are stale"
+        );
+    }
+
+    #[test]
+    fn an_empty_query_reports_no_position_at_all() {
+        // "0 of 0" in the find bar the instant it opens would be noise; there is nothing
+        // to count yet.
+        let mut d = doc("anything");
+        search(&mut d, "");
+        assert_eq!(d.search.position(), None);
+        assert!(d.search.matches().is_empty());
+    }
+
+    #[test]
+    fn a_query_with_no_matches_reports_zero_rather_than_nothing() {
+        // The no-match state the brief asks for: distinct from an empty query, because the
+        // bar has to say "No results" rather than stay blank.
+        let mut d = doc("alpha beta");
+        search(&mut d, "gamma");
+        assert_eq!(d.search.position(), Some((None, 0)));
+        assert!(!d.select_match(true), "next must report failure, not move the cursor");
+        assert_eq!(d.selection.head, 0);
+    }
+
+    #[test]
+    fn next_selects_the_match_and_wraps_at_the_end() {
+        let mut d = doc("a__a__a");
+        search(&mut d, "a");
+        assert_eq!(d.search.matches().len(), 3);
+
+        assert!(d.select_match(true));
+        assert_eq!(d.selection.range(), 0..1);
+        assert_eq!(d.search.position(), Some((Some(1), 3)));
+
+        assert!(d.select_match(true));
+        assert_eq!(d.selection.range(), 3..4);
+        assert!(d.select_match(true));
+        assert_eq!(d.selection.range(), 6..7);
+        assert_eq!(d.search.position(), Some((Some(3), 3)));
+
+        assert!(d.select_match(true), "the fourth press wraps");
+        assert_eq!(d.selection.range(), 0..1);
+        assert_eq!(d.search.position(), Some((Some(1), 3)));
+    }
+
+    #[test]
+    fn prev_walks_backwards_and_wraps_at_the_start() {
+        let mut d = doc("a__a__a");
+        search(&mut d, "a");
+
+        assert!(d.select_match(false), "the first ⌘⇧G from the top wraps to the last");
+        assert_eq!(d.selection.range(), 6..7);
+        assert!(d.select_match(false));
+        assert_eq!(d.selection.range(), 3..4);
+        assert!(d.select_match(false));
+        assert_eq!(d.selection.range(), 0..1);
+        assert!(d.select_match(false));
+        assert_eq!(d.selection.range(), 6..7, "and wraps again");
+    }
+
+    #[test]
+    fn next_starts_from_the_cursor_rather_than_the_top() {
+        // ⌘F with the cursor halfway down a file must find the next hit below it, not
+        // scroll back to the first one — the single most noticeable way this goes wrong.
+        let mut d = doc("needle\n\n\n\nneedle\n\n\n\nneedle");
+        d.move_to(10, false);
+        search(&mut d, "needle");
+
+        assert!(d.select_match(true));
+        assert_eq!(d.selection.range().start, 10);
+    }
+
+    #[test]
+    fn a_match_becomes_the_selection_and_replaces_an_existing_one() {
+        // How a match interacts with a selection: it *is* the new selection, discarding
+        // whatever was selected before, so ⌘C after ⌘G copies the hit.
+        let mut d = doc("alpha needle omega");
+        d.selection = Selection { anchor: 0, head: 5 };
+        search(&mut d, "needle");
+        d.select_match(true);
+
+        assert_eq!(d.selection.range(), 6..12);
+        assert_eq!(d.selected_text().as_deref(), Some("needle"));
+    }
+
+    #[test]
+    fn matches_survive_an_edit_by_rescanning() {
+        let mut d = doc("one two one");
+        search(&mut d, "one");
+        assert_eq!(d.search.matches().len(), 2);
+
+        // Typing in the *document* while the find bar is open. A stale list here would
+        // paint a highlight over bytes that have moved.
+        d.move_to(0, false);
+        d.insert("one ");
+        d.refresh_search();
+        assert_eq!(d.search.matches().len(), 3);
+        assert_eq!(d.search.matches().all()[0], 0..3);
+    }
+
+    #[test]
+    fn a_multibyte_match_selects_whole_characters() {
+        // The panic this rules out: a selection boundary mid-codepoint. `Buffer::slice`
+        // rounds, so a wrong offset shows up as the wrong *text* rather than a crash —
+        // which is worse, because it is silent.
+        let mut d = doc("função ação função");
+        search(&mut d, "ção");
+        assert_eq!(d.search.matches().len(), 3);
+
+        d.select_match(true);
+        assert_eq!(d.selected_text().as_deref(), Some("ção"));
+        d.select_match(true);
+        assert_eq!(d.selected_text().as_deref(), Some("ção"));
+        // `função ` is 8 bytes (ç and ã are two each), so the second `ção` starts at 10 —
+        // a char-offset implementation would say 8.
+        assert_eq!(d.selection.range(), 10..15, "byte offsets, not char offsets");
+    }
+
+    #[test]
+    fn replacing_a_multibyte_match_keeps_the_rest_of_the_text_intact() {
+        let mut d = doc("função ação");
+        search(&mut d, "ção");
+        assert_eq!(d.replace_all("cao"), 2);
+        assert_eq!(d.buffer.text(), "funcao acao");
+    }
+
+    #[test]
+    fn replace_current_edits_only_the_current_match_and_advances() {
+        let mut d = doc("cat cat cat");
+        search(&mut d, "cat");
+        d.select_match(true);
+
+        assert!(d.replace_current("dog"));
+        assert_eq!(d.buffer.text(), "dog cat cat");
+        assert_eq!(d.selection.range(), 4..7, "and the next match is now selected");
+
+        assert!(d.replace_current("dog"));
+        assert_eq!(d.buffer.text(), "dog dog cat");
+    }
+
+    #[test]
+    fn replace_with_nothing_current_selects_instead_of_editing() {
+        // Pressing Replace before ever pressing Next must not silently edit a hit the
+        // user has not been shown.
+        let mut d = doc("cat cat");
+        search(&mut d, "cat");
+        assert!(d.replace_current("dog"));
+        assert_eq!(d.buffer.text(), "cat cat", "nothing was replaced");
+        assert_eq!(d.selection.range(), 0..3, "the first match is now current");
+    }
+
+    #[test]
+    fn replacing_a_match_with_text_containing_it_terminates() {
+        // The infinite-loop shape: replacing `a` with `aa` and then searching forward
+        // from the *start* of the edit would find the replacement itself, forever.
+        let mut d = doc("a a");
+        search(&mut d, "a");
+        d.select_match(true);
+        d.replace_current("aa");
+        assert_eq!(d.buffer.text(), "aa a");
+        assert_eq!(d.selection.range(), 3..4, "the cursor moved past what it just wrote");
+    }
+
+    #[test]
+    fn replace_all_replaces_every_match() {
+        let mut d = doc("$user = $user + $user;");
+        search(&mut d, "$user");
+        assert_eq!(d.replace_all("$account"), 3);
+        assert_eq!(d.buffer.text(), "$account = $account + $account;");
+        assert_eq!(d.search.position(), Some((None, 0)), "the old matches are gone");
+    }
+
+    #[test]
+    fn replace_all_is_one_undo_step() {
+        // #73's rule, and the one the brief singles out: twenty replacements must not take
+        // twenty ⌘Z. Twenty, not three, because a coalescing bug that merges pairs would
+        // pass at three and fail in real use.
+        let mut d = doc(&"cat\n".repeat(20));
+        search(&mut d, "cat");
+        assert_eq!(d.replace_all("dog"), 20);
+        assert_eq!(d.buffer.text(), "dog\n".repeat(20));
+
+        d.undo();
+        assert_eq!(d.buffer.text(), "cat\n".repeat(20), "one ⌘Z restored all twenty");
+
+        d.undo();
+        assert_eq!(d.buffer.text(), "cat\n".repeat(20), "and nothing else was on the stack");
+    }
+
+    #[test]
+    fn replace_all_does_not_swallow_the_edit_before_it() {
+        // The other direction of the same guard: an edit made just before replace-all is
+        // its own step and must survive the undo that reverses the replacement.
+        let mut d = doc("cat cat");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert("!");
+        search(&mut d, "cat");
+        assert_eq!(d.replace_all("dog"), 2);
+        assert_eq!(d.buffer.text(), "dog dog!");
+
+        d.undo();
+        assert_eq!(d.buffer.text(), "cat cat!", "the replacement undid on its own");
+        d.undo();
+        assert_eq!(d.buffer.text(), "cat cat", "and the typing is a separate step");
+    }
+
+    #[test]
+    fn replace_all_with_text_of_a_different_length_lands_on_the_right_bytes() {
+        // The bug reverse ordering exists to prevent: applying front to back without
+        // rebasing shifts every later edit by the accumulated length delta.
+        let mut d = doc("a b a b a");
+        search(&mut d, "a");
+        assert_eq!(d.replace_all("LONGER"), 3);
+        assert_eq!(d.buffer.text(), "LONGER b LONGER b LONGER");
+    }
+
+    #[test]
+    fn replace_all_on_no_matches_changes_nothing() {
+        let mut d = doc("alpha");
+        search(&mut d, "zzz");
+        assert_eq!(d.replace_all("beta"), 0);
+        assert_eq!(d.buffer.text(), "alpha");
+        assert!(!d.buffer.is_dirty(), "a no-op replace must not dirty the buffer");
+    }
+
+    #[test]
+    fn a_whole_word_query_skips_substrings() {
+        let mut d = doc("user username $user");
+        d.set_search_query(SearchQuery { whole_word: true, ..SearchQuery::literal("user") });
+        assert_eq!(d.search.matches().len(), 2);
+        assert_eq!(d.replace_all("member"), 2);
+        assert_eq!(d.buffer.text(), "member username $member");
+    }
+
+    #[test]
+    fn a_case_sensitive_query_replaces_only_the_exact_case() {
+        let mut d = doc("User user USER");
+        d.set_search_query(SearchQuery { case_sensitive: true, ..SearchQuery::literal("user") });
+        assert_eq!(d.replace_all("member"), 1);
+        assert_eq!(d.buffer.text(), "User member USER");
+    }
+
+    #[test]
+    fn a_regex_replacement_can_reorder_capture_groups() {
+        let mut d = doc("$a = 1;\n$b = 2;");
+        d.set_search_query(SearchQuery {
+            regex: true,
+            ..SearchQuery::literal(r"\$(\w+) = (\d+);")
+        });
+        assert_eq!(d.replace_all("$$$1 === $2;"), 2);
+        assert_eq!(d.buffer.text(), "$a === 1;\n$b === 2;");
+    }
+
+    #[test]
+    fn an_invalid_regex_refuses_to_replace() {
+        // Mid-typing, `[a-` is what the pattern looks like. Replace-all must be a no-op
+        // rather than matching nothing and silently reporting success.
+        let mut d = doc("abc");
+        d.set_search_query(SearchQuery { regex: true, ..SearchQuery::literal("[a-") });
+        assert!(d.search.matches().is_invalid());
+        assert_eq!(d.replace_all("x"), 0);
+        assert!(!d.replace_current("x"));
+        assert_eq!(d.buffer.text(), "abc");
+    }
+
+    #[test]
+    fn clearing_the_search_turns_highlighting_off() {
+        let mut d = doc("cat cat");
+        search(&mut d, "cat");
+        assert_eq!(d.search.matches().len(), 2);
+
+        d.clear_search();
+        assert!(d.search.matches().is_empty());
+        assert_eq!(d.search.position(), None);
+
+        // And reopening with the same query works: the reset version must not make the
+        // rescan look unnecessary.
+        search(&mut d, "cat");
+        assert_eq!(d.search.matches().len(), 2);
     }
 }
