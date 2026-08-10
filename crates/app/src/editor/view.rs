@@ -972,12 +972,16 @@ fn styled_line(
 ) -> Line {
     let (text, highlights) =
         line_runs(line, line_start, spans, diagnostics, brackets, matches, theme);
+    // Guides come from the line's own indent, so they are computed here and painted by the
+    // element — not folded into the runs above, which is what made them blocks (#108).
+    let guides = indent_guide_columns(&text).into_iter().map(|range| range.start).collect();
     Line::new(
         text.clone(),
         to_runs(&text, &highlights, theme, fonts),
         fonts.size,
         fonts.line_height(),
     )
+    .with_guides(guides, theme.indent_guide)
 }
 
 /// Turns the sparse `(range, style)` list into the contiguous runs `shape_line` needs.
@@ -1154,13 +1158,14 @@ fn line_runs(
     // *does* span a line's own indent, and a guide pushed on top of it would be a second
     // run over the same bytes, which gpui paints unpredictably. Losing a guide inside a
     // comment is invisible; an overlapping run is not.
+    // Indent guides are *not* here. They were a character background, which is a block one
+    // character wide — the grey rectangles reported twice (#108). They vanished when rows
+    // moved to a painted element (#110) because this path stopped being drawn at all, and
+    // came back the moment `paint_background` was restored for the cursor (#111).
+    //
+    // They are now quads drawn by `Line`, one pixel wide, which is what the feature has
+    // always meant and what Zed does (`element.rs:5126`, width clamped to 1..=10, default 1).
     let mut decorations: Vec<(Range<usize>, GpuiHighlight)> = Vec::new();
-    for range in indent_guide_columns(&text) {
-        decorations.push((
-            range,
-            GpuiHighlight { background_color: Some(theme.indent_guide), ..Default::default() },
-        ));
-    }
 
     // `line`, not `text`: the padding space a cursor at end-of-line adds is not the file's
     // trailing whitespace, and tinting it would mark every line the cursor rests on.
@@ -1719,8 +1724,13 @@ mod tests {
         let theme = Theme::dark();
         // Eight spaces then code: guides at columns 0 and 4, and *not* at 8, which is the
         // first code character.
-        let (_, runs) = line_runs("        return $x;", 0, &[], &theme);
-        assert_eq!(backgrounds(&runs, theme.indent_guide), vec![0..1, 4..5]);
+        //
+        // Asserted against `indent_guide_columns` rather than through the runs a line
+        // produces: guides are painted as quads by `Line` now, not folded into the colour
+        // runs (#108), so a run-based assertion would test a path they no longer take.
+        let _ = &theme;
+        let columns: Vec<_> = indent_guide_columns("        return $x;");
+        assert_eq!(columns, vec![0..1, 4..5]);
     }
 
     #[test]
@@ -1766,15 +1776,17 @@ mod tests {
         // Guides are computed from leading ASCII whitespace only, so a line whose *code*
         // is accented still produces boundary-safe ranges. Asserting it because a guide
         // range landing mid-codepoint would make StyledText debug-assert.
-        let theme = Theme::dark();
         let line = "    $m = 'ação';";
-        let (text, runs) = line_runs(line, 0, &[], &theme);
+        let columns = indent_guide_columns(line);
 
-        assert_eq!(backgrounds(&runs, theme.indent_guide), vec![0..1]);
-        for (range, _) in &runs {
+        assert_eq!(columns, vec![0..1]);
+        // The real hazard, unchanged by the move to quads: `Line::paint` calls
+        // `x_for_index`, which panics on an index inside a codepoint just as StyledText
+        // debug-asserted before it.
+        for range in &columns {
             assert!(
-                text.is_char_boundary(range.start) && text.is_char_boundary(range.end),
-                "run {range:?} splits a codepoint in {text:?}"
+                line.is_char_boundary(range.start) && line.is_char_boundary(range.end),
+                "guide {range:?} splits a codepoint in {line:?}"
             );
         }
     }
