@@ -42,6 +42,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   about them; a non-`file:` URI is refused rather than guessed at, because opening the wrong
   file is worse than opening none (#81)
 
+- **Find and replace in a file (#80).** ⌘F opens a find bar, ⌘⌥F opens it with the replace
+  row. Incremental as you type, with a live count (`3 of 17`), ⌘G / ⌘⇧G or ↵ / ⇧↵ to walk
+  the matches with wrap-around at both ends, and case-sensitive, whole-word and regex
+  toggles. Replace one, or replace all. ⌘F with text selected seeds the query from the
+  selection; escape closes the bar, clears the highlights and puts focus back in the text
+  **without closing the tab**. The bar has its own key context (`Find`) precisely so escape
+  there cannot reach anything else.
+
+  **Replace-all is one undo step**, which is the part that took two attempts. The obvious
+  implementation — a loop over `Buffer::replace` inside a `break_undo_group` sandwich —
+  does not work, and the test caught it: `Buffer::replace` coalesces only when
+  `Edit::extends` holds, and that is deliberately true just for contiguous typing with
+  nothing deleted. Twenty replacements are twenty deletions and therefore twenty groups no
+  matter where the breaks go. It is now **one** `replace` over the span from the first
+  match to the last, with the replacements spliced in — the same shape `indent_lines`
+  already uses, and the syntax tree sees one edit instead of N.
+
+  **Match highlighting composes with syntax colours rather than replacing them.** A match
+  paints a background and the token underneath keeps its foreground, so searching for
+  `return` does not turn every keyword the colour of a hit — the same discipline the
+  diagnostic underlines follow, and `merge_underline` was generalised to `merge_over` so
+  both use one run-splitting implementation. The current match is a different colour from
+  the rest, both derived from per-variant theme values rather than added as fields, because
+  a tint chosen against `#282c34` is invisible on `#ffffff` and `selected`/`selection`
+  already solve exactly that problem in all five themes.
+
+  **The performance shape is stated rather than assumed.** Matches are computed once per
+  (query, buffer version) over the whole file — the count is a whole-file fact and ⌘G that
+  stops at the bottom of the viewport is not ⌘G — but the **per-frame** cost still tracks
+  the viewport: `Matches::in_range` is two binary searches over a sorted list, pinned by
+  `match_lookup_cost_does_not_grow_with_file_size`, the search counterpart to #52's
+  `viewport_cost_does_not_grow_with_file_size`. The rescan itself was measured, not
+  guessed: **1.8 ms** for a 50k-line file with a hit on every line, 2.4 ms for the same
+  with a regex, 235 µs with no hits (the cost tracks the _hit count_, not the file size).
+  That fits inside a 8.3 ms frame and only fires on a keystroke in the find field — but it
+  is a fifth of the budget, so `benchmarks/BASELINE.md` says so plainly instead of claiming
+  search is free. Past `MAX_SEARCH_BYTES` (4 MB, derived from that table) the bar says
+  "File too large to search" rather than dropping frames silently.
+
+  `regex` is now a direct dependency. It is not a new one in any meaningful sense — it was
+  already compiled for every build through `gpui` (via `gpui_util`) and `tree-sitter`, so
+  declaring it costs no build time and adds nothing to the supply chain. The alternative
+  was hand-rolling Unicode-aware case folding and word boundaries, which are the two rules
+  most likely to be subtly wrong, to avoid a crate that was already linked in.
+
+  **Find in project (⌘⇧F) is not in this change.** It is the expensive one, it wants the
+  `crates/index` walk, `CancelFlag` and streaming results the issue describes, and it
+  deserves its own PR built on what this one learned. The Search entry in the activity bar
+  stays disabled until then.
 
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —
@@ -97,7 +146,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   which had been added on the assumption gpui resolves the CSS generic — measured, it comes
   back _proportional_, i.e. an entry that would have failed the check it existed to satisfy
   (#49)
-
 
 - A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
   startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`

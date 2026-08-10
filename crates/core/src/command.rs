@@ -143,6 +143,12 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("editor.new_file", "New File"),
     Command::new("editor.save", "Save File"),
     Command::new("editor.close", "Close Tab"),
+    // #80. Both are also chords (⌘F / ⌘⌥F) and both are here anyway, unlike the #73
+    // motions: find is a thing people look for by name in a new editor, and the Edit menu
+    // is where they look. `editor.find_in_project` is deliberately absent — it does not
+    // exist yet, and a palette row for it would be a lie.
+    Command::new("editor.find", "Find…"),
+    Command::new("editor.replace", "Replace…"),
     Command::new("palette.toggle", "Command Palette"),
     Command::new("palette.quick_open", "Quick Open File"),
     Command::new("laravel.routes", "Go to Route…"),

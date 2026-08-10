@@ -210,6 +210,61 @@ it by dropping the `fsync`; that trades a user's file for milliseconds they neve
 
 ---
 
+## Find in file — measured out of tree (#80)
+
+Recorded 2026-08-10. Not a `cargo bench` target: the search lives in `crates/app`, which is
+a **binary** crate, so `elle-benchmarks` cannot import it. The numbers below come from a
+standalone release binary reproducing `Matches::new` exactly — `Rope::to_string`, then the
+same `Regex::new("(?im)…")` and `find_iter` the real code runs. Medians of 60 runs on
+Laravel-shaped PHP, Apple Silicon.
+
+The claim under test: **a rescan on every keystroke in the find field fits inside a frame.**
+
+| file             | query                             |      total | of which scan |
+| ---------------- | --------------------------------- | ---------: | ------------: |
+| 33 KB / 1k lines | `$user` — a hit on every line     |     120 µs |        106 µs |
+| 349 KB / 10k     | `$user` — a hit on every line     |     389 µs |        334 µs |
+| 1.8 MB / 50k     | `$user` — a hit on every line     | **1.8 ms** |       1.64 ms |
+| 1.8 MB / 50k     | `zzz` — no hits                   |     235 µs |        148 µs |
+| 1.8 MB / 50k     | `\$user\d+` regex, hit every line | **2.4 ms** |       2.22 ms |
+
+**Verdict: it fits, with less headroom than expected.** The 50k-line worst case is a fifth
+of the 8.3 ms frame budget, on the UI thread, once per keystroke _in the find field_.
+Typing in the document itself is unaffected — the rescan there is guarded by a buffer
+version comparison. But "search is free" would be false, and the next change that makes it
+slower should re-measure rather than assume the room is there.
+
+**The cost tracks the hit count, not the file size.** The same 1.8 MB file with no matches
+costs 235 µs, 7.5× less. That is the shape of `find_iter` doing work per match, not per
+byte, and it is why the pathological case is a one-character query on a large file
+(1.1 ms) rather than a large file as such.
+
+Two components measured separately because the total disagreed with the parts at 1k lines,
+which is the disagreement this file's opening section says to chase:
+
+- `Rope::to_string` on 1.8 MB: **74 µs**. Real, not dominant.
+- `Regex::new`: **33 µs** literal, **58 µs** for a real pattern. Also real, also not
+  dominant — but it is a third of the whole cost at 1k lines, which is why caching the
+  compiled regex is named in `editor/find.rs` as the first optimisation if one is needed.
+- Dropping the `Regex` and the `String`: **~1 µs**. Not the #27 teardown trap again.
+
+At 50k lines the parts add up (74 + 1640 + 35 ≈ 1749 against a 1756 total), so the
+measurement is coherent where it matters. At 1k lines they did not, and the gap is
+allocation noise at a scale where the whole operation is 120 µs — small enough that
+chasing it further would be optimising against a number rather than a user.
+
+`MAX_SEARCH_BYTES` (4 MB) is derived from this table, not chosen for roundness: ~1 ms per
+megabyte of hit-dense text puts 4 MB at about half a frame, and past that the find bar says
+"File too large to search" rather than dropping frames silently.
+
+**Per-frame cost is separate and is _not_ in this table**, because it is asserted
+structurally instead: `Matches::in_range` is two binary searches over a sorted list, pinned
+by `match_lookup_cost_does_not_grow_with_file_size` in `crates/app/src/editor/find.rs` —
+the search counterpart to `viewport_cost_does_not_grow_with_file_size` in `crates/syntax`.
+A wall-clock assertion there would be a flaky test that teaches nothing when it fails.
+
+---
+
 ## Application — measured with `ELLE_PERF=1`
 
 Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefuanti`).

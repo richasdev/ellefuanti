@@ -3,6 +3,7 @@
 mod actions;
 mod editor;
 mod file_cache;
+mod find_bar;
 mod fonts;
 mod icons;
 mod lsp_session;

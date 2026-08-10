@@ -52,6 +52,13 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-bash = "0.25"
 tree-sitter-yaml = "0.7"
 ignore = "0.4"
+# Find and replace (#80). Not a new dependency in any meaningful sense: `regex` is already
+# compiled for every build via `gpui` (through `gpui_util`) and `tree-sitter`, both direct
+# dependencies of `crates/app`, so declaring it costs zero build time and adds nothing to
+# the supply chain. Writing a literal scanner by hand would have meant hand-rolling
+# case-insensitive Unicode matching and word boundaries — the two rules most likely to be
+# subtly wrong — to avoid a crate that is already linked in.
+regex = "1"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 lsp-types = "0.97"

@@ -15,13 +15,14 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, DecreaseFontSize, Dispatch, FindReferences, GoToDefinition, GoToRoute, GoToSymbol,
-    IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
-    OpenSettings, ResetFontSize, Save, ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen,
-    ToggleTerminal, ToggleTheme, context, dispatch_for,
+    CloseTab, DecreaseFontSize, Dispatch, Find, FindNext, FindPrev, FindReferences, GoToDefinition,
+    GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal,
+    OpenFolder, OpenSettings, Replace, ResetFontSize, Save, ToggleCommandPalette,
+    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
 };
 use crate::editor::{Document, EditorEvent, EditorView};
 use crate::file_cache;
+use crate::find_bar::{FindBar, FindEvent, Status};
 use crate::fonts::Fonts;
 use crate::icons;
 use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
@@ -291,6 +292,12 @@ pub struct WorkspaceView {
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
+    /// The find/replace bar (#80). `Some` only while it is open.
+    ///
+    /// One bar for the window rather than one per tab, which is what VS Code does and
+    /// what keeps ⌘F from resurrecting a stale query when you switch tabs. Switching tabs
+    /// re-applies the query to the newly active document rather than closing the bar.
+    find: Option<Entity<FindBar>>,
     /// The bottom terminal panel. `Some` only while it is open — a panel that is closed is
     /// absent, not hidden, so its poll timer and its shells stop existing with it.
     terminal: Option<Entity<TerminalView>>,
@@ -334,6 +341,7 @@ impl WorkspaceView {
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
+            find: None,
             terminal: None,
             status: None,
             jobs: Jobs::default(),
@@ -484,6 +492,27 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn toggle_theme_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_theme(&ToggleTheme, window, cx);
+    }
+
+    /// ⌘F / ⌘⌥F through the real handler (#80).
+    #[cfg(test)]
+    pub fn find_for_test(&mut self, replacing: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if replacing {
+            self.replace(&Replace, window, cx);
+        } else {
+            self.find(&Find, window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn find_bar_for_test(&self) -> Option<Entity<FindBar>> {
+        self.find.clone()
+    }
+
+    /// Escape, through the real handler.
+    #[cfg(test)]
+    pub fn dismiss_find_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_find(window, cx);
     }
 
     /// Publishes diagnostics as if a server had sent them, and pushes them to the editors.
@@ -865,6 +894,172 @@ impl WorkspaceView {
             // Opening the panel already creates a session, so this is the same path.
             None => self.toggle_terminal(&ToggleTerminal, window, cx),
         }
+    }
+
+    // --- find and replace (#80) ----------------------------------------------------
+
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(false, window, cx);
+    }
+
+    fn replace(&mut self, _: &Replace, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(true, window, cx);
+    }
+
+    /// ⌘F / ⌘⌥F. Opens the bar, or **refocuses** one already open.
+    ///
+    /// Refocusing rather than reopening is the constraint from the issue, and it is not
+    /// just a nicety: ⌘F with the bar already open and a query typed must not throw the
+    /// query away. ⌘⌥F on a find-only bar additionally reveals the replace row.
+    fn open_find(&mut self, replacing: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing to search. Opening a bar over the empty-state placeholder would be a
+        // control that cannot do anything.
+        if self.active_editor().is_none() {
+            return;
+        }
+
+        if let Some(bar) = self.find.clone() {
+            bar.update(cx, |bar, cx| bar.reopen(replacing, cx));
+            window.focus(&bar.read(cx).focus_handle(cx));
+            self.apply_search(cx);
+            cx.notify();
+            return;
+        }
+
+        let bar = cx.new(|cx| FindBar::new(replacing, cx));
+
+        // Seed from the selection, the way every editor does — but only a single-line one.
+        if let Some(editor) = self.active_editor()
+            && let Some(text) = editor.read(cx).document.selected_text()
+        {
+            bar.update(cx, |bar, _cx| bar.seed(&text));
+        }
+
+        cx.subscribe_in(&bar, window, |this, _bar, event, window, cx| match event {
+            FindEvent::QueryChanged => this.apply_search(cx),
+            FindEvent::Navigate { forward } => this.navigate_match(*forward, cx),
+            FindEvent::ReplaceOne => this.replace_one(cx),
+            FindEvent::ReplaceAll => this.replace_all(cx),
+            FindEvent::Dismissed => this.dismiss_find(window, cx),
+        })
+        .detach();
+
+        window.focus(&bar.read(cx).focus_handle(cx));
+        self.find = Some(bar);
+        // Apply immediately: a seeded query must highlight before the user types anything.
+        self.apply_search(cx);
+        cx.notify();
+    }
+
+    /// Pushes the bar's query into the active document and pulls the count back out.
+    ///
+    /// The document owns the matches (`Document::search`) and the bar owns the query, so
+    /// this is the one place the two meet. Called on every keystroke in the find field —
+    /// which is where the search cost lands, and why `editor/find.rs` documents it — and
+    /// once per render, so a tab switch re-searches the file now on screen.
+    ///
+    /// **Notifies only when something changed.** That is load-bearing rather than tidy:
+    /// `Render` calls this, and an unconditional `cx.notify()` from inside a render is an
+    /// infinite repaint loop.
+    fn apply_search(&mut self, cx: &mut Context<Self>) {
+        let Some(bar) = self.find.clone() else { return };
+        let Some(editor) = self.active_editor().cloned() else { return };
+
+        let query = bar.read(cx).query().clone();
+        let status = editor.update(cx, |editor, cx| {
+            if editor.document.set_search_query(query) {
+                cx.notify();
+            }
+            search_status(&editor.document)
+        });
+        bar.update(cx, |bar, cx| bar.set_status(status, cx));
+    }
+
+    fn navigate_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        editor.update(cx, |editor, cx| {
+            editor.select_match(forward, cx);
+        });
+        self.refresh_find_status(cx);
+    }
+
+    fn replace_one(&mut self, cx: &mut Context<Self>) {
+        let (Some(bar), Some(editor)) = (self.find.clone(), self.active_editor().cloned()) else {
+            return;
+        };
+        let replacement = bar.read(cx).replacement().to_string();
+        editor.update(cx, |editor, cx| {
+            editor.document.replace_current(&replacement);
+            cx.notify();
+        });
+        self.refresh_find_status(cx);
+    }
+
+    fn replace_all(&mut self, cx: &mut Context<Self>) {
+        let (Some(bar), Some(editor)) = (self.find.clone(), self.active_editor().cloned()) else {
+            return;
+        };
+        let replacement = bar.read(cx).replacement().to_string();
+        let count = editor.update(cx, |editor, cx| {
+            let count = editor.document.replace_all(&replacement);
+            cx.notify();
+            count
+        });
+        // A count in the status bar rather than a dialog: replace-all is undoable in one
+        // step, so the only thing the user needs is confirmation that it happened.
+        self.status = Some(match count {
+            0 => "Nothing to replace".into(),
+            1 => "Replaced 1 occurrence".into(),
+            count => format!("Replaced {count} occurrences").into(),
+        });
+        self.refresh_find_status(cx);
+        cx.notify();
+    }
+
+    /// Re-reads the count from the document after something moved.
+    fn refresh_find_status(&mut self, cx: &mut Context<Self>) {
+        let (Some(bar), Some(editor)) = (self.find.clone(), self.active_editor().cloned()) else {
+            return;
+        };
+        let status = editor.update(cx, |editor, _cx| search_status(&editor.document));
+        bar.update(cx, |bar, cx| bar.set_status(status, cx));
+    }
+
+    /// Escape: closes the bar, clears the highlights, and returns focus to the editor.
+    ///
+    /// Explicitly **not** a tab close. `escape` is bound in the `Find` context only, so it
+    /// cannot reach anything else while the bar has focus, and the editor gets focus back
+    /// rather than the workspace root — pressing escape and then typing must insert text.
+    ///
+    /// Clearing the query is a choice, and it costs macOS's "⌘G still works after escape".
+    /// The alternative costs more: matches highlighted across a file with no visible
+    /// control explaining why, and no way to clear them short of searching for something
+    /// else. VS Code clears; so does this.
+    fn dismiss_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        if let Some(editor) = self.active_editor().cloned() {
+            editor.update(cx, |editor, cx| {
+                editor.document.clear_search();
+                cx.notify();
+            });
+            window.focus(&editor.read(cx).focus_handle(cx));
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// ⌘G / ⌘⇧G, from anywhere in the workspace.
+    ///
+    /// Workspace-scoped so it works with focus back in the editor — ⌘F, type, click into
+    /// the text, ⌘G is the common loop. A no-op with no query set, which is the state
+    /// after escape.
+    fn find_next(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_match(true, cx);
+    }
+
+    fn find_prev(&mut self, _: &FindPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_match(false, cx);
     }
 
     // --- palette -----------------------------------------------------------------
@@ -1722,6 +1917,8 @@ impl WorkspaceView {
                         self.toggle_hidden_files(&ToggleHiddenFiles, window, cx)
                     }
                     Dispatch::OpenSettings => self.open_settings(&OpenSettings, window, cx),
+                    Dispatch::Find => self.find(&Find, window, cx),
+                    Dispatch::Replace => self.replace(&Replace, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -1763,6 +1960,25 @@ fn lsp_label(lsp: &Lsp) -> String {
     }
 }
 
+/// What the find bar's count area should say for `document`.
+///
+/// A free function so the mapping from document state to bar state — the part with the
+/// three-way distinction between "no query", "no results" and "bad pattern" in it — is
+/// testable without a window.
+fn search_status(document: &Document) -> Status {
+    let matches = document.search.matches();
+    if matches.is_too_large() {
+        return Status::TooLarge;
+    }
+    if matches.is_invalid() {
+        return Status::InvalidRegex;
+    }
+    match document.search.position() {
+        None => Status::Empty,
+        Some((current, total)) => Status::Counted { current, total },
+    }
+}
+
 /// Which tab is active after the one at `closed` is removed, leaving `remaining` tabs.
 ///
 /// Closing a tab *before* the active one shifts every later tab down by one, so keeping
@@ -1801,6 +2017,23 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.frames.tick();
 
+        // Re-apply the find query to whichever document is active (#80).
+        //
+        // Switching tabs with the bar open has to search the *new* file, and `active_tab`
+        // is assigned from six places — a tab click, a quick-open confirm, a close, two
+        // open paths. Hooking all six means an `activate_tab` helper and six call sites
+        // rewritten, which is a restructure this change does not need and a conflict with
+        // #81, which is editing the same file.
+        //
+        // Doing it here instead is safe because it is idempotent and *version-guarded*:
+        // `Document::set_search_query` returns immediately unless the query or the buffer
+        // version moved, so the steady state is one comparison. It only costs a scan on
+        // the frame where the active document genuinely changed, which is the frame that
+        // needs one. `frames.tick()` already establishes that this render does work.
+        if self.find.is_some() {
+            self.apply_search(cx);
+        }
+
         let theme = cx.theme().clone();
         window.set_window_title(&self.title(cx));
 
@@ -1813,6 +2046,10 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::replace))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_prev))
             .on_action(cx.listener(Self::go_to_route))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
@@ -1848,6 +2085,11 @@ impl Render for WorkspaceView {
                             .flex_1()
                             .overflow_hidden()
                             .child(self.render_tab_bar(&theme, cx))
+                            // Between the tabs and the text, which is where every editor
+                            // puts it — and in the flow rather than absolutely positioned
+                            // like the palette, so it *pushes* the text down instead of
+                            // covering the first two lines of the file being searched.
+                            .children(self.find.clone())
                             .child(self.render_editor_area(&theme))
                             // Below the editor and inside its column, so the sidebar keeps
                             // its full height — the layout every other IDE uses.

@@ -1722,6 +1722,7 @@ dependencies = [
  "elle-theme",
  "elle-workspace",
  "gpui",
+ "regex",
  "tempfile",
  "tracing",
  "tracing-subscriber",

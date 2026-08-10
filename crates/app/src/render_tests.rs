@@ -40,6 +40,7 @@ use elle_core::{BUILTIN_COMMANDS, CommandRegistry};
 use gpui::{TestAppContext, VisualTestContext, px, size};
 
 use crate::editor::{Document, EditorView};
+use crate::find_bar::{FindEvent, Status};
 use crate::fonts::Fonts;
 use crate::palette::{Palette, PaletteMode};
 use crate::theme::{Metrics, ThemeVariant, Themed, set_theme};
@@ -468,5 +469,238 @@ async fn an_editor_with_diagnostics_renders(cx: &mut TestAppContext) {
         );
     });
 
+    draw(cx);
+}
+
+// --- find and replace (#80) ---------------------------------------------------------
+//
+// The same boundary applies as everywhere else in this file: these prove the bar builds,
+// lays out and paints inside the real workspace, and that the wiring between the bar and
+// the document is connected. They do **not** prove the bar looks right, or that a match
+// highlight lands on the correct pixels — that is #35.
+
+/// Opens a workspace with one PHP document, the fixture every find test below wants.
+fn workspace_with_php<'a>(
+    cx: &'a mut TestAppContext,
+    text: &str,
+) -> (gpui::Entity<WorkspaceView>, &'a mut VisualTestContext) {
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    let text = text.to_string();
+    workspace.update(cx, |workspace, cx| {
+        let document = Document::new(Some(std::path::PathBuf::from("User.php")), &text, true)
+            .expect("php grammar loads");
+        workspace.open_document_for_test(document, cx);
+    });
+    (workspace, cx)
+}
+
+#[gpui::test]
+async fn the_find_bar_renders_and_highlights_matches(cx: &mut TestAppContext) {
+    let (workspace, cx) =
+        workspace_with_php(cx, "<?php\n$user = 1;\n$user = 2;\n$other = $user;\n");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+    });
+
+    let bar = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("⌘F opens the bar");
+
+    bar.update(cx, |bar, cx| bar.type_query_for_test("$user", cx));
+
+    // The matches reached the document, which is what the highlight reads from.
+    workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace.active_editor_for_test().expect("a tab is open");
+        assert_eq!(editor.read(cx).document.search.matches().len(), 3);
+    });
+    bar.read_with(cx, |bar, _cx| {
+        assert_eq!(bar.status_for_test(), Status::Counted { current: None, total: 3 });
+    });
+
+    // And the whole thing paints, in both themes, with the highlights live.
+    draw(cx);
+}
+
+#[gpui::test]
+async fn the_replace_row_renders_and_replace_all_edits_the_buffer(cx: &mut TestAppContext) {
+    let (workspace, cx) = workspace_with_php(cx, "<?php\n$a = 1;\n$a = 2;\n");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(true, window, cx);
+    });
+    let bar = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("⌘⌥F opens the bar");
+
+    bar.update(cx, |bar, cx| {
+        bar.set_replacement_for_test("$b");
+        bar.type_query_for_test("$a", cx);
+    });
+    draw(cx);
+
+    bar.update(cx, |_bar, cx| cx.emit(FindEvent::ReplaceAll));
+
+    workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace.active_editor_for_test().expect("a tab is open");
+        assert_eq!(editor.read(cx).document.buffer.text(), "<?php\n$b = 1;\n$b = 2;\n");
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn reopening_find_keeps_the_query_and_escape_clears_it(cx: &mut TestAppContext) {
+    // The two constraints the issue spells out: ⌘F while open refocuses rather than
+    // reopening, and escape dismisses the bar without closing the tab.
+    let (workspace, cx) = workspace_with_php(cx, "<?php\n$user = 1;\n");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+    });
+    let bar = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("the bar opened");
+    bar.update(cx, |bar, cx| bar.type_query_for_test("$user", cx));
+
+    // ⌘F again: same entity, same query, and now with the replace row after ⌘⌥F.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+        workspace.find_for_test(true, window, cx);
+    });
+    let again = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("the bar is still open");
+    assert_eq!(again.entity_id(), bar.entity_id(), "⌘F must refocus, not build a second bar");
+    again.read_with(cx, |bar, _cx| {
+        assert_eq!(bar.query().pattern, "$user", "the typed query survived");
+        assert!(bar.replacing, "⌘⌥F revealed the replace row on the open bar");
+    });
+    draw(cx);
+
+    // Escape: the bar goes, the tab stays, and the highlights clear.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.dismiss_find_for_test(window, cx);
+    });
+    workspace.read_with(cx, |workspace, cx| {
+        assert!(workspace.find_bar_for_test().is_none(), "escape closed the bar");
+        let editor = workspace.active_editor_for_test().expect("escape must not close the tab");
+        assert!(editor.read(cx).document.search.matches().is_empty(), "highlights cleared");
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn find_seeds_from_the_selection_and_navigates(cx: &mut TestAppContext) {
+    let (workspace, cx) = workspace_with_php(cx, "<?php\n$user = 1;\n$user = 2;\n");
+
+    // Select `$user` on line 2, the way a double-click would.
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a tab is open");
+    editor.update(cx, |editor, _cx| {
+        editor.document.select_range_for_test(6..11);
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+    });
+    let bar = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("the bar opened");
+    bar.read_with(cx, |bar, _cx| {
+        assert_eq!(bar.query().pattern, "$user", "seeded from selection");
+    });
+
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(editor.document.search.matches().len(), 2, "the seed searched immediately");
+    });
+
+    // ⌘G walks to the second, and the count follows.
+    bar.update(cx, |_bar, cx| cx.emit(FindEvent::Navigate { forward: true }));
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(editor.document.selection.range(), 17..22, "the second match is selected");
+    });
+    bar.read_with(cx, |bar, _cx| {
+        assert_eq!(bar.status_for_test(), Status::Counted { current: Some(2), total: 2 });
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn find_renders_over_multibyte_text(cx: &mut TestAppContext) {
+    // The accented corpus this repo already uses elsewhere. A match boundary landing
+    // mid-codepoint is a debug-build panic during paint, so this is the test that would
+    // actually catch it — the unit tests catch the offsets, this catches the paint.
+    let (workspace, cx) = workspace_with_php(cx, "<?php\n$ação = 'não';\n$função = $ação;\n");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+    });
+    let bar = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("the bar opened");
+    bar.update(cx, |bar, cx| bar.type_query_for_test("ção", cx));
+
+    workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace.active_editor_for_test().expect("a tab is open");
+        assert_eq!(editor.read(cx).document.search.matches().len(), 3);
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn switching_tabs_with_the_bar_open_searches_the_new_file(cx: &mut TestAppContext) {
+    // The bar belongs to the window, not the tab, so the query has to follow the user to
+    // whatever file is now on screen. `apply_search` runs from `render` for exactly this,
+    // and painting twice here is also what would hang if that call notified unconditionally.
+    let (workspace, cx) = workspace_with_php(cx, "<?php\n$user = 1;\n");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+    });
+    let bar = workspace
+        .read_with(cx, |workspace, _cx| workspace.find_bar_for_test())
+        .expect("the bar opened");
+    bar.update(cx, |bar, cx| bar.type_query_for_test("$user", cx));
+    draw(cx);
+
+    // A second tab, with three hits instead of one.
+    workspace.update(cx, |workspace, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("Post.php")),
+            "<?php\n$user = 1;\n$user = 2;\n$user = 3;\n",
+            true,
+        )
+        .expect("php grammar loads");
+        workspace.open_document_for_test(document, cx);
+    });
+    draw(cx);
+
+    workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace.active_editor_for_test().expect("the new tab is active");
+        assert_eq!(
+            editor.read(cx).document.search.matches().len(),
+            3,
+            "the query followed the user to the newly active file"
+        );
+    });
+}
+
+#[gpui::test]
+async fn find_on_an_empty_workspace_does_nothing(cx: &mut TestAppContext) {
+    // No tab means nothing to search; opening a bar over the empty-state hint would be a
+    // control that cannot do anything.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_for_test(false, window, cx);
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.find_bar_for_test().is_none(), "⌘F with no tab must not open a bar");
+    });
     draw(cx);
 }
