@@ -407,6 +407,112 @@ fn references_forwards_the_include_declaration_flag() {
 }
 
 #[test]
+fn every_request_has_a_deferred_variant_reaching_the_same_method() {
+    // The `request_*` pair must not drift from its blocking twin: same method, same
+    // params. Sending the deferred form to a different method — or without the
+    // position the blocking one computes — is the failure this pins down.
+    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+        "textDocument/hover" => Reply::Result(json!({ "contents": "x" })),
+        "textDocument/signatureHelp" => Reply::Result(json!({ "signatures": [] })),
+        _ => Reply::Result(json!([])),
+    });
+
+    client.did_open(uri(), "php", "<?php\n$x = 1;\n").unwrap();
+
+    let hover = client.request_hover(&uri(), 6).unwrap();
+    let definition = client.request_definition(&uri(), 6).unwrap();
+    let references = client.request_references(&uri(), 6, true).unwrap();
+    let symbols = client.request_document_symbols(&uri()).unwrap();
+    let signature = client.request_signature_help(&uri(), 6).unwrap();
+
+    let wait = Duration::from_secs(5);
+    assert!(client.await_response::<lsp_types::Hover>(&hover, wait).unwrap().is_some());
+    assert!(
+        client
+            .await_response::<lsp_types::GotoDefinitionResponse>(&definition, wait)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        client.await_response::<Vec<lsp_types::Location>>(&references, wait).unwrap().is_some()
+    );
+    assert!(
+        client
+            .await_response::<lsp_types::DocumentSymbolResponse>(&symbols, wait)
+            .unwrap()
+            .is_some()
+    );
+    assert!(client.await_response::<lsp_types::SignatureHelp>(&signature, wait).unwrap().is_some());
+
+    // Every deferred request carried the position its blocking twin would have sent:
+    // line 1, character 0 for byte offset 6 of "<?php\n$x = 1;\n".
+    let position = json!({ "line": 1, "character": 0 });
+    for method in [
+        "textDocument/hover",
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/signatureHelp",
+    ] {
+        let params = server.params_for(method);
+        assert_eq!(params.len(), 1, "{method} should have been sent exactly once");
+        assert_eq!(params[0]["position"], position, "{method} sent the wrong position");
+        assert_eq!(params[0]["textDocument"]["uri"], json!(uri().as_str()));
+    }
+
+    // documentSymbol is the one request with no position at all.
+    let symbol_params = server.params_for("textDocument/documentSymbol");
+    assert_eq!(symbol_params.len(), 1);
+    assert!(symbol_params[0].get("position").is_none(), "documentSymbol takes no position");
+    assert_eq!(
+        server.params_for("textDocument/references")[0]["context"]["includeDeclaration"],
+        json!(true)
+    );
+}
+
+#[test]
+fn a_deferred_request_can_be_cancelled_like_a_completion() {
+    // The reason the deferred variants exist. References is the slowest request a
+    // server serves, so abandoning it must end the local wait at once rather than
+    // holding the caller until the timeout.
+    let (mut client, _server) = open_client(full_capabilities(), |_, _| Reply::Silence);
+    client.did_open(uri(), "php", "<?php\n").unwrap();
+
+    let id = client.request_references(&uri(), 6, true).unwrap();
+    client.cancel(&id);
+
+    let started = std::time::Instant::now();
+    let result: Option<Vec<lsp_types::Location>> =
+        client.await_response(&id, Duration::from_secs(30)).unwrap();
+
+    assert!(result.is_none(), "a cancelled request yields no answer");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cancelling must not wait for the timeout; took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_deferred_request_against_an_unopened_document_is_an_error() {
+    // The check has to happen before the request goes out, otherwise the caller gets a
+    // RequestId for something the server will answer about a file it does not have.
+    // `document_symbols` is the interesting case: it sends no position, so nothing
+    // else in its path would have noticed the document was missing.
+    let (client, _server) = open_client(full_capabilities(), |_, _| Reply::Silence);
+
+    for err in [
+        client.request_hover(&uri(), 0).unwrap_err().to_string(),
+        client.request_definition(&uri(), 0).unwrap_err().to_string(),
+        client.request_references(&uri(), 0, true).unwrap_err().to_string(),
+        client.request_signature_help(&uri(), 0).unwrap_err().to_string(),
+        client.request_document_symbols(&uri()).unwrap_err().to_string(),
+        client.document_symbols(&uri()).unwrap_err().to_string(),
+    ] {
+        assert!(err.contains("not open"), "{err}");
+    }
+}
+
+#[test]
 fn a_null_result_is_no_answer_rather_than_an_error() {
     // Hover over whitespace legitimately replies null; surfacing that as an error
     // would put a failure message on screen every time the cursor moved.
