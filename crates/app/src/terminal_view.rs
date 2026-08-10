@@ -79,6 +79,11 @@ pub struct TerminalView {
     /// The close prompt's task. Held so dropping the view cancels it (ADR-0007), and so a
     /// second ⌘W replaces the first dialog rather than stacking two over one terminal.
     close_prompt: Option<Task<()>>,
+    /// How many repaint timers have been spawned, for the test that #97's split does not
+    /// add one. Counted rather than inferred from `poll`, which being an `Option` cannot
+    /// distinguish "reused the timer" from "replaced it with a new one".
+    #[cfg(test)]
+    polls_started: usize,
 }
 
 impl TerminalView {
@@ -95,6 +100,8 @@ impl TerminalView {
             grid_origin: None,
             split: None,
             close_prompt: None,
+            #[cfg(test)]
+            polls_started: 0,
         }
     }
 
@@ -116,6 +123,24 @@ impl TerminalView {
     #[cfg(test)]
     pub fn split_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.split_terminal(&SplitTerminal, window, cx);
+    }
+
+    /// Whether the repaint timer is running.
+    #[cfg(test)]
+    pub fn is_polling_for_test(&self) -> bool {
+        self.poll.is_some()
+    }
+
+    /// How many timer tasks have been spawned over this view's life.
+    ///
+    /// A *count*, not `poll.is_some()`. The field is an `Option`, so asking whether it is
+    /// set can only ever answer "one" and a test built on it passes even if `ensure_polling`
+    /// spawns a fresh timer on every call — verified by making that mutation and watching
+    /// the `is_some` version stay green. The cost this guards is the spawn itself, so the
+    /// spawn is what gets counted.
+    #[cfg(test)]
+    pub fn polls_started_for_test(&self) -> usize {
+        self.polls_started
     }
 
     /// Opens a session running a named program, so a test does not depend on the login
@@ -277,6 +302,11 @@ impl TerminalView {
     fn ensure_polling(&mut self, cx: &mut Context<Self>) {
         if self.poll.is_some() {
             return;
+        }
+
+        #[cfg(test)]
+        {
+            self.polls_started += 1;
         }
 
         self.poll = Some(cx.spawn(async move |this, cx| {

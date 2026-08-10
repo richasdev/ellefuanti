@@ -962,3 +962,53 @@ async fn splitting_an_empty_panel_opens_a_single_session(cx: &mut TestAppContext
 
     draw(cx);
 }
+
+/// The perf constraint from #97: two terminals must not mean two timers.
+///
+/// The panel drives repaints from a 16ms poll, and the idle-CPU gate sits at 2% over gpui's
+/// own ~0.5-0.9% display-link floor (#93) — so a timer per pane would be a real, measurable
+/// regression rather than a theoretical one.
+///
+/// It counts timer *spawns* rather than checking `poll.is_some()`. The field is an
+/// `Option`, so "is it set" can only ever answer one, and that version of this test passes
+/// even with `ensure_polling`'s early return deleted — I made that mutation and watched it
+/// stay green before rewriting it this way. The cost being guarded is the spawn, so the
+/// spawn is what is counted.
+///
+/// Honest about its limit: this pins the *invariant*, not a CPU number. Measuring the real
+/// idle cost of a split panel needs the app on a screen with keystrokes driven into it, and
+/// keystroke injection is denied in this environment — so the wall-clock figure stays on
+/// #35's human list alongside the rest of the geometry.
+#[gpui::test]
+async fn splitting_does_not_start_a_second_timer(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (terminal, cx) = cx.add_window_view(|_window, cx| TerminalView::new(cx));
+
+    terminal.update(cx, |terminal, cx| terminal.open_shell_for_test("cat", cx));
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.polls_started_for_test(), 1, "one session starts one timer");
+    });
+
+    terminal.update_in(cx, |terminal, window, cx| terminal.split_for_test(window, cx));
+
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.session_count(), 2, "the split spawned a second shell");
+        assert!(terminal.is_split());
+        assert_eq!(
+            terminal.polls_started_for_test(),
+            1,
+            "a split must reuse the existing timer, not start a second"
+        );
+    });
+
+    // Closing back down to nothing stops it, rather than leaving a timer behind for a panel
+    // with no sessions.
+    terminal.update(cx, |terminal, cx| {
+        terminal.close_active(cx);
+        terminal.close_active(cx);
+    });
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.session_count(), 0);
+        assert!(!terminal.is_polling_for_test(), "an empty panel must not keep polling");
+    });
+}
