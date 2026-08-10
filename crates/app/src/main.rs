@@ -4,6 +4,7 @@ mod actions;
 mod editor;
 mod file_cache;
 mod icons;
+mod lsp_session;
 mod palette;
 mod perf;
 #[cfg(test)]

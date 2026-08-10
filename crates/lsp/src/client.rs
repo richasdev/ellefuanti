@@ -311,6 +311,34 @@ impl Client {
         )
     }
 
+    /// Replaces the server's copy of a document with `text`.
+    ///
+    /// The resync path, for a caller that has the new text but not the edit that produced
+    /// it. [`Client::did_change`] is the better call whenever an `Edit` is in hand — it
+    /// sends only what changed — but a caller reading the buffer after the fact does not
+    /// have one, and inventing a diff to look incremental would be a second chance to
+    /// diverge from the server's copy for no bandwidth that matters at PHP file sizes.
+    ///
+    /// Ignores the server's declared [`SyncKind`] deliberately: a full replacement is
+    /// valid for a server that asked for incremental changes, where the reverse is not.
+    pub fn did_change_full(&mut self, uri: &Uri, text: &str) -> Result<()> {
+        let Some(document) = self.documents.iter_mut().find(|d| &d.uri == uri) else {
+            tracing::debug!(uri = uri.as_str(), "ignoring a resync of an untracked document");
+            return Ok(());
+        };
+
+        let changes = document.reset(text);
+        let params = DidChangeTextDocumentParams {
+            text_document: document.versioned_identifier(),
+            content_changes: changes,
+        };
+
+        self.connection.notify(
+            lsp_types::notification::DidChangeTextDocument::METHOD,
+            serde_json::to_value(params)?,
+        )
+    }
+
     pub fn did_close(&mut self, uri: &Uri) -> Result<()> {
         let Some(position) = self.documents.iter().position(|d| &d.uri == uri) else {
             return Ok(());

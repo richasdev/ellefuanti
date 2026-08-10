@@ -709,6 +709,46 @@ fn diagnostics_notifications_become_events() {
     let _ = handle.join();
 }
 
+/// #43, and it was never the timing flake it was filed as.
+///
+/// `Shared` had one `Condvar` guarding two mutexes. `wait` blocks on `pending`, and
+/// `wait_for_events` blocks on `inbox`; a client that handshakes and then listens — which
+/// is every client that wants diagnostics — waits on both with the same condvar. Rust's
+/// std detects that and aborts the thread with "attempted to use a condition variable
+/// with two mutexes". The waiter panicked holding `inbox`, poisoning it, and the reader
+/// thread then died on `inbox.lock().unwrap()` at connection.rs:371 — the poisoned-mutex
+/// panic in the issue. The `unwrap` was the messenger.
+///
+/// It looked load-dependent only because the test above it happened to be the one that
+/// waited on `pending` first; alone, `diagnostics_notifications_become_events` timed out
+/// silently at 5s instead. This test does both waits in one client, in order, so the
+/// panic is deterministic rather than a matter of which test ran first.
+#[test]
+fn waiting_for_a_reply_and_then_for_a_push_does_not_panic() {
+    let (mut client, mut server) = open_client(full_capabilities(), |method, _| {
+        if method == "textDocument/hover" {
+            return Reply::Result(json!({ "contents": "hi" }));
+        }
+        Reply::Silence
+    });
+
+    // `Client::connect` already waited on `pending` once, for `initialize`. Wait on it
+    // again explicitly so the ordering is stated rather than inherited from the harness.
+    client.did_open(uri(), "php", "<?php\n").ok();
+    let _ = client.hover(&uri(), 0);
+
+    // And now wait on `inbox`. Before the fix this is where the process died.
+    let events = client.wait_for_events(Duration::from_millis(200));
+
+    // Nothing was pushed, so an empty result is the right answer. Surviving to assert it
+    // is the whole point.
+    assert!(events.is_empty(), "the mock pushes nothing: {events:?}");
+    assert!(client.is_alive(), "the reader thread must still be running");
+
+    drop(client);
+    server.join();
+}
+
 // --- fault isolation (§24) ---------------------------------------------------------------
 
 #[test]
