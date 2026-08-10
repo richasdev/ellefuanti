@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
-use elle_lsp::lsp_types::{DocumentSymbolResponse, GotoDefinitionResponse, Location, Uri};
+use elle_lsp::lsp_types::{
+    CompletionResponse, DocumentSymbolResponse, GotoDefinitionResponse, Location, Uri,
+};
 use elle_test_runner::CancelFlag as TestCancelFlag;
 use elle_text::Point;
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
@@ -16,11 +18,15 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext, FindPrev,
-    FindReferences, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack,
-    NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace, RerunFailedTests,
-    ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette, ToggleHiddenFiles,
-    ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context, dispatch_for,
+    CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
+    FindPrev, FindReferences, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize,
+    NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
+    RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
+    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
+    dispatch_for,
+};
+use crate::completion::{
+    CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, word_before,
 };
 use crate::editor::{Document, EditorEvent, EditorView, search_project};
 use crate::file_cache;
@@ -117,6 +123,12 @@ enum Job {
     /// Starting a second run *does* supersede the first, which is what the slot is for: two
     /// concurrent suites would fight over the same database and report interleaved results.
     TestRun,
+    /// Waiting for a completion the language server is computing (#61).
+    ///
+    /// Its own slot rather than `LspQuery`'s, for the reason `completion_query` documents:
+    /// completion supersedes *completion*, and sharing would make a keystroke in the popup
+    /// cancel a find-references sweep the user is still waiting on.
+    Completion,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -481,13 +493,29 @@ pub struct WorkspaceView {
     /// for nothing. A `Subscription` dropped is a subscription cancelled, so holding it
     /// here is also what keeps the observer alive for exactly as long as the workspace.
     window_activation: Option<gpui::Subscription>,
-    /// Byte range the route-name palette will overwrite when confirmed (#83).
+    /// The completion popup, while one is open (#61).
+    completion: Option<Entity<CompletionPopup>>,
+    /// The buffer offset the open popup will overwrite from, when an item is accepted.
     ///
-    /// Held here rather than recomputed on confirm because the buffer is the thing being
-    /// written to: recomputing would re-read a document the user may have edited while the
-    /// palette was open, and write the name over whatever is at that offset *now*.
-    /// Staleness is still possible and is checked at the point of the edit.
-    completion_target: Option<std::ops::Range<usize>>,
+    /// What gets replaced is `word_start..cursor`, so this is the *start of the word*, not
+    /// the cursor: typing narrows the list and moves the cursor, and the accepted item has
+    /// to overwrite everything typed since the popup opened rather than being appended to
+    /// it — otherwise typing `str` and accepting `strlen` produces `strstrlen`.
+    ///
+    /// Held rather than recomputed on accept because the buffer is the thing being written
+    /// to, and recomputing would re-read a document that may have moved underneath. It is
+    /// still re-validated at the point of the edit, since holding it does not make it true.
+    completion_word_start: Option<usize>,
+    /// The completion request currently in flight, so the next keystroke can cancel it.
+    ///
+    /// **A separate slot from [`Self::in_flight_query`] deliberately.** That one is shared
+    /// by definition, references and symbols because those genuinely supersede each other —
+    /// they are all "answer a question about the cursor" and a new one means the old answer
+    /// is unwanted. Completion is not one of those: pressing ⌃space while a
+    /// find-references sweep runs must not abandon the sweep, and typing a character while
+    /// the popup is open must cancel the *previous completion* and nothing else. Sharing the
+    /// slot would have made every keystroke in the popup cancel an unrelated navigation.
+    completion_query: Option<elle_lsp::RequestId>,
 }
 
 impl WorkspaceView {
@@ -523,7 +551,9 @@ impl WorkspaceView {
             git_cancel: None,
             git_diff: None,
             window_activation: None,
-            completion_target: None,
+            completion: None,
+            completion_word_start: None,
+            completion_query: None,
         }
     }
 
@@ -811,6 +841,69 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn toggle_terminal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_terminal(&ToggleTerminal, window, cx);
+    }
+
+    /// ⌃space, through the real action handler, for the same reason (#61).
+    #[cfg(test)]
+    pub fn complete_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.complete(&Complete, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn completion_for_test(&self) -> Option<Entity<CompletionPopup>> {
+        self.completion.clone()
+    }
+
+    /// A character typed while the popup holds focus, through the real path.
+    #[cfg(test)]
+    pub fn completion_typed_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.completion_typed(text, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn accept_completion_for_test(
+        &mut self,
+        item: CompletionItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.accept_completion(item, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn dismiss_completion_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_completion(window, cx);
+    }
+
+    /// The status-bar message, which for a missing language server must stay `None` (#74).
+    #[cfg(test)]
+    pub fn status_for_test(&self) -> Option<SharedString> {
+        self.status.clone()
+    }
+
+    /// Feeds the popup items as though a source had answered.
+    ///
+    /// The sources themselves are asynchronous and one of them is a language server, so a
+    /// test that wanted real items would be testing Intelephense. What is worth pinning here
+    /// is everything *after* the answer arrives — filtering, selection, and the insertion
+    /// that a wrong replace-range would corrupt.
+    #[cfg(test)]
+    pub fn offer_completions_for_test(
+        &mut self,
+        items: Vec<CompletionItem>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popup) = self.completion.clone() {
+            popup.update(cx, |popup, cx| {
+                popup.add_items(items, cx);
+                popup.mark_loaded(cx);
+            });
+        }
     }
 
     #[cfg(test)]
@@ -1962,18 +2055,358 @@ impl WorkspaceView {
         self.toggle_palette(PaletteMode::Routes, window, cx);
     }
 
-    /// ⌃space: complete a Laravel route name, or do nothing (#83).
+    /// ⌃space: open the completion popup at the cursor (#61).
     ///
-    /// Silence outside a `route('…')` is deliberate. There is no general completion in this
-    /// editor yet, so the alternative is an empty palette that says "No matches" about a
-    /// question the user did not ask.
+    /// Both sources are asked, and each answers about a different thing: Laravel knows route
+    /// names inside a `route('…')` and nothing else, the language server knows identifiers
+    /// and knows nothing about a string literal. They rarely both have something to say, and
+    /// when they do the list shows both with their badges — which is the whole point of
+    /// carrying the source in the item.
+    ///
+    /// Silent with no tab, and silent with no server: the popup opens for whatever answered,
+    /// and if nothing answered it closes itself rather than sitting there saying "No
+    /// completions" about a question the user's setup cannot answer (#74, §24).
+    fn complete(&mut self, _: &Complete, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_completion(window, cx);
+    }
+
+    /// The `laravel.route_name` palette command (#83), now opening the popup.
+    ///
+    /// Kept as its own entry point because the command row exists and people may have
+    /// learned it; it is no longer bound to a key, since ⌃space is now the general
+    /// completion this command was standing in for.
     fn complete_laravel(
         &mut self,
         _: &CompleteLaravel,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.complete_route_name(window, cx);
+        self.open_completion(window, cx);
+    }
+
+    // --- completion (#61) ---------------------------------------------------------------
+
+    /// Opens the popup at the cursor and asks every source.
+    ///
+    /// The order here is load-bearing. The popup is created *first*, with whatever is
+    /// synchronously available, because both sources are asynchronous and a popup that
+    /// appears only once the server answers is a popup that appears after the user has
+    /// typed three more characters. It fills in as answers land.
+    fn open_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A second ⌃space with the popup already open re-asks rather than toggling: the
+        // list is not a panel being shown, it is an answer about a position, and pressing
+        // the key again means "I have typed since you asked".
+        self.dismiss_completion(window, cx);
+
+        let Some(editor) = self.active_editor().cloned() else { return };
+
+        let (word_start, prefix, offset) = {
+            let document = &editor.read(cx).document;
+            let offset = document.selection.head;
+            let text = document.buffer.text();
+            let prefix = word_before(&text, offset).to_string();
+            (offset - prefix.len(), prefix, offset)
+        };
+
+        let Some(origin) = self.completion_origin(&editor, window, cx) else { return };
+
+        let popup = cx.new(|cx| CompletionPopup::new(Vec::new(), prefix, origin, cx));
+        cx.subscribe_in(&popup, window, |this, _popup, event, window, cx| match event {
+            CompletionEvent::Accepted(item) => this.accept_completion(item.clone(), window, cx),
+            CompletionEvent::Dismissed => this.dismiss_completion(window, cx),
+            CompletionEvent::Typed(text) => this.completion_typed(text, window, cx),
+            CompletionEvent::Backspaced => this.completion_backspace(window, cx),
+        })
+        .detach();
+
+        // Focus moves to the popup, which is what activates its key context and therefore
+        // what makes `up`/`down` reach the list. Typing is forwarded back to the editor by
+        // `completion_typed`, so the buffer still receives every character.
+        window.focus(&popup.read(cx).focus_handle(cx));
+        self.completion = Some(popup.clone());
+        self.completion_word_start = Some(word_start);
+
+        self.request_route_completions(popup.clone(), cx);
+        self.request_lsp_completions(popup, offset, cx);
+        cx.notify();
+    }
+
+    /// Where on screen the popup goes, in window coordinates.
+    ///
+    /// The cursor position arrives already window-absolute, because the editor *measured*
+    /// it from a laid-out row rather than adding up the chrome above itself. That is the
+    /// whole reason there is no tab-bar or find-bar height in this function: the find bar's
+    /// height varies with whether it is showing a replace field, and a constant here would
+    /// be the same class of bug `text_origin_x` was introduced to fix.
+    fn completion_origin(
+        &self,
+        editor: &Entity<EditorView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Point<gpui::Pixels>> {
+        let fonts = Fonts::get(cx);
+        let cursor = editor.read(cx).cursor_position(window, cx)?;
+
+        // Placed for a full-height list up front rather than re-placed as items arrive: a
+        // popup that jumps from below the cursor to above it when the server answers is
+        // worse than one that occasionally sits higher than it needed to.
+        Some(crate::completion::place(
+            cursor,
+            fonts.line_height(),
+            crate::completion::popup_height(crate::completion::MAX_VISIBLE_ROWS),
+            window.viewport_size(),
+        ))
+    }
+
+    /// Asks Laravel for route names, when the cursor is inside a `route('…')`.
+    ///
+    /// Nothing at all otherwise, which is the same rule #83 established: route names are an
+    /// answer to "what goes in this string literal", and offering them anywhere else would
+    /// put a hundred irrelevant rows above the identifier the user is actually typing.
+    ///
+    /// Only the names that were statically readable, which `route_names` already enforces.
+    /// **An incomplete list is the acceptable failure here** (#83) and the reason completion
+    /// is the feature rather than a diagnostic: a route registered by a service provider is
+    /// missing from this list, and the user types it themselves. The same gap expressed as
+    /// "this route does not exist" would be a false claim about working code (RISKS.md #4).
+    /// The `route` badge is what keeps that honest at the point the user reads the list.
+    ///
+    /// Shares `Job::RouteIndex` with the route palette: both parse the same files for the
+    /// same reason, and only one of the two can be open at a time.
+    fn request_route_completions(
+        &mut self,
+        popup: Entity<CompletionPopup>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(path) = tab.path.clone() else { return };
+        let Some(blade) = laravel_dialect(&path) else { return };
+
+        let document = &tab.editor.read(cx).document;
+        let source = document.buffer.text();
+        let offset = document.selection.head;
+
+        let Some(reference) = elle_laravel::reference_at(&source, offset, blade) else { return };
+        if reference.kind != elle_laravel::ReferenceKind::Route {
+            return;
+        }
+        // The literal's own range, so accepting replaces the whole name rather than
+        // appending to the half already typed inside the quotes.
+        self.completion_word_start = Some(reference.range.start);
+
+        let task = cx.spawn(async move |_this, cx| {
+            let names = cx.background_spawn(async move { elle_laravel::route_names(&root) }).await;
+            let items = names
+                .into_iter()
+                // The source is named at construction, which is the only place it can be
+                // known for certain — these came from a route file, and nothing downstream
+                // has to infer it from the shape of the string.
+                .map(|name| CompletionItem::new(name, CompletionSource::LaravelRoute))
+                .collect();
+            popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
+    }
+
+    /// Asks the language server, without blocking, and cancels whatever it supersedes.
+    ///
+    /// This is the first caller of `request_completion` (#45), which has existed uncalled
+    /// since it was written. The non-blocking variant is what #61 asks for: the request is
+    /// issued, its id is kept, and the *next* keystroke sends `$/cancelRequest` for it
+    /// before issuing its own. Nothing queues.
+    fn request_lsp_completions(
+        &mut self,
+        popup: Entity<CompletionPopup>,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) {
+        // No server is the common case and stays silent — the popup shows whatever Laravel
+        // found, or closes. It must not say "no language server" (#74).
+        let Some((uri, _)) = self.navigation_origin(cx) else {
+            popup.update(cx, |popup, cx| popup.mark_loaded(cx));
+            return;
+        };
+        let Some(client) = self.lsp.client_mut() else {
+            popup.update(cx, |popup, cx| popup.mark_loaded(cx));
+            return;
+        };
+
+        let id = match client.request_completion(&uri, offset) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for completions: {err:#}");
+                popup.update(cx, |popup, cx| popup.mark_loaded(cx));
+                return;
+            }
+        };
+
+        let query = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let found = Self::poll_query::<CompletionResponse>(&this, &query, cx).await;
+            this.update(cx, |this, _| this.completion_query = None).ok();
+
+            let items = match found {
+                Ok(Some(response)) => completion_items(response),
+                // No answer is an ordinary outcome — a keyword, a comment, a position the
+                // server has nothing for. The popup simply has no LSP rows.
+                Ok(None) => Vec::new(),
+                Err(err) => {
+                    tracing::debug!("completion request failed: {err:#}");
+                    Vec::new()
+                }
+            };
+
+            popup
+                .update(cx, |popup, cx| {
+                    popup.add_items(items, cx);
+                    popup.mark_loaded(cx);
+                })
+                .ok();
+        });
+
+        self.cancel_completion_query();
+        self.completion_query = Some(id);
+        self.jobs.start(Job::Completion, task);
+    }
+
+    /// Tells the server to stop computing a completion nobody will read.
+    ///
+    /// The two halves ADR-0007 asks for, and the reason this is not just a dropped task:
+    /// dropping stops *us waiting*, `$/cancelRequest` stops the *server working* and
+    /// reclaims the pending slot the abandoned request would otherwise hold for the life of
+    /// the process. At typing speed this fires on every keystroke.
+    fn cancel_completion_query(&mut self) {
+        let Some(id) = self.completion_query.take() else { return };
+        if let Some(client) = self.lsp.client_mut() {
+            client.cancel(&id);
+        }
+    }
+
+    /// A character typed while the popup has focus: insert it, and narrow the list.
+    ///
+    /// Both, and in that order. The popup holding focus must not mean the buffer stops
+    /// receiving text — that would make ⌃space a modal state where typing is swallowed,
+    /// which is the failure the palette-based stopgap had and the reason a popup was worth
+    /// building.
+    fn completion_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        editor.update(cx, |editor, cx| editor.insert_typed(text, cx));
+
+        let Some(popup) = self.completion.clone() else { return };
+        // Nothing matches any more: the user has typed past the list, so it closes rather
+        // than following them down the line as an empty box.
+        let still_matching = popup.update(cx, |popup, cx| popup.push_query(text, cx));
+        if !still_matching {
+            self.dismiss_completion(window, cx);
+            return;
+        }
+
+        // A request still in flight was asked about the offset *before* this character. Its
+        // answer is for a position that no longer exists, and the narrowed list is already
+        // on screen — so it is dropped rather than allowed to land and repopulate the popup
+        // with items for the wrong prefix.
+        //
+        // This is the "typing quickly must drop in-flight work rather than queue it" half of
+        // #20, and it is what makes the cancellation real rather than nominal: without it,
+        // fast typing leaves one `$/cancelRequest`-less request per keystroke on the server.
+        self.supersede_completion_query();
+    }
+
+    /// Backspace while the popup has focus: delete, and widen the list.
+    ///
+    /// Backspacing past the point the popup opened at closes it — at that point the user is
+    /// no longer editing the word the list is about.
+    fn completion_backspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        editor.update(cx, |editor, cx| editor.backspace_typed(cx));
+
+        let Some(popup) = self.completion.clone() else { return };
+        let still_open = popup.update(cx, |popup, cx| popup.pop_query(cx));
+        if !still_open {
+            self.dismiss_completion(window, cx);
+            return;
+        }
+        // Same reasoning as typing: the cursor moved, so an in-flight answer is about a
+        // position that no longer exists.
+        self.supersede_completion_query();
+    }
+
+    /// Drops a completion request whose answer is no longer wanted, without closing the
+    /// popup.
+    ///
+    /// Distinct from [`Self::cancel_completion_query`] only in intent, and that is worth a
+    /// name: this one is called *while the popup stays open*, when the list on screen is
+    /// already the better answer. Both halves ADR-0007 asks for still happen — the task is
+    /// dropped so nothing awaits the answer, and `$/cancelRequest` tells the server to stop
+    /// computing it and reclaims its pending slot.
+    fn supersede_completion_query(&mut self) {
+        if self.completion_query.is_none() {
+            return;
+        }
+        self.cancel_completion_query();
+        self.jobs.cancel(Job::Completion);
+    }
+
+    /// Writes the accepted item over the word the popup was opened on.
+    ///
+    /// The replaced range is `word_start..cursor`, so everything typed while the list was
+    /// narrowing is overwritten rather than appended to — typing `str` then accepting
+    /// `strlen` must not produce `strstrlen`.
+    ///
+    /// Selecting the range and inserting over it, rather than splicing the buffer, so the
+    /// edit joins the undo history the way #83's insertion does: ⌘Z after a completion
+    /// undoes exactly the completion.
+    fn accept_completion(
+        &mut self,
+        item: CompletionItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = self.completion_word_start;
+        // Taken before dismissing, which clears it — the same ordering trap #83 documents.
+        self.dismiss_completion(window, cx);
+
+        let Some(start) = start else { return };
+        let Some(editor) = self.active_editor().cloned() else { return };
+
+        editor.update(cx, |editor, cx| {
+            let document = &mut editor.document;
+            let end = document.selection.head;
+            // Re-validated against the buffer as it is *now*. An async reload can move
+            // offsets under an open popup, and writing an identifier into the middle of
+            // unrelated code is far worse than a completion that declines to fire.
+            if start > end || end > document.buffer.len_bytes() {
+                return;
+            }
+            document.move_to(start, false);
+            document.move_to(end, true);
+            document.insert(&item.insert);
+            cx.notify();
+        });
+    }
+
+    /// Closes the popup, returning focus to the editor and stopping the server's work.
+    fn dismiss_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing open: not even the focus move, which would steal focus from whatever
+        // has it — this is called unconditionally from paths that may have no popup.
+        if self.completion.take().is_none() {
+            return;
+        }
+        self.completion_word_start = None;
+        // The answer has nowhere to go now, so the server must stop computing it.
+        self.cancel_completion_query();
+        self.jobs.cancel(Job::Completion);
+
+        // Focus goes back to the *editor*, not to the workspace: the user was mid-edit and
+        // escape must leave them where they were typing. This is the difference from the
+        // palette, whose escape returns to the workspace.
+        if let Some(editor) = self.active_editor().cloned() {
+            window.focus(&editor.read(cx).focus_handle(cx));
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
     }
 
     /// Opens settings.json in a tab — #60 built the file, so ⌘, edits it as text.
@@ -2014,7 +2447,6 @@ impl WorkspaceView {
             // Everything else arrives asynchronously — the palette opens empty and fills in.
             PaletteMode::Files
             | PaletteMode::Routes
-            | PaletteMode::RouteNames
             | PaletteMode::Symbols
             | PaletteMode::References => Vec::new(),
         };
@@ -2036,7 +2468,6 @@ impl WorkspaceView {
         match mode {
             PaletteMode::Files => self.load_quick_open_items(palette, cx),
             PaletteMode::Routes => self.load_route_items(palette, cx),
-            PaletteMode::RouteNames => self.load_route_name_items(palette, cx),
             PaletteMode::Symbols => self.load_symbol_items(palette, cx),
             // References are filled by the request that opened the palette, not from here:
             // the offset they are about is the cursor position at the moment the user
@@ -2143,64 +2574,6 @@ impl WorkspaceView {
             this.update(cx, |_, cx| cx.notify()).ok();
         });
         self.jobs.start(Job::RouteIndex, task);
-    }
-
-    /// Fills the palette with route *names*, for completing a `route('…')` (#83).
-    ///
-    /// Only the names that were statically readable, which `route_names` already enforces.
-    /// **An incomplete list is the acceptable failure here** and the reason completion is
-    /// the feature rather than a diagnostic: a route registered by a service provider is
-    /// missing from this list, and the user types it themselves. The same gap expressed as
-    /// "this route does not exist" would be a false claim about working code (RISKS.md #4).
-    ///
-    /// Shares `Job::RouteIndex` with the route palette: both parse the same files for the
-    /// same reason, and only one palette is open at a time, so a second open superseding
-    /// the first is exactly right.
-    fn load_route_name_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
-        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
-
-        let task = cx.spawn(async move |this, cx| {
-            let names = cx.background_spawn(async move { elle_laravel::route_names(&root) }).await;
-            // Label and id are the same string: what the user reads is exactly what gets
-            // typed, which is the whole contract of a completion.
-            let items = names.into_iter().map(|name| (name.clone(), name)).collect();
-
-            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
-            this.update(cx, |_, cx| cx.notify()).ok();
-        });
-        self.jobs.start(Job::RouteIndex, task);
-    }
-
-    /// Offers route-name completion when the cursor sits inside a `route('…')` literal.
-    ///
-    /// Returns whether it took the keystroke. Not a popup: there is no completion widget in
-    /// this editor yet, and building one — anchoring to a text position, intercepting keys,
-    /// dismissing on the right events — is a feature in its own right, not a step on the
-    /// way to this one. The palette already does filtering, async fill and keyboard
-    /// selection, so reusing it is the cheap version that works today, and a popup can
-    /// replace the presentation later without changing where the names come from.
-    fn complete_route_name(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(tab) = self.tabs.get(self.active_tab) else { return false };
-        let Some(path) = tab.path.clone() else { return false };
-        let Some(blade) = laravel_dialect(&path) else { return false };
-
-        let document = &tab.editor.read(cx).document;
-        let source = document.buffer.text();
-        let offset = document.selection.head;
-
-        // The same reader ⌘click uses, so "the cursor is in a route name" means one thing.
-        // An empty `route('')` is the ordinary case for completion and reads as a `Route`
-        // reference with an empty name, which is exactly what should open the list.
-        let Some(reference) = elle_laravel::reference_at(&source, offset, blade) else {
-            return false;
-        };
-        if reference.kind != elle_laravel::ReferenceKind::Route {
-            return false;
-        }
-
-        self.completion_target = Some(reference.range);
-        self.toggle_palette(PaletteMode::RouteNames, window, cx);
-        true
     }
 
     // --- navigation (#81) -------------------------------------------------------------
@@ -2881,10 +3254,6 @@ impl WorkspaceView {
         // A walk still running is now pure waste — nothing will consume its results.
         self.cancel_quick_open_walk();
         self.palette = None;
-        // An escaped completion must not leave a range behind for a later confirm to write
-        // into. `confirm_palette` takes the target before calling this, so what is cleared
-        // here is only ever an abandoned one.
-        self.completion_target = None;
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -2892,11 +3261,6 @@ impl WorkspaceView {
     /// Runs whatever the palette confirmed.
     fn confirm_palette(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.palette.as_ref().map(|p| p.read(cx).mode());
-        // Taken *before* dismissing, which clears it: dismissal is also the escape path,
-        // where an abandoned range must not survive, and the two orders are indistinguishable
-        // until you notice that confirming dismisses first. Written the other way round, the
-        // completion silently never fired.
-        let completion_target = self.completion_target.take();
         self.dismiss_palette(window, cx);
 
         match mode {
@@ -2921,8 +3285,6 @@ impl WorkspaceView {
                 }
                 self.open_path_at(path, target, window, cx);
             }
-            // The one mode that writes into the buffer instead of opening a file (#83).
-            Some(PaletteMode::RouteNames) => self.insert_route_name(completion_target, &id, cx),
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -2971,48 +3333,37 @@ impl WorkspaceView {
             None => {}
         }
     }
+}
 
-    /// Writes a chosen route name over the literal the completion was opened on (#83).
-    ///
-    /// The range is re-validated against the buffer as it is *now*, not as it was when the
-    /// palette opened. The palette is modal so ordinary typing cannot have moved it, but an
-    /// asynchronous reload of the file can, and writing a route name into the middle of
-    /// unrelated code because an offset went stale is a far worse outcome than a completion
-    /// that declines to fire.
-    ///
-    /// The bounds check is the only guard that is cheap *and* meaningful. It cannot prove the
-    /// range still spans the same literal — only that writing there will not panic — and a
-    /// stronger check would mean re-reading the reference, which is the work the palette was
-    /// opened to avoid repeating. The exposure is small: the palette holds focus for its whole
-    /// life, so the tab cannot be switched under it from the keyboard.
-    fn insert_route_name(
-        &mut self,
-        target: Option<std::ops::Range<usize>>,
-        name: &str,
-        cx: &mut Context<Self>,
-    ) {
-        // `None` should not happen — reaching this mode goes through `complete_route_name`,
-        // which sets the range before opening the palette, whether it was reached by ⌃space
-        // or through the command row. Declining is still the right response to the case that
-        // should not arise: inserting at the cursor instead would drop a route name into
-        // whatever the user happened to be editing.
-        let Some(range) = target else { return };
-        let Some(editor) = self.active_editor().cloned() else { return };
+/// Turns a server's completion response into items that know where they came from (#61).
+///
+/// The source is stamped here, at the boundary where it is *known* — these came off the
+/// wire from the language server and nothing else in the program has to infer it. That is
+/// the difference #20 asks for: a row rendering an `LSP` badge is reporting a fact recorded
+/// at the point of arrival, not a guess made from the shape of the label.
+///
+/// `insert_text` is preferred over the label when the server gives one, because they
+/// genuinely differ: Intelephense labels a method `getName` but can ask for `getName()` to
+/// be inserted, and a label like `strlen(string $string): int` is a signature to read rather
+/// than text to type.
+fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
+    let items = match response {
+        CompletionResponse::Array(items) => items,
+        // `is_incomplete` is dropped deliberately: it means "ask again as the user types",
+        // which is a re-request policy this popup does not have yet. Recording it and
+        // ignoring it would be worse than not carrying it — #20 is where it belongs.
+        CompletionResponse::List(list) => list.items,
+    };
 
-        editor.update(cx, |editor, cx| {
-            let document = &mut editor.document;
-            if range.end > document.buffer.len_bytes() {
-                return;
-            }
-            // Selecting the old literal and inserting over it, rather than a bare buffer
-            // splice, so the edit joins the undo history and moves the cursor the way every
-            // other insertion does — ⌘Z after a completion undoes exactly the completion.
-            document.move_to(range.start, false);
-            document.move_to(range.end, true);
-            document.insert(name);
-            cx.notify();
-        });
-    }
+    items
+        .into_iter()
+        .map(|item| {
+            let insert = item.insert_text.clone().unwrap_or_else(|| item.label.clone());
+            CompletionItem::new(item.label, CompletionSource::Lsp)
+                .with_insert(insert)
+                .with_detail(item.detail)
+        })
+        .collect()
 }
 
 /// The status-bar text for the language server, which is usually nothing at all.
@@ -3140,6 +3491,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::find_prev))
             .on_action(cx.listener(Self::find_in_project))
             .on_action(cx.listener(Self::go_to_route))
+            .on_action(cx.listener(Self::complete))
             .on_action(cx.listener(Self::complete_laravel))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
@@ -3200,6 +3552,20 @@ impl Render for WorkspaceView {
                 // reflow the layout underneath while it is open.
                 div().absolute().top_0().left_0().size_full().flex().justify_center().child(palette)
             }))
+            // The completion popup, in the same overlay layer and for the same reason, but
+            // *not* centred: it positions itself at the cursor, which is the whole point of
+            // #61 and the one thing the palette could not do. The wrapper is a full-window
+            // absolute box so the popup's own `left`/`top` are window coordinates — the
+            // coordinates the editor measured.
+            //
+            // After the palette, so if both were somehow open the completion would draw on
+            // top. In practice they are mutually exclusive: opening the palette moves focus
+            // away from the popup, and the popup dismisses on losing it.
+            .children(
+                self.completion
+                    .clone()
+                    .map(|popup| div().absolute().top_0().left_0().size_full().child(popup)),
+            )
     }
 }
 

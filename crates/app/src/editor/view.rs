@@ -60,6 +60,17 @@ pub struct EditorView {
     /// a panel is added, resized or collapsed, so it is measured from the laid-out element
     /// instead. `None` until the first prepaint, which is before any click can arrive.
     text_origin_x: Option<Pixels>,
+    /// Window y of the cursor's row, measured at prepaint (#61).
+    ///
+    /// The completion popup anchors to it. Measured rather than computed from the row index
+    /// for two reasons that are both already load-bearing above: `uniform_list` scrolls, so
+    /// the absolute row says nothing about where it is on screen, and the chrome above the
+    /// editor (tab bar, and a find bar whose height varies with its replace field) is the
+    /// workspace's business, not something this view can add up from constants.
+    ///
+    /// `None` when the cursor's row was not painted in the last frame — it is scrolled out
+    /// of view, and there is no on-screen caret for a popup to sit under.
+    cursor_row_origin_y: Option<Pixels>,
     /// Whether the caret is in its visible half of the blink cycle.
     ///
     /// Starts `true` so a freshly-opened editor shows a caret before the first tick.
@@ -116,6 +127,7 @@ impl EditorView {
             visible_rows: 0..0,
             diagnostics: Vec::new(),
             text_origin_x: None,
+            cursor_row_origin_y: None,
             caret_visible: true,
             blink: None,
             window_activation: None,
@@ -610,6 +622,28 @@ impl EditorView {
         }
     }
 
+    /// Inserts text the *popup* received, because the popup holds keyboard focus (#61).
+    ///
+    /// While a completion list is open the focus is on the popup — that is what makes its
+    /// key context active and arrows navigate the list — so the character the user typed
+    /// arrives there rather than here. It still has to end up in the buffer, and it has to
+    /// go through the same path ordinary typing does: `insert_with_pairs` for auto-closing,
+    /// then `after_edit` for the search rescan, the scroll and the blink. Splicing the
+    /// buffer directly instead would give a completion-time keystroke different undo and
+    /// bracket behaviour from the identical keystroke a second later with the popup closed.
+    pub fn insert_typed(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !self.document.insert_with_pairs(text) {
+            self.document.insert(text);
+        }
+        self.after_edit(cx);
+    }
+
+    /// Deletes backwards for a backspace the popup received, for the same reason.
+    pub fn backspace_typed(&mut self, cx: &mut Context<Self>) {
+        self.document.backspace();
+        self.after_edit(cx);
+    }
+
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         // Typing with the find bar open moves every match after the caret. A stale list
         // paints a highlight over bytes that have shifted, so the rescan happens here
@@ -865,6 +899,56 @@ impl Render for EditorView {
 }
 
 impl EditorView {
+    /// Where the caret is on screen, in window coordinates — what a popup anchors to (#61).
+    ///
+    /// This is the *inverse* of `on_row_mouse_down`, and deliberately built from the same
+    /// two pieces so the two directions cannot disagree: `text_origin_x` for the window x
+    /// where text begins, and a shaped line for how far into it byte `column` sits.
+    ///
+    /// Measured rather than `column * cell_width` for the reasons `editor::caret` documents
+    /// at length — a proportional fallback font and multibyte text both defeat arithmetic on
+    /// a byte offset. `x_for_index` asks the shaped line where the byte actually is.
+    ///
+    /// Both coordinates are **window**-absolute, because both were measured from a
+    /// laid-out element rather than assembled from constants. `None` before the first
+    /// prepaint, and `None` when the cursor's row is scrolled out of view — there is no
+    /// on-screen caret to anchor to, and a popup pinned to a cursor nobody can see belongs
+    /// nowhere.
+    pub fn cursor_position(&self, window: &Window, cx: &App) -> Option<gpui::Point<Pixels>> {
+        let fonts = Fonts::get(cx);
+        let cursor = self.document.cursor_point();
+
+        let origin_y = self.cursor_row_origin_y?;
+        let origin_x = self.text_origin_x?;
+
+        let line = self.document.buffer.line(cursor.row);
+        let column = floor_boundary(&line, cursor.column.min(line.len()));
+        let measured = &line[..column.min(MAX_MEASURE_BYTES)];
+        let measured = &measured[..floor_boundary(measured, measured.len())];
+
+        // Shaping an empty prefix to be told the answer is zero is the common case on a
+        // fresh line, and the shortcut is exact rather than an approximation — the same one
+        // `editor::caret` takes.
+        let x = if measured.is_empty() {
+            px(0.0)
+        } else {
+            let runs = [TextRun {
+                len: measured.len(),
+                font: fonts.font(),
+                color: gpui::white(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            window
+                .text_system()
+                .layout_line(measured, fonts.size, &runs, None)
+                .x_for_index(measured.len())
+        };
+
+        Some(gpui::point(origin_x + x, origin_y))
+    }
+
     /// Builds the elements for one band of visible rows.
     fn render_rows(
         &mut self,
@@ -937,6 +1021,7 @@ impl EditorView {
                 let entity = entity.clone();
 
                 let measuring_entity = entity.clone();
+                let cursor_row = cursor.row;
 
                 div()
                     // The click handler needs the window x where the text starts, and only
@@ -948,6 +1033,16 @@ impl EditorView {
                         if let Some(text) = bounds.get(1) {
                             measuring_entity.update(cx, |editor, _cx| {
                                 editor.text_origin_x = Some(text.origin.x);
+                                // The row's own window y, kept for the completion popup
+                                // (#61). Measured for the same reason the x is: the chrome
+                                // above the editor is a tab bar plus a find bar whose height
+                                // depends on whether it is showing a replace field, and
+                                // adding those up from constants is the bug `text_origin_x`
+                                // exists because someone already wrote. Only the cursor row
+                                // is recorded — it is the only one anything anchors to.
+                                if row == cursor_row {
+                                    editor.cursor_row_origin_y = Some(text.origin.y);
+                                }
                             });
                         }
                     })

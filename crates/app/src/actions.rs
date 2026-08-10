@@ -76,9 +76,14 @@ actions!(
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
-        // Laravel completion (#83). Offers the project's route names inside a `route('…')`,
-        // and does nothing anywhere else — so the key stays free for the general completion
-        // this editor does not have yet.
+        // Completion (#61). `Complete` is ⌃space and opens the popup at the cursor with
+        // every source that has something to say.
+        //
+        // `CompleteLaravel` is kept and is no longer bound to a key: #83 registered it as a
+        // palette *command* (`laravel.route_name`), so removing it would delete a row from
+        // the command palette that people may have learned. It now opens the popup filtered
+        // to route names, which is what that command always meant.
+        Complete,
         CompleteLaravel,
         // Navigation (#81). `GoToDefinition` and `FindReferences` are also reachable by
         // ⌘click and the Go menu; the palette-backed two are keyboard-only.
@@ -131,6 +136,17 @@ pub mod context {
     /// The test results panel (#25). Its own context so a rerun key means "rerun" only
     /// while the panel has focus, and does not shadow anything in the editor.
     pub const TESTS: &str = "Tests";
+    /// The completion popup (#61). **Its own context is the entire reason arrows are not
+    /// stolen from the document**: `up` and `down` are bound here and in `Editor`, and gpui
+    /// dispatches to the innermost context that has a binding. With no popup open there is
+    /// no element carrying this context, so every arrow reaches the editor exactly as
+    /// before — the popup cannot suppress a key it is not on screen for.
+    ///
+    /// Not `PALETTE`: `escape` there dismisses an overlay and returns focus to the
+    /// workspace, where here it must return focus to the *editor* mid-edit, and `tab`
+    /// accepts a completion where in the palette it does nothing. Sharing the context would
+    /// have meant a mode check at the top of five handlers.
+    pub const COMPLETION: &str = "Completion";
     /// The find-in-project panel (#80). Its own context rather than `FIND`: `enter` there
     /// runs the search rather than advancing to a next match, `escape` returns focus to
     /// the editor without closing the panel, and there is no replace field for ⇥ to reach.
@@ -165,11 +181,14 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("f12", GoToDefinition, Some(context::WORKSPACE)),
         KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
-        // ⌃space is the universal "complete here". Workspace-scoped like the rest, and it
-        // falls through silently when the cursor is not in a `route('…')` — there is no
-        // general completion to fall back to yet, so a press elsewhere does nothing rather
-        // than opening an empty list.
-        KeyBinding::new("ctrl-space", CompleteLaravel, Some(context::WORKSPACE)),
+        // ⌃space is the universal "complete here". It opened #83's route-name palette until
+        // #61; it now opens the popup, which asks the language server *and* Laravel and
+        // shows both in one list with their sources marked.
+        //
+        // Still workspace-scoped rather than editor-scoped, matching every other binding
+        // that acts on the active tab. It is silent with no tab and no server, which stays
+        // the common case (#74).
+        KeyBinding::new("ctrl-space", Complete, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl--", NavigateBack, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift--", NavigateForward, Some(context::WORKSPACE)),
         // ctrl-` is the conventional terminal toggle. It is bound workspace-wide so it
@@ -242,6 +261,22 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-alt-w", ToggleWholeWord, Some(context::SEARCH_PANEL)),
         KeyBinding::new("cmd-alt-r", ToggleRegex, Some(context::SEARCH_PANEL)),
         //
+        // The completion popup (#61). These exist *only* while the popup is on screen,
+        // because the context comes from the popup's own element — which is what makes
+        // "arrows must still move the cursor when nothing is open" true by construction
+        // rather than by a guard inside a handler.
+        //
+        // `tab` as well as `enter` accepts, which is the convention in every IDE and is the
+        // key most people actually press. It shadows the editor's `Tab` (indent) only while
+        // the popup holds focus.
+        KeyBinding::new("escape", Cancel, Some(context::COMPLETION)),
+        KeyBinding::new("enter", Confirm, Some(context::COMPLETION)),
+        KeyBinding::new("tab", Confirm, Some(context::COMPLETION)),
+        KeyBinding::new("down", SelectNext, Some(context::COMPLETION)),
+        KeyBinding::new("up", SelectPrev, Some(context::COMPLETION)),
+        KeyBinding::new("ctrl-n", SelectNext, Some(context::COMPLETION)),
+        KeyBinding::new("ctrl-p", SelectPrev, Some(context::COMPLETION)),
+        KeyBinding::new("backspace", Backspace, Some(context::COMPLETION)),
         // Overlay
         KeyBinding::new("escape", Cancel, Some(context::PALETTE)),
         KeyBinding::new("enter", Confirm, Some(context::PALETTE)),
@@ -402,6 +437,94 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped body of `init`, which is where every binding is declared.
+    ///
+    /// Read from source rather than from gpui, because gpui exposes no way to enumerate the
+    /// bindings it has been given — `bind_keys` consumes them. The check is textual and that
+    /// crudeness is the point, the same argument `tests/theming.rs` makes: the failure mode
+    /// is a binding *written* without a context, and that is exactly what this reads.
+    fn keymap_source() -> String {
+        let source = include_str!("actions.rs");
+        let start = source.find("pub fn init(").expect("init must exist");
+        let end = source[start..].find("\n    let mut registry").expect("init must end") + start;
+        source[start..end].to_string()
+    }
+
+    #[test]
+    fn no_binding_is_global() {
+        // Every `KeyBinding::new` must name a context. A binding with `None` fires no matter
+        // what has focus, which for an arrow key means the popup's navigation would move the
+        // list while the user is moving the cursor in a document — #61's "must not steal the
+        // keymap", stated as something a machine checks rather than something a reviewer
+        // remembers.
+        let source = keymap_source();
+        for line in source.lines() {
+            if line.trim_start().starts_with("//") || !line.contains("KeyBinding::new") {
+                continue;
+            }
+            assert!(
+                line.contains("Some(context::"),
+                "every binding must be scoped to a context, got: {}",
+                line.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn the_completion_popups_navigation_keys_are_scoped_to_its_own_context() {
+        // The specific keys #61 is about. `up`, `down`, `enter`, `tab` and `escape` all mean
+        // something else in the editor, and the popup may only claim them inside
+        // `context::COMPLETION` — which no element carries unless a popup is on screen.
+        //
+        // Mutation-checked: binding `down` to `SelectNext` in `context::EDITOR` instead makes
+        // this fail, which is the arrangement that would break arrow-key movement.
+        let source = keymap_source();
+        let completion_bindings: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| line.contains("context::COMPLETION"))
+            .collect();
+
+        for key in ["\"up\"", "\"down\"", "\"enter\"", "\"tab\"", "\"escape\""] {
+            assert!(
+                completion_bindings.iter().any(|line| line.contains(key)),
+                "{key} must be bound in the completion context"
+            );
+        }
+
+        // And the mirror image: none of the popup's actions may be bound anywhere a document
+        // has focus. `SelectNext`/`SelectPrev` in the editor context would move a list that
+        // is not on screen instead of the cursor.
+        for line in source.lines().map(str::trim).filter(|line| !line.starts_with("//")) {
+            if line.contains("SelectNext") || line.contains("SelectPrev") {
+                assert!(
+                    line.contains("context::COMPLETION") || line.contains("context::PALETTE"),
+                    "list navigation must never be bound where the document has focus: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_space_opens_the_general_completion_rather_than_only_laravel_routes() {
+        // #83 bound ⌃space to `CompleteLaravel` because no popup existed. #61 is the popup,
+        // and the key has to reach it — otherwise the feature ships unreachable, which is
+        // the kind of thing that passes every other test in this file.
+        let source = keymap_source();
+        let binding = source
+            .lines()
+            .map(str::trim)
+            .find(|line| line.contains("\"ctrl-space\"") && !line.starts_with("//"))
+            .expect("⌃space must still be bound");
+
+        assert!(binding.contains("Complete,"), "⌃space must open the popup, got: {binding}");
+        assert!(
+            !binding.contains("CompleteLaravel"),
+            "⌃space must no longer be the route-name-only path: {binding}"
+        );
+    }
 
     #[test]
     fn every_builtin_command_except_the_palette_itself_is_wired() {
