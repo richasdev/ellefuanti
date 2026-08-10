@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
-use elle_workspace::{CancelFlag, FileTree, index_files, read_file, write_file};
+use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions, SharedString,
     Task, Window, div, prelude::*, px, svg, uniform_list,
@@ -16,6 +16,7 @@ use crate::actions::{
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
 };
 use crate::editor::{Document, EditorView};
+use crate::file_cache;
 use crate::icons;
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
@@ -636,11 +637,16 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// Walks the project on the background executor and fills the palette when it lands.
+    /// Fills the palette with the project's files, from the persisted index when it is
+    /// current and from a live walk otherwise.
     ///
     /// The palette opens immediately with an empty list rather than waiting: on a large
     /// project the walk takes long enough that blocking on it would be the difference
     /// between an instant palette and a visible stall (§13, §22).
+    ///
+    /// A cache hit is 3.5-4.5x faster than the walk on real projects — see
+    /// [`crate::file_cache`] for the measurements and for why a mismatch re-walks rather
+    /// than repairing rows.
     fn load_quick_open_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
 
@@ -652,22 +658,31 @@ impl WorkspaceView {
         self.quick_open_cancel = Some(cancel.clone());
 
         let task = cx.spawn(async move |this, cx| {
-            let walk_cancel = cancel.clone();
-            let files = cx.background_spawn(async move { index_files(&root, &walk_cancel) }).await;
+            let load_cancel = cancel.clone();
+            let write_root = root.clone();
+            let (files, source) =
+                cx.background_spawn(async move { file_cache::load(&root, &load_cancel) }).await;
 
-            // A cancelled walk returns whatever it had; showing a partial list for a
+            // A cancelled load returns whatever it had; showing a partial list for a
             // palette the user already closed would be noise.
             if cancel.is_cancelled() {
                 return;
             }
 
             let items = files
-                .into_iter()
-                .map(|file| (file.relative, file.path.display().to_string()))
+                .iter()
+                .map(|file| (file.relative.clone(), file.path.display().to_string()))
                 .collect();
 
             palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
             this.update(cx, |_, cx| cx.notify()).ok();
+
+            // Persist only what we just walked, and only *after* the palette is filled —
+            // the user is never waiting on this write. A cache hit has nothing new to say.
+            if source == file_cache::Source::Walk {
+                cx.background_spawn(async move { file_cache::store(&write_root, &files, &cancel) })
+                    .await;
+            }
         });
         self.jobs.start(Job::QuickOpenIndex, task);
     }
