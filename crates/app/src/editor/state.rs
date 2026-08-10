@@ -625,6 +625,304 @@ impl Document {
         self.goal_column = None;
     }
 
+    // --- brackets --------------------------------------------------------------------
+
+    /// The pairs auto-close inserts, and that [`Document::matching_bracket`] pairs up.
+    ///
+    /// Quotes are here as *wrapping* pairs only — see [`Document::insert_with_pairs`] for
+    /// why typing a bare `'` does not auto-close. The list is ASCII on purpose: typographic
+    /// quotes and CJK brackets are a keyboard-layout question, not a syntax one.
+    const PAIRS: [(char, char); 5] = [('(', ')'), ('[', ']'), ('{', '}'), ('\'', '\''), ('"', '"')];
+
+    /// The two ends of the bracket pair the cursor is touching, if any.
+    ///
+    /// **This is a node lookup, not a scan.** The tree-sitter tree is already parsed and
+    /// already in memory, so the bracket at the cursor is found with
+    /// `descendant_for_byte_range` — one descent from the root, O(depth) — and its partner
+    /// is a *sibling of the same parent node*, which the parse tree already knows because
+    /// pairing brackets is what parsing them means. Scanning the buffer counting depth
+    /// would be O(distance to the partner), which on the `{` of a 2000-line class is the
+    /// whole class, every frame the cursor sits there.
+    ///
+    /// What that rules out: a file with no grammar (plain text) and a file whose parse is
+    /// broken get no highlight at all, because there is no tree to ask. That is the right
+    /// failure — a bracket "match" derived from a broken parse points at the wrong
+    /// character, which is worse than pointing at nothing.
+    ///
+    /// Both offsets are returned so the renderer can highlight the pair; the cursor may be
+    /// on either end, and on the character *before* the cursor as well as under it, which
+    /// is what makes it feel right after typing a closer.
+    pub fn matching_bracket(&self) -> Option<(usize, usize)> {
+        let tree = self.syntax.tree()?;
+        let head = self.selection.head;
+        let root = tree.root_node();
+
+        // Under the cursor first, then just before it. Typing `)` leaves the cursor after
+        // it, and that is exactly when the user wants to see what it closed.
+        let candidates = [head, self.prev_char_offset(head)];
+        for at in candidates {
+            let text = self.buffer.slice(at..self.next_char_offset(at));
+            let Some(ch) = text.chars().next() else { continue };
+            let Some((open, close)) =
+                Self::PAIRS.iter().copied().find(|&(o, c)| (ch == o || ch == c) && o != c)
+            else {
+                continue;
+            };
+
+            // The smallest named node covering this byte is the bracket token itself. Its
+            // parent is the construct the pair delimits, and the partner is that parent's
+            // matching child — so the lookup never leaves the two nodes tree-sitter has
+            // already associated.
+            let node = root.descendant_for_byte_range(at, at + text.len())?;
+            let parent = node.parent().unwrap_or(node);
+
+            let wanted = if ch == open { close } else { open };
+            let mut cursor = parent.walk();
+            let partner = parent.children(&mut cursor).find(|child| {
+                child.start_byte() != at
+                    && child.end_byte() - child.start_byte() == wanted.len_utf8()
+                    && self.buffer.slice(child.start_byte()..child.end_byte()) == wanted.to_string()
+            });
+
+            if let Some(partner) = partner {
+                return Some((at, partner.start_byte()));
+            }
+        }
+        None
+    }
+
+    /// Inserts typed text, auto-closing brackets and typing over a closer.
+    ///
+    /// Three behaviours, all of which every editor has and none of which the user thinks
+    /// about until they are missing:
+    ///
+    /// 1. **Wrap.** With a selection, typing an opener (or a quote) surrounds the selection
+    ///    rather than replacing it. This is the one that is actively destructive to get
+    ///    wrong — replacing a paragraph with `"` loses work.
+    /// 2. **Type over.** Typing the closer when it is already the next character just steps
+    ///    past it, so `foo()` typed in full does not become `foo())`.
+    /// 3. **Auto-close.** Typing an opener inserts the pair and leaves the cursor between.
+    ///
+    /// Returns false when none applied, so the caller falls back to a plain insert.
+    ///
+    /// Bare quotes deliberately do **not** auto-close: `it's` and `don't` are the common
+    /// case in comments and strings, and an editor that turns them into `it''s` is worse
+    /// than one with no auto-close at all. Quotes still *wrap* a selection, which is the
+    /// half users actually reach for.
+    pub fn insert_with_pairs(&mut self, text: &str) -> bool {
+        let mut chars = text.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            // Multi-character input is a paste or an IME commit, never a keystroke to pair.
+            return false;
+        };
+
+        // 1. Wrap a selection.
+        if !self.selection.is_empty()
+            && let Some(&(open, close)) = Self::PAIRS.iter().find(|&&(o, _)| o == ch)
+        {
+            let range = self.selection.range();
+            let selected = self.buffer.slice(range.clone());
+            // One replace, so wrapping is one undo step and ⌘Z gives back the bare
+            // selection rather than peeling off a quote at a time.
+            self.replace_as_one_step(range.clone(), &format!("{open}{selected}{close}"));
+            // Keep the text selected so wrapping twice nests, matching every editor.
+            self.selection = Selection {
+                anchor: range.start + open.len_utf8(),
+                head: range.start + open.len_utf8() + selected.len(),
+            };
+            return true;
+        }
+
+        if !self.selection.is_empty() {
+            return false;
+        }
+
+        let head = self.selection.head;
+        let next = self.buffer.slice(head..self.next_char_offset(head));
+
+        // 2. Type over a closer this editor just inserted. Restricted to closers so typing
+        //    `(` in front of an existing `(` still opens a new pair.
+        if Self::PAIRS.iter().any(|&(o, c)| c == ch && o != c) && next == ch.to_string() {
+            self.move_to(self.next_char_offset(head), false);
+            return true;
+        }
+
+        // 3. Auto-close. Openers only — see the doc comment on quotes.
+        if let Some(&(_, close)) = Self::PAIRS.iter().find(|&&(o, c)| o == ch && o != c) {
+            // Not in front of a word: `(` typed before `foo` means the user is wrapping by
+            // hand, and a `)` landing between `(` and `foo` is in the way.
+            let closes_here = next.chars().next().is_none_or(|n| !n.is_alphanumeric() && n != '_');
+            if closes_here {
+                // The pair is its own undo step, in both directions. The leading break
+                // stops it joining a typing run already on the stack; the trailing one is
+                // belt-and-braces, because `Edit::extends` would refuse to coalesce the
+                // *next* keystroke anyway — it needs the insertion to begin where the group
+                // ended, and this group ends after the `)` while the cursor sits before it.
+                // Making that explicit beats relying on a coincidence of `extends`. See
+                // `typing_inside_an_auto_closed_pair_undoes_before_the_pair_appeared`.
+                self.buffer.break_undo_group();
+                let edit = self.buffer.replace(head..head, &format!("{ch}{close}"));
+                // Cursor between the two, which is the whole point.
+                self.selection = Selection::at(edit.new_range().start + ch.len_utf8());
+                self.goal_column = None;
+                self.buffer.break_undo_group();
+                self.sync_syntax();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Enter, keeping the new line's indentation.
+    ///
+    /// Matches the current line's indent, and adds one level when the cursor sits just
+    /// after an opening brace. When the cursor is between a pair (`{|}`), the closer is
+    /// pushed to a third line at the outer indent — the shape every editor produces and the
+    /// reason auto-close and auto-indent have to be built together.
+    ///
+    /// One `replace` throughout, so a newline that produces three lines is still one undo
+    /// step.
+    pub fn newline_with_indent(&mut self) {
+        let head = self.selection.head;
+        let row = self.buffer.offset_to_point(head).row;
+        let ending = self.line_ending(row);
+        let indent = self.indent_of(row);
+
+        // Only look at the characters either side of the cursor: the decision is local, so
+        // this stays O(1) rather than reading the line.
+        let before = self.buffer.slice(self.prev_char_offset(head)..head);
+        let after = self.buffer.slice(head..self.next_char_offset(head));
+        let opened = matches!(before.as_str(), "{" | "[" | "(");
+        let closed =
+            matches!((before.as_str(), after.as_str()), ("{", "}") | ("[", "]") | ("(", ")"));
+
+        // ponytail: four spaces, the same hardcoded indent as `indent_lines` and
+        // `EditorView::tab`. All three read the setting together once there is one (#60).
+        const INDENT: &str = "    ";
+
+        let text = if closed {
+            format!("{ending}{indent}{INDENT}{ending}{indent}")
+        } else if opened {
+            format!("{ending}{indent}{INDENT}")
+        } else {
+            format!("{ending}{indent}")
+        };
+
+        let range = self.selection.range();
+        self.replace_as_one_step(range.clone(), &text);
+
+        // On the split-pair case the cursor belongs on the *middle* line, not after the
+        // closer that `replace_as_one_step` left it on.
+        if closed {
+            self.move_to(range.start + ending.len() + indent.len() + INDENT.len(), false);
+        }
+    }
+
+    // --- comments ----------------------------------------------------------------------
+
+    /// ⌘/: comments the selected lines, or uncomments them if they are all commented.
+    ///
+    /// A toggle rather than two commands, and "all commented" rather than "any", because
+    /// that is what makes it reversible: pressing it twice on a mixed block leaves the
+    /// block commented, and pressing it again uncomments everything. Deciding per line
+    /// instead would make the second press a no-op on half the lines.
+    ///
+    /// Returns false when the language has no comment syntax, which the caller reports —
+    /// see [`Language::line_comment`] for why JSON is the language that means.
+    ///
+    /// The comment marker goes at the block's *shallowest* indent rather than at column
+    /// zero, so commenting a method body keeps it visually inside the method. Blank lines
+    /// are skipped, for the same reason `indent_lines` skips them: a marker on a blank line
+    /// is trailing whitespace a linter then flags.
+    pub fn toggle_comment(&mut self) -> bool {
+        let language = self.language();
+
+        if let Some(marker) = language.line_comment() {
+            self.toggle_line_comment(marker);
+            true
+        } else if let Some((open, close)) = language.block_comment() {
+            self.toggle_block_comment(open, close);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn toggle_line_comment(&mut self, marker: &str) {
+        let (first, last) = self.selected_rows();
+        let span = self.line_span(first..=last);
+        let text = self.buffer.slice(span.clone());
+
+        // Content lines only: a block of blank lines has nothing to toggle, and letting
+        // them vote would make "all commented" false forever.
+        let content: Vec<&str> =
+            text.split_inclusive('\n').filter(|l| !strip_newline(l).trim().is_empty()).collect();
+        if content.is_empty() {
+            return;
+        }
+
+        let all_commented = content.iter().all(|l| l.trim_start().starts_with(marker));
+        // Column to insert at, as a *character* count of leading whitespace, so a line
+        // indented with a tab and one with four spaces still line up with each other.
+        let column = content.iter().map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+
+        let mut out = String::with_capacity(text.len() + content.len() * (marker.len() + 1));
+        for line in text.split_inclusive('\n') {
+            if strip_newline(line).trim().is_empty() {
+                out.push_str(line);
+            } else if all_commented {
+                // Remove the marker and the single space this function adds after it, but
+                // only that one space — a `//    aligned` comment keeps its alignment.
+                let at = line.len() - line.trim_start().len();
+                let (indent, rest) = line.split_at(at);
+                let rest = &rest[marker.len()..];
+                out.push_str(indent);
+                out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            } else {
+                let (indent, rest) = line.split_at(column);
+                out.push_str(indent);
+                out.push_str(marker);
+                out.push(' ');
+                out.push_str(rest);
+            }
+        }
+
+        self.replace_as_one_step(span, &out);
+        self.select_rows(first, last);
+    }
+
+    /// The block-comment form, for CSS, HTML and Blade — languages with no line comment.
+    ///
+    /// Wraps the whole selected block in one pair rather than one pair per line: `<!-- -->`
+    /// per line on a ten-line template is noise, and HTML comments do not nest, so a
+    /// per-line form would break the moment a line already had one.
+    fn toggle_block_comment(&mut self, open: &str, close: &str) {
+        let (first, last) = self.selected_rows();
+        let span = self.line_span(first..=last);
+        let text = self.buffer.slice(span.clone());
+        let body = strip_newline(&text);
+        let terminator = &text[body.len()..];
+        let trimmed = body.trim();
+
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let out = if trimmed.starts_with(open) && trimmed.ends_with(close) {
+            // Uncomment: take the delimiters and the one space each side this adds.
+            let inner = trimmed[open.len()..trimmed.len() - close.len()].trim();
+            let indent = &body[..body.len() - body.trim_start().len()];
+            format!("{indent}{inner}{terminator}")
+        } else {
+            let indent = &body[..body.len() - body.trim_start().len()];
+            format!("{indent}{open} {trimmed} {close}{terminator}")
+        };
+
+        self.replace_as_one_step(span, &out);
+        self.select_rows(first, last);
+    }
+
     // --- word boundaries -------------------------------------------------------------
 
     /// Where ⌥→ lands: past any whitespace, then past the run that follows.
@@ -1527,6 +1825,509 @@ mod tests {
     fn blade_document_detects_its_language() {
         let d = Document::new(Some(PathBuf::from("v/show.blade.php")), "@if(1)", true).unwrap();
         assert_eq!(d.language(), Language::Blade);
+    }
+
+    // --- bracket matching ------------------------------------------------------------
+    //
+    // The lookup goes through the parse tree, so these fixtures are valid PHP: an
+    // unparseable file has no tree and correctly matches nothing, which is asserted below
+    // rather than worked around.
+
+    /// The pair `matching_bracket` finds, as the two characters it points at.
+    fn matched(d: &Document) -> Option<(String, String)> {
+        d.matching_bracket().map(|(a, b)| (d.buffer.slice(a..a + 1), d.buffer.slice(b..b + 1)))
+    }
+
+    #[test]
+    fn the_bracket_under_the_cursor_finds_its_partner() {
+        let mut d = doc("<?php\nfunction f() { return 1; }\n");
+        let open = d.buffer.text().find('{').unwrap();
+        d.move_to(open, false);
+
+        let (a, b) = d.matching_bracket().expect("a match on the opening brace");
+        assert_eq!(a, open);
+        assert_eq!(&d.buffer.text()[b..b + 1], "}");
+    }
+
+    #[test]
+    fn matching_works_from_either_end_of_the_pair() {
+        let mut d = doc("<?php\nfunction f() { return 1; }\n");
+        let text = d.buffer.text();
+        let open = text.find('{').unwrap();
+        let close = text.find('}').unwrap();
+
+        d.move_to(close, false);
+        let (a, b) = d.matching_bracket().expect("a match on the closing brace");
+        assert_eq!((a.min(b), a.max(b)), (open, close), "the closer must find its opener");
+    }
+
+    #[test]
+    fn the_bracket_just_before_the_cursor_matches_too() {
+        // Typing `)` leaves the cursor *after* it, and that is the moment the user most
+        // wants to see what it closed. Without this the highlight never appears while typing.
+        let mut d = doc("<?php\n$a = f(1);\n");
+        let close = d.buffer.text().find(')').unwrap();
+        d.move_to(close + 1, false);
+
+        let (_, b) = d.matching_bracket().expect("a match on the bracket behind the cursor");
+        assert_eq!(&d.buffer.text()[b..b + 1], "(");
+    }
+
+    #[test]
+    fn nested_brackets_pair_with_the_right_partner() {
+        // The case a naive "next closer" scan gets wrong.
+        let mut d = doc("<?php\n$a = f(g(1), 2);\n");
+        let text = d.buffer.text();
+        let outer = text.find('(').unwrap();
+        d.move_to(outer, false);
+
+        let (_, partner) = d.matching_bracket().expect("a match");
+        assert_eq!(partner, text.rfind(')').unwrap(), "the outer ( pairs with the *last* )");
+    }
+
+    #[test]
+    fn a_cursor_on_no_bracket_matches_nothing() {
+        let mut d = doc("<?php\n$name = 1;\n");
+        d.move_to(d.buffer.text().find("name").unwrap() + 1, false);
+        assert_eq!(d.matching_bracket(), None);
+    }
+
+    #[test]
+    fn plain_text_has_no_tree_and_therefore_no_match() {
+        // Deliberate: the match comes from the parse tree, so a file with no grammar gets
+        // no highlight rather than a scan-based guess. Stated as a test because "brackets
+        // do not highlight in a .md file" would otherwise read as a bug.
+        let mut d = Document::new(Some(PathBuf::from("notes.txt")), "a (b) c", false).unwrap();
+        d.move_to(2, false);
+        assert!(d.syntax.tree().is_none());
+        assert_eq!(d.matching_bracket(), None);
+    }
+
+    #[test]
+    fn bracket_matching_is_multibyte_safe() {
+        // Slicing one byte either side of a bracket next to a multi-byte character would
+        // land mid-codepoint and panic in a debug build before it could return a wrong
+        // answer. Accented text in a real Laravel string is where this happens.
+        let mut d = doc("<?php\n$m = f('ação', 'çé');\n");
+        let open = d.buffer.text().find('(').unwrap();
+        d.move_to(open, false);
+        let (a, b) = d.matching_bracket().expect("a match past the accented arguments");
+        assert_eq!(&d.buffer.text()[a..a + 1], "(");
+        assert_eq!(&d.buffer.text()[b..b + 1], ")");
+
+        // And with the cursor sitting *on* a multi-byte character, where the "before the
+        // cursor" probe reads backwards over two bytes.
+        let at = d.buffer.text().find('ç').unwrap();
+        d.move_to(at, false);
+        assert_eq!(d.matching_bracket(), None, "no bracket here, and no panic getting there");
+    }
+
+    // --- auto-close ------------------------------------------------------------------
+
+    #[test]
+    fn typing_an_opener_inserts_the_pair_and_sits_between_them() {
+        let mut d = doc("");
+        assert!(d.insert_with_pairs("("));
+        assert_eq!(d.buffer.text(), "()");
+        assert_eq!(d.selection.head, 1, "the cursor belongs between the two");
+
+        for (open, want) in [("[", "[]"), ("{", "{}")] {
+            let mut d = doc("");
+            assert!(d.insert_with_pairs(open));
+            assert_eq!(d.buffer.text(), want);
+        }
+    }
+
+    #[test]
+    fn typing_the_closer_types_over_it_rather_than_doubling() {
+        // `foo()` typed in full: the `)` must step over the one auto-close inserted.
+        let mut d = doc("");
+        d.insert("foo");
+        d.insert_with_pairs("(");
+        assert_eq!(d.buffer.text(), "foo()");
+        assert!(d.insert_with_pairs(")"));
+        assert_eq!(d.buffer.text(), "foo()", "no second )");
+        assert_eq!(d.selection.head, 5, "and the cursor moved past it");
+    }
+
+    #[test]
+    fn a_closer_with_no_pair_in_front_of_it_is_typed_normally() {
+        // Type-over must not swallow a `)` the user genuinely means, or closing a paren
+        // opened on an earlier line silently does nothing.
+        let mut d = doc("");
+        d.insert("f(1");
+        assert!(!d.insert_with_pairs(")"), "nothing to type over, so the caller inserts");
+    }
+
+    #[test]
+    fn an_opener_before_a_word_does_not_auto_close() {
+        // Wrapping an existing call by hand: `(` typed before `foo` must not drop a `)`
+        // between the two, which is exactly where it would be in the way.
+        let mut d = doc("foo");
+        d.move_to(0, false);
+        assert!(!d.insert_with_pairs("("));
+    }
+
+    #[test]
+    fn quotes_wrap_a_selection_but_do_not_auto_close_on_their_own() {
+        // The apostrophe rule: `don't` in a comment must stay `don't`. Auto-closing a bare
+        // quote is worse than having no auto-close at all.
+        let mut d = doc("");
+        assert!(!d.insert_with_pairs("'"), "a bare quote is just a quote");
+
+        let mut d = doc("hello");
+        d.select_all();
+        assert!(d.insert_with_pairs("'"), "but it still wraps a selection");
+        assert_eq!(d.buffer.text(), "'hello'");
+    }
+
+    #[test]
+    fn wrapping_a_selection_keeps_it_selected_so_wrapping_twice_nests() {
+        let mut d = doc("x");
+        d.select_all();
+        d.insert_with_pairs("(");
+        assert_eq!(d.buffer.text(), "(x)");
+        assert_eq!(d.selected_text().unwrap(), "x", "the text stays selected, not the brackets");
+        d.insert_with_pairs("\"");
+        assert_eq!(d.buffer.text(), "(\"x\")");
+    }
+
+    #[test]
+    fn wrapping_a_selection_is_multibyte_safe() {
+        let mut d = doc("ação");
+        d.select_all();
+        d.insert_with_pairs("'");
+        assert_eq!(d.buffer.text(), "'ação'");
+        assert_eq!(d.selected_text().unwrap(), "ação", "byte arithmetic must not clip the ç");
+    }
+
+    #[test]
+    fn a_paste_is_never_treated_as_a_pair() {
+        // Multi-character input is a paste or an IME commit. Wrapping on it would corrupt
+        // the paste, and auto-closing on it makes no sense.
+        let mut d = doc("");
+        assert!(!d.insert_with_pairs("(abc)"));
+    }
+
+    // --- auto-close undo granularity ---------------------------------------------------
+    //
+    // The trap the brief names: `()` appearing from one keystroke must not make ⌘Z behave
+    // strangely. Both directions, the same shape #73 established for the line mutators.
+
+    #[test]
+    fn typing_inside_an_auto_closed_pair_undoes_before_the_pair_appeared() {
+        // The granularity question the brief raises, answered explicitly because it is not
+        // the obvious one.
+        //
+        // `Buffer::replace` coalesces only when `Edit::extends` holds, which needs the next
+        // insertion to begin exactly where the previous group ended. Auto-close ends its
+        // group *after* the `)` while leaving the cursor *before* it, so the following
+        // keystroke can never extend it — the pair is structurally its own undo step, and no
+        // amount of `break_undo_group` placement changes that.
+        //
+        // So ⌘Z peels: first the typing inside the pair, then the pair itself. That is two
+        // presses to get back to `f`, and it is the *right* two: the pair is a thing the
+        // editor did on its own, and an undo that silently removed both would give no way to
+        // keep `()` while dropping what was typed in it. What must never happen is a ⌘Z that
+        // leaves the buffer in a state the user never saw, and neither step does.
+        let mut d = doc("");
+        d.insert("f");
+        d.insert_with_pairs("(");
+        d.insert("name");
+        assert_eq!(d.buffer.text(), "f(name)");
+
+        d.undo();
+        assert_eq!(d.buffer.text(), "f()", "the typing inside the pair undoes on its own");
+        d.undo();
+        assert_eq!(d.buffer.text(), "f", "and the pair itself is the step before it");
+        d.undo();
+        assert_eq!(d.buffer.text(), "", "nothing unexpected left on the stack");
+    }
+
+    #[test]
+    fn typing_a_whole_call_undoes_in_steps_the_user_can_follow() {
+        // The end-to-end shape: `foo()` typed in full, with the closer typed over. Every
+        // intermediate state below is one the user actually saw on screen, which is the
+        // property that matters more than the step count.
+        let mut d = doc("");
+        d.insert("foo");
+        d.insert_with_pairs("(");
+        d.insert("1");
+        d.insert_with_pairs(")");
+        assert_eq!(d.buffer.text(), "foo(1)");
+
+        d.undo();
+        assert_eq!(d.buffer.text(), "foo()");
+        d.undo();
+        assert_eq!(d.buffer.text(), "foo");
+        d.undo();
+        assert_eq!(d.buffer.text(), "");
+    }
+
+    #[test]
+    fn wrapping_a_selection_undoes_in_one_step() {
+        let mut d = doc("hello world");
+        d.selection = Selection { anchor: 0, head: 5 };
+        d.insert_with_pairs("(");
+        assert_eq!(d.buffer.text(), "(hello) world");
+        d.undo();
+        assert_eq!(d.buffer.text(), "hello world", "one undo, not an insert plus an insert");
+    }
+
+    #[test]
+    fn typing_before_an_auto_close_is_a_separate_undo_step() {
+        // The other direction. A typing run already on the stack must not absorb the pair
+        // and leave one ⌘Z removing both.
+        let mut d = doc("");
+        d.insert("alpha");
+        d.buffer.break_undo_group();
+        d.insert_with_pairs("(");
+        assert_eq!(d.buffer.text(), "alpha()");
+        d.undo();
+        assert_eq!(d.buffer.text(), "alpha", "the pair undid on its own");
+    }
+
+    #[test]
+    fn auto_close_keeps_the_syntax_tree_in_sync() {
+        // The invariant `a_path_swap_never_happens_with_edits_outstanding` pins for every
+        // other mutator: a new mutating path must drain the edit log.
+        let mut d = doc("<?php\n$a = f");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert_with_pairs("(");
+        assert!(!d.buffer.has_pending(), "insert_with_pairs must drain");
+        d.insert("1");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.insert(";");
+        assert!(!d.syntax.has_error(), "the tree must still agree with the text");
+    }
+
+    // --- auto-indent on newline --------------------------------------------------------
+
+    #[test]
+    fn newline_keeps_the_current_indentation() {
+        let mut d = doc("    $a = 1;");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "    $a = 1;\n    ");
+        assert_eq!(d.cursor_point(), Point::new(1, 4));
+    }
+
+    #[test]
+    fn newline_after_an_opening_brace_indents_one_level_further() {
+        let mut d = doc("    function f() {");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "    function f() {\n        ");
+    }
+
+    #[test]
+    fn newline_between_a_pair_pushes_the_closer_to_its_own_line() {
+        // The shape auto-close makes common: the cursor is `{|}` and Enter has to produce
+        // three lines, with the closer back at the outer indent.
+        let mut d = doc("    if (x) {}");
+        d.move_to(d.buffer.len_bytes() - 1, false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "    if (x) {\n        \n    }");
+        assert_eq!(d.cursor_point(), Point::new(1, 8), "the cursor sits on the middle line");
+    }
+
+    #[test]
+    fn newline_undoes_in_one_step_even_when_it_makes_three_lines() {
+        let mut d = doc("if (x) {}");
+        d.move_to(d.buffer.len_bytes() - 1, false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "if (x) {\n    \n}");
+        d.undo();
+        assert_eq!(d.buffer.text(), "if (x) {}", "one undo, not three");
+    }
+
+    #[test]
+    fn newline_keeps_crlf_endings_crlf() {
+        let mut d = doc("    $a = 1;\r\n$b = 2;\r\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(0, 11)), false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "    $a = 1;\r\n    \r\n$b = 2;\r\n");
+    }
+
+    #[test]
+    fn newline_is_multibyte_safe() {
+        // The `before`/`after` probes read one character either side of the cursor; byte
+        // arithmetic there would land mid-codepoint next to accented text.
+        let mut d = doc("    $m = 'ação';");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "    $m = 'ação';\n    ");
+
+        // And with the cursor immediately after a multi-byte character.
+        let mut d = doc("çé");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "çé\n");
+    }
+
+    #[test]
+    fn newline_replaces_a_selection() {
+        let mut d = doc("    keep DROP");
+        d.selection = Selection { anchor: 9, head: 13 };
+        d.newline_with_indent();
+        assert_eq!(d.buffer.text(), "    keep \n    ");
+    }
+
+    // --- comment toggle ----------------------------------------------------------------
+
+    #[test]
+    fn comment_toggle_comments_and_uncomments_a_php_line() {
+        let mut d = doc("$a = 1;\n");
+        d.move_to(0, false);
+        assert!(d.toggle_comment());
+        assert_eq!(d.buffer.text(), "// $a = 1;\n");
+        assert!(d.toggle_comment());
+        assert_eq!(d.buffer.text(), "$a = 1;\n", "and back, so it is a toggle");
+    }
+
+    #[test]
+    fn comment_toggle_puts_the_marker_at_the_blocks_own_indent() {
+        // At column zero the comment would visually leave the method it is inside.
+        let mut d = doc("    $a = 1;\n    $b = 2;\n");
+        d.select_all();
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "    // $a = 1;\n    // $b = 2;\n");
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "    $a = 1;\n    $b = 2;\n");
+    }
+
+    #[test]
+    fn a_mixed_block_comments_rather_than_toggling_line_by_line() {
+        // "All commented" and not "any", which is what makes the second press reversible.
+        let mut d = doc("// $a = 1;\n$b = 2;\n");
+        d.select_all();
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "// // $a = 1;\n// $b = 2;\n", "a mixed block commutes up");
+        d.toggle_comment();
+        assert_eq!(
+            d.buffer.text(),
+            "// $a = 1;\n$b = 2;\n",
+            "and the next press undoes exactly that"
+        );
+    }
+
+    #[test]
+    fn comment_toggle_leaves_blank_lines_alone() {
+        // A marker on a blank line is trailing whitespace a linter then flags — the same
+        // rule `indent_lines` follows.
+        let mut d = doc("$a = 1;\n\n$b = 2;\n");
+        d.select_all();
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "// $a = 1;\n\n// $b = 2;\n");
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "$a = 1;\n\n$b = 2;\n");
+    }
+
+    #[test]
+    fn uncommenting_keeps_alignment_past_the_first_space() {
+        // `//    aligned` is a deliberate layout; only the single space this function adds
+        // comes back off.
+        let mut d = doc("//    aligned\n");
+        d.move_to(0, false);
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "   aligned\n");
+    }
+
+    #[test]
+    fn comment_toggle_uses_each_languages_own_marker() {
+        for (name, source, want) in [
+            ("t.yml", "key: 1\n", "# key: 1\n"),
+            ("t.toml", "key = 1\n", "# key = 1\n"),
+            ("t.sh", "echo x\n", "# echo x\n"),
+            ("t.js", "let a = 1;\n", "// let a = 1;\n"),
+            ("t.ts", "let a: number = 1;\n", "// let a: number = 1;\n"),
+        ] {
+            let mut d = Document::new(Some(PathBuf::from(name)), source, true).unwrap();
+            d.move_to(0, false);
+            assert!(d.toggle_comment(), "{name}");
+            assert_eq!(d.buffer.text(), want, "{name}");
+            d.toggle_comment();
+            assert_eq!(d.buffer.text(), source, "{name} must round trip");
+        }
+    }
+
+    #[test]
+    fn comment_toggle_does_nothing_at_all_in_json() {
+        // The deliberate decision. JSON has no comment syntax: `//` in composer.json is a
+        // parse error, and the user finds out at `composer install`, not here. So ⌘/ makes
+        // no edit and pushes nothing onto the undo stack.
+        let mut d = Document::new(
+            Some(PathBuf::from("composer.json")),
+            "{\n  \"name\": \"a/b\"\n}\n",
+            true,
+        )
+        .unwrap();
+        d.select_all();
+
+        assert!(!d.toggle_comment(), "JSON must report that it has no comment syntax");
+        assert_eq!(d.buffer.text(), "{\n  \"name\": \"a/b\"\n}\n", "and the file is untouched");
+        assert!(!d.buffer.is_dirty(), "an untouched file must not be marked dirty");
+    }
+
+    #[test]
+    fn block_comment_languages_wrap_the_whole_block_once() {
+        // CSS, HTML and Blade have no line comment. One pair around the block, not one per
+        // line: HTML comments do not nest, so a per-line form breaks on the second press.
+        for (name, source, want) in [
+            ("t.css", ".a { color: red; }\n", "/* .a { color: red; } */\n"),
+            ("t.html", "<p>x</p>\n", "<!-- <p>x</p> -->\n"),
+            ("v.blade.php", "@if($x)\n", "{{-- @if($x) --}}\n"),
+        ] {
+            let mut d = Document::new(Some(PathBuf::from(name)), source, true).unwrap();
+            d.move_to(0, false);
+            assert!(d.toggle_comment(), "{name}");
+            assert_eq!(d.buffer.text(), want, "{name}");
+            d.toggle_comment();
+            assert_eq!(d.buffer.text(), source, "{name} must round trip");
+        }
+    }
+
+    #[test]
+    fn comment_toggle_undoes_in_one_step() {
+        let mut d = doc("$a = 1;\n$b = 2;\n$c = 3;\n");
+        d.select_all();
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "// $a = 1;\n// $b = 2;\n// $c = 3;\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "$a = 1;\n$b = 2;\n$c = 3;\n", "three lines, one undo");
+    }
+
+    #[test]
+    fn comment_toggle_is_multibyte_safe() {
+        // The marker is inserted at a byte offset derived from the indent; accented text on
+        // the line would make a wrong offset land mid-codepoint and panic.
+        let mut d = doc("    $m = 'ação';\n    $n = 'çé';\n");
+        d.select_all();
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "    // $m = 'ação';\n    // $n = 'çé';\n");
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "    $m = 'ação';\n    $n = 'çé';\n");
+    }
+
+    #[test]
+    fn comment_toggle_keeps_crlf_endings_crlf() {
+        let mut d = doc("$a = 1;\r\n$b = 2;\r\n");
+        d.select_all();
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "// $a = 1;\r\n// $b = 2;\r\n");
+        d.toggle_comment();
+        assert_eq!(d.buffer.text(), "$a = 1;\r\n$b = 2;\r\n");
+    }
+
+    #[test]
+    fn comment_toggle_keeps_the_syntax_tree_in_sync() {
+        let mut d = doc("<?php\n$a = 1;\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 0)), false);
+        d.toggle_comment();
+        assert!(!d.buffer.has_pending(), "toggle_comment must drain");
+        d.toggle_comment();
+        assert!(!d.buffer.has_pending());
+        assert!(!d.syntax.has_error());
     }
 
     // --- byte-exact round trip ---------------------------------------------------

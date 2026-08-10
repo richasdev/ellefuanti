@@ -64,6 +64,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   back _proportional_, i.e. an entry that would have failed the check it existed to satisfy
   (#49)
 
+- Bracket matching, auto-close, comment toggle, indent guides and trailing-whitespace
+  rendering — the cheap half of #82. The matching bracket at the cursor is found through the
+  **parse tree**, not by scanning: `descendant_for_byte_range` locates the bracket token and
+  its partner is a sibling of the same parent, so the cost is O(depth) rather than O(distance
+  to the partner), and a file with no grammar correctly matches nothing rather than guessing.
+  Typing `(` gives `()`, typing the closer types over it, and a selection is wrapped rather
+  than replaced; bare quotes deliberately do **not** auto-close, because `don't` becoming
+  `don''t` is worse than having no auto-close at all. Enter keeps the indent and splits a
+  pair onto three lines. ⌘/ takes each language's own marker from `crates/syntax` (`//`, `#`,
+  and the block forms `/* */`, `<!-- -->`, `{{-- --}}` for CSS, HTML and Blade) and **does
+  nothing at all in JSON**, which has no comment syntax — a `//` inserted into
+  `composer.json` is a parse error the user would discover at `composer install`, not here.
+  Guides and the trailing tint are per-visible-row and measured at **228 ns for 80 rows**,
+  flat across a 55× file-size range; both colours are new `Theme` fields set per variant,
+  because a guide that reads on `#282c34` is invisible on `#ffffff` (#82)
+
 - A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
   startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`
   importer is a key mapping over an already-parsed document instead of a second parser

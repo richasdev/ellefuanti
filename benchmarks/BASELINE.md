@@ -343,6 +343,37 @@ direction and still look plausible, and single bench runs on a loaded machine we
 to trust here (a pre-fix rerun read 2.74 ms, a post-fix one 5.28 ms — pure load drift).
 Interleaved A/B in a single process is what produced a number worth believing.
 
+### Indent guides and trailing whitespace (#82)
+
+The per-row decorations added in #82, measured on the same 55k-line PHP file, 80 visible
+rows:
+
+| Arm                                 | Time       |
+| ----------------------------------- | ---------- |
+| `frame_80_rows/decorations/without` | 79.3 µs    |
+| `frame_80_rows/decorations/with`    | 80.4 µs    |
+| `frame_80_rows/decorations/alone`   | **228 ns** |
+| `decorations_80_rows/1k_lines`      | 232 ns     |
+| `decorations_80_rows/55k_lines`     | 229 ns     |
+
+**The number to quote is 228 ns for 80 rows — ~2.9 ns per row, 0.003% of the 8.3 ms budget.**
+
+The A/B arms are reported but should **not** be subtracted from each other, and that is the
+interesting part. `frame_at` costs ~80 µs with a run-to-run spread of several µs, which is
+an order of magnitude larger than the thing under test; across four runs the `with` arm read
+80.4, 80.7, 90.8 and 95.5 µs while `without` stayed at 79–81 µs. Taking the difference on
+any single run yields anything from ~1 µs to ~15 µs, all of it noise wearing a plausible
+sign. This is the failure mode the top of this file describes, met head on: two runs of
+identical code disagreed, so the disagreement is a fact about the harness. The `alone` arm
+exists because it is the only one sharp enough to answer the question, and it is stable to
+within a few ns across runs.
+
+The last two rows are the property that actually matters, and the one
+`viewport_cost_does_not_grow_with_file_size` (#52) guards for highlighting: **a 55× larger
+file costs the same 230 ns**, because the pass reads only the 80 lines already sliced for
+the frame and never touches the buffer. A regression making guides per-file rather than
+per-viewport would show up as those two columns diverging and nowhere else.
+
 ### Frame timing in the running app
 
 Instrumented as worst-of-120-frames against the 8.3 ms budget (`ELLE_PERF=1`).

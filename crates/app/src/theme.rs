@@ -77,6 +77,21 @@ pub struct Theme {
     pub information: Hsla,
     pub hint: Hsla,
 
+    /// The vertical rule drawn at each indent level, and the tint over trailing whitespace.
+    ///
+    /// Two fields rather than a reuse of `border` or `text_muted`, because a guide has a
+    /// contrast requirement neither of those meets in both directions: it has to be
+    /// *findable* against the background and *quieter* than any character, and a value that
+    /// does that on `#282c34` is invisible on `#ffffff`. That is the whole reason #82 calls
+    /// this out — one grey cannot serve five variants, so each one picks its own.
+    ///
+    /// `trailing_whitespace` is a background tint, not a glyph: rendering a `·` per space
+    /// would change the text being laid out, which breaks the 1:1 byte mapping every
+    /// highlight range in `line_runs` depends on. A background over the real spaces marks
+    /// them without inventing characters.
+    pub indent_guide: Hsla,
+    pub trailing_whitespace: Hsla,
+
     /// The sixteen ANSI slots the terminal renders: 0-7 normal, 8-15 bright.
     ///
     /// An array rather than sixteen named fields because the terminal indexes it
@@ -388,6 +403,13 @@ impl Theme {
             information: rgb(0x7dd3fc).into(),
             hint: rgb(0x6b7280).into(),
 
+            // A guide has to be findable and never compete with a character. On this
+            // background that is a few steps up from `border` (0x2a2d36) — `border` itself
+            // separates panels and is too dark to see inside the text area.
+            indent_guide: rgb(0x363a45).into(),
+            // Warmer than the guide so trailing space reads as "wrong" rather than "grid".
+            trailing_whitespace: rgb(0x4a2b35).into(),
+
             // Tuned to this theme rather than the hardware VT100 palette: a literal
             // 0x0000ff blue is unreadable on a dark background, and `ls` uses it for
             // directories on every Laravel project.
@@ -451,6 +473,12 @@ impl Theme {
             warning: rgb(0x9a6700).into(),
             information: rgb(0x0b6e8f).into(),
             hint: rgb(0x8a8f9c).into(),
+
+            // The direction reverses on a light theme: the guide is *darker* than the
+            // background, not lighter. The dark theme's 0x363a45 would be a near-black bar
+            // on 0xfbfbfd — which is the exact failure #82 names.
+            indent_guide: rgb(0xe2e4ec).into(),
+            trailing_whitespace: rgb(0xf7dfe4).into(),
             // Property sits deliberately close to `variable`: `$user->name` reads as one
             // expression, and pulling the two far apart makes a member access look like two
             // unrelated tokens. Close, not equal — the distinctness test rejects equal.
@@ -557,6 +585,11 @@ impl Theme {
             information: rgb(0x61afef).into(),
             hint: rgb(0x7f848e).into(),
 
+            // One Dark Pro's own `editorIndentGuide.background` (#3b4048). The one UI key
+            // upstream actually defines for this, so it is taken rather than derived.
+            indent_guide: rgb(0x3b4048).into(),
+            trailing_whitespace: rgb(0x4b3238).into(),
+
             // The theme file's own `terminal.ansi*` keys, verbatim.
             //
             // **Eight of these were wrong until #58.** The hand-extraction substituted the
@@ -659,6 +692,11 @@ impl Theme {
             information: rgb(0x2f81f7).into(),
             hint: rgb(0x8b949e).into(),
 
+            // GitHub Dark's `editorIndentGuide.background1` (#21262d) lifted one step: the
+            // upstream value is nearly the editor background and disappears at this size.
+            indent_guide: rgb(0x2d333b).into(),
+            trailing_whitespace: rgb(0x4a2529).into(),
+
             ansi: [
                 rgb(0x484f58).into(),
                 rgb(0xff7b72).into(),
@@ -728,6 +766,11 @@ impl Theme {
             warning: rgb(0x9a6700).into(),
             information: rgb(0x0969da).into(),
             hint: rgb(0x6e7781).into(),
+
+            // GitHub Light's `editorIndentGuide.background1` (#d8dee4), and its red-tinted
+            // danger background for the trailing tint.
+            indent_guide: rgb(0xd8dee4).into(),
+            trailing_whitespace: rgb(0xffebe9).into(),
 
             ansi: [
                 rgb(0x24292f).into(),
@@ -801,6 +844,18 @@ impl Theme {
             warning: color("warning", text),
             information: color("information", text),
             hint: color("hint", text),
+
+            // Optional keys, not required ones, and deliberately so: adding either to
+            // `REQUIRED_COLORS` would reject every theme file already on disk, for a rule
+            // whose whole subject is a hairline that most theme authors have no opinion
+            // about. A file that does set them wins; one that does not falls back to
+            // `border` (the closest "quiet line" the file must define) and to `selection`
+            // (a tint the file must define that is already meant to sit under text).
+            indent_guide: color("indent_guide", file.color("border").unwrap_or(background)),
+            trailing_whitespace: color(
+                "trailing_whitespace",
+                file.color("selection").unwrap_or(background),
+            ),
 
             ansi,
         }
