@@ -24,7 +24,6 @@ use crate::actions::{
     SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
     ToggleComment, Undo, context,
 };
-use crate::editor::caret::Caret;
 use crate::editor::line::Line;
 use crate::editor::state::Document;
 use crate::fonts::Fonts;
