@@ -135,6 +135,11 @@ fn subsequence_span(haystack: &str, needle: &str) -> Option<usize> {
 pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("workspace.open_folder", "Open Folder…"),
     Command::new("workspace.quit", "Quit"),
+    // Had an action and a ⌘⇧. binding since the file tree landed, but no id — so it was
+    // reachable by chord and invisible to the palette. #62 needed it in the View menu, and
+    // a menu row has to name a command, so the command is what got added.
+    Command::new("workspace.toggle_hidden_files", "Toggle Hidden Files"),
+    Command::new("workspace.open_settings", "Open Settings"),
     Command::new("editor.new_file", "New File"),
     Command::new("editor.save", "Save File"),
     Command::new("editor.close", "Close Tab"),

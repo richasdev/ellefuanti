@@ -12,8 +12,9 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, Dispatch, NewFile, NewTerminal, OpenFolder, Save, ToggleCommandPalette,
-    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
+    CloseTab, Dispatch, GoToRoute, NewFile, NewTerminal, OpenFolder, OpenSettings, Save,
+    ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context,
+    dispatch_for,
 };
 use crate::editor::{Document, EditorView};
 use crate::file_cache;
@@ -650,6 +651,28 @@ impl WorkspaceView {
         self.toggle_palette(PaletteMode::Files, window, cx);
     }
 
+    /// Route search, for the View menu. Unbound: every route-ish chord is taken, and #62
+    /// only needed a menu item, not a shortcut.
+    fn go_to_route(&mut self, _: &GoToRoute, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette(PaletteMode::Routes, window, cx);
+    }
+
+    /// Opens settings.json in a tab — #60 built the file, so ⌘, edits it as text.
+    ///
+    /// No settings *UI*: the file is the interface for now, and a form over four keys is
+    /// the kind of thing that has to be rebuilt the moment a fifth key is not a string.
+    fn open_settings(&mut self, _: &OpenSettings, _window: &mut Window, cx: &mut Context<Self>) {
+        match crate::settings::path_for_editing(cx) {
+            Some(path) => self.open_path(path, cx),
+            // Only when HOME is unset or the file is unparseable — both already logged, and
+            // both mean there is no file it would be safe to open.
+            None => {
+                self.status = Some("no settings file to open — see the log".into());
+                cx.notify();
+            }
+        }
+    }
+
     fn toggle_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
         // Same mode reopened means "dismiss"; a different mode swaps the contents.
         if self.palette.as_ref().is_some_and(|p| p.read(cx).mode() == mode) {
@@ -1110,6 +1133,10 @@ impl WorkspaceView {
                     Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
                     Dispatch::ToggleTerminal => self.toggle_terminal(&ToggleTerminal, window, cx),
                     Dispatch::ToggleTheme => self.toggle_theme(&ToggleTheme, window, cx),
+                    Dispatch::ToggleHiddenFiles => {
+                        self.toggle_hidden_files(&ToggleHiddenFiles, window, cx)
+                    }
+                    Dispatch::OpenSettings => self.open_settings(&OpenSettings, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -1201,6 +1228,8 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
+            .on_action(cx.listener(Self::go_to_route))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_hidden_files))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::new_terminal))
