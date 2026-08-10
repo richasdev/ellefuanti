@@ -42,7 +42,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   about them; a non-`file:` URI is refused rather than guessed at, because opening the wrong
   file is worse than opening none (#81)
 
-<<<<<<< HEAD
 
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —
@@ -64,7 +63,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   position in a document, which an importer resolving a name in the abstract does not have.
   Where a theme says nothing, the fallback names another key in the same theme, so an
   unstyled concept lands in the theme's own palette and never at black (#58)
-=======
 - Configurable fonts, on the settings layer #60 added: `editor.fontFamily`,
   `editor.fontSize`, `ui.fontSize` and `editor.lineHeight`. Line height is a **multiplier**
   rather than pixels — the old `20px` against `13px` text was a ratio someone chose once
@@ -100,7 +98,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   back _proportional_, i.e. an entry that would have failed the check it existed to satisfy
   (#49)
 
->>>>>>> 8d254de (feat(fonts): configurable family, size and line height - verified monospace)
 
 - A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
   startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`

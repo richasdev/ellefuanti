@@ -144,17 +144,33 @@ impl JumpHistory {
     }
 
     /// Pops the last place jumped from, given where the cursor is now.
+    ///
+    /// Entries whose file has since been deleted or moved are dropped rather than returned.
+    /// The alternative is worse than it sounds: `open_path_at` loads asynchronously and
+    /// cannot report failure back here, so returning a dead path would leave the cursor
+    /// where it is while the history believed the jump happened — every later Back and
+    /// Forward then off by one, with nothing on screen to explain why.
     fn back(&mut self, here: (PathBuf, Point)) -> Option<(PathBuf, Point)> {
-        let previous = self.back.pop()?;
+        let previous = Self::pop_reachable(&mut self.back)?;
         self.forward.push(here);
         Some(previous)
     }
 
     /// Undoes a [`JumpHistory::back`].
     fn forward(&mut self, here: (PathBuf, Point)) -> Option<(PathBuf, Point)> {
-        let next = self.forward.pop()?;
+        let next = Self::pop_reachable(&mut self.forward)?;
         self.back.push(here);
         Some(next)
+    }
+
+    /// Pops the newest entry that still names a file on disk, discarding any that do not.
+    fn pop_reachable(stack: &mut Vec<(PathBuf, Point)>) -> Option<(PathBuf, Point)> {
+        while let Some(entry) = stack.pop() {
+            if entry.0.exists() {
+                return Some(entry);
+            }
+        }
+        None
     }
 }
 
@@ -180,6 +196,13 @@ fn first_location(response: &GotoDefinitionResponse) -> Option<(PathBuf, Point)>
     };
 
     let path = elle_lsp::uri_to_path(uri).ok()?;
+    // Column 0, not `range.start.character`. The character is a UTF-16 offset and a `Point`
+    // column is a byte offset; they agree only for ASCII, and converting needs the buffer,
+    // which does not exist until the file has loaded. Landing at the start of the line is
+    // both correct and a normal IDE behaviour, where landing at a mis-converted column would
+    // put the cursor mid-identifier on exactly the accented Portuguese source this project
+    // is for. `crates/lsp`'s `LineIndex` does the conversion properly when there is a buffer
+    // to do it against — see `Lsp::set_diagnostics`.
     Some((path, Point::new(range.start.line as usize, 0)))
 }
 
@@ -291,6 +314,15 @@ pub struct WorkspaceView {
     lsp: Lsp,
     /// Where the cursor has been, for Back and Forward.
     history: JumpHistory,
+    /// The navigation request currently in flight, if any.
+    ///
+    /// Held separately from [`Job::LspQuery`] because dropping the task and cancelling the
+    /// request are two different things and only the first happens for free. A dropped task
+    /// stops *us* waiting; the server carries on computing an answer nobody will read, and
+    /// the pending entry it was inserted into stays in the connection's map for good. This
+    /// is the handle that lets a superseding navigation say `$/cancelRequest` and reclaim
+    /// both — ADR-0007's "cancellation, not queueing", which needs the id to mean anything.
+    in_flight_query: Option<elle_lsp::RequestId>,
 }
 
 impl WorkspaceView {
@@ -309,6 +341,7 @@ impl WorkspaceView {
             quick_open_cancel: None,
             lsp: Lsp::new(),
             history: JumpHistory::default(),
+            in_flight_query: None,
         }
     }
 
@@ -1035,8 +1068,11 @@ impl WorkspaceView {
     // says "no language server" every time F12 is pressed is complaining about software the
     // user never asked for. The failure goes to the log.
     //
-    // All three queries share `Job::LspQuery`, so a new one drops the task awaiting the old
-    // one, and `Client::cancel` tells the server to stop working on it.
+    // All three queries go through `start_query`, which does the two halves of superseding
+    // a navigation that do not imply each other: `Job::LspQuery` drops the task awaiting the
+    // old answer, and `cancel_in_flight_query` sends `$/cancelRequest` so the server stops
+    // computing it and the connection reclaims its pending slot. Dropping the task alone
+    // leaves the server working and leaks that slot for the life of the process.
 
     /// The active tab's URI and cursor offset — what every navigation request is about.
     ///
@@ -1051,6 +1087,30 @@ impl WorkspaceView {
         }
         let uri = crate::lsp_session::uri_for(path)?;
         Some((uri, tab.editor.read(cx).document.selection.head))
+    }
+
+    /// Tells the server to stop working on the navigation still in flight, if any.
+    ///
+    /// Both halves matter and neither implies the other. Dropping the task stops us
+    /// *waiting*; `$/cancelRequest` stops the server *computing* and — because
+    /// `Connection::cancel` removes the local entry first — reclaims the slot in the pending
+    /// map that an abandoned request would otherwise occupy for the life of the process.
+    fn cancel_in_flight_query(&mut self) {
+        let Some(id) = self.in_flight_query.take() else { return };
+        if let Some(client) = self.lsp.client_mut() {
+            client.cancel(&id);
+        }
+    }
+
+    /// Makes `task` the current navigation, cancelling whatever it supersedes.
+    ///
+    /// Every navigation goes through here so that "a new question abandons the old one" is
+    /// true of the server as well as of us. Doing it at each call site is how one of the
+    /// three quietly ends up leaking the request it replaced.
+    fn start_query(&mut self, id: elle_lsp::RequestId, task: Task<()>) {
+        self.cancel_in_flight_query();
+        self.in_flight_query = Some(id);
+        self.jobs.start(Job::LspQuery, task);
     }
 
     /// Where the cursor is now, for the jump history.
@@ -1093,11 +1153,16 @@ impl WorkspaceView {
         cx.notify();
 
         let origin = self.current_location(cx);
+        let query = id.clone();
         let task = cx.spawn(async move |this, cx| {
-            let found = Self::poll_query::<GotoDefinitionResponse>(&this, &id, cx).await;
+            let found = Self::poll_query::<GotoDefinitionResponse>(&this, &query, cx).await;
 
             this.update(cx, |this, cx| {
                 this.status = None;
+                // Answered, so there is nothing left to cancel. Clearing it keeps a later
+                // navigation from sending `$/cancelRequest` for an id the server has
+                // already retired.
+                this.in_flight_query = None;
                 match found {
                     // A server with no answer is the ordinary outcome for a keyword, a
                     // comment, or a symbol it has not indexed. Saying so beats a silent
@@ -1119,12 +1184,24 @@ impl WorkspaceView {
             })
             .ok();
         });
-        self.jobs.start(Job::LspQuery, task);
+        self.start_query(id, task);
     }
 
     /// Find usages (⇧F12), into the palette as a result list.
     fn find_references(&mut self, _: &FindReferences, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((uri, offset)) = self.navigation_origin(cx) else { return };
+        let Some((uri, _)) = self.navigation_origin(cx) else { return };
+
+        // The palette opens *before* anything is asked, and opens *first* because
+        // `toggle_palette` treats a second ⇧F12 as "dismiss". Sending the request first
+        // meant that press launched a whole-project search and then threw the palette it
+        // would have filled away — the request abandoned, uncancelled, with the user
+        // watching the panel vanish.
+        self.toggle_palette(PaletteMode::References, window, cx);
+        let Some(palette) = self.palette.clone() else { return };
+
+        // Re-read the offset after the toggle: opening the palette moves focus, and the
+        // origin has to be the cursor as it was, not as some later frame finds it.
+        let Some((_, offset)) = self.navigation_origin(cx) else { return };
         let Some(client) = self.lsp.client_mut() else { return };
 
         // `true`: the declaration is a usage the reader wants in the list. Excluding it
@@ -1138,15 +1215,11 @@ impl WorkspaceView {
             }
         };
 
-        // The palette opens *now*, empty, and says "Searching…" — the same contract quick
-        // open has. A whole-project search is the slowest thing a server does, and blocking
-        // the window until it lands is exactly what #81 says must not happen.
-        self.toggle_palette(PaletteMode::References, window, cx);
-        let Some(palette) = self.palette.clone() else { return };
-
         let root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        let query = id.clone();
         let task = cx.spawn(async move |this, cx| {
-            let found = Self::poll_query::<Vec<Location>>(&this, &id, cx).await;
+            let found = Self::poll_query::<Vec<Location>>(&this, &query, cx).await;
+            this.update(cx, |this, _| this.in_flight_query = None).ok();
 
             let locations = match found {
                 Ok(Some(locations)) => locations,
@@ -1177,7 +1250,7 @@ impl WorkspaceView {
             palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
             this.update(cx, |_, cx| cx.notify()).ok();
         });
-        self.jobs.start(Job::LspQuery, task);
+        self.start_query(id, task);
     }
 
     /// Go to symbol in the active file (⌘⇧O).
@@ -1203,8 +1276,10 @@ impl WorkspaceView {
             }
         };
 
+        let query = id.clone();
         let task = cx.spawn(async move |this, cx| {
-            let found = Self::poll_query::<DocumentSymbolResponse>(&this, &id, cx).await;
+            let found = Self::poll_query::<DocumentSymbolResponse>(&this, &query, cx).await;
+            this.update(cx, |this, _| this.in_flight_query = None).ok();
 
             let items = match found {
                 Ok(Some(response)) => crate::lsp_session::flatten_symbols(&response)
@@ -1226,7 +1301,7 @@ impl WorkspaceView {
             palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
             this.update(cx, |_, cx| cx.notify()).ok();
         });
-        self.jobs.start(Job::LspQuery, task);
+        self.start_query(id, task);
     }
 
     /// Waits for a request to be answered without blocking the main thread.
@@ -1250,7 +1325,12 @@ impl WorkspaceView {
         loop {
             let polled = this.update(cx, |this, _| {
                 let Some(client) = this.lsp.client_mut() else {
-                    return Ok(Some(None));
+                    // The server died or was replaced while we were waiting. That is *not*
+                    // the same as the server answering with nothing, and reporting it as
+                    // such would put "No definition found" on screen — a positive claim
+                    // about a question nobody ever got to ask. An error is logged and
+                    // silent, which is what §24 asks for.
+                    anyhow::bail!("the language server went away before it answered");
                 };
                 client.poll_response::<T>(id)
             })?;
@@ -2243,51 +2323,105 @@ mod tests {
     }
 
     // --- jump history ---------------------------------------------------------------
+    //
+    // These use real files on a real disk rather than invented paths, because `back` and
+    // `forward` skip entries whose file has gone — a history of fictional paths would
+    // exercise only the skipping and never the retracing.
 
-    fn at(path: &str, row: usize) -> (PathBuf, Point) {
-        (PathBuf::from(path), Point::new(row, 0))
+    /// A directory of real `.php` files to point history entries at.
+    fn files(names: &[&str]) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = names
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, "<?php\n").unwrap();
+                path
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    fn at(path: &std::path::Path, row: usize) -> (PathBuf, Point) {
+        (path.to_path_buf(), Point::new(row, 0))
     }
 
     #[test]
     fn back_returns_to_where_the_jump_started() {
+        let (_dir, paths) = files(&["a.php", "b.php"]);
         let mut history = JumpHistory::default();
-        history.push(at("/srv/a.php", 10));
+        history.push(at(&paths[0], 10));
 
         // Standing at the definition, Back returns to the call site.
-        assert_eq!(history.back(at("/srv/b.php", 50)), Some(at("/srv/a.php", 10)));
+        assert_eq!(history.back(at(&paths[1], 50)), Some(at(&paths[0], 10)));
         // And nothing is left to go back to.
-        assert_eq!(history.back(at("/srv/a.php", 10)), None);
+        assert_eq!(history.back(at(&paths[0], 10)), None);
     }
 
     #[test]
     fn forward_undoes_a_back() {
         // The round trip that makes the pair worth having: ⌃- then ⌃⇧- puts you back where
         // you were, not somewhere a third of the way through the trail.
+        let (_dir, paths) = files(&["a.php", "b.php"]);
         let mut history = JumpHistory::default();
-        history.push(at("/srv/a.php", 10));
+        history.push(at(&paths[0], 10));
 
-        let back = history.back(at("/srv/b.php", 50)).unwrap();
-        assert_eq!(back, at("/srv/a.php", 10));
-        assert_eq!(history.forward(back), Some(at("/srv/b.php", 50)));
+        let back = history.back(at(&paths[1], 50)).unwrap();
+        assert_eq!(back, at(&paths[0], 10));
+        assert_eq!(history.forward(back), Some(at(&paths[1], 50)));
     }
 
     #[test]
     fn a_new_jump_abandons_the_forward_trail() {
         // Browser behaviour, and for the browser's reason: once you go somewhere else, the
         // places you could have gone forward to are not on the path you took.
+        let (_dir, paths) = files(&["a.php", "b.php", "c.php"]);
         let mut history = JumpHistory::default();
-        history.push(at("/srv/a.php", 10));
-        history.back(at("/srv/b.php", 50));
+        history.push(at(&paths[0], 10));
+        history.back(at(&paths[1], 50));
         assert!(!history.forward.is_empty());
 
-        history.push(at("/srv/c.php", 1));
+        history.push(at(&paths[2], 1));
         assert!(history.forward.is_empty(), "a new jump must clear the forward stack");
     }
 
     #[test]
     fn forward_with_nothing_to_undo_does_nothing() {
+        let (_dir, paths) = files(&["a.php"]);
         let mut history = JumpHistory::default();
-        assert_eq!(history.forward(at("/srv/a.php", 1)), None);
+        assert_eq!(history.forward(at(&paths[0], 1)), None);
+    }
+
+    #[test]
+    fn a_deleted_file_is_skipped_rather_than_desynchronising_the_trail() {
+        // `open_path_at` is asynchronous and cannot report failure back to the history, so
+        // handing it a path that no longer exists would leave the cursor put while the
+        // history believed the jump happened — every later Back off by one.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.php");
+        std::fs::write(&real, "<?php\n").unwrap();
+
+        let mut history = JumpHistory::default();
+        history.push((real.clone(), Point::new(3, 0)));
+        // Pushed later, so it is popped first — and it is gone.
+        history.push((dir.path().join("deleted.php"), Point::new(7, 0)));
+
+        let here = at(std::path::Path::new("/srv/current.php"), 1);
+        assert_eq!(
+            history.back(here),
+            Some((real, Point::new(3, 0))),
+            "the missing entry must be skipped, not returned"
+        );
+    }
+
+    #[test]
+    fn a_history_of_nothing_but_deleted_files_is_a_no_op() {
+        // And must not loop forever draining the stack, nor return a path that cannot open.
+        let mut history = JumpHistory::default();
+        history.push(at(std::path::Path::new("/srv/definitely/not/here.php"), 1));
+        history.push(at(std::path::Path::new("/srv/also/gone.php"), 2));
+
+        assert_eq!(history.back(at(std::path::Path::new("/srv/current.php"), 0)), None);
     }
 
     #[test]
@@ -2296,7 +2430,7 @@ mod tests {
         // session with a lot of navigation is a slow leak of paths nobody will retrace.
         let mut history = JumpHistory::default();
         for row in 0..MAX_HISTORY + 10 {
-            history.push(at("/srv/a.php", row));
+            history.push(at(std::path::Path::new("/srv/a.php"), row));
         }
 
         assert_eq!(history.back.len(), MAX_HISTORY);
