@@ -72,6 +72,13 @@ actions!(
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
+        // Navigation (#81). `GoToDefinition` and `FindReferences` are also reachable by
+        // ⌘click and the Go menu; the palette-backed two are keyboard-only.
+        GoToSymbol,
+        GoToDefinition,
+        FindReferences,
+        NavigateBack,
+        NavigateForward,
         OpenSettings,
         IncreaseFontSize,
         DecreaseFontSize,
@@ -104,6 +111,18 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some(context::WORKSPACE)),
         // ⌘, is the macOS convention for preferences, and the menu item shows it.
         KeyBinding::new("cmd-,", OpenSettings, Some(context::WORKSPACE)),
+        // Navigation (#81). Workspace-scoped, not editor-scoped: they act on the active
+        // tab but the palette they open belongs to the workspace, and ⌘⇧O must still work
+        // when focus sits in the tree rather than in the text.
+        //
+        // F12 and ⇧F12 are the cross-platform IDE convention; ⌘⇧O is VS Code's and
+        // PhpStorm's "go to symbol in file". ⌃- / ⌃⇧- are the JetBrains back/forward pair,
+        // chosen over ⌘[ / ⌘] because those are already indent and outdent in the editor.
+        KeyBinding::new("f12", GoToDefinition, Some(context::WORKSPACE)),
+        KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
+        KeyBinding::new("ctrl--", NavigateBack, Some(context::WORKSPACE)),
+        KeyBinding::new("ctrl-shift--", NavigateForward, Some(context::WORKSPACE)),
         // ctrl-` is the conventional terminal toggle. It is bound workspace-wide so it
         // also *closes* the panel while the terminal itself has focus.
         KeyBinding::new("ctrl-`", ToggleTerminal, Some(context::WORKSPACE)),
@@ -209,6 +228,11 @@ pub enum Dispatch {
     CloseTab,
     QuickOpen,
     Routes,
+    GoToSymbol,
+    GoToDefinition,
+    FindReferences,
+    NavigateBack,
+    NavigateForward,
     Quit,
     NewTerminal,
     ToggleTerminal,
@@ -229,6 +253,11 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "editor.close" => Dispatch::CloseTab,
         "palette.quick_open" => Dispatch::QuickOpen,
         "laravel.routes" => Dispatch::Routes,
+        "navigate.symbol" => Dispatch::GoToSymbol,
+        "navigate.definition" => Dispatch::GoToDefinition,
+        "navigate.references" => Dispatch::FindReferences,
+        "navigate.back" => Dispatch::NavigateBack,
+        "navigate.forward" => Dispatch::NavigateForward,
         "terminal.new" => Dispatch::NewTerminal,
         "terminal.toggle" => Dispatch::ToggleTerminal,
         "theme.toggle" => Dispatch::ToggleTheme,

@@ -75,8 +75,14 @@ pub use connection::{Connection, RequestOutcome, ServerMessage};
 pub use document::{SyncKind, TrackedDocument};
 pub use jsonrpc::{RequestId, ResponseError};
 pub use offset::{LineIndex, OffsetEncoding};
-pub use process::path_to_uri;
+pub use process::{path_to_uri, uri_to_path};
 
 // Re-exported so callers do not need their own `lsp-types` dependency pinned to a
 // matching version — the protocol types are part of this crate's API surface.
 pub use lsp_types;
+
+/// Re-exported for the same reason as `lsp_types`: [`Client::poll_response`] and
+/// [`Client::await_response`] are generic over it, so a caller writing that bound would
+/// otherwise need its own `serde` dependency pinned to a matching version for a trait it
+/// never names in its own types.
+pub use serde::de::DeserializeOwned;

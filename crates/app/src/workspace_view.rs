@@ -2,9 +2,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
+use elle_lsp::lsp_types::{DocumentSymbolResponse, GotoDefinitionResponse, Location, Uri};
+use elle_text::Point;
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
     App, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
@@ -12,11 +15,12 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, DecreaseFontSize, Dispatch, GoToRoute, IncreaseFontSize, NewFile, NewTerminal,
-    OpenFolder, OpenSettings, ResetFontSize, Save, ToggleCommandPalette, ToggleHiddenFiles,
-    ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
+    CloseTab, DecreaseFontSize, Dispatch, FindReferences, GoToDefinition, GoToRoute, GoToSymbol,
+    IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
+    OpenSettings, ResetFontSize, Save, ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen,
+    ToggleTerminal, ToggleTheme, context, dispatch_for,
 };
-use crate::editor::{Document, EditorView};
+use crate::editor::{Document, EditorEvent, EditorView};
 use crate::file_cache;
 use crate::fonts::Fonts;
 use crate::icons;
@@ -45,6 +49,13 @@ enum Job {
     QuickOpenIndex,
     RouteIndex,
     ClosePrompt,
+    /// One slot for every language-server *query* — definition, references, symbols.
+    ///
+    /// Shared deliberately. These are all "answer a question about where the cursor is",
+    /// and asking a new one means the previous answer is no longer wanted: F12 then ⇧F12
+    /// must abandon the definition lookup, not race it. That is the cancellation ADR-0007
+    /// asks for, and a slot per request kind would instead let three stale answers land.
+    LspQuery,
     /// Starting a language server, and then the loop that drains its notifications. One
     /// slot for both because they are strictly sequential — the poll loop only exists once
     /// a start succeeded, and a new start must supersede whatever the old server was doing.
@@ -84,6 +95,147 @@ fn route_label(route: &Route) -> String {
         label.push_str(&show(name));
     }
     label
+}
+
+/// How long a navigation waits for the server before giving up.
+///
+/// Generous on purpose: a cold Intelephense indexing `vendor/` genuinely takes seconds to
+/// answer its first question, and a timeout tuned for a warm server would make the feature
+/// look broken exactly when the user first tries it. The window stays responsive throughout
+/// — see [`WorkspaceView::poll_query`] — so the only cost of waiting is the wait.
+const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a pending navigation is checked for an answer.
+///
+/// Fast enough that a warm server's reply feels immediate, slow enough that a cold one does
+/// not cost 30 seconds of busy polling. Only one navigation is ever in flight.
+const NAVIGATION_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How many jumps Back can retrace.
+///
+/// A bound rather than an unbounded `Vec`, because this grows for the whole life of the
+/// session and nothing else ever trims it. Fifty is far past what anyone retraces by hand.
+const MAX_HISTORY: usize = 50;
+
+/// Where the cursor has been, so Back and Forward can retrace it.
+///
+/// A cursor stack, not a browser history: `back` pushes where you *are* onto the forward
+/// stack as it pops where you were, which is what makes ⌃- then ⌃⇧- a round trip.
+///
+/// Only *jumps* are recorded — a go-to-definition, a reference, a symbol. Ordinary cursor
+/// movement is not, because a Back that stepped through every arrow key press would be
+/// useless for the thing it exists to do: getting out of a definition you jumped into.
+#[derive(Default)]
+struct JumpHistory {
+    back: Vec<(PathBuf, Point)>,
+    forward: Vec<(PathBuf, Point)>,
+}
+
+impl JumpHistory {
+    /// Records a place being jumped *away from*.
+    fn push(&mut self, location: (PathBuf, Point)) {
+        self.back.push(location);
+        if self.back.len() > MAX_HISTORY {
+            self.back.remove(0);
+        }
+        // A new jump abandons the forward trail, exactly as a browser does: the places you
+        // could have gone forward to are no longer on the path you actually took.
+        self.forward.clear();
+    }
+
+    /// Pops the last place jumped from, given where the cursor is now.
+    ///
+    /// Entries whose file has since been deleted or moved are dropped rather than returned.
+    /// The alternative is worse than it sounds: `open_path_at` loads asynchronously and
+    /// cannot report failure back here, so returning a dead path would leave the cursor
+    /// where it is while the history believed the jump happened — every later Back and
+    /// Forward then off by one, with nothing on screen to explain why.
+    fn back(&mut self, here: (PathBuf, Point)) -> Option<(PathBuf, Point)> {
+        let previous = Self::pop_reachable(&mut self.back)?;
+        self.forward.push(here);
+        Some(previous)
+    }
+
+    /// Undoes a [`JumpHistory::back`].
+    fn forward(&mut self, here: (PathBuf, Point)) -> Option<(PathBuf, Point)> {
+        let next = Self::pop_reachable(&mut self.forward)?;
+        self.back.push(here);
+        Some(next)
+    }
+
+    /// Pops the newest entry that still names a file on disk, discarding any that do not.
+    fn pop_reachable(stack: &mut Vec<(PathBuf, Point)>) -> Option<(PathBuf, Point)> {
+        while let Some(entry) = stack.pop() {
+            if entry.0.exists() {
+                return Some(entry);
+            }
+        }
+        None
+    }
+}
+
+/// The first place a go-to-definition response points at.
+///
+/// The response has three shapes and servers use all of them. Taking the first is what an
+/// F12 means: jump, do not ask. A symbol with several definitions — an interface and its
+/// implementations — is what ⇧F12 is for, and offering a picker on every F12 would slow the
+/// common case down to serve the rare one.
+fn first_location(response: &GotoDefinitionResponse) -> Option<(PathBuf, Point)> {
+    let (uri, range) = match response {
+        GotoDefinitionResponse::Scalar(location) => (&location.uri, location.range),
+        GotoDefinitionResponse::Array(locations) => {
+            let first = locations.first()?;
+            (&first.uri, first.range)
+        }
+        // A link carries the *target selection* range, which is the identifier itself
+        // rather than the whole declaration — the better landing spot when it is offered.
+        GotoDefinitionResponse::Link(links) => {
+            let first = links.first()?;
+            (&first.target_uri, first.target_selection_range)
+        }
+    };
+
+    let path = elle_lsp::uri_to_path(uri).ok()?;
+    // Column 0, not `range.start.character`. The character is a UTF-16 offset and a `Point`
+    // column is a byte offset; they agree only for ASCII, and converting needs the buffer,
+    // which does not exist until the file has loaded. Landing at the start of the line is
+    // both correct and a normal IDE behaviour, where landing at a mis-converted column would
+    // put the cursor mid-identifier on exactly the accented Portuguese source this project
+    // is for. `crates/lsp`'s `LineIndex` does the conversion properly when there is a buffer
+    // to do it against — see `Lsp::set_diagnostics`.
+    Some((path, Point::new(range.start.line as usize, 0)))
+}
+
+/// A palette id that carries a place in a file: `path:row`, row 0-based.
+///
+/// The palette's contract is one string per row, and widening it to a typed payload would
+/// mean the palette knowing what its rows mean — which is the one thing it is arranged not
+/// to know. Encoding the row into the id keeps the widget generic.
+///
+/// Appended rather than prepended so the common `path` prefix still matches when the user
+/// types a directory: quick open filters on the id as well as the label.
+fn target_id(path: &std::path::Path, row: usize) -> String {
+    format!("{}:{row}", path.display())
+}
+
+/// Splits a [`target_id`] back into a path and a row.
+///
+/// A plain path with no suffix is not an error — quick open's ids are bare paths, and both
+/// kinds of row arrive at the same confirm handler. Windows drive letters are not a concern
+/// here (macOS only, ADR-0004), but the parse still requires the suffix to be *entirely*
+/// digits, so a file called `notes:draft.php` is read as a path rather than a bad row.
+fn split_target_id(id: &str) -> (PathBuf, Option<Point>) {
+    match id.rsplit_once(':') {
+        Some((path, row)) if !row.is_empty() && row.bytes().all(|b| b.is_ascii_digit()) => {
+            match row.parse::<usize>() {
+                Ok(row) => (PathBuf::from(path), Some(Point::new(row, 0))),
+                // Only an overflowing row reaches this, and a line number that large is a
+                // corrupt id, not a place to jump to.
+                Err(_) => (PathBuf::from(id), None),
+            }
+        }
+        _ => (PathBuf::from(id), None),
+    }
 }
 
 /// One in-flight [`Task`] per [`Job`].
@@ -160,6 +312,17 @@ pub struct WorkspaceView {
     /// was opened or closed. Dropping the workspace drops this, which shuts the server
     /// down — that is what keeps a quit from leaving an orphan behind.
     lsp: Lsp,
+    /// Where the cursor has been, for Back and Forward.
+    history: JumpHistory,
+    /// The navigation request currently in flight, if any.
+    ///
+    /// Held separately from [`Job::LspQuery`] because dropping the task and cancelling the
+    /// request are two different things and only the first happens for free. A dropped task
+    /// stops *us* waiting; the server carries on computing an answer nobody will read, and
+    /// the pending entry it was inserted into stays in the connection's map for good. This
+    /// is the handle that lets a superseding navigation say `$/cancelRequest` and reclaim
+    /// both — ADR-0007's "cancellation, not queueing", which needs the id to mean anything.
+    in_flight_query: Option<elle_lsp::RequestId>,
 }
 
 impl WorkspaceView {
@@ -177,6 +340,8 @@ impl WorkspaceView {
             frames: FrameTimer::new(),
             quick_open_cancel: None,
             lsp: Lsp::new(),
+            history: JumpHistory::default(),
+            in_flight_query: None,
         }
     }
 
@@ -362,16 +527,64 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn open_document_for_test(&mut self, document: Document, cx: &mut Context<Self>) {
         let path = document.path.clone();
-        let editor = cx.new(|cx| EditorView::new(document, cx));
+        let editor = self.new_editor(document, cx);
         self.tabs.push(Tab { path, editor });
         self.active_tab = self.tabs.len() - 1;
         cx.notify();
     }
 
+    /// Builds an editor and subscribes to what it reports.
+    ///
+    /// Every tab goes through here so none can be created without the subscription — a
+    /// ⌘click that silently does nothing in tabs opened one particular way is the kind of
+    /// bug that survives a long time, because the feature demonstrably works elsewhere.
+    fn new_editor(&self, document: Document, cx: &mut Context<Self>) -> Entity<EditorView> {
+        let editor = cx.new(|cx| EditorView::new(document, cx));
+        cx.subscribe(&editor, |this, _editor, event, cx| match event {
+            // The editor has already moved the cursor, so the origin this reads is the
+            // clicked position — which is both where the query is about and where Back
+            // should return to.
+            EditorEvent::GoToDefinition => this.go_to_definition_at_cursor(cx),
+        })
+        .detach();
+        editor
+    }
+
     /// Opens a file in a tab, or activates the tab already showing it.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_path_at(path, None, cx);
+    }
+
+    /// Opens a file and, if `target` is given, puts the cursor there.
+    ///
+    /// # Why the target is threaded through here rather than added per feature
+    ///
+    /// Every navigation in the app is "open this file, then land somewhere in it": a route
+    /// in the palette, a go-to-definition, a reference, a symbol. The open is asynchronous —
+    /// the file is read on the background executor — so a caller that wanted a cursor
+    /// position had nowhere to put it and could only open the file and give up on the line.
+    /// That is exactly what #68's route palette did.
+    ///
+    /// Doing it per feature is how three subtly different jump paths appear, each with its
+    /// own answer to the tab-already-open case and its own clamping. There is one answer
+    /// here: `EditorView::reveal`, reached identically whether the tab was loaded just now
+    /// or was already in front of the user.
+    ///
+    /// The target is a [`Point`], not a byte offset. A line number is what every producer
+    /// actually has — a route index, an LSP position, a stack frame — and resolving it to
+    /// an offset needs the buffer, which does not exist until the load finishes.
+    pub fn open_path_at(&mut self, path: PathBuf, target: Option<Point>, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
+            // A file already open still has to move: "go to definition" on something in the
+            // current file is the common case, and leaving the cursor where it was would
+            // make the command look broken.
+            if let Some(target) = target {
+                self.tabs[index].editor.update(cx, |editor, cx| {
+                    editor.reveal(target);
+                    cx.notify();
+                });
+            }
             cx.notify();
             return;
         }
@@ -386,7 +599,13 @@ impl WorkspaceView {
                         match Document::new(Some(path.clone()), &file.text, file.trailing_newline) {
                             Ok(document) => {
                                 let text = document.buffer.text();
-                                let editor = cx.new(|cx| EditorView::new(document, cx));
+                                let editor = this.new_editor(document, cx);
+                                // Before the tab is pushed, so the first frame the user sees
+                                // is already at the target rather than painting the top of
+                                // the file and jumping a frame later.
+                                if let Some(target) = target {
+                                    editor.update(cx, |editor, _| editor.reveal(target));
+                                }
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
                                 this.status = None;
@@ -419,7 +638,7 @@ impl WorkspaceView {
     pub fn new_file(&mut self, cx: &mut Context<Self>) {
         match Document::untitled() {
             Ok(document) => {
-                let editor = cx.new(|cx| EditorView::new(document, cx));
+                let editor = self.new_editor(document, cx);
                 self.tabs.push(Tab { path: None, editor });
                 self.active_tab = self.tabs.len() - 1;
                 self.status = None;
@@ -709,8 +928,11 @@ impl WorkspaceView {
                 .iter()
                 .map(|command| (command.title.to_string(), command.id.0.to_string()))
                 .collect(),
-            // Files and routes arrive asynchronously — the palette opens empty and fills in.
-            PaletteMode::Files | PaletteMode::Routes => Vec::new(),
+            // Everything else arrives asynchronously — the palette opens empty and fills in.
+            PaletteMode::Files
+            | PaletteMode::Routes
+            | PaletteMode::Symbols
+            | PaletteMode::References => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -730,6 +952,11 @@ impl WorkspaceView {
         match mode {
             PaletteMode::Files => self.load_quick_open_items(palette, cx),
             PaletteMode::Routes => self.load_route_items(palette, cx),
+            PaletteMode::Symbols => self.load_symbol_items(palette, cx),
+            // References are filled by the request that opened the palette, not from here:
+            // the offset they are about is the cursor position at the moment the user
+            // pressed the key, which `toggle_palette` does not know.
+            PaletteMode::References => {}
             PaletteMode::Commands => {}
         }
 
@@ -816,7 +1043,11 @@ impl WorkspaceView {
                     for path in files {
                         let Ok(source) = std::fs::read_to_string(&path) else { continue };
                         for route in extract_routes(&source).routes {
-                            items.push((route_label(&route), path.display().to_string()));
+                            // `route.line` is 1-based; `Point` rows are 0-based.
+                            items.push((
+                                route_label(&route),
+                                target_id(&path, route.line.saturating_sub(1)),
+                            ));
                         }
                     }
                     items
@@ -827,6 +1058,320 @@ impl WorkspaceView {
             this.update(cx, |_, cx| cx.notify()).ok();
         });
         self.jobs.start(Job::RouteIndex, task);
+    }
+
+    // --- navigation (#81) -------------------------------------------------------------
+    //
+    // Every action here is silent with no server running. That is not laziness about error
+    // handling, it is §24 and #74's established behaviour: nobody has Intelephense on a
+    // fresh machine, most folders anyone opens are not PHP projects, and an editor that
+    // says "no language server" every time F12 is pressed is complaining about software the
+    // user never asked for. The failure goes to the log.
+    //
+    // All three queries go through `start_query`, which does the two halves of superseding
+    // a navigation that do not imply each other: `Job::LspQuery` drops the task awaiting the
+    // old answer, and `cancel_in_flight_query` sends `$/cancelRequest` so the server stops
+    // computing it and the connection reclaims its pending slot. Dropping the task alone
+    // leaves the server working and leaks that slot for the life of the process.
+
+    /// The active tab's URI and cursor offset — what every navigation request is about.
+    ///
+    /// `None` when there is no tab, no path, or the file is not one the server was told
+    /// about. Blade is the case that matters: `lsp_session::handles` excludes it, so
+    /// asking about a template would be asking about a document the server has never seen.
+    fn navigation_origin(&self, cx: &App) -> Option<(Uri, usize)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let path = tab.path.as_deref()?;
+        if !crate::lsp_session::handles(path) {
+            return None;
+        }
+        let uri = crate::lsp_session::uri_for(path)?;
+        Some((uri, tab.editor.read(cx).document.selection.head))
+    }
+
+    /// Tells the server to stop working on the navigation still in flight, if any.
+    ///
+    /// Both halves matter and neither implies the other. Dropping the task stops us
+    /// *waiting*; `$/cancelRequest` stops the server *computing* and — because
+    /// `Connection::cancel` removes the local entry first — reclaims the slot in the pending
+    /// map that an abandoned request would otherwise occupy for the life of the process.
+    fn cancel_in_flight_query(&mut self) {
+        let Some(id) = self.in_flight_query.take() else { return };
+        if let Some(client) = self.lsp.client_mut() {
+            client.cancel(&id);
+        }
+    }
+
+    /// Makes `task` the current navigation, cancelling whatever it supersedes.
+    ///
+    /// Every navigation goes through here so that "a new question abandons the old one" is
+    /// true of the server as well as of us. Doing it at each call site is how one of the
+    /// three quietly ends up leaking the request it replaced.
+    fn start_query(&mut self, id: elle_lsp::RequestId, task: Task<()>) {
+        self.cancel_in_flight_query();
+        self.in_flight_query = Some(id);
+        self.jobs.start(Job::LspQuery, task);
+    }
+
+    /// Where the cursor is now, for the jump history.
+    fn current_location(&self, cx: &App) -> Option<(PathBuf, Point)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let path = tab.path.clone()?;
+        Some((path, tab.editor.read(cx).document.cursor_point()))
+    }
+
+    /// Go to definition (F12, and the Go menu).
+    fn go_to_definition(
+        &mut self,
+        _: &GoToDefinition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_to_definition_at_cursor(cx);
+    }
+
+    /// Go to definition from wherever the cursor is.
+    ///
+    /// Shared by F12 and ⌘click rather than duplicated, so the two cannot drift into
+    /// answering differently — the click has already moved the cursor by the time this
+    /// runs, which is what makes "wherever the cursor is" the right question for both.
+    fn go_to_definition_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some((uri, offset)) = self.navigation_origin(cx) else { return };
+        let Some(client) = self.lsp.client_mut() else { return };
+
+        let id = match client.request_definition(&uri, offset) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for a definition: {err:#}");
+                return;
+            }
+        };
+
+        // Said before the answer arrives, because on a cold server this is the seconds the
+        // user would otherwise spend wondering whether the key registered.
+        self.status = Some("Finding definition…".into());
+        cx.notify();
+
+        let origin = self.current_location(cx);
+        let query = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let found = Self::poll_query::<GotoDefinitionResponse>(&this, &query, cx).await;
+
+            this.update(cx, |this, cx| {
+                this.status = None;
+                // Answered, so there is nothing left to cancel. Clearing it keeps a later
+                // navigation from sending `$/cancelRequest` for an id the server has
+                // already retired.
+                this.in_flight_query = None;
+                match found {
+                    // A server with no answer is the ordinary outcome for a keyword, a
+                    // comment, or a symbol it has not indexed. Saying so beats a silent
+                    // no-op that is indistinguishable from a dropped keystroke.
+                    Ok(None) => this.status = Some("No definition found".into()),
+                    Ok(Some(response)) => match first_location(&response) {
+                        Some((path, point)) => {
+                            if let Some(origin) = origin {
+                                this.history.push(origin);
+                            }
+                            this.open_path_at(path, Some(point), cx);
+                        }
+                        None => this.status = Some("No definition found".into()),
+                    },
+                    // The server died or answered with an error. §24: log it, carry on.
+                    Err(err) => tracing::debug!("definition lookup failed: {err:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.start_query(id, task);
+    }
+
+    /// Find usages (⇧F12), into the palette as a result list.
+    fn find_references(&mut self, _: &FindReferences, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((uri, _)) = self.navigation_origin(cx) else { return };
+
+        // The palette opens *before* anything is asked, and opens *first* because
+        // `toggle_palette` treats a second ⇧F12 as "dismiss". Sending the request first
+        // meant that press launched a whole-project search and then threw the palette it
+        // would have filled away — the request abandoned, uncancelled, with the user
+        // watching the panel vanish.
+        self.toggle_palette(PaletteMode::References, window, cx);
+        let Some(palette) = self.palette.clone() else { return };
+
+        // Re-read the offset after the toggle: opening the palette moves focus, and the
+        // origin has to be the cursor as it was, not as some later frame finds it.
+        let Some((_, offset)) = self.navigation_origin(cx) else { return };
+        let Some(client) = self.lsp.client_mut() else { return };
+
+        // `true`: the declaration is a usage the reader wants in the list. Excluding it
+        // makes "3 usages" mean something different from what the count in every other IDE
+        // means, for no gain.
+        let id = match client.request_references(&uri, offset, true) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for references: {err:#}");
+                return;
+            }
+        };
+
+        let root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        let query = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let found = Self::poll_query::<Vec<Location>>(&this, &query, cx).await;
+            this.update(cx, |this, _| this.in_flight_query = None).ok();
+
+            let locations = match found {
+                Ok(Some(locations)) => locations,
+                Ok(None) => Vec::new(),
+                Err(err) => {
+                    tracing::debug!("reference search failed: {err:#}");
+                    Vec::new()
+                }
+            };
+
+            let items: Vec<(String, String)> = locations
+                .iter()
+                .filter_map(|location| {
+                    let path = elle_lsp::uri_to_path(&location.uri).ok()?;
+                    let row = location.range.start.line as usize;
+                    // Project-relative where we can: an absolute path per row pushes the
+                    // part that differs off the right of a 520px palette.
+                    let shown = root
+                        .as_deref()
+                        .and_then(|root| path.strip_prefix(root).ok())
+                        .unwrap_or(&path);
+                    // 1-based in the label, because that is what the rest of the world
+                    // calls line 1 — the id stays 0-based for `Point`.
+                    Some((format!("{}:{}", shown.display(), row + 1), target_id(&path, row)))
+                })
+                .collect();
+
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.start_query(id, task);
+    }
+
+    /// Go to symbol in the active file (⌘⇧O).
+    fn go_to_symbol(&mut self, _: &GoToSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        // Opened before the request is sent, so an unindexed file still shows an empty
+        // palette rather than nothing happening at all.
+        self.toggle_palette(PaletteMode::Symbols, window, cx);
+    }
+
+    /// Fills the symbol palette from the active file's document symbols.
+    fn load_symbol_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some((uri, _)) = self.navigation_origin(cx) else { return };
+        let Some(path) = self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()) else {
+            return;
+        };
+        let Some(client) = self.lsp.client_mut() else { return };
+
+        let id = match client.request_document_symbols(&uri) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for document symbols: {err:#}");
+                return;
+            }
+        };
+
+        let query = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let found = Self::poll_query::<DocumentSymbolResponse>(&this, &query, cx).await;
+            this.update(cx, |this, _| this.in_flight_query = None).ok();
+
+            let items = match found {
+                Ok(Some(response)) => crate::lsp_session::flatten_symbols(&response)
+                    .into_iter()
+                    .map(|symbol| {
+                        // Two spaces per level. A class's methods have to *look* nested or
+                        // the list reads as a flat jumble of names.
+                        let label = format!("{}{}", "  ".repeat(symbol.depth), symbol.label);
+                        (label, target_id(&path, symbol.line as usize))
+                    })
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(err) => {
+                    tracing::debug!("symbol lookup failed: {err:#}");
+                    Vec::new()
+                }
+            };
+
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.start_query(id, task);
+    }
+
+    /// Waits for a request to be answered without blocking the main thread.
+    ///
+    /// The loop is the whole point. `Client` lives in the view, so it can only be touched
+    /// inside `this.update(…)` — and that closure runs on the main thread, where a blocking
+    /// wait would park the window for as long as a cold Intelephense takes to think.
+    /// ADR-0007 forbids exactly that, and the compiler does not catch it. So: check, yield
+    /// to the executor, check again.
+    ///
+    /// Dropping the task (a superseding navigation, or the window closing) stops the loop
+    /// where it stands; the pending request is then cancelled by the next `cancel` or
+    /// simply abandoned, which costs the server one wasted answer and nobody a stall.
+    async fn poll_query<T: elle_lsp::DeserializeOwned + 'static>(
+        this: &gpui::WeakEntity<Self>,
+        id: &elle_lsp::RequestId,
+        cx: &mut gpui::AsyncApp,
+    ) -> anyhow::Result<Option<T>> {
+        let deadline = std::time::Instant::now() + NAVIGATION_TIMEOUT;
+
+        loop {
+            let polled = this.update(cx, |this, _| {
+                let Some(client) = this.lsp.client_mut() else {
+                    // The server died or was replaced while we were waiting. That is *not*
+                    // the same as the server answering with nothing, and reporting it as
+                    // such would put "No definition found" on screen — a positive claim
+                    // about a question nobody ever got to ask. An error is logged and
+                    // silent, which is what §24 asks for.
+                    anyhow::bail!("the language server went away before it answered");
+                };
+                client.poll_response::<T>(id)
+            })?;
+
+            match polled? {
+                Some(answer) => return Ok(answer),
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        // Stop asking and tell the server to stop working. A server this
+                        // slow has already lost the user's attention.
+                        this.update(cx, |this, _| {
+                            if let Some(client) = this.lsp.client_mut() {
+                                client.cancel(id);
+                            }
+                        })
+                        .ok();
+                        anyhow::bail!("the language server did not answer in time");
+                    }
+                    cx.background_executor().timer(NAVIGATION_POLL_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    /// Back (⌃-): return to where the last jump started.
+    fn navigate_back(&mut self, _: &NavigateBack, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(here) = self.current_location(cx) else { return };
+        let Some((path, point)) = self.history.back(here) else { return };
+        self.open_path_at(path, Some(point), cx);
+    }
+
+    /// Forward (⌃⇧-): undo a Back.
+    fn navigate_forward(
+        &mut self,
+        _: &NavigateForward,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(here) = self.current_location(cx) else { return };
+        let Some((path, point)) = self.history.forward(here) else { return };
+        self.open_path_at(path, Some(point), cx);
     }
 
     // --- language server ------------------------------------------------------------
@@ -1132,11 +1677,27 @@ impl WorkspaceView {
         self.dismiss_palette(window, cx);
 
         match mode {
-            // Routes carry the file that declares them; opening it is the whole
-            // navigation for now. ponytail: the route's line is known and not used —
-            // `open_path` loads asynchronously and has nowhere to put a cursor target,
-            // so jumping to the line means threading one through that load.
-            Some(PaletteMode::Files | PaletteMode::Routes) => self.open_path(PathBuf::from(id), cx),
+            // Every one of these hands back a path, and all but quick open append the row
+            // to land on. Quick open's ids are bare paths and decode to no target, which
+            // opens the file at the top — the behaviour it always had.
+            Some(
+                PaletteMode::Files
+                | PaletteMode::Routes
+                | PaletteMode::Symbols
+                | PaletteMode::References,
+            ) => {
+                let (path, target) = split_target_id(&id);
+                // A symbol or a usage is a jump, so Back must return here. A file opened
+                // from quick open is not: the user chose a destination, they did not follow
+                // a reference out of somewhere they were reading.
+                if target.is_some()
+                    && matches!(mode, Some(PaletteMode::Symbols | PaletteMode::References))
+                    && let Some(origin) = self.current_location(cx)
+                {
+                    self.history.push(origin);
+                }
+                self.open_path_at(path, target, cx);
+            }
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -1147,6 +1708,13 @@ impl WorkspaceView {
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
                     Dispatch::Routes => self.toggle_palette(PaletteMode::Routes, window, cx),
+                    Dispatch::GoToSymbol => self.go_to_symbol(&GoToSymbol, window, cx),
+                    Dispatch::GoToDefinition => self.go_to_definition(&GoToDefinition, window, cx),
+                    Dispatch::FindReferences => self.find_references(&FindReferences, window, cx),
+                    Dispatch::NavigateBack => self.navigate_back(&NavigateBack, window, cx),
+                    Dispatch::NavigateForward => {
+                        self.navigate_forward(&NavigateForward, window, cx)
+                    }
                     Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
                     Dispatch::ToggleTerminal => self.toggle_terminal(&ToggleTerminal, window, cx),
                     Dispatch::ToggleTheme => self.toggle_theme(&ToggleTheme, window, cx),
@@ -1246,6 +1814,11 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
             .on_action(cx.listener(Self::go_to_route))
+            .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::go_to_definition))
+            .on_action(cx.listener(Self::find_references))
+            .on_action(cx.listener(Self::navigate_back))
+            .on_action(cx.listener(Self::navigate_forward))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_hidden_files))
             .on_action(cx.listener(Self::toggle_terminal))
@@ -1642,6 +2215,228 @@ mod tests {
                 "icons::ICONS is out of order: every panel would get the wrong glyph"
             );
         }
+    }
+
+    // --- palette ids that carry a place -------------------------------------------
+
+    #[test]
+    fn a_target_id_round_trips_through_the_palette() {
+        // The palette can only carry a string, so a jump target has to survive being
+        // flattened into one and parsed back. Row 0 is included because `saturating_sub`
+        // on a 1-based line number produces it and `0` must not be read as "no target".
+        for row in [0, 1, 41, 100_000] {
+            let id = target_id(std::path::Path::new("/srv/app/routes/web.php"), row);
+            let (path, target) = split_target_id(&id);
+            assert_eq!(path, PathBuf::from("/srv/app/routes/web.php"));
+            assert_eq!(target, Some(Point::new(row, 0)), "row {row} did not survive the id");
+        }
+    }
+
+    #[test]
+    fn a_bare_path_decodes_to_no_target() {
+        // Quick open's ids are plain paths and must keep opening at the top of the file.
+        // Both kinds of row reach the same confirm handler, so this is not a hypothetical.
+        let (path, target) = split_target_id("/srv/app/Models/User.php");
+        assert_eq!(path, PathBuf::from("/srv/app/Models/User.php"));
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn a_colon_in_a_filename_is_not_read_as_a_row() {
+        // A colon is legal in a macOS filename. Splitting on it unconditionally would open
+        // the wrong path — silently, and only for the user who names files this way.
+        let (path, target) = split_target_id("/srv/notes:draft.php");
+        assert_eq!(path, PathBuf::from("/srv/notes:draft.php"));
+        assert_eq!(target, None, "the suffix is not all digits, so it is part of the name");
+
+        // And the same name *with* a row still splits at the last colon.
+        let (path, target) = split_target_id("/srv/notes:draft.php:7");
+        assert_eq!(path, PathBuf::from("/srv/notes:draft.php"));
+        assert_eq!(target, Some(Point::new(7, 0)));
+    }
+
+    // --- go to definition: reading the three response shapes ------------------------
+
+    fn location(path: &str, line: u32) -> Location {
+        Location {
+            uri: crate::lsp_session::uri_for(std::path::Path::new(path)).unwrap(),
+            range: elle_lsp::lsp_types::Range {
+                start: elle_lsp::lsp_types::Position { line, character: 4 },
+                end: elle_lsp::lsp_types::Position { line, character: 8 },
+            },
+        }
+    }
+
+    #[test]
+    fn every_definition_response_shape_yields_a_place_to_jump() {
+        // The protocol has three and servers use all of them. Handling only the one the
+        // server of the day sends is a feature that silently does nothing after a swap.
+        let scalar = GotoDefinitionResponse::Scalar(location("/srv/app/User.php", 12));
+        assert_eq!(
+            first_location(&scalar),
+            Some((PathBuf::from("/srv/app/User.php"), Point::new(12, 0)))
+        );
+
+        // An array takes the first: F12 means jump, not "ask me which".
+        let array = GotoDefinitionResponse::Array(vec![
+            location("/srv/app/User.php", 12),
+            location("/srv/app/Other.php", 99),
+        ]);
+        assert_eq!(
+            first_location(&array),
+            Some((PathBuf::from("/srv/app/User.php"), Point::new(12, 0)))
+        );
+    }
+
+    #[test]
+    fn a_link_response_lands_on_the_identifier_not_the_declaration() {
+        // `target_range` covers the whole declaration including its doc comment;
+        // `target_selection_range` is the name. Landing on the comment reads as an
+        // off-by-several to the user, and the wrong field is the easy one to reach for.
+        let link = GotoDefinitionResponse::Link(vec![elle_lsp::lsp_types::LocationLink {
+            origin_selection_range: None,
+            target_uri: crate::lsp_session::uri_for(std::path::Path::new("/srv/app/User.php"))
+                .unwrap(),
+            target_range: elle_lsp::lsp_types::Range {
+                start: elle_lsp::lsp_types::Position { line: 8, character: 0 },
+                end: elle_lsp::lsp_types::Position { line: 20, character: 0 },
+            },
+            target_selection_range: elle_lsp::lsp_types::Range {
+                start: elle_lsp::lsp_types::Position { line: 12, character: 4 },
+                end: elle_lsp::lsp_types::Position { line: 12, character: 8 },
+            },
+        }]);
+
+        assert_eq!(
+            first_location(&link),
+            Some((PathBuf::from("/srv/app/User.php"), Point::new(12, 0))),
+            "must use the selection range, not the enclosing one"
+        );
+    }
+
+    #[test]
+    fn an_empty_definition_response_is_not_a_jump() {
+        // Servers answer with an empty array for a keyword or an unindexed symbol. Taking
+        // `[0]` unguarded would panic on exactly that, in the middle of ordinary use.
+        assert_eq!(first_location(&GotoDefinitionResponse::Array(vec![])), None);
+        assert_eq!(first_location(&GotoDefinitionResponse::Link(vec![])), None);
+    }
+
+    // --- jump history ---------------------------------------------------------------
+    //
+    // These use real files on a real disk rather than invented paths, because `back` and
+    // `forward` skip entries whose file has gone — a history of fictional paths would
+    // exercise only the skipping and never the retracing.
+
+    /// A directory of real `.php` files to point history entries at.
+    fn files(names: &[&str]) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = names
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, "<?php\n").unwrap();
+                path
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    fn at(path: &std::path::Path, row: usize) -> (PathBuf, Point) {
+        (path.to_path_buf(), Point::new(row, 0))
+    }
+
+    #[test]
+    fn back_returns_to_where_the_jump_started() {
+        let (_dir, paths) = files(&["a.php", "b.php"]);
+        let mut history = JumpHistory::default();
+        history.push(at(&paths[0], 10));
+
+        // Standing at the definition, Back returns to the call site.
+        assert_eq!(history.back(at(&paths[1], 50)), Some(at(&paths[0], 10)));
+        // And nothing is left to go back to.
+        assert_eq!(history.back(at(&paths[0], 10)), None);
+    }
+
+    #[test]
+    fn forward_undoes_a_back() {
+        // The round trip that makes the pair worth having: ⌃- then ⌃⇧- puts you back where
+        // you were, not somewhere a third of the way through the trail.
+        let (_dir, paths) = files(&["a.php", "b.php"]);
+        let mut history = JumpHistory::default();
+        history.push(at(&paths[0], 10));
+
+        let back = history.back(at(&paths[1], 50)).unwrap();
+        assert_eq!(back, at(&paths[0], 10));
+        assert_eq!(history.forward(back), Some(at(&paths[1], 50)));
+    }
+
+    #[test]
+    fn a_new_jump_abandons_the_forward_trail() {
+        // Browser behaviour, and for the browser's reason: once you go somewhere else, the
+        // places you could have gone forward to are not on the path you took.
+        let (_dir, paths) = files(&["a.php", "b.php", "c.php"]);
+        let mut history = JumpHistory::default();
+        history.push(at(&paths[0], 10));
+        history.back(at(&paths[1], 50));
+        assert!(!history.forward.is_empty());
+
+        history.push(at(&paths[2], 1));
+        assert!(history.forward.is_empty(), "a new jump must clear the forward stack");
+    }
+
+    #[test]
+    fn forward_with_nothing_to_undo_does_nothing() {
+        let (_dir, paths) = files(&["a.php"]);
+        let mut history = JumpHistory::default();
+        assert_eq!(history.forward(at(&paths[0], 1)), None);
+    }
+
+    #[test]
+    fn a_deleted_file_is_skipped_rather_than_desynchronising_the_trail() {
+        // `open_path_at` is asynchronous and cannot report failure back to the history, so
+        // handing it a path that no longer exists would leave the cursor put while the
+        // history believed the jump happened — every later Back off by one.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.php");
+        std::fs::write(&real, "<?php\n").unwrap();
+
+        let mut history = JumpHistory::default();
+        history.push((real.clone(), Point::new(3, 0)));
+        // Pushed later, so it is popped first — and it is gone.
+        history.push((dir.path().join("deleted.php"), Point::new(7, 0)));
+
+        let here = at(std::path::Path::new("/srv/current.php"), 1);
+        assert_eq!(
+            history.back(here),
+            Some((real, Point::new(3, 0))),
+            "the missing entry must be skipped, not returned"
+        );
+    }
+
+    #[test]
+    fn a_history_of_nothing_but_deleted_files_is_a_no_op() {
+        // And must not loop forever draining the stack, nor return a path that cannot open.
+        let mut history = JumpHistory::default();
+        history.push(at(std::path::Path::new("/srv/definitely/not/here.php"), 1));
+        history.push(at(std::path::Path::new("/srv/also/gone.php"), 2));
+
+        assert_eq!(history.back(at(std::path::Path::new("/srv/current.php"), 0)), None);
+    }
+
+    #[test]
+    fn the_history_is_bounded() {
+        // It grows for the whole session and nothing else trims it. Unbounded, a long
+        // session with a lot of navigation is a slow leak of paths nobody will retrace.
+        let mut history = JumpHistory::default();
+        for row in 0..MAX_HISTORY + 10 {
+            history.push(at(std::path::Path::new("/srv/a.php"), row));
+        }
+
+        assert_eq!(history.back.len(), MAX_HISTORY);
+        // The *oldest* entries are the ones dropped, so Back still retraces the most
+        // recent jumps rather than ancient ones.
+        assert_eq!(history.back.last().unwrap().1.row, MAX_HISTORY + 9);
     }
 
     /// Stands in for a `Task`, recording its own cancellation.

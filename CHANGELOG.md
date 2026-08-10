@@ -9,6 +9,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- **Navigation**: go to definition (F12, ⌘click), find usages (⇧F12), go to symbol in file
+  (⌘⇧O) and back/forward (⌃- / ⌃⇧-). `elle-lsp` has had the typed methods since #45 and #74
+  wired a real server; none of them was called by anything, so this is the UI over work that
+  already existed.
+
+  The blocker all of them shared went first: **`open_path` was asynchronous with nowhere to
+  put a cursor target**, so a caller that knew where it wanted to land could only open the
+  file and give up on the line. `open_path_at` takes an optional position and
+  `EditorView::reveal` is the single place a jump lands, so the tab-already-open case and the
+  just-loaded case cannot drift apart. #68's route palette had been extracting `route.line`
+  and discarding it — it now jumps to the line that declares the route (#68, #81).
+
+  Symbol responses are flattened from **both** shapes the protocol allows. A server chooses
+  between `DocumentSymbol` and `SymbolInformation`, and handling only the modern one is a
+  palette that silently goes empty the day somebody swaps their server — RISKS.md #2 in
+  miniature. Definition responses likewise handle all three shapes, and a `LocationLink` uses
+  its _selection_ range, so the cursor lands on the identifier rather than on the first line
+  of the doc comment the enclosing range starts at.
+
+  Every query shares one job slot, so a second navigation cancels the first rather than
+  racing it, and each is silent when no server is running — §24's rule and #74's established
+  behaviour, since nobody has a language server on a fresh machine and most folders anyone
+  opens are not PHP projects.
+
+  `Connection::poll` is new and is what keeps this responsive. `wait` cannot be polled: a
+  zero timeout _drops the pending entry_, so asking "answered yet?" that way would cancel the
+  request on the second call. The UI needs a non-destructive check because the `Client` lives
+  in the view and reaching it happens on the main thread, where blocking for the seconds a
+  cold server takes is precisely what ADR-0007 forbids. `uri_to_path` is the counterpart to
+  `path_to_uri`, needed now the server _answers_ with locations instead of only being told
+  about them; a non-`file:` URI is refused rather than guessed at, because opening the wrong
+  file is worse than opening none (#81)
+
+
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —
   plus an importer for VS Code's `colors` and `tokenColors`. Themes are read from
@@ -64,21 +98,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   back _proportional_, i.e. an entry that would have failed the check it existed to satisfy
   (#49)
 
-- Bracket matching, auto-close, comment toggle, indent guides and trailing-whitespace
-  rendering — the cheap half of #82. The matching bracket at the cursor is found through the
-  **parse tree**, not by scanning: `descendant_for_byte_range` locates the bracket token and
-  its partner is a sibling of the same parent, so the cost is O(depth) rather than O(distance
-  to the partner), and a file with no grammar correctly matches nothing rather than guessing.
-  Typing `(` gives `()`, typing the closer types over it, and a selection is wrapped rather
-  than replaced; bare quotes deliberately do **not** auto-close, because `don't` becoming
-  `don''t` is worse than having no auto-close at all. Enter keeps the indent and splits a
-  pair onto three lines. ⌘/ takes each language's own marker from `crates/syntax` (`//`, `#`,
-  and the block forms `/* */`, `<!-- -->`, `{{-- --}}` for CSS, HTML and Blade) and **does
-  nothing at all in JSON**, which has no comment syntax — a `//` inserted into
-  `composer.json` is a parse error the user would discover at `composer install`, not here.
-  Guides and the trailing tint are per-visible-row and measured at **228 ns for 80 rows**,
-  flat across a 55× file-size range; both colours are new `Theme` fields set per variant,
-  because a guide that reads on `#282c34` is invisible on `#ffffff` (#82)
 
 - A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
   startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`

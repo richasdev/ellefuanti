@@ -384,6 +384,23 @@ impl Client {
         decode(self.connection.wait(id, timeout)?, &self.name)
     }
 
+    /// Takes the answer to a request if it has arrived, without blocking.
+    ///
+    /// For a caller on a thread it must not block — the UI thread — this is the counterpart
+    /// to [`Client::await_response`]: poll, yield, poll again. See [`Connection::poll`] for
+    /// why a zero-timeout `wait` cannot serve.
+    ///
+    /// The two layers of `Option` are not the same question and collapsing them would lose
+    /// the one that matters: the outer is *has the server answered*, the inner is *did it
+    /// have anything to say*. A caller polling in a loop must keep waiting on the first and
+    /// stop on the second — `Some(None)` is "no definition found", which is a final answer.
+    pub fn poll_response<T: DeserializeOwned>(&self, id: &RequestId) -> Result<Option<Option<T>>> {
+        match self.connection.poll(id)? {
+            Some(outcome) => decode(outcome, &self.name).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Cancels a pending request (`$/cancelRequest`).
     pub fn cancel(&self, id: &RequestId) {
         self.connection.cancel(id);

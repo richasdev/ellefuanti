@@ -9,9 +9,10 @@ use std::ops::Range;
 use elle_syntax::HighlightSpan;
 use elle_text::Point;
 use gpui::{
-    App, ClipboardItem, Context, FocusHandle, Focusable, HighlightStyle as GpuiHighlight,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, ScrollStrategy, SharedString, StyledText,
-    TextRun, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+    HighlightStyle as GpuiHighlight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    ScrollStrategy, SharedString, StyledText, TextRun, UniformListScrollHandle, Window, div,
+    prelude::*, px, uniform_list,
 };
 
 use crate::actions::{
@@ -78,6 +79,19 @@ impl EditorView {
     /// server goes away — see `Lsp::shut_down` for why clearing matters more than it looks.
     pub fn set_diagnostics(&mut self, diagnostics: Vec<(Range<usize>, Severity)>) {
         self.diagnostics = diagnostics;
+    }
+
+    /// Puts the cursor at `target` and scrolls it on screen.
+    ///
+    /// The one place a navigation lands, so every jump — a route, a definition, a
+    /// reference, a symbol — leaves the editor in the same state. `point_to_offset` clamps
+    /// both row and column, which is what makes a stale target (a line number from an
+    /// index built before the file shrank) a cursor at the end of the file rather than a
+    /// panic.
+    pub fn reveal(&mut self, target: Point) {
+        let offset = self.document.buffer.point_to_offset(target);
+        self.document.move_to(offset, false);
+        self.scroll_cursor_into_view();
     }
 
     /// Where the text column starts, as measured at prepaint.
@@ -469,9 +483,28 @@ impl EditorView {
         let offset = self.document.buffer.point_to_offset(Point::new(row, column));
         // Shift-click extends the existing selection, matching every other editor.
         self.document.move_to(offset, event.modifiers.shift);
+
+        // ⌘click is go-to-definition, the way it is in every IDE. The cursor moves first
+        // either way, so a ⌘click that finds nothing still behaves like the ordinary click
+        // it also was — and the workspace, not the editor, owns the language server.
+        if event.modifiers.platform {
+            cx.emit(EditorEvent::GoToDefinition);
+        }
         cx.notify();
     }
 }
+
+/// What the editor tells the workspace.
+///
+/// One variant, because there is one thing an editor knows that the workspace has to act
+/// on: the user asked to navigate from a place only the editor knows the coordinates of.
+/// An event rather than a call into the workspace keeps the editor unaware that a language
+/// server exists — the same split `set_diagnostics` already has in the other direction.
+pub enum EditorEvent {
+    GoToDefinition,
+}
+
+impl EventEmitter<EditorEvent> for EditorView {}
 
 impl Focusable for EditorView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

@@ -146,6 +146,13 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("palette.toggle", "Command Palette"),
     Command::new("palette.quick_open", "Quick Open File"),
     Command::new("laravel.routes", "Go to Route…"),
+    // Navigation (#81). These have keybindings too — a command id is what makes them
+    // findable by someone who does not know the chord, and what lets the Go menu name them.
+    Command::new("navigate.symbol", "Go to Symbol in File…"),
+    Command::new("navigate.definition", "Go to Definition"),
+    Command::new("navigate.references", "Find Usages"),
+    Command::new("navigate.back", "Back"),
+    Command::new("navigate.forward", "Forward"),
     Command::new("terminal.new", "New Terminal"),
     Command::new("terminal.toggle", "Toggle Terminal"),
     Command::new("theme.toggle", "Switch Theme"),

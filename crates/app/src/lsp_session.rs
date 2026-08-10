@@ -43,7 +43,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use elle_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Uri};
+use elle_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, DocumentSymbol, DocumentSymbolResponse, Uri,
+};
 use elle_lsp::{Client, ServerConfig, path_to_uri};
 
 /// The server started when `ELLE_LSP_COMMAND` is unset.
@@ -305,6 +307,69 @@ impl Lsp {
             .collect();
 
         self.diagnostics.insert(uri, FileDiagnostics { items });
+    }
+}
+
+/// One row of the symbol palette: what to show, and where it lives.
+///
+/// Flattened out of whichever shape the server answered in, so nothing downstream has to
+/// know that `textDocument/documentSymbol` has two incompatible return types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Symbol {
+    /// `Class::method` where the server told us the container, `method` where it did not.
+    pub label: String,
+    /// 0-based, ready for a `Point` row. The *selection* range where there is one — that is
+    /// the identifier itself, which is where a reader wants the cursor, rather than the
+    /// first line of a doc comment that the enclosing range starts at.
+    pub line: u32,
+    /// Nesting depth, for the indent that makes a class's methods readable as its methods.
+    pub depth: usize,
+}
+
+/// Flattens a document-symbol response into palette rows, in document order.
+///
+/// # Why both shapes are handled
+///
+/// The protocol has two return types for this request and lets the server pick. `Nested`
+/// (`DocumentSymbol`) is the modern one and carries a tree; `Flat` (`SymbolInformation`) is
+/// the legacy one and carries a `container_name` string instead. Handling only the shape
+/// the server of the day happens to send is the kind of thing that works until someone
+/// swaps their server and the palette silently goes empty — RISKS.md #2 in miniature, so
+/// both are flattened here into the one type the UI knows.
+///
+/// Depth-first, because a symbol list that does not follow the file reads as a jumble: a
+/// class's methods belong under the class, in the order they are written.
+pub fn flatten_symbols(response: &DocumentSymbolResponse) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    match response {
+        DocumentSymbolResponse::Nested(symbols) => push_nested(symbols, 0, &mut out),
+        DocumentSymbolResponse::Flat(symbols) => {
+            for symbol in symbols {
+                // The legacy shape has no tree, only a container name. Qualifying the label
+                // with it is what keeps two `handle` methods in one file distinguishable.
+                let label = match &symbol.container_name {
+                    Some(container) if !container.is_empty() => {
+                        format!("{container}::{}", symbol.name)
+                    }
+                    _ => symbol.name.clone(),
+                };
+                out.push(Symbol { label, line: symbol.location.range.start.line, depth: 0 });
+            }
+        }
+    }
+    out
+}
+
+fn push_nested(symbols: &[DocumentSymbol], depth: usize, out: &mut Vec<Symbol>) {
+    for symbol in symbols {
+        out.push(Symbol {
+            label: symbol.name.clone(),
+            line: symbol.selection_range.start.line,
+            depth,
+        });
+        if let Some(children) = &symbol.children {
+            push_nested(children, depth + 1, out);
+        }
     }
 }
 
@@ -600,6 +665,92 @@ mod tests {
         let end = file.items[0].range.end;
         assert!(file.at(end).is_some(), "the offset just past the range must still match");
         assert!(file.at(end + 1).is_none(), "but not one beyond that");
+    }
+
+    // --- document symbols ----------------------------------------------------------
+
+    fn range(line: u32) -> Range {
+        Range { start: Position { line, character: 0 }, end: Position { line, character: 10 } }
+    }
+
+    #[allow(deprecated)]
+    fn nested(name: &str, line: u32, children: Vec<DocumentSymbol>) -> DocumentSymbol {
+        DocumentSymbol {
+            name: name.to_string(),
+            detail: None,
+            kind: elle_lsp::lsp_types::SymbolKind::CLASS,
+            tags: None,
+            deprecated: None,
+            // Deliberately different from the selection range: the enclosing range starts
+            // at the doc comment, and jumping there rather than to the identifier is the
+            // bug this fixture exists to catch.
+            range: range(line.saturating_sub(2)),
+            selection_range: range(line),
+            children: if children.is_empty() { None } else { Some(children) },
+        }
+    }
+
+    #[test]
+    fn nested_symbols_flatten_in_document_order_with_depth() {
+        // A class's methods must read as its methods, in the order they are written.
+        let response = DocumentSymbolResponse::Nested(vec![
+            nested("User", 10, vec![nested("save", 12, vec![]), nested("delete", 20, vec![])]),
+            nested("Post", 40, vec![]),
+        ]);
+
+        let symbols = flatten_symbols(&response);
+        let seen: Vec<_> = symbols.iter().map(|s| (s.label.as_str(), s.line, s.depth)).collect();
+        assert_eq!(seen, [("User", 10, 0), ("save", 12, 1), ("delete", 20, 1), ("Post", 40, 0)]);
+    }
+
+    #[test]
+    fn a_nested_symbol_points_at_its_name_not_its_doc_comment() {
+        // `range` encloses the whole declaration including comments; `selection_range` is
+        // the identifier. Landing on the comment two lines above looks like an off-by-two
+        // to the user and is the easier of the two fields to reach for.
+        let response = DocumentSymbolResponse::Nested(vec![nested("User", 10, vec![])]);
+        assert_eq!(flatten_symbols(&response)[0].line, 10);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn the_legacy_flat_shape_is_handled_too() {
+        // The protocol lets the server choose the shape. Handling only the modern one works
+        // until somebody swaps their server and the palette silently goes empty — which is
+        // exactly the substitutability failure RISKS.md #2 is about.
+        let location = elle_lsp::lsp_types::Location { uri: uri(), range: range(7) };
+        let response = DocumentSymbolResponse::Flat(vec![
+            elle_lsp::lsp_types::SymbolInformation {
+                name: "save".into(),
+                kind: elle_lsp::lsp_types::SymbolKind::METHOD,
+                tags: None,
+                deprecated: None,
+                location: location.clone(),
+                container_name: Some("User".into()),
+            },
+            elle_lsp::lsp_types::SymbolInformation {
+                name: "helper".into(),
+                kind: elle_lsp::lsp_types::SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: None,
+                location,
+                container_name: None,
+            },
+        ]);
+
+        let symbols = flatten_symbols(&response);
+        // The container qualifies the name, which is what keeps two `save` methods in one
+        // file apart. A symbol with no container is shown bare rather than as `::save`.
+        assert_eq!(symbols[0].label, "User::save");
+        assert_eq!(symbols[1].label, "helper");
+        assert_eq!(symbols[0].line, 7);
+    }
+
+    #[test]
+    fn a_server_with_nothing_to_say_yields_no_rows() {
+        // A file the server has not indexed yet answers with an empty list, not an error.
+        assert!(flatten_symbols(&DocumentSymbolResponse::Nested(vec![])).is_empty());
+        assert!(flatten_symbols(&DocumentSymbolResponse::Flat(vec![])).is_empty());
     }
 
     #[test]
