@@ -1093,13 +1093,14 @@ mod tests {
 
     #[test]
     fn closing_a_tab_left_of_the_active_one_keeps_the_same_file_active() {
-        // The bug the ✕ button introduced. Three tabs with the third active: clicking ✕ on
-        // the first shifts the other two down, so an `active_tab` that only ever got clamped
-        // stayed at 2 — off the end — and the clamp then landed it on the *second* file.
-        // The user closed one file and silently got shown another.
+        // Three tabs with the third active, closing the first: the clamp happens to agree
+        // here (both give 1), because the active tab was last and clamping to the new end
+        // lands on the right file by luck. Kept as a regression guard, not as evidence.
         assert_eq!(active_after_close(2, 0, 2), 1);
-        // Same shift, mid-list, where the clamp cannot hide it: five tabs, fourth active,
-        // close the second and the active file is now at 2.
+        // This is the case that actually proves the bug — the only one where the clamp
+        // cannot hide it. Five tabs, fourth active, close the second: the three later tabs
+        // shift down, so the active file is now at 2. Clamping alone returns 3, which is a
+        // different file. The user closed one file and silently got shown another.
         assert_eq!(active_after_close(3, 1, 4), 2);
     }
 
