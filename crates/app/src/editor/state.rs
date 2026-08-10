@@ -24,11 +24,16 @@ use crate::editor::find::{Matches, SearchQuery};
 /// This rules out language-aware boundaries: `$` is a word character in a `.md` file
 /// too. Getting that right needs the token stream from `crates/syntax`, which is a much
 /// bigger change than a motion.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// The variant order is load-bearing and matches Zed's `CharKind`
+/// (`crates/language/src/buffer.rs:581`), which derives `Ord` in the order
+/// `Whitespace, Punctuation, Word`. [`Document::select_word_at`] relies on that ordering —
+/// see its doc comment.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum CharClass {
     Whitespace,
-    Word,
     Punctuation,
+    Word,
 }
 
 impl CharClass {
@@ -441,6 +446,103 @@ impl Document {
     pub fn select_all(&mut self) {
         self.selection = Selection { anchor: 0, head: self.buffer.len_bytes() };
         self.goal_column = None;
+    }
+
+    /// Double-click: selects the run of one character class around `offset`.
+    ///
+    /// Ported from Zed's `BufferSnapshot::surrounding_word`
+    /// (`crates/language/src/buffer.rs:4179`), whose whole shape is three lines that are
+    /// easy to get wrong by reasoning:
+    ///
+    /// ```text
+    /// let word_kind = cmp::max(
+    ///     prev_chars.peek().copied().map(|c| classifier.kind(c)),
+    ///     next_chars.peek().copied().map(|c| classifier.kind(c)),
+    /// );
+    /// ```
+    ///
+    /// **`max`, not "the class to the right".** A click lands *between* two characters, so
+    /// there are two candidate classes, and `CharKind`'s ordering
+    /// (`Whitespace < Punctuation < Word`, `buffer.rs:581`) makes `max` mean "prefer the
+    /// more interesting side". Double-clicking just past the end of `name` therefore selects
+    /// `name` rather than the space after it, and double-clicking between `->` and `name`
+    /// selects `name` rather than `->`. Picking one side unconditionally gets one of those
+    /// two cases wrong, and which one depends on which side you picked — this is exactly the
+    /// kind of rule the task brief means by "read, not reasoned about".
+    ///
+    /// **`&& ch != '\n'`** in both loops (`buffer.rs:4195`, `4089`) is the other detail: a
+    /// newline is whitespace, so a double-click in the indentation of a line would otherwise
+    /// run through the line break and swallow the blank lines around it. Selection stays on
+    /// one line.
+    ///
+    /// The `.take(128)` cap Zed applies at `buffer.rs:4186` is adopted too — it bounds the
+    /// scan on a minified line, the same concern `MAX_MEASURE_BYTES` covers for rendering.
+    /// A 128-character "word" is not one, so the cap changes no real outcome.
+    ///
+    /// Not adopted: Zed's `CharScopeContext` / language-scope `word_characters`
+    /// (`buffer.rs:5845`), which is how PHP declares `$` a word character. This editor
+    /// hardcodes `$` in [`CharClass::of`] instead and that limitation is already documented
+    /// there; wiring per-language scopes is the same much-bigger change.
+    pub fn select_word_at(&mut self, offset: usize) {
+        let rope = self.buffer.rope();
+        let len = rope.len_chars();
+        let mid = rope.byte_to_char(offset.min(self.buffer.len_bytes()));
+
+        let prev = (mid > 0).then(|| CharClass::of(rope.char(mid - 1)));
+        let next = (mid < len).then(|| CharClass::of(rope.char(mid)));
+        // `Option`'s own `Ord` puts `None` below every `Some`, which is what Zed's
+        // `cmp::max` over two `Option<CharKind>` relies on: one side being past the end of
+        // the buffer must not win.
+        let Some(kind) = prev.max(next) else {
+            // Empty buffer: there is no run to select.
+            self.selection = Selection::at(0);
+            self.goal_column = None;
+            return;
+        };
+
+        const MAX_SCAN: usize = 128;
+
+        let mut start = mid;
+        while start > 0 && mid - start < MAX_SCAN {
+            let ch = rope.char(start - 1);
+            if CharClass::of(ch) != kind || ch == '\n' {
+                break;
+            }
+            start -= 1;
+        }
+
+        let mut end = mid;
+        while end < len && end - mid < MAX_SCAN {
+            let ch = rope.char(end);
+            if CharClass::of(ch) != kind || ch == '\n' {
+                break;
+            }
+            end += 1;
+        }
+
+        self.selection =
+            Selection { anchor: rope.char_to_byte(start), head: rope.char_to_byte(end) };
+        self.goal_column = None;
+        // A click is a jump: the same reason `move_to` breaks the run.
+        self.buffer.break_undo_group();
+    }
+
+    /// Triple-click: selects the whole line `row` sits on, including its line ending.
+    ///
+    /// Zed's third click (`crates/editor/src/selection.rs:1294-1305`) ends the selection at
+    /// `next_line_boundary(position).0 + Point::new(1, 0)`, clipped — i.e. **column zero of
+    /// the following row**, not the end of this row's content. That is why copying a
+    /// triple-clicked line in Zed pastes as a whole line rather than as a fragment that
+    /// needs a newline typed after it.
+    ///
+    /// `line_span` already computes exactly that range (line ending included, whatever the
+    /// ending is, and stopping at content on the last row, which is Zed's `clip_point`).
+    pub fn select_line_at(&mut self, row: usize) {
+        let row = row.min(self.buffer.len_lines().saturating_sub(1));
+        let span = self.line_span(row..=row);
+        self.selection = Selection { anchor: span.start, head: span.end };
+        self.goal_column = None;
+        self.buffer.break_undo_group();
     }
 
     // --- deletion ------------------------------------------------------------------
@@ -1435,6 +1537,113 @@ mod tests {
         assert_eq!(d.cursor_point(), Point::new(0, 3));
         d.move_line_home(false);
         assert_eq!(d.cursor_point(), Point::new(0, 0));
+    }
+
+    // --- click selection -------------------------------------------------------------
+
+    /// The text a `select_*` call left selected, so a test reads as the user's outcome
+    /// rather than as two offsets.
+    fn selected(d: &Document) -> String {
+        d.buffer.slice(d.selection.range())
+    }
+
+    #[test]
+    fn a_double_click_inside_a_word_takes_the_whole_word() {
+        let mut d = doc("let name = 1;");
+        // Byte 5 is inside `name`.
+        d.select_word_at(5);
+        assert_eq!(selected(&d), "name");
+    }
+
+    #[test]
+    fn a_double_click_between_a_word_and_a_space_prefers_the_word() {
+        // This is the `cmp::max` in Zed's `surrounding_word` (`language/src/buffer.rs:4190`)
+        // and the reason it is a max rather than "look right". A click lands between two
+        // characters; with `let |name`, looking right gives `name` and looking left gives
+        // the space. `CharKind`'s ordering makes Word win both times.
+        //             0123456789
+        let mut d = doc("let name = 1;");
+        // Byte 4 is between the space at 3 and `n` at 4: the word is to the *right*.
+        d.select_word_at(4);
+        assert_eq!(selected(&d), "name", "the word is to the right of the click");
+        // Byte 8 is between `e` at 7 and the space at 8: the word is to the *left*. This is
+        // the direction that fails if the rule is "classify the character after the click" —
+        // that reads the space and selects " " instead.
+        d.select_word_at(8);
+        assert_eq!(selected(&d), "name", "the word is to the left of the click");
+    }
+
+    #[test]
+    fn a_double_click_on_punctuation_takes_the_punctuation_run() {
+        // Three classes, so `->` is a run of its own — the same rule word *motion* already
+        // follows. Double-clicking the arrow in `$user->name` must not select `$user->name`
+        // (punctuation lumped with words) nor a single `-` (punctuation split per char).
+        let mut d = doc("$user->name;");
+        d.select_word_at(6); // between `-` and `>`
+        assert_eq!(selected(&d), "->");
+        d.select_word_at(2);
+        assert_eq!(selected(&d), "$user", "`$` is a word character here");
+    }
+
+    #[test]
+    fn a_double_click_never_crosses_a_line_break() {
+        // A newline is whitespace, so without Zed's `&& ch != '\n'` guard
+        // (`language/src/buffer.rs:4195`) a double-click in this indentation would run
+        // through the blank line above and below and select all three line breaks.
+        let mut d = doc("a\n\n    x\n\nb");
+        let indent = d.buffer.point_to_offset(Point::new(2, 2)); // inside the four spaces
+        d.select_word_at(indent);
+        assert_eq!(selected(&d), "    ");
+        assert!(!selected(&d).contains('\n'));
+    }
+
+    #[test]
+    fn a_double_click_on_a_multibyte_word_keeps_whole_characters() {
+        // `ação` is 6 bytes and 4 characters. Selecting by byte arithmetic would cut `ç`
+        // in half, which panics on the next slice — the failure mode every other multibyte
+        // test in this file exists to catch.
+        let mut d = doc("uma ação boa");
+        d.select_word_at(6); // inside `ação`, mid-word
+        assert_eq!(selected(&d), "ação");
+    }
+
+    #[test]
+    fn a_double_click_in_an_empty_buffer_selects_nothing() {
+        let mut d = doc("");
+        d.select_word_at(0);
+        assert!(d.selection.is_empty());
+    }
+
+    #[test]
+    fn a_triple_click_takes_the_line_including_its_ending() {
+        // Zed ends the third-click selection at column zero of the *next* row
+        // (`editor/src/selection.rs:1296`), not at the end of this row's content — which is
+        // what makes a triple-clicked line paste back as a line.
+        let mut d = doc("one\ntwo\nthree");
+        d.select_line_at(1);
+        assert_eq!(selected(&d), "two\n");
+    }
+
+    #[test]
+    fn a_triple_click_on_the_last_line_stops_at_the_content() {
+        // There is no following row to reach column zero of. Zed's `clip_point` does this;
+        // here `line_span` already did.
+        let mut d = doc("one\ntwo");
+        d.select_line_at(1);
+        assert_eq!(selected(&d), "two");
+        // And a row past the end clamps rather than panicking, the way a stale coordinate
+        // from an index built before the file shrank has to.
+        d.select_line_at(99);
+        assert_eq!(selected(&d), "two");
+    }
+
+    #[test]
+    fn a_triple_click_keeps_a_crlf_ending_intact() {
+        // Nothing in this pipeline normalises line endings, so the selected line ending has
+        // to be whatever the file uses — otherwise cut-and-paste rewrites it.
+        let mut d = doc("one\r\ntwo\r\nthree");
+        d.select_line_at(1);
+        assert_eq!(selected(&d), "two\r\n");
     }
 
     // --- word motion ---------------------------------------------------------------
