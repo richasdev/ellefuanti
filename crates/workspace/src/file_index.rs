@@ -61,12 +61,21 @@ impl CancelFlag {
 /// arrive — when someone hits it on a real project.
 pub const MAX_INDEXED_FILES: usize = 100_000;
 
+/// Directories never worth indexing, regardless of what `.gitignore` says.
+///
+/// `.gitignore` covers these on a well-kept project, but not on every one: a checkout with
+/// no `.gitignore`, or a `vendor/` that is deliberately committed, would otherwise bury
+/// quick open under tens of thousands of dependency files. Skipping them by name costs one
+/// comparison per directory and removes the failure mode entirely.
+const ALWAYS_SKIPPED: [&str; 3] = ["vendor", "node_modules", ".git"];
+
 /// Walks `root` and returns every non-ignored file.
 ///
 /// Blocking, and deliberately so: the caller wraps it in `cx.background_spawn` (ADR-0007).
 ///
-/// Respects `.gitignore` and skips hidden files and `.git`, matching what the file tree
-/// shows — quick open offering `vendor/` results that the tree hides would be incoherent.
+/// Respects `.gitignore` and skips hidden files, matching what the file tree shows — quick
+/// open offering `vendor/` results that the tree hides would be incoherent. `vendor/`,
+/// `node_modules/` and `.git/` are skipped even when `.gitignore` does not mention them.
 ///
 /// Returns whatever was collected before cancellation, rather than an error: a partial
 /// index is still useful to a palette that is about to be re-populated anyway.
@@ -78,6 +87,13 @@ pub fn index_files(root: &Path, cancel: &CancelFlag) -> Vec<IndexedFile> {
         .git_ignore(true)
         .git_global(true)
         .parents(false)
+        // Prunes rather than filters: `filter_entry` stops the walk descending into these
+        // at all, so a 40k-file `vendor/` costs one rejected directory instead of 40k
+        // rejected files.
+        .filter_entry(|entry| {
+            !entry.file_type().is_some_and(|t| t.is_dir())
+                || !entry.file_name().to_str().is_some_and(|n| ALWAYS_SKIPPED.contains(&n))
+        })
         // The walk is already on a background thread; threading it further would
         // complicate cancellation for no benefit at this scale.
         .build();
@@ -195,6 +211,25 @@ mod tests {
         let artisan = files.iter().find(|f| f.relative == "artisan").unwrap();
         assert_eq!(artisan.name_offset, 0);
         assert_eq!(artisan.name(), "artisan");
+    }
+
+    #[test]
+    fn dependency_directories_are_skipped_without_a_gitignore() {
+        // The fixture above gitignores `vendor`, which hid the real question: a project
+        // with no `.gitignore` at all, or one that commits its `vendor/`, used to have
+        // quick open buried under dependency files.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("app/Models")).unwrap();
+        fs::create_dir_all(root.join("vendor/laravel/framework")).unwrap();
+        fs::create_dir_all(root.join("node_modules/vite/dist")).unwrap();
+
+        fs::write(root.join("app/Models/User.php"), "<?php").unwrap();
+        fs::write(root.join("vendor/laravel/framework/Str.php"), "<?php").unwrap();
+        fs::write(root.join("node_modules/vite/dist/index.js"), "export {}").unwrap();
+
+        assert_eq!(relatives(&index_files(root, &CancelFlag::new())), vec!["app/Models/User.php"]);
     }
 
     #[test]
