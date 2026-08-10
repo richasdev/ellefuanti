@@ -889,6 +889,13 @@ impl TerminalView {
             .overflow_hidden()
             .font_family(fonts.family.clone())
             .text_size(fonts.size)
+            // Must match the cell height each row is given, and gpui's default does not: it
+            // lays text out at roughly 1.618 em while a terminal row is `cell.1` — 16/13 em.
+            // At 13px that is 21.03px of text in a 16px cell, so every line overflows by
+            // 5.03px and the drift reaches a whole row in three lines. That is what made
+            // typed output overlap the prompt above it. Worse here than in the editor
+            // (#106), because the terminal's cell is deliberately tighter than a text row.
+            .line_height(cell.1)
             .child(
                 // A canvas purely to learn the panel's pixel size, which is what decides
                 // the PTY's rows and columns. gpui gives layout bounds to an element, not
