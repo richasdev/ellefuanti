@@ -2,6 +2,7 @@
 
 mod caret;
 mod find;
+pub(crate) mod line;
 mod project_search;
 mod state;
 mod view;

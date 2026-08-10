@@ -25,6 +25,7 @@ use crate::actions::{
     ToggleComment, Undo, context,
 };
 use crate::editor::caret::Caret;
+use crate::editor::line::Line;
 use crate::editor::state::Document;
 use crate::fonts::Fonts;
 use crate::lsp_session::Severity;
@@ -914,10 +915,8 @@ impl EditorView {
                         // leaves that function's four documented overlays
                         // (matches → guides → bracket → cursor) intact minus the one that
                         // no longer exists.
-                        div()
-                            .flex_1()
-                            .relative()
-                            .child(styled_line(
+                        div().flex_1().child({
+                            let rendered = styled_line(
                                 &line,
                                 line_start,
                                 &spans,
@@ -925,10 +924,18 @@ impl EditorView {
                                 brackets,
                                 &row_matches,
                                 &theme,
-                            ))
-                            .when(is_cursor_row && caret_visible, |el| {
-                                el.child(Caret::new(&line, cursor.column, theme.cursor, &fonts))
-                            }),
+                                &fonts,
+                            );
+                            // The caret is drawn by the row itself, not layered over it.
+                            // As a sibling it was placed by the flex pass and stacked
+                            // *below* the text; inside the element it shares the shaped
+                            // line the glyphs came from.
+                            if is_cursor_row && caret_visible {
+                                rendered.with_caret(cursor.column, theme.cursor)
+                            } else {
+                                rendered
+                            }
+                        }),
                     )
                     .into_any_element()
             })
@@ -961,10 +968,68 @@ fn styled_line(
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
-) -> StyledText {
+    fonts: &Fonts,
+) -> Line {
     let (text, highlights) =
         line_runs(line, line_start, spans, diagnostics, brackets, matches, theme);
-    StyledText::new(SharedString::from(text)).with_highlights(highlights)
+    Line::new(
+        text.clone(),
+        to_runs(&text, &highlights, theme, fonts),
+        fonts.size,
+        fonts.line_height(),
+    )
+}
+
+/// Turns the sparse `(range, style)` list into the contiguous runs `shape_line` needs.
+///
+/// `StyledText` accepts gaps and fills them from the ambient style; `shape_line` does not —
+/// it walks runs in order and their lengths must sum to the text. So every uncovered stretch
+/// becomes an explicit run in the default colour.
+///
+/// Ranges are assumed sorted and disjoint, which `line_runs` already guarantees (it asserts
+/// it in tests). A range landing off a character boundary would panic in `shape_line`, so
+/// they are clamped here rather than trusted.
+fn to_runs(
+    text: &str,
+    highlights: &[(Range<usize>, GpuiHighlight)],
+    theme: &Theme,
+    fonts: &Fonts,
+) -> Vec<TextRun> {
+    let font = fonts.font();
+    let plain = |len: usize| TextRun {
+        len,
+        font: font.clone(),
+        color: theme.text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+
+    let mut runs: Vec<TextRun> = Vec::with_capacity(highlights.len() * 2 + 1);
+    let mut at = 0usize;
+    for (range, style) in highlights {
+        let start = range.start.clamp(at, text.len());
+        let end = range.end.clamp(start, text.len());
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) || start == end {
+            continue;
+        }
+        if start > at {
+            runs.push(plain(start - at));
+        }
+        runs.push(TextRun {
+            len: end - start,
+            font: font.clone(),
+            color: style.color.unwrap_or(theme.text),
+            background_color: style.background_color,
+            underline: style.underline,
+            strikethrough: style.strikethrough,
+        });
+        at = end;
+    }
+    if at < text.len() {
+        runs.push(plain(text.len() - at));
+    }
+    runs
 }
 
 /// The text and colour runs for one rendered line.

@@ -695,7 +695,11 @@ impl TerminalView {
     /// wraps at a column that is not where the pane ends. The caller divides, because it is
     /// the caller that knows how the panel was laid out.
     fn sync_size(&mut self, width: gpui::Pixels, height: gpui::Pixels, cell: (Pixels, Pixels)) {
-        let cols = (f32::from(width) / f32::from(cell.0)).floor().max(1.0) as u16;
+        // Minus the one cell `render_grid` pads the left with. The shell is told what it can
+        // actually draw into, not what the panel measures — the difference is #92's bug in
+        // the other direction.
+        let usable = f32::from(width) - f32::from(cell.0);
+        let cols = (usable / f32::from(cell.0)).floor().max(1.0) as u16;
         let rows = (f32::from(height) / f32::from(cell.1)).floor().max(1.0) as u16;
 
         if (rows, cols) != self.grid_size {
@@ -1081,6 +1085,8 @@ impl TerminalView {
                 theme,
                 fonts.cell_size().1,
                 &fonts.family,
+                fonts.size,
+                fonts.cell_size().0,
             ))
     }
 
@@ -1138,8 +1144,14 @@ fn render_grid(
     theme: &Theme,
     row_height: Pixels,
     family: &SharedString,
+    font_size: Pixels,
+    cell_width: Pixels,
 ) -> impl IntoElement {
-    div().flex_1().flex().flex_col().overflow_hidden().children(
+    // One cell of breathing room on the left, so the first character is not flush against
+    // the panel edge. Subtracted in `sync_size` before the column count is computed — a
+    // padding the layout adds and the arithmetic does not know about is exactly how #92
+    // handed the PTY a column that could not be drawn.
+    div().flex_1().flex().flex_col().overflow_hidden().pl(cell_width).children(
         snapshot.lines.iter().enumerate().map(|(index, line)| {
             let cursor_column =
                 snapshot.cursor.filter(|cursor| cursor.line == index).map(|cursor| cursor.column);
@@ -1153,12 +1165,16 @@ fn render_grid(
                 })
                 .unwrap_or(0..0);
 
-            div().h(row_height).line_height(row_height).flex_none().child(styled_row(
+            // No `.line_height()`: the row paints itself and takes the height as an
+            // argument, so there is nothing for a style to disagree with.
+            div().h(row_height).flex_none().child(styled_row(
                 line,
                 cursor_column,
                 selected,
                 theme,
                 family,
+                font_size,
+                (cell_width, row_height),
             ))
         }),
     )
@@ -1176,9 +1192,15 @@ fn styled_row(
     selected: std::ops::Range<usize>,
     theme: &Theme,
     family: &SharedString,
-) -> StyledText {
+    font_size: Pixels,
+    cell: (Pixels, Pixels),
+) -> crate::editor::line::Line {
     let (text, runs) = row_runs(cells, cursor_column, selected, theme, family);
-    StyledText::new(SharedString::from(text)).with_runs(runs)
+    // `force_width` pins every glyph to one cell, which is what makes a terminal a grid
+    // rather than a paragraph: a font whose glyphs advance slightly differently would
+    // otherwise drift across a long line. Zed's terminal passes the same argument for the
+    // same reason (`BatchedTextRun::paint`).
+    crate::editor::line::Line::new(text, runs, font_size, cell.1).with_cell_width(cell.0)
 }
 
 /// The text and colour runs for one row.
