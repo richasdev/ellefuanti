@@ -187,11 +187,11 @@ mod tests {
         // colour, because a broken parse also breaks the styles around it. Priority 1 of
         // #53 stops here on purpose; the rest is follow-up work, not an oversight.
         for name in [
-            "tsconfig.jsonc",  // comments and trailing commas; the JSON grammar rejects both
-            "data.json5",      // same
-            "App.tsx",         // needs LANGUAGE_TSX, not LANGUAGE_TYPESCRIPT
-            "app.scss",        // nesting and $vars are not CSS
-            "theme.less",      // likewise
+            "tsconfig.jsonc", // comments and trailing commas; the JSON grammar rejects both
+            "data.json5",     // same
+            "App.tsx",        // needs LANGUAGE_TSX, not LANGUAGE_TYPESCRIPT
+            "app.scss",       // nesting and $vars are not CSS
+            "theme.less",     // likewise
             "docker-compose.yml",
             "README.md",
             "schema.sql",

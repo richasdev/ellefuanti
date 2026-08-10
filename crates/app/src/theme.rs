@@ -684,8 +684,7 @@ mod tests {
         // The collision that a port must keep. `assert_eq!`, not `assert_ne!` — this is
         // the inverse of the distinctness rule and it is deliberate.
         assert_eq!(
-            one_dark.variable,
-            one_dark.property,
+            one_dark.variable, one_dark.property,
             "One Dark Pro paints variable and property alike; a port must too"
         );
         assert_eq!(one_dark.variable, rgb(0xe06c75).into());

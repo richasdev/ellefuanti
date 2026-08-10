@@ -727,8 +727,16 @@ mod tests {
             // JSON has no top-level statement list, so the growth has to go inside the
             // one root object. The head is the first few pairs of that object.
             (Language::Json, "{\n\"a\": 1,\n\"b\": 2,\n", "\"k\": \"v\",\n"),
-            (Language::JavaScript, "// h\nlet a = 1;\nlet b = 2;\n", "function f() { return 'x'; }\n"),
-            (Language::TypeScript, "// h\nlet a: number = 1;\nlet b = 2;\n", "function f(): string { return 'x'; }\n"),
+            (
+                Language::JavaScript,
+                "// h\nlet a = 1;\nlet b = 2;\n",
+                "function f() { return 'x'; }\n",
+            ),
+            (
+                Language::TypeScript,
+                "// h\nlet a: number = 1;\nlet b = 2;\n",
+                "function f(): string { return 'x'; }\n",
+            ),
             (Language::Css, "/* h */\n.a { color: red; }\n", ".cls { margin: 1px; }\n"),
         ];
 
@@ -978,8 +986,7 @@ mod tests {
 
         let tree = SyntaxTree::new(Language::Css, &buffer).unwrap();
         let spans = tree.highlights(&buffer, 0..buffer.len_bytes());
-        let vars: Vec<_> =
-            spans.iter().filter(|s| s.style == HighlightStyle::Variable).collect();
+        let vars: Vec<_> = spans.iter().filter(|s| s.style == HighlightStyle::Variable).collect();
         assert_eq!(vars.len(), 500, "every custom property must match the ^-- predicate");
     }
 
