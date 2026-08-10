@@ -23,7 +23,7 @@ use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::terminal_view::TerminalView;
-use crate::theme::{Metrics, Theme, Themed, set_theme};
+use crate::theme::{Metrics, Theme, Themed};
 
 /// An open tab.
 struct Tab {
@@ -251,19 +251,19 @@ impl WorkspaceView {
         }
     }
 
-    /// Switches to the next compiled-in theme.
+    /// Switches to the next theme: the five compiled in, then any loaded from disk.
     ///
     /// `refresh_windows` rather than `cx.notify()`: notify marks *this* entity dirty, and
     /// the editor, terminal and palette are sibling entities that would keep their old
     /// colours until something else happened to redraw them. A theme change is the one
     /// case where every window really is stale, which is what `refresh_windows` means.
     ///
-    /// ponytail: no persistence. Reopening the app is back to dark, because remembering the
-    /// choice needs somewhere to write it and that is the settings crate, not this.
+    /// Disk themes join this cycle rather than getting a command of their own (#58): the
+    /// keybinding already exists, and a theme nobody can reach is a theme that may as well
+    /// not have loaded.
     fn toggle_theme(&mut self, _: &ToggleTheme, _w: &mut Window, cx: &mut Context<Self>) {
-        let next = cx.theme_variant().next();
-        set_theme(next, cx);
-        self.status = Some(format!("Theme: {}", next.label()).into());
+        let label = crate::themes::cycle(cx);
+        self.status = Some(format!("Theme: {label}").into());
         cx.refresh_windows();
     }
 

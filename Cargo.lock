@@ -1687,6 +1687,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-theme"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "elle-workspace"
 version = "0.1.0"
 dependencies = [
@@ -1710,6 +1719,7 @@ dependencies = [
  "elle-syntax",
  "elle-terminal",
  "elle-text",
+ "elle-theme",
  "elle-workspace",
  "gpui",
  "tempfile",

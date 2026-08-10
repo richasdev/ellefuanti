@@ -11,6 +11,7 @@ members = [
     "crates/index",
     "crates/laravel",
     "crates/settings",
+    "crates/theme",
     "benchmarks",
 ]
 
@@ -31,6 +32,7 @@ elle-lsp = { path = "crates/lsp" }
 elle-index = { path = "crates/index" }
 elle-laravel = { path = "crates/laravel" }
 elle-settings = { path = "crates/settings" }
+elle-theme = { path = "crates/theme" }
 
 # UI. The runtime_shaders feature is selected by crates/app, not here, so a release build
 # can turn it off and precompile shaders instead (see ADR-0002 and crates/app/Cargo.toml).
