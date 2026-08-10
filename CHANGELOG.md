@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- `elle-laravel`: static route extraction from `routes/*.php` via tree-sitter — HTTP method,
+  URI, name, controller/action, middleware and line, including `Route::resource`
+  expansion and `Route::group` prefix/middleware/name inheritance (part of #23)
+- Every route field that can be dynamic is a `Resolved<T>`, so "we could not determine
+  this" is a distinct value rather than an empty string. Routes registered from variables,
+  concatenation, interpolation or loops come back `Unknown` carrying the source expression
+  that defeated the reader, and registrations that resolve to nothing at all are reported
+  separately instead of being dropped (RISKS.md #4)
+
+### Not included
+
+- No Artisan integration, no `route('` completion, no command-palette or other UI, and no
+  persistence — the extractor returns plain in-memory values. SQLite storage waits on #21.
+
 ## [0.1.0] — unreleased
 
 First release. A working editor foundation for PHP, Laravel, Livewire and Blade — native,
@@ -64,15 +80,15 @@ layer; the parts that need a human at a screen have not been confirmed. Read
 
 Measured, not estimated. Full detail and methodology in `benchmarks/BASELINE.md`.
 
-| Metric                                     | Target     | Measured                   |
-| ------------------------------------------ | ---------- | -------------------------- |
-| Cold startup, first launch of a new binary  | < 500 ms   | 520–536 ms ❌              |
-| Cold startup, later launches               | < 500 ms   | **~195–380 ms**            |
-| Warm startup                               | < 150 ms   | ~200 ms ❌                 |
-| Idle RAM                                   | 100–200 MB | **69 MB**                  |
-| Keystroke → pixel, 55k-line file           | < 8.3 ms   | **2.65 ms**                |
-| Frame render, 55k-line file                | < 8.3 ms   | **0.08–0.77 ms**           |
-| Folder open, 5000 vendor files             | —          | **64 µs**                  |
+| Metric                                     | Target     | Measured         |
+| ------------------------------------------ | ---------- | ---------------- |
+| Cold startup, first launch of a new binary | < 500 ms   | 520–536 ms ❌    |
+| Cold startup, later launches               | < 500 ms   | **~195–380 ms**  |
+| Warm startup                               | < 150 ms   | ~200 ms ❌       |
+| Idle RAM                                   | 100–200 MB | **69 MB**        |
+| Keystroke → pixel, 55k-line file           | < 8.3 ms   | **2.65 ms**      |
+| Frame render, 55k-line file                | < 8.3 ms   | **0.08–0.77 ms** |
+| Folder open, 5000 vendor files             | —          | **64 µs**        |
 
 **A note on the startup numbers, because an earlier draft of this file got them wrong.**
 
