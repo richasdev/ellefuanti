@@ -1618,6 +1618,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-laravel"
+version = "0.1.0"
+dependencies = [
+ "elle-syntax",
+ "elle-text",
+ "tree-sitter",
+]
+
+[[package]]
 name = "elle-lsp"
 version = "0.1.0"
 dependencies = [

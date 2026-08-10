@@ -1,0 +1,10 @@
+[package]
+name = "elle-laravel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+elle-syntax.workspace = true
+elle-text.workspace = true
+tree-sitter.workspace = true
