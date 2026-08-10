@@ -1,0 +1,17 @@
+[package]
+name = "elle-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `bundled` compiles SQLite from source rather than linking the system library. The
+# alternative is whatever SQLite the user's macOS shipped, whose version and compile-time
+# options we do not control — and the schema here is only as portable as the oldest SQLite
+# it might meet. Costs a slower first build; buys a known SQLite everywhere.
+rusqlite = { version = "0.37", features = ["bundled"] }
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
