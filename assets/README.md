@@ -1,11 +1,12 @@
 # assets
 
-| Path                   | What it is                                                                                     |
-| ---------------------- | ---------------------------------------------------------------------------------------------- |
-| `app-icon.svg`         | The application's own identity icon, square and transparent.                                   |
-| `macos/`               | Everything needed to turn that into a macOS `.app` icon.                                       |
-| `icons/`               | **Different thing.** In-app UI glyphs for the activity bar (issue #50); see `icons/README.md`. |
-| `grammars/`, `themes/` | Empty placeholders.                                                                            |
+| Path           | What it is                                                                                     |
+| -------------- | ---------------------------------------------------------------------------------------------- |
+| `app-icon.svg` | The application's own identity icon, square and transparent.                                   |
+| `macos/`       | Everything needed to turn that into a macOS `.app` icon.                                       |
+| `icons/`       | **Different thing.** In-app UI glyphs for the activity bar (issue #50); see `icons/README.md`. |
+| `themes/`      | Themes loaded from disk (#58); see `themes/README.md`. Empty, on purpose — that file says why. |
+| `grammars/`    | Empty placeholder.                                                                             |
 
 `app-icon.svg` and `icons/` are deliberately kept apart. One is the product's identity and
 is consumed by the operating system; the others are interface furniture consumed by the

@@ -188,6 +188,53 @@ impl ThemeVariant {
     }
 }
 
+/// Which theme is active: one of the five compiled in, or one loaded from disk.
+///
+/// A separate type from [`ThemeVariant`] rather than a sixth arm on it, because the two
+/// have different guarantees and collapsing them would give up the one that matters.
+/// `ThemeVariant` is closed: a match on it cannot reach a theme that does not exist, and
+/// `build()` cannot fail. A disk theme is a name that may or may not still be on the
+/// filesystem, which is a different thing wearing the same word.
+///
+/// The practical consequence is #58's hard constraint — **a missing or corrupt
+/// `assets/themes/` must still launch with Dark available.** Because the built-in path never
+/// touches this variant, there is no code path on which a bad file can leave the editor
+/// without colours.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ThemeChoice {
+    BuiltIn(ThemeVariant),
+    /// A theme read from a file, by the name it was selected under.
+    Disk(String),
+}
+
+impl Default for ThemeChoice {
+    fn default() -> Self {
+        Self::BuiltIn(ThemeVariant::default())
+    }
+}
+
+impl ThemeChoice {
+    /// The name this choice has in `settings.json`.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::BuiltIn(variant) => variant.name(),
+            Self::Disk(name) => name,
+        }
+    }
+
+    /// A compiled-in variant if the name is one, otherwise a disk theme by that name.
+    ///
+    /// Built-ins win a name collision. A file called `dark.json` cannot shadow
+    /// `Theme::dark()`, which is what keeps "Dark is always available" true even when
+    /// someone has dropped a broken theme with that name into the directory.
+    pub fn from_name(name: &str) -> Self {
+        match ThemeVariant::from_name(name) {
+            Some(variant) => Self::BuiltIn(variant),
+            None => Self::Disk(name.to_string()),
+        }
+    }
+}
+
 /// Every variant. Moved out of the test module in #60 because `from_name` needs it: one
 /// list means a theme cannot be given a `name` and forgotten here, which would be a theme
 /// that saves and never loads back.
@@ -209,6 +256,14 @@ const ALL_VARIANTS: [ThemeVariant; 5] = [
 /// [`set_theme`] and the only way out is [`Themed::theme`]. A view cannot set it and cannot
 /// construct one to set.
 struct ActiveTheme {
+    /// What is active. `BuiltIn` for the five compiled in, `Disk` for a loaded file.
+    choice: ThemeChoice,
+    /// The variant `theme.toggle` cycles from.
+    ///
+    /// Kept alongside `choice` because the cycle is over the built-ins only: a disk theme
+    /// has no position in `ThemeVariant::next()`, and toggling out of one has to resume
+    /// from somewhere. This is that somewhere — the last built-in that was active, or the
+    /// default if a disk theme was selected at startup.
     variant: ThemeVariant,
     theme: Theme,
 }
@@ -222,6 +277,8 @@ impl Global for ActiveTheme {}
 pub trait Themed {
     fn theme(&self) -> &Theme;
     fn theme_variant(&self) -> ThemeVariant;
+    /// What is actually active, which a disk theme's name does not fit in a `ThemeVariant`.
+    fn theme_choice(&self) -> ThemeChoice;
 }
 
 impl Themed for App {
@@ -233,6 +290,10 @@ impl Themed for App {
 
     fn theme_variant(&self) -> ThemeVariant {
         self.global::<ActiveTheme>().variant
+    }
+
+    fn theme_choice(&self) -> ThemeChoice {
+        self.global::<ActiveTheme>().choice.clone()
     }
 }
 
@@ -248,11 +309,29 @@ impl Themed for App {
 /// having to remember to ask for it. See [`crate::settings::persist_theme`] for what makes
 /// the startup call and the test calls not write anything.
 pub fn set_theme(variant: ThemeVariant, cx: &mut App) {
-    let previous = cx.try_global::<ActiveTheme>().map(|active| active.variant);
-    cx.set_global(ActiveTheme { variant, theme: variant.build() });
+    install(ThemeChoice::BuiltIn(variant), variant, variant.build(), cx);
+}
 
-    if previous != Some(variant) {
-        crate::settings::persist_theme(variant, cx);
+/// Installs a theme loaded from disk.
+///
+/// The same funnel as [`set_theme`], so a disk theme persists for the same reason a built-in
+/// does and neither call site has to remember to ask.
+///
+/// `resume` is the built-in `theme.toggle` continues from, since a disk theme has no place
+/// in the cycle. The caller passes whatever was active before, which makes toggling out of a
+/// disk theme land where the user was rather than always at Dark.
+pub fn set_disk_theme(file: &elle_theme::ThemeFile, resume: ThemeVariant, cx: &mut App) {
+    install(ThemeChoice::Disk(file.name.clone()), resume, Theme::from_file(file), cx);
+}
+
+/// The one place the global is written, and therefore the one place persistence happens.
+fn install(choice: ThemeChoice, variant: ThemeVariant, theme: Theme, cx: &mut App) {
+    let previous = cx.try_global::<ActiveTheme>().map(|active| active.choice.clone());
+    let name = choice.name().to_string();
+    cx.set_global(ActiveTheme { choice, variant, theme });
+
+    if previous.as_ref().map(ThemeChoice::name) != Some(name.as_str()) {
+        crate::settings::persist_theme_name(&name, cx);
     }
 }
 
@@ -469,23 +548,31 @@ impl Theme {
             information: rgb(0x61afef).into(),
             hint: rgb(0x7f848e).into(),
 
+            // The theme file's own `terminal.ansi*` keys, verbatim.
+            //
+            // **Eight of these were wrong until #58.** The hand-extraction substituted the
+            // syntax palette for the terminal one — slot 1 was `#e06c75`, the keyword red,
+            // where the file says `#e05561`; slot 2 was the string green; slot 10 was
+            // `#4cd137`, a colour that appears nowhere in One Dark Pro at all. The importer
+            // reading the same file disagreed, and the file won. Pinned by
+            // `crates/theme/tests/vscode.rs`, which reads it rather than trusting this.
             ansi: [
-                rgb(0x3f4451).into(),
-                rgb(0xe06c75).into(),
-                rgb(0x98c379).into(),
-                rgb(0xd19a66).into(),
-                rgb(0x61afef).into(),
-                rgb(0xc678dd).into(),
-                rgb(0x56b6c2).into(),
-                rgb(0xabb2bf).into(),
-                rgb(0x4f5666).into(),
-                rgb(0xff616e).into(),
-                rgb(0x4cd137).into(),
-                rgb(0xf0a45d).into(),
-                rgb(0x4dc4ff).into(),
-                rgb(0xde73ff).into(),
-                rgb(0x4cd1e0).into(),
-                rgb(0xd7dae0).into(),
+                rgb(0x3f4451).into(), // 0 black
+                rgb(0xe05561).into(), // 1 red
+                rgb(0x8cc265).into(), // 2 green
+                rgb(0xd18f52).into(), // 3 yellow
+                rgb(0x4aa5f0).into(), // 4 blue
+                rgb(0xc162de).into(), // 5 magenta
+                rgb(0x42b3c2).into(), // 6 cyan
+                rgb(0xd7dae0).into(), // 7 white
+                rgb(0x4f5666).into(), // 8 bright black
+                rgb(0xff616e).into(), // 9 bright red
+                rgb(0xa5e075).into(), // 10 bright green
+                rgb(0xf0a45d).into(), // 11 bright yellow
+                rgb(0x4dc4ff).into(), // 12 bright blue
+                rgb(0xde73ff).into(), // 13 bright magenta
+                rgb(0x4cd1e0).into(), // 14 bright cyan
+                rgb(0xe6e6e6).into(), // 15 bright white
             ],
         }
     }
@@ -495,15 +582,27 @@ impl Theme {
     /// Origin: `github.github-vscode-theme` v6.3.5, `themes/dark-default.json`.
     /// Licence: MIT.
     ///
-    /// Syntax colours read from that file's `tokenColors`. Three of this editor's styles
+    /// Syntax colours read from that file's `tokenColors`. Several of this editor's styles
     /// have no scope of their own in the source and are resolved the way the theme itself
     /// resolves them, rather than guessed:
     ///
     /// - `type` and `property` fall under the `entity` / `meta.property-name` group
     ///   (`#79c0ff`).
-    /// - `attribute` follows `entity.name.tag` (`#7ee787`).
-    /// - `operator` has no scope at all, so it inherits `editor.foreground` (`#e6edf3`).
-    ///   That is what VS Code renders, so it is what this renders.
+    /// - `attribute` is also `entity` (`#79c0ff`). **This was `#7ee787` until #58**, on the
+    ///   stated reasoning that it "follows `entity.name.tag`". It cannot: an attribute's
+    ///   scope is `entity.other.attribute-name`, which diverges from `entity.name.tag` at
+    ///   the second segment, so the tag rule never matches it. The only selector in the file
+    ///   that does match is the bare `entity`.
+    /// - `operator` is the keyword red (`#ff7b72`). **Also corrected in #58**, where it was
+    ///   `editor.foreground` on the reasoning that operators have "no scope at all". There
+    ///   is no `keyword.operator` *rule*, but the bare `keyword` selector matches
+    ///   `keyword.operator` and everything under it — and VS Code's own PHP grammar scopes
+    ///   `=`, `->` and `??` as `keyword.operator.assignment.php` and friends, all of which
+    ///   begin `keyword.`. So GitHub paints PHP operators red, and `#e6edf3` is a colour
+    ///   they never take.
+    ///
+    /// Both corrections came from `crates/theme`'s importer reading this same file and
+    /// disagreeing with the hand-extracted values; the file won.
     pub fn github_dark() -> Self {
         Self {
             background: rgb(0x0d1117).into(),
@@ -529,17 +628,23 @@ impl Theme {
             string: rgb(0xa5d6ff).into(),
             // `constant` — the group numeric literals belong to in this theme.
             number: rgb(0x56d364).into(),
-            operator: rgb(0xe6edf3).into(),
-            attribute: rgb(0x7ee787).into(),
+            // Both from the bare `keyword` and `entity` rules; see the doc comment.
+            operator: rgb(0xff7b72).into(),
+            attribute: rgb(0x79c0ff).into(),
             comment: rgb(0x8b949e).into(),
             tag: rgb(0x7ee787).into(),
             // No Blade scope upstream; `markup.changed` (#ffa657) is taken by `variable`,
             // so this uses the theme's own `#ff7b72`-adjacent accent from its ANSI table.
             blade: rgb(0xffa198).into(),
 
-            // GitHub Dark's `editorError.foreground` (#ff7b72) and
-            // `editorWarning.foreground` (#d29922), with its `accent` blue for information
-            // and `text_muted` for hints — the same two the theme uses everywhere else.
+            // The theme's own red and amber, which are its `terminal.ansiRed` (#ff7b72) and
+            // `terminal.ansiYellow` (#d29922), with its `accent` blue for information and
+            // `text_muted` for hints.
+            //
+            // This comment used to credit `editorError.foreground` and
+            // `editorWarning.foreground`. **Neither key exists in the file** — GitHub leaves
+            // both to VS Code's built-in defaults, which are not this theme's colours. The
+            // values are right and the attribution was not; corrected in #58.
             error: rgb(0xff7b72).into(),
             warning: rgb(0xd29922).into(),
             information: rgb(0x2f81f7).into(),
@@ -561,7 +666,9 @@ impl Theme {
                 rgb(0x79c0ff).into(),
                 rgb(0xd2a8ff).into(),
                 rgb(0x56d4dd).into(),
-                rgb(0xf0f6fc).into(),
+                // `terminal.ansiBrightWhite` is #ffffff in the file; this said #f0f6fc
+                // until #58.
+                rgb(0xffffff).into(),
             ],
         }
     }
@@ -596,15 +703,18 @@ impl Theme {
             property: rgb(0x0550ae).into(),
             string: rgb(0x0a3069).into(),
             number: rgb(0x0550ae).into(),
-            operator: rgb(0x1f2328).into(),
-            attribute: rgb(0x116329).into(),
+            // The light counterparts of the two corrections in `github_dark`: the bare
+            // `keyword` rule for operators, the bare `entity` rule for attributes.
+            operator: rgb(0xcf222e).into(),
+            attribute: rgb(0x0550ae).into(),
             comment: rgb(0x6e7781).into(),
             tag: rgb(0x116329).into(),
             blade: rgb(0xa40e26).into(),
 
-            // GitHub Light's `editorError.foreground` (#cf222e) and
-            // `editorWarning.foreground` (#9a6700), which are also its keyword red and a
-            // darkened amber — legible on white, where the dark theme's values are not.
+            // The theme's own red and a darkened amber — legible on white, where the dark
+            // theme's values are not. As in `github_dark`, this comment used to credit
+            // `editorError.foreground` and `editorWarning.foreground`, and neither key is in
+            // the file; corrected in #58.
             error: rgb(0xcf222e).into(),
             warning: rgb(0x9a6700).into(),
             information: rgb(0x0969da).into(),
@@ -628,6 +738,62 @@ impl Theme {
                 rgb(0x3192aa).into(),
                 rgb(0x8c959f).into(),
             ],
+        }
+    }
+
+    /// Builds a theme from a file loaded by `elle-theme`.
+    ///
+    /// The translation layer ADR-0004 requires: `elle-theme` is plain Rust and hands back
+    /// `u32` RGB, and `Hsla` is a gpui type, so the conversion has to live here.
+    ///
+    /// Infallible, because `ThemeFile::parse` has already rejected any file missing a
+    /// required colour — by the time one of these exists, every key is present. The
+    /// `unwrap_or` arms are therefore unreachable rather than merely unlikely, and they
+    /// fall back to `text` and `background` rather than to black so that a future key added
+    /// to `Theme` without being added to `REQUIRED_COLORS` is a wrong colour somebody can
+    /// see, not an invisible one.
+    pub fn from_file(file: &elle_theme::ThemeFile) -> Self {
+        let color =
+            |key: &str, fallback: u32| gpui::rgb(file.color(key).unwrap_or(fallback)).into();
+
+        let background = file.color("background").unwrap_or(0x000000);
+        let text = file.color("text").unwrap_or(0xffffff);
+
+        let ansi = file.ansi().unwrap_or([text; 16]).map(|slot| gpui::rgb(slot).into());
+
+        Self {
+            background: gpui::rgb(background).into(),
+            panel: color("panel", background),
+            border: color("border", background),
+            text: gpui::rgb(text).into(),
+            text_muted: color("text_muted", text),
+            accent: color("accent", text),
+            hover: color("hover", background),
+            selected: color("selected", background),
+            pressed: color("pressed", background),
+            cursor: color("cursor", text),
+            selection: color("selection", background),
+            status_bar: color("status_bar", background),
+
+            keyword: color("keyword", text),
+            type_name: color("type", text),
+            function: color("function", text),
+            variable: color("variable", text),
+            property: color("property", text),
+            string: color("string", text),
+            number: color("number", text),
+            operator: color("operator", text),
+            attribute: color("attribute", text),
+            comment: color("comment", text),
+            tag: color("tag", text),
+            blade: color("blade", text),
+
+            error: color("error", text),
+            warning: color("warning", text),
+            information: color("information", text),
+            hint: color("hint", text),
+
+            ansi,
         }
     }
 
@@ -863,6 +1029,14 @@ mod tests {
         assert_eq!(one_dark.variable, rgb(0xe06c75).into());
         assert_eq!(one_dark.operator, one_dark.text, "One Dark Pro's operator is its foreground");
 
+        // One Dark Pro's ANSI table is its own `terminal.ansi*` keys and not its syntax
+        // palette — the distinction eight slots got wrong before #58. Slot 1 is the one to
+        // watch: it is a hair off the keyword red, which is exactly why the substitution
+        // was easy to make and hard to see.
+        assert_eq!(one_dark.ansi[1], rgb(0xe05561).into(), "ansiRed, not the #e06c75 keyword");
+        assert_eq!(one_dark.ansi[2], rgb(0x8cc265).into(), "ansiGreen, not the string green");
+        assert_eq!(one_dark.ansi[10], rgb(0xa5e075).into(), "the old #4cd137 was not in the file");
+
         let gh_dark = Theme::github_dark();
         assert_eq!(gh_dark.background, rgb(0x0d1117).into());
         assert_eq!(gh_dark.text, rgb(0xe6edf3).into());
@@ -871,7 +1045,12 @@ mod tests {
         assert_eq!(gh_dark.comment, rgb(0x8b949e).into());
         assert_eq!(gh_dark.function, rgb(0xd2a8ff).into());
         assert_eq!(gh_dark.variable, rgb(0xffa657).into());
-        assert_eq!(gh_dark.attribute, rgb(0x7ee787).into());
+        assert_eq!(gh_dark.tag, rgb(0x7ee787).into());
+        // The two #58 corrections. `attribute` resolves through the bare `entity` rule and
+        // `operator` through the bare `keyword` rule; neither is the value that was here.
+        assert_eq!(gh_dark.attribute, rgb(0x79c0ff).into());
+        assert_eq!(gh_dark.operator, rgb(0xff7b72).into());
+        assert_ne!(gh_dark.attribute, gh_dark.tag, "attributes and tags are different scopes");
 
         let gh_light = Theme::github_light();
         assert_eq!(gh_light.background, rgb(0xffffff).into());
@@ -881,7 +1060,9 @@ mod tests {
         assert_eq!(gh_light.comment, rgb(0x6e7781).into());
         assert_eq!(gh_light.function, rgb(0x8250df).into());
         assert_eq!(gh_light.variable, rgb(0x953800).into());
-        assert_eq!(gh_light.attribute, rgb(0x116329).into());
+        assert_eq!(gh_light.tag, rgb(0x116329).into());
+        assert_eq!(gh_light.attribute, rgb(0x0550ae).into());
+        assert_eq!(gh_light.operator, rgb(0xcf222e).into());
     }
 
     #[test]

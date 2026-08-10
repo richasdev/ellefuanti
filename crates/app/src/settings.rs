@@ -46,6 +46,11 @@ impl Global for LiveSettings {}
 /// the result back, and the alternative is opening a window in the wrong theme and
 /// repainting it. Anything here that grows a directory walk moves to the background.
 pub fn load_and_apply(cx: &mut App) {
+    // Before the theme is chosen, because the name in the settings file may be a disk
+    // theme and resolving it needs the registry to exist. A failure in here is logged and
+    // leaves an empty registry; the five built-ins do not depend on it (#58).
+    crate::themes::load(cx);
+
     let Some(path) = elle_settings::settings_path() else {
         tracing::warn!("HOME is unset; running on default settings and persisting nothing");
         set_theme(ThemeVariant::default(), cx);
@@ -66,7 +71,9 @@ pub fn load_and_apply(cx: &mut App) {
         );
     }
 
-    set_theme(theme_from(&settings), cx);
+    // `apply_named` rather than `theme_from`, so a name that is not a compiled-in variant
+    // gets a chance to be a disk theme before it is treated as unrecognised.
+    crate::themes::apply_named(settings.theme(), cx);
 
     // A file we could not read does **not** become writable. `settings` here is defaults,
     // and installing it would mean the next theme toggle overwrote a file full of the
@@ -98,14 +105,14 @@ pub fn load_and_apply(cx: &mut App) {
 ///
 /// A failed write logs and nothing else. Losing a theme preference is not worth an error
 /// dialog, and there is nothing the user can do about a full disk from inside the editor.
-pub fn persist_theme(variant: ThemeVariant, cx: &mut App) {
+pub fn persist_theme_name(name: &str, cx: &mut App) {
     let Some(live) = cx.try_global::<LiveSettings>() else { return };
-    if live.settings.theme() == variant.name() {
+    if live.settings.theme() == name {
         return;
     }
 
     let live = cx.global_mut::<LiveSettings>();
-    live.settings.set_theme(variant.name());
+    live.settings.set_theme(name);
     let (settings, path) = (live.settings.clone(), live.path.clone());
 
     cx.background_spawn(async move {
@@ -146,12 +153,17 @@ pub fn path_for_editing(cx: &mut App) -> Option<PathBuf> {
     Some(path)
 }
 
-/// The variant the settings named, or the default.
+/// The compiled-in variant the settings named, or the default.
 ///
 /// An unrecognised name logs and falls back rather than failing, and — importantly — does
-/// not rewrite the file. `"solarized"` in someone's settings is either a typo they can see
-/// and fix or a theme #58 will load from disk; either way, silently replacing it with
-/// `"dark"` on the next save destroys the evidence.
+/// not rewrite the file. Silently replacing `"solarized"` with `"dark"` on the next save
+/// destroys the evidence of the typo.
+///
+/// **Superseded by `themes::apply_named` on the real startup path**, which tries disk themes
+/// before giving up on a name. Kept because the tests below pin the crate-boundary contract
+/// it describes — that an unknown name falls back without being rewritten — and that
+/// contract still holds; `apply_named` merely widens what counts as known.
+#[cfg(test)]
 fn theme_from(settings: &Settings) -> ThemeVariant {
     let name = settings.theme();
     ThemeVariant::from_name(name).unwrap_or_else(|| {

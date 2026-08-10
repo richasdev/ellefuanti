@@ -9,6 +9,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
+  crate holding a native format — flat, one key per colour, versioned from the first commit —
+  plus an importer for VS Code's `colors` and `tokenColors`. Themes are read from
+  `assets/themes/` and `~/Library/Application Support/ellefuanti/themes/`, the user's copy
+  winning a name collision and a **built-in winning over both**, so no file can shadow
+  `Theme::dark()` and the "Dark is always available" guarantee holds through a directory full
+  of broken files. A theme that fails to load names the file and the problem and costs one
+  theme, never the launch; nothing writes a theme file back, so ADR-0009's "malformed file
+  saved over with defaults" trap has no equivalent here. Disk themes join the existing
+  `theme.toggle` cycle rather than getting a command of their own (#58)
+
+- **Scope resolution by specificity, not file order**, which is the half of the importer with
+  the actual work in it. A TextMate scope like `entity.other.attribute-name` is matched by
+  `entity`, `entity.other` and itself, and the longest wins. A script written during #53 got
+  this wrong and reported One Dark Pro's `attribute` as `#e06c75`, because `entity.name.tag`
+  is listed earlier in the file; the published value is `#d19a66`. Descendant selectors
+  (`string variable`) are skipped rather than approximated — they need the scope stack at a
+  position in a document, which an importer resolving a name in the abstract does not have.
+  Where a theme says nothing, the fallback names another key in the same theme, so an
+  unstyled concept lands in the theme's own palette and never at black (#58)
+
 - A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
   startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`
   importer is a key mapping over an already-parsed document instead of a second parser
@@ -34,6 +55,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   deletions and line operations each apply as one `Buffer::replace` between explicit
   `break_undo_group` calls, so a deleted word comes back whole and never drags the
   surrounding typing with it (part of #69)
+
+### Fixed
+
+- **Twelve wrong colours in the three ported themes**, found by pointing the new importer at
+  the same files they were hand-extracted from and comparing. Every disagreement was
+  investigated against the file on disk; in all twelve the file was right.
+
+  - **One Dark Pro's ANSI table had eight wrong slots.** The extraction substituted the
+    theme's _syntax_ palette for its _terminal_ palette: slot 1 was `#e06c75`, the keyword
+    red, where `terminal.ansiRed` is `#e05561`; slot 2 was the string green; slot 10 was
+    `#4cd137`, a colour that appears nowhere in the file. Easy to make and hard to see,
+    because the substituted values are a hair off the real ones and the terminal is not where
+    anyone checks a theme.
+  - **GitHub Dark and Light coloured attributes as tags.** `attribute` was recorded as
+    following `entity.name.tag`, which it cannot: an attribute's scope is
+    `entity.other.attribute-name`, and the two diverge at the second segment, so the tag rule
+    never matches. The only selector in either file that does match is the bare `entity` —
+    `#79c0ff` dark, `#0550ae` light.
+  - **GitHub Dark and Light painted operators as body text.** Recorded as "no scope at all,
+    so it inherits `editor.foreground`". There is no `keyword.operator` _rule_, but the bare
+    `keyword` selector matches `keyword.operator` and everything under it — and VS Code's own
+    PHP grammar scopes `=`, `->` and `??` as `keyword.operator.assignment.php` and nineteen
+    more, all beginning `keyword.`. Both themes paint PHP operators their keyword red.
+  - GitHub Dark's ANSI slot 15 was `#f0f6fc`; the file says `#ffffff`.
+
+  Two doc comments also credited `editorError.foreground` and `editorWarning.foreground` for
+  GitHub's diagnostic colours. **Neither key exists in either file** — GitHub leaves both to
+  VS Code's built-in defaults. The values were right and the attribution was not (#58)
 
 ### Changed
 

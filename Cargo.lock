@@ -1719,6 +1719,7 @@ dependencies = [
  "elle-syntax",
  "elle-terminal",
  "elle-text",
+ "elle-theme",
  "elle-workspace",
  "gpui",
  "tempfile",

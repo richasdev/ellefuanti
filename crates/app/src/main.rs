@@ -13,6 +13,7 @@ mod render_tests;
 mod settings;
 mod terminal_view;
 mod theme;
+mod themes;
 mod workspace_view;
 
 use std::sync::Arc;

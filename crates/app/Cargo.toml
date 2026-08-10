@@ -37,6 +37,7 @@ elle-index.workspace = true
 elle-lsp.workspace = true
 elle-settings.workspace = true
 elle-terminal.workspace = true
+elle-theme.workspace = true
 
 gpui.workspace = true
 anyhow.workspace = true
