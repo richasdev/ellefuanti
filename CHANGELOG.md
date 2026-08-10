@@ -9,6 +9,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- **File-type icons in the tree and the tab bar** (#50, completing what #67 began). The file
+  tree's disclosure arrows were the text characters `▾`/`▸` and files got two leading spaces
+  and no glyph; tabs had no icon at all. Fourteen more Codicons — chevrons, folder and
+  folder-opened, and a glyph per file type — all from tag **0.0.36**, the tag two of the
+  activity bar's were already pinned to, so the whole in-app set is now one drawing
+  generation rather than two.
+
+  Files no longer pad with spaces: the disclosure slot is a fixed-width empty box, so a file
+  name starts at the same x as its sibling folder's. Space padding only aligns in a monospace
+  font and the sidebar is not one.
+
+  **PHP takes `file-code` and Blade takes `file-markup`, not language logos.** Codicons has
+  neither an elephant nor a Laravel mark, and the brand marks are rejected for the reasons
+  #67 gave: not CC-licensed, terms Apache-2.0 does not grant, and gpui keeps only the alpha
+  channel and fills it with one flat theme colour — a mark defined by its colour does not
+  survive that. **This rules out per-language identity**: PHP shares a glyph with JS, TS and
+  Rust. That is a real loss, and it is not the collision #67 fixed — there two activity-bar
+  panels rendered `D` with nothing else to tell them apart, whereas here the extension is
+  written in the row beside the icon. The glyph is reinforcement for scanning and never the
+  only signal, and nothing in the mapping is distinguished by colour.
+
+  The tab icon is an unconditional fixed 16px box, which is what preserves #40: the dirty dot
+  and the close button share one slot so a tab never changes width as it becomes dirty, and
+  an icon whose width depended on presence or state would have reopened that. Every tab is
+  16px wider than before and none of them move.
+
+  `icons::ICONS` is now everything the binary carries, with `ACTIVITY_ICONS` a named prefix
+  of it. Appending to the single old table would have left the activity bar working by luck —
+  `render_activity_bar` zips it positionally and `zip` stops at the shorter side, so an
+  insertion among the first seven would have shifted every panel's glyph with nothing
+  failing. Both guards were mutation-checked by performing that insertion.
+
 - **A real caret: thin, between characters, blinking** (#98). The block cursor — a background
   highlight on the character _under_ the cursor — is gone. `crates/app/src/editor/caret.rs`
   is this repo's first `Element` implementation, which is the point: `Element` is the only
