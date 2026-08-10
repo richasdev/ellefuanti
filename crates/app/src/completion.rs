@@ -199,6 +199,19 @@ impl CompletionPopup {
         cx.notify();
     }
 
+    /// Replaces the query, for a source that knows the typed span better than the opener did.
+    ///
+    /// Exactly one caller, and it is not a general setter: a route name is dotted, and the
+    /// generic `word_before` scan stops at the `.`. The Laravel source knows the whole
+    /// literal is the span being completed, so it corrects both the query and the range the
+    /// workspace will overwrite. Correcting only one of the two is the bug this exists to
+    /// have fixed — see `request_route_completions`.
+    pub fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.query = query;
+        self.refilter();
+        cx.notify();
+    }
+
     /// The list as the user currently sees it. Used by the tests, which assert on what is
     /// *shown* rather than on what was offered — the filtering is the part that can be
     /// wrong.

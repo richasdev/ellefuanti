@@ -2191,9 +2191,23 @@ impl WorkspaceView {
         if reference.kind != elle_laravel::ReferenceKind::Route {
             return;
         }
-        // The literal's own range, so accepting replaces the whole name rather than
-        // appending to the half already typed inside the quotes.
-        self.completion_word_start = Some(reference.range.start);
+
+        // Widen the replaced range to the whole literal, and widen the popup's query to
+        // match it. **Both, or neither** — they are two views of one span, and moving only
+        // the range is a bug I wrote and caught here: a route name is dotted, `word_before`
+        // stops at the `.`, so in `route('users.sh|')` the query was `sh` while the range
+        // started at `users`. Accepting `users.show` then wrote the full name over a range
+        // beginning at `u`, giving `users.users.show` — an off-by-one-word that only shows
+        // up on names with a dot, which is most of them.
+        //
+        // Guarded on the reference actually starting at or before the cursor: `reference_at`
+        // answers about the literal the cursor is *in*, so this holds, but a range that
+        // began after the cursor would produce a backwards replace at accept time.
+        if reference.range.start <= offset {
+            self.completion_word_start = Some(reference.range.start);
+            let typed = source[reference.range.start..offset].to_string();
+            popup.update(cx, |popup, cx| popup.set_query(typed, cx));
+        }
 
         let task = cx.spawn(async move |_this, cx| {
             let names = cx.background_spawn(async move { elle_laravel::route_names(&root) }).await;
@@ -4067,6 +4081,47 @@ mod tests {
     /// `render_activity_bar` zips its panel list against `icons::ACTIVITY_ICONS`, and `zip`
     /// stops at the shorter side — so adding a panel without adding an icon would silently
     /// drop the last panel off the bar rather than fail. Assert the lengths match.
+    #[test]
+    fn a_dotted_route_name_needs_the_whole_literal_not_the_word_before_the_cursor() {
+        // The bug this pins was real and shipped in an earlier draft of #61. A route name is
+        // dotted; `word_before` stops at the `.`, so in `route('users.sh|')` the popup's
+        // query was `sh` while the range it would overwrite began at `users`. Accepting
+        // `users.show` then wrote the full name over a range starting at `u` and produced
+        // `users.users.show`.
+        //
+        // The fix is that the Laravel source corrects *both* — the query and the range — and
+        // this states the property that makes them consistent: whatever span the popup will
+        // overwrite, the query must be exactly the text already typed inside it.
+        let source = "<?php\nroute('users.sh');\n";
+        let cursor = source.find("');").expect("the cursor sits just before the closing quote");
+
+        let reference = elle_laravel::reference_at(source, cursor, false)
+            .expect("the cursor is inside a route() literal");
+        assert_eq!(reference.kind, elle_laravel::ReferenceKind::Route);
+
+        // What the generic scan would have used, and why it is not enough on its own.
+        assert_eq!(
+            crate::completion::word_before(source, cursor),
+            "sh",
+            "the generic scan stops at the dot — this is the input to the bug, not the bug"
+        );
+
+        // What the route path uses instead: the literal's own span.
+        let range = reference.range.clone();
+        let typed = &source[range.start..cursor];
+        assert_eq!(typed, "users.sh", "the query must cover the whole literal typed so far");
+
+        // And the property that matters — replacing `range.start..cursor` with the accepted
+        // name yields the name itself, not a doubled prefix.
+        let mut buffer = source.to_string();
+        buffer.replace_range(range.start..cursor, "users.show");
+        assert!(buffer.contains("route('users.show')"), "got {buffer:?}");
+        assert!(!buffer.contains("users.users.show"), "the prefix must not be doubled");
+    }
+
+    /// `render_activity_bar` zips its panel list against `icons::ICONS`, and `zip` stops at
+    /// the shorter side — so adding a panel without adding an icon would silently drop the
+    /// last panel off the bar rather than fail. Assert the lengths match.
     ///
     /// The names are asserted too, because equal lengths in the wrong order is the other
     /// way to get this wrong, and it is the more confusing one: every icon renders, each
