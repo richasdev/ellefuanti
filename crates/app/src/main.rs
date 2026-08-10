@@ -9,6 +9,7 @@ mod palette;
 mod perf;
 #[cfg(test)]
 mod render_tests;
+mod settings;
 mod terminal_view;
 mod theme;
 mod workspace_view;
@@ -51,8 +52,11 @@ fn main() {
         startup.phase("event_loop_start");
 
         // Before any view exists, because `cx.theme()` panics without it and the first
-        // render happens inside `open_window` below.
-        theme::set_theme(theme::ThemeVariant::default(), cx);
+        // render happens inside `open_window` below. Reads settings.json and applies what
+        // it finds — a missing or unreadable file is a default theme and a log line, never
+        // a failure to launch (#60).
+        settings::load_and_apply(cx);
+        startup.phase("settings");
 
         let registry = Arc::new(actions::init(cx));
 

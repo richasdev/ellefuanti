@@ -42,13 +42,14 @@ use elle_workspace::{CancelFlag, IndexedFile, index_files};
 /// 64-bit hash makes that unlikely enough, and the stat-verify pass below would reject
 /// nearly every row anyway if it ever happened.
 ///
-/// ponytail: no settings layer exists yet (#60), so this is hardcoded. When settings land,
-/// this is the one function that has to change.
+/// The directory itself comes from `elle_settings::support_dir` since #60, so the index
+/// and settings.json cannot drift onto two different roots. The *location* is still not
+/// configurable and there is no key for it: nobody has asked to move their cache, and a
+/// setting that exists to be left alone is a setting that goes untested.
 pub fn index_path(root: &Path) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
     Some(
-        PathBuf::from(home)
-            .join("Library/Application Support/ellefuanti/index")
+        elle_settings::support_dir()?
+            .join("index")
             .join(format!("{:016x}.sqlite", path_hash(root))),
     )
 }

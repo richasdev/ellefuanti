@@ -147,7 +147,51 @@ impl ThemeVariant {
             Self::GitHubLight => "GitHub Light",
         }
     }
+
+    /// The name this variant has in `settings.json`.
+    ///
+    /// Separate from [`label`](Self::label) even though both are strings, because they
+    /// answer to different people: `label` is shown in the command palette and may be
+    /// reworded freely, while this is written to a file someone else's build has to read
+    /// back. Deriving one from the other would mean a copy edit silently invalidating
+    /// every saved setting.
+    ///
+    /// Lowercase and hyphenated, matching VS Code's convention, so #58's importer maps
+    /// names rather than reformatting them.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::OneDarkPro => "one-dark-pro",
+            Self::GitHubDark => "github-dark",
+            Self::GitHubLight => "github-light",
+        }
+    }
+
+    /// The variant a settings file named, or `None` if this build has no such theme.
+    ///
+    /// `None` rather than defaulting here: the caller wants to say *which* name it did not
+    /// recognise, and a function that quietly returns Dark cannot. #58's disk themes turn
+    /// this from "unknown, use the default" into "not compiled in, look on disk".
+    pub fn from_name(name: &str) -> Option<Self> {
+        ALL_VARIANTS.into_iter().find(|variant| variant.name() == name)
+    }
 }
+
+/// Every variant. Moved out of the test module in #60 because `from_name` needs it: one
+/// list means a theme cannot be given a `name` and forgotten here, which would be a theme
+/// that saves and never loads back.
+///
+/// The length assertion in the test module is the half the compiler cannot check — an
+/// exhaustive match keeps `name` and `label` honest, but nothing stops someone adding an
+/// arm to every match and not to this array.
+const ALL_VARIANTS: [ThemeVariant; 5] = [
+    ThemeVariant::Dark,
+    ThemeVariant::Light,
+    ThemeVariant::OneDarkPro,
+    ThemeVariant::GitHubDark,
+    ThemeVariant::GitHubLight,
+];
 
 /// The active theme, as gpui stores it.
 ///
@@ -187,8 +231,19 @@ impl Themed for App {
 /// `set_global` notifies global observers, but observing is not what repaints — gpui
 /// repaints an entity when *it* is notified. The caller does the refresh; see
 /// `WorkspaceView::toggle_theme`.
+///
+/// The choice is persisted here rather than in `WorkspaceView::toggle_theme`, because this
+/// is the one funnel every theme change goes through — a second way to switch themes (the
+/// palette already has one, #58 will add another) gets persistence for free instead of
+/// having to remember to ask for it. See [`crate::settings::persist_theme`] for what makes
+/// the startup call and the test calls not write anything.
 pub fn set_theme(variant: ThemeVariant, cx: &mut App) {
+    let previous = cx.try_global::<ActiveTheme>().map(|active| active.variant);
     cx.set_global(ActiveTheme { variant, theme: variant.build() });
+
+    if previous != Some(variant) {
+        crate::settings::persist_theme(variant, cx);
+    }
 }
 
 impl Theme {
@@ -653,15 +708,6 @@ mod tests {
             HighlightStyle::Attribute => "attribute",
         }
     }
-
-    /// Every variant, kept complete by `ThemeVariant::label` for the same reason.
-    const ALL_VARIANTS: [ThemeVariant; 5] = [
-        ThemeVariant::Dark,
-        ThemeVariant::Light,
-        ThemeVariant::OneDarkPro,
-        ThemeVariant::GitHubDark,
-        ThemeVariant::GitHubLight,
-    ];
 
     /// The themes ported verbatim from a published VS Code theme.
     ///

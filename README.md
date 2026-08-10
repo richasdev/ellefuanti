@@ -52,9 +52,30 @@ CI does this on every push, precisely because the release path can break while `
 keeps working locally. See [ADR-0002](docs/adr/0002-gpui-for-ui.md).
 
 ```sh
-cargo test        # 258 tests across every crate
+cargo test        # 522 tests across every crate
 cargo bench       # performance baselines — see benchmarks/BASELINE.md
 ```
+
+## Settings
+
+`~/Library/Application Support/ellefuanti/settings.json`, created on the first change. The
+app runs without it, and every key has a default that is what a first run should get.
+
+| Key       | Type   | Default  | Meaning                                                            |
+| --------- | ------ | -------- | ------------------------------------------------------------------ |
+| `theme`   | string | `"dark"` | `dark`, `light`, `one-dark-pro`, `github-dark` or `github-light`   |
+| `version` | number | `1`      | Written by the app. Present so a future format change has a marker |
+
+A file that is not valid JSON is reported with its line and column and the app launches on
+defaults, **without saving over it** — the text you typed is still there to fix, and a theme
+switch during that session is not persisted rather than overwriting your config with
+defaults. A single key of the wrong type falls back to that key's default and costs nothing
+else. Keys this build does not recognise are preserved when it saves, so downgrading does
+not lose configuration.
+
+Settings are global. There is no per-project settings file, deliberately —
+[ADR-0009](docs/adr/0009-json-settings-global-only.md) explains why, and what would have to
+change for one to exist.
 
 ## Architecture
 
@@ -69,10 +90,13 @@ crates/
 ├── syntax/      tree-sitter incremental parsing, highlighting
 ├── workspace/   filesystem, lazy file tree, project index, safe file IO
 ├── terminal/    PTY sessions, VT/ANSI emulation
-└── lsp/         generic LSP client with substitutable backends
+├── lsp/         generic LSP client with substitutable backends
+├── index/       SQLite project index
+├── laravel/     route extraction
+└── settings/    settings.json: read, merge with defaults, write atomically
 ```
 
-Seven crates, not the eighteen the spec sketches. Crates are added when there is code to put
+Ten crates, not the eighteen the spec sketches. Crates are added when there is code to put
 in them.
 
 Read next:
