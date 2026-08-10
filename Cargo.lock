@@ -1688,6 +1688,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-test-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "elle-text"
 version = "0.1.0"
 dependencies = [
@@ -1728,11 +1736,13 @@ dependencies = [
  "elle-settings",
  "elle-syntax",
  "elle-terminal",
+ "elle-test-runner",
  "elle-text",
  "elle-theme",
  "elle-workspace",
  "gpui",
  "regex",
+ "smol",
  "tempfile",
  "tracing",
  "tracing-subscriber",

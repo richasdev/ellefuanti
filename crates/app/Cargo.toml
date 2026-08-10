@@ -38,10 +38,19 @@ elle-index.workspace = true
 elle-lsp.workspace = true
 elle-settings.workspace = true
 elle-terminal.workspace = true
+elle-test-runner.workspace = true
 elle-theme.workspace = true
 
 gpui.workspace = true
 anyhow.workspace = true
+# The async channel that carries test events from the background run to the panel (#25).
+#
+# Not a new dependency in any meaningful sense: `smol` is already declared in the workspace
+# and its `async-channel` is already compiled for every build through gpui's own executor.
+# The alternative was `std::sync::mpsc` plus a timer to poll it, which is exactly the idle
+# cost #79 and #93 exist to keep out — a channel that wakes the task when an event arrives
+# costs nothing when no run is happening.
+smol.workspace = true
 regex.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

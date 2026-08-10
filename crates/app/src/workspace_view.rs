@@ -7,6 +7,7 @@ use std::time::Duration;
 use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
 use elle_lsp::lsp_types::{DocumentSymbolResponse, GotoDefinitionResponse, Location, Uri};
+use elle_test_runner::CancelFlag as TestCancelFlag;
 use elle_text::Point;
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
@@ -17,9 +18,9 @@ use gpui::{
 use crate::actions::{
     CloseTab, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindNext, FindPrev,
     FindReferences, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack,
-    NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace, ResetFontSize, Save,
-    ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context,
-    dispatch_for,
+    NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace, RerunFailedTests,
+    ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette, ToggleHiddenFiles,
+    ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context, dispatch_for,
 };
 use crate::editor::{Document, EditorEvent, EditorView};
 use crate::file_cache;
@@ -31,6 +32,7 @@ use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::terminal_view::TerminalView;
+use crate::test_view::{RunState, TestView};
 use crate::theme::{Metrics, Theme, Themed};
 
 /// Which panel the sidebar is showing.
@@ -93,6 +95,15 @@ enum Job {
     /// cancel the status refresh that is repopulating the list underneath it — they answer
     /// different questions and both answers are wanted.
     GitDiff,
+    /// A test run (#25).
+    ///
+    /// Its own slot, and emphatically not shared with anything else: a suite takes minutes,
+    /// and every other job here finishes in milliseconds. Sharing would mean a ⌘S half way
+    /// through a run cancelled it — the precise failure this enum was split up to stop.
+    ///
+    /// Starting a second run *does* supersede the first, which is what the slot is for: two
+    /// concurrent suites would fight over the same database and report interleaved results.
+    TestRun,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -350,6 +361,16 @@ pub struct WorkspaceView {
     /// The bottom terminal panel. `Some` only while it is open — a panel that is closed is
     /// absent, not hidden, so its poll timer and its shells stop existing with it.
     terminal: Option<Entity<TerminalView>>,
+    /// The bottom test panel (#25). `Some` only while it is open.
+    ///
+    /// Unlike the terminal, closing this does *not* stop the work: a run in flight keeps
+    /// going and its results are still there when the panel is reopened, because a suite
+    /// takes minutes and closing the panel to read some code is not a request to abandon
+    /// it. Cancelling is a separate, explicit thing — [`Job::TestRun`] plus the flag below.
+    tests: Option<Entity<TestView>>,
+    /// Cancels an in-flight test run. Separate from the task slot for the usual reason
+    /// (ADR-0007): dropping the `Task` stops the await, not the PHP process behind it.
+    test_cancel: Option<TestCancelFlag>,
     /// Transient message for the status bar (a failed save, mostly).
     status: Option<SharedString>,
     /// In-flight background work, one slot per [`Job`]. Held rather than detached so a new
@@ -431,6 +452,8 @@ impl WorkspaceView {
             palette: None,
             find: None,
             terminal: None,
+            tests: None,
+            test_cancel: None,
             status: None,
             jobs: Jobs::default(),
             frames: FrameTimer::new(),
@@ -491,6 +514,14 @@ impl WorkspaceView {
                     Ok(tree) => {
                         this.tree = Some(tree);
                         this.status = None;
+                        // A run belongs to the project it was started in. Its results name
+                        // files in the old tree and its `--filter` names the old suite, so
+                        // carrying either into a new project would show verdicts about code
+                        // the user is no longer looking at. The panel goes with it, and is
+                        // rebuilt against the new root when it is next opened — which is
+                        // also what re-runs detection for a project that may not have Pest.
+                        this.cancel_test_run();
+                        this.tests = None;
                         // A new project gets a new server, pointed at the new root. The
                         // old one is dropped by `set_root`, which kills its process.
                         this.start_lsp(cx);
@@ -718,6 +749,33 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn toggle_command_palette_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_command_palette(&ToggleCommandPalette, window, cx);
+    }
+
+    /// Opens the test panel through the real handler (#25).
+    #[cfg(test)]
+    pub fn toggle_test_panel_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_test_panel(&ToggleTestPanel, window, cx);
+    }
+
+    /// Puts a finished run into the panel so a render test can paint results.
+    ///
+    /// Feeds real [`elle_test_runner::Event`]s through the same `push` the live run uses,
+    /// rather than assigning a `Report` — a test that built the report directly would pass
+    /// while the event folding was broken.
+    #[cfg(test)]
+    pub fn seed_test_results_for_test(
+        &mut self,
+        events: Vec<elle_test_runner::Event>,
+        state: RunState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.tests.clone() else { return };
+        panel.update(cx, |panel, cx| {
+            for event in events {
+                panel.push(event, cx);
+            }
+            panel.finish(state, cx);
+        });
     }
 
     #[cfg(test)]
@@ -1129,6 +1187,220 @@ impl WorkspaceView {
             // Opening the panel already creates a session, so this is the same path.
             None => self.toggle_terminal(&ToggleTerminal, window, cx),
         }
+    }
+
+    // --- test runner (#25) ---------------------------------------------------------
+
+    /// Opens the test panel, or closes it if it is already open.
+    ///
+    /// Closing does not cancel a run. Unlike the terminal — whose shells exist only to be
+    /// looked at — a suite is work the user started and may want to keep running while they
+    /// read the code it is testing. Cancelling is [`Self::cancel_test_run`], and it happens
+    /// when a new run supersedes this one or the folder changes.
+    fn toggle_test_panel(
+        &mut self,
+        _: &ToggleTestPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.tests.take() {
+            Some(_) => window.focus(&self.focus_handle),
+            None => {
+                self.tests = Some(self.new_test_panel(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Builds the panel, detects the project's runner, and wires clicks to `open_path_at`.
+    fn new_test_panel(&mut self, cx: &mut Context<Self>) -> Entity<TestView> {
+        let root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        let panel = cx.new(TestView::new);
+        let workspace = cx.entity();
+
+        panel.update(cx, |panel, _| {
+            // Detection is a handful of `is_file` calls, so it happens inline rather than
+            // on the background executor. `None` — no test framework in this project — is
+            // the common case and produces no work, no message and no error (§24).
+            panel.runner = root.as_deref().and_then(elle_test_runner::detect);
+
+            let root = root.clone();
+            panel.on_jump(move |test, cx| {
+                let Some(location) = test.location.clone() else { return };
+                let Some(root) = root.clone() else { return };
+                // Pest prints paths relative to the project root, PHPUnit absolute ones.
+                // Joining an absolute path onto the root is a no-op in `PathBuf`, so this
+                // handles both without asking which runner produced it.
+                let path = root.join(&location.path);
+                if !path.is_file() {
+                    // The runner named a file we cannot find. Saying nothing is the honest
+                    // answer — opening a plausible-looking neighbour would be worse than
+                    // not moving at all (RISKS.md #4).
+                    return;
+                }
+                // `Location::line` is 1-based; `Point` rows are 0-based. One jump path for
+                // the whole app (#88), not a second one invented here.
+                let point = Point::new(location.line.saturating_sub(1) as usize, 0);
+                workspace.update(cx, |workspace, cx| workspace.open_path_at(path, Some(point), cx));
+            });
+        });
+        panel
+    }
+
+    fn run_tests(&mut self, _: &RunTests, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_test_run(elle_test_runner::Scope::All, window, cx);
+    }
+
+    /// Runs the tests in the active tab's file.
+    fn run_tests_in_file(
+        &mut self,
+        _: &RunTestsInFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()) else {
+            // An unsaved tab has no file for the runner to be pointed at.
+            return;
+        };
+        let root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        // Relative to the root, so the command shown is one the user could paste into a
+        // terminal in that folder.
+        let scoped = root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(PathBuf::from)
+            .unwrap_or(path);
+
+        self.start_test_run(elle_test_runner::Scope::File(scoped), window, cx);
+    }
+
+    /// Re-runs only the tests that failed in the last run.
+    fn rerun_failed_tests(
+        &mut self,
+        _: &RerunFailedTests,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let failed = self
+            .tests
+            .as_ref()
+            .map(|panel| panel.read(cx).report.failed_names())
+            .unwrap_or_default();
+
+        // Nothing failed, so there is nothing to rerun. Falling through to a scope that
+        // selects everything would turn "rerun the failures" into a full suite run — the
+        // trap `Scope::is_empty` exists to make visible.
+        if failed.is_empty() {
+            return;
+        }
+        self.start_test_run(elle_test_runner::Scope::Names(failed), window, cx);
+    }
+
+    /// Cancels a run in flight, if there is one.
+    fn cancel_test_run(&mut self) {
+        if let Some(cancel) = self.test_cancel.take() {
+            cancel.cancel();
+        }
+        // The flag stops the read loop and kills the child; dropping the task stops us
+        // awaiting it. Both are needed (ADR-0007).
+        self.jobs.cancel(Job::TestRun);
+    }
+
+    /// Spawns a run and streams its results into the panel.
+    fn start_test_run(
+        &mut self,
+        scope: elle_test_runner::Scope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Running tests is the one action that opens the panel by itself: the results have
+        // to land somewhere the user can see them.
+        let panel = match self.tests.clone() {
+            Some(panel) => panel,
+            None => {
+                let panel = self.new_test_panel(cx);
+                self.tests = Some(panel.clone());
+                window.focus(&panel.read(cx).focus_handle(cx));
+                panel
+            }
+        };
+
+        let Some(runner) = panel.read(cx).runner.clone() else {
+            // No Pest and no PHPUnit in this project. The panel says so and nothing is
+            // spawned — no dialog, no log line, no error (§24).
+            panel.update(cx, |panel, cx| {
+                panel.finish(
+                    RunState::Failed {
+                        message: "No Pest or PHPUnit found in vendor/bin".to_string(),
+                    },
+                    cx,
+                );
+            });
+            cx.notify();
+            return;
+        };
+
+        // A second run supersedes the first: two suites at once would fight over the same
+        // database and interleave their output into one report.
+        self.cancel_test_run();
+
+        let command = runner.command(&scope);
+        let shown = command.display();
+        panel.update(cx, |panel, cx| panel.begin(shown, &scope, cx));
+
+        let cancel = TestCancelFlag::new();
+        self.test_cancel = Some(cancel.clone());
+
+        let task = cx.spawn(async move |this, cx| {
+            // A channel rather than calling back into the panel from the background
+            // thread: `on_event` runs on the executor, and touching an `Entity` there is
+            // not allowed. The receiver marshals each event onto the foreground thread, so
+            // the panel fills in *as* the suite runs rather than all at once at the end.
+            //
+            // Unbounded and async: unbounded because a fast suite emits events faster than
+            // the UI repaints and a bounded channel would block the reader thread on the
+            // frame rate; async because awaiting the receiver parks this task until an
+            // event actually arrives. No timer and no poll — an editor between runs does
+            // no work at all, which is what the idle-footprint gate measures (#79, #93).
+            let (sender, receiver) = smol::channel::unbounded();
+            let run_command = command.clone();
+            let run_cancel = cancel.clone();
+            let outcome = cx.background_spawn(async move {
+                let result = elle_test_runner::run(&run_command, &run_cancel, |event| {
+                    // A send error means the receiver is gone, which means the run was
+                    // abandoned. The cancel flag is what actually stops it.
+                    let _ = sender.send_blocking(event);
+                });
+                // Dropping the sender here closes the channel, which is what ends the
+                // receive loop below — including when the run failed to start at all.
+                result
+            });
+
+            // Parks until an event arrives, and ends when the sender is dropped.
+            while let Ok(event) = receiver.recv().await {
+                panel.update(cx, |panel, cx| panel.push(event, cx)).ok();
+            }
+
+            let outcome = outcome.await;
+            this.update(cx, |this, cx| {
+                this.test_cancel = None;
+                let state = match outcome {
+                    Ok(elle_test_runner::Outcome::Exited { code }) => {
+                        RunState::Finished { command: command.display(), code }
+                    }
+                    Ok(elle_test_runner::Outcome::Cancelled) => {
+                        RunState::Cancelled { command: command.display() }
+                    }
+                    // Could not start the runner at all — distinct from a suite that
+                    // failed, and worded so the difference is visible.
+                    Err(error) => RunState::Failed { message: format!("{error:#}") },
+                };
+                panel.update(cx, |panel, cx| panel.finish(state, cx));
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::TestRun, task);
     }
 
     // --- find and replace (#80) ----------------------------------------------------
@@ -2313,6 +2585,14 @@ impl WorkspaceView {
                     Dispatch::OpenSettings => self.open_settings(&OpenSettings, window, cx),
                     Dispatch::Find => self.find(&Find, window, cx),
                     Dispatch::Replace => self.replace(&Replace, window, cx),
+                    Dispatch::ToggleTestPanel => {
+                        self.toggle_test_panel(&ToggleTestPanel, window, cx)
+                    }
+                    Dispatch::RunTests => self.run_tests(&RunTests, window, cx),
+                    Dispatch::RunTestsInFile => self.run_tests_in_file(&RunTestsInFile, window, cx),
+                    Dispatch::RerunFailedTests => {
+                        self.rerun_failed_tests(&RerunFailedTests, window, cx)
+                    }
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -2501,6 +2781,10 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_hidden_files))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::toggle_test_panel))
+            .on_action(cx.listener(Self::run_tests))
+            .on_action(cx.listener(Self::run_tests_in_file))
+            .on_action(cx.listener(Self::rerun_failed_tests))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
@@ -2534,7 +2818,11 @@ impl Render for WorkspaceView {
                             .child(self.render_editor_area(&theme, cx))
                             // Below the editor and inside its column, so the sidebar keeps
                             // its full height — the layout every other IDE uses.
-                            .children(self.terminal.clone()),
+                            .children(self.terminal.clone())
+                            // Under the terminal, in the same column and by the same
+                            // reasoning. Both can be open at once: a run and the shell you
+                            // started it from are things people look at together.
+                            .children(self.tests.clone()),
                     ),
             )
             .child(self.render_status_bar(&theme, cx))
@@ -2873,6 +3161,11 @@ impl WorkspaceView {
 
         let diagnostics = lsp_label(&self.lsp);
 
+        // Like the terminal count, only while the panel is open. A project with no test
+        // framework — and one that has simply not run its tests — says nothing here, the
+        // same rule `lsp_label` follows for a project with no language server (§24).
+        let tests = self.tests.as_ref().map(|tests| tests.read(cx).summary()).unwrap_or_default();
+
         // A squiggle the user cannot read only says "something is wrong near here". Putting
         // the cursor on it spells it out, which is the cheapest thing that makes the
         // underlines actually useful — a hover card or a problems panel is a bigger feature
@@ -2903,6 +3196,7 @@ impl WorkspaceView {
                     .child(message),
             )
             .child(SharedString::from(diagnostics))
+            .child(SharedString::from(tests))
             .child(SharedString::from(terminals))
             .child(SharedString::from(position))
             .child(SharedString::from(language))
@@ -3324,6 +3618,7 @@ mod tests {
             Job::QuickOpenIndex,
             Job::ClosePrompt,
             Job::Lsp,
+            Job::TestRun,
         ];
         for job in all {
             h.start(job);
@@ -3345,6 +3640,31 @@ mod tests {
 
         h.start(Job::Lsp);
         assert_eq!(h.cancelled(), vec![Job::Lsp]);
+    }
+
+    /// A test run is the longest-lived job here — minutes, against milliseconds for
+    /// everything else — so it is the one with the most chances to be cancelled by
+    /// something unrelated. Saving, opening a file, walking for quick open and starting a
+    /// language server all happen constantly *while* a suite runs, and none of them is a
+    /// request to abandon it (#25, ADR-0007).
+    #[test]
+    fn nothing_the_user_does_while_a_suite_runs_cancels_it() {
+        let mut h = Harness::new();
+        h.start(Job::TestRun);
+
+        for job in [Job::Save, Job::OpenFile, Job::QuickOpenIndex, Job::Lsp, Job::OpenFolder] {
+            h.start(job);
+        }
+        assert!(
+            !h.cancelled().contains(&Job::TestRun),
+            "a test run was cancelled by unrelated work: {:?}",
+            h.cancelled()
+        );
+
+        // But a second run does supersede the first: two suites at once would fight over
+        // the same database and interleave their results.
+        h.start(Job::TestRun);
+        assert_eq!(h.cancelled(), vec![Job::TestRun]);
     }
 }
 

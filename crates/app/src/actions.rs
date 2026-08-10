@@ -98,6 +98,13 @@ actions!(
         ToggleWholeWord,
         ToggleRegex,
         FocusReplaceField,
+        // Test runner (#25). `RunTests` runs the whole suite, `RunTestsInFile` the active
+        // tab, and `RerunFailedTests` only what failed last time. All four are no-ops in a
+        // project with no test framework, which is the common case (§24).
+        ToggleTestPanel,
+        RunTests,
+        RunTestsInFile,
+        RerunFailedTests,
     ]
 );
 
@@ -113,6 +120,9 @@ pub mod context {
     /// instead of dismissing an overlay, and the bar has toggles a palette has no
     /// concept of. Sharing the context would have meant a mode check in every handler.
     pub const FIND: &str = "Find";
+    /// The test results panel (#25). Its own context so a rerun key means "rerun" only
+    /// while the panel has focus, and does not shadow anything in the editor.
+    pub const TESTS: &str = "Tests";
 }
 
 /// Registers the default keymap and the palette's command list.
@@ -152,6 +162,19 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // also *closes* the panel while the terminal itself has focus.
         KeyBinding::new("ctrl-`", ToggleTerminal, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-`", NewTerminal, Some(context::WORKSPACE)),
+        //
+        // Test runner (#25). Workspace-scoped so they work from the editor and from the
+        // panel, and so the toggle also *closes* the panel while it has focus — the same
+        // reasoning as the terminal above.
+        //
+        // ⌃⇧ rather than ⌘: ⌘T and ⌘R are a new tab and a reload in every macOS app the
+        // user also has open, and the comment on `ToggleTheme` above declines to claim
+        // them for exactly that reason. These four are near the terminal's own ⌃` chord,
+        // which is where a runner panel belongs.
+        KeyBinding::new("ctrl-shift-t", ToggleTestPanel, Some(context::WORKSPACE)),
+        KeyBinding::new("ctrl-shift-r", RunTests, Some(context::WORKSPACE)),
+        KeyBinding::new("ctrl-shift-f", RunTestsInFile, Some(context::WORKSPACE)),
+        KeyBinding::new("ctrl-shift-e", RerunFailedTests, Some(context::WORKSPACE)),
         // `ToggleTheme` is deliberately unbound: it reaches the user through the palette.
         // Every obvious chord (cmd-k, cmd-t) is a prefix or a tab command elsewhere, and
         // picking one now means choosing a keymap before there is a file to override it in.
@@ -291,6 +314,10 @@ pub enum Dispatch {
     OpenSettings,
     Find,
     Replace,
+    ToggleTestPanel,
+    RunTests,
+    RunTestsInFile,
+    RerunFailedTests,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -318,6 +345,10 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "workspace.open_settings" => Dispatch::OpenSettings,
         "editor.find" => Dispatch::Find,
         "editor.replace" => Dispatch::Replace,
+        "tests.toggle" => Dispatch::ToggleTestPanel,
+        "tests.run" => Dispatch::RunTests,
+        "tests.run_file" => Dispatch::RunTestsInFile,
+        "tests.rerun_failed" => Dispatch::RerunFailedTests,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

@@ -15,6 +15,7 @@ mod perf;
 mod render_tests;
 mod settings;
 mod terminal_view;
+mod test_view;
 mod theme;
 mod themes;
 mod workspace_view;

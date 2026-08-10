@@ -1,0 +1,14 @@
+[package]
+name = "elle-test-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+# Detection answers "is there a runner in this project", so the tests have to build trees
+# that really do and really do not have one. Asserting on the command this *would* build
+# proves only that string joining works — the whole point is the `is_file` check.
+tempfile = "3"
