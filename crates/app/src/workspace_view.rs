@@ -3849,12 +3849,20 @@ impl WorkspaceView {
                         // 16px inside a 32px hit target: the icon is the glyph, the square is
                         // the thing you can hit, and VS Code uses the same ratio.
                         //
-                        // The colour is set on this parent, not on the svg. gpui rasterises
-                        // the SVG to an alpha mask and fills it with `style.text.color`, so
-                        // the icon inherits `text_color` above and every theme variant
-                        // recolours it for free. An icon with a hardcoded fill would be
-                        // invisible in at least one of the five.
-                        .child(svg().path(icon.path).size(px(16.0)))
+                        // The colour is set on the svg itself, and it has to be: gpui
+                        // rasterises the SVG to an alpha mask and fills it with
+                        // `style.text.color` **on that element**, which does not inherit
+                        // from this parent. The comment here used to claim it did, and the
+                        // bar rendered nothing at all — the same defect the tree and tab
+                        // icons had. Reusing the three states above rather than a flat
+                        // colour keeps the icon dimmed with its label when disabled.
+                        .child(svg().path(icon.path).size(px(16.0)).text_color(if is_active {
+                            theme.accent
+                        } else if enabled {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        }))
                 },
             ))
     }
