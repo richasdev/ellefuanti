@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
+use elle_text::Point;
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
     App, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
@@ -84,6 +85,38 @@ fn route_label(route: &Route) -> String {
         label.push_str(&show(name));
     }
     label
+}
+
+/// A palette id that carries a place in a file: `path:row`, row 0-based.
+///
+/// The palette's contract is one string per row, and widening it to a typed payload would
+/// mean the palette knowing what its rows mean — which is the one thing it is arranged not
+/// to know. Encoding the row into the id keeps the widget generic.
+///
+/// Appended rather than prepended so the common `path` prefix still matches when the user
+/// types a directory: quick open filters on the id as well as the label.
+fn target_id(path: &std::path::Path, row: usize) -> String {
+    format!("{}:{row}", path.display())
+}
+
+/// Splits a [`target_id`] back into a path and a row.
+///
+/// A plain path with no suffix is not an error — quick open's ids are bare paths, and both
+/// kinds of row arrive at the same confirm handler. Windows drive letters are not a concern
+/// here (macOS only, ADR-0004), but the parse still requires the suffix to be *entirely*
+/// digits, so a file called `notes:draft.php` is read as a path rather than a bad row.
+fn split_target_id(id: &str) -> (PathBuf, Option<Point>) {
+    match id.rsplit_once(':') {
+        Some((path, row)) if !row.is_empty() && row.bytes().all(|b| b.is_ascii_digit()) => {
+            match row.parse::<usize>() {
+                Ok(row) => (PathBuf::from(path), Some(Point::new(row, 0))),
+                // Only an overflowing row reaches this, and a line number that large is a
+                // corrupt id, not a place to jump to.
+                Err(_) => (PathBuf::from(id), None),
+            }
+        }
+        _ => (PathBuf::from(id), None),
+    }
 }
 
 /// One in-flight [`Task`] per [`Job`].
@@ -370,8 +403,39 @@ impl WorkspaceView {
 
     /// Opens a file in a tab, or activates the tab already showing it.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_path_at(path, None, cx);
+    }
+
+    /// Opens a file and, if `target` is given, puts the cursor there.
+    ///
+    /// # Why the target is threaded through here rather than added per feature
+    ///
+    /// Every navigation in the app is "open this file, then land somewhere in it": a route
+    /// in the palette, a go-to-definition, a reference, a symbol. The open is asynchronous —
+    /// the file is read on the background executor — so a caller that wanted a cursor
+    /// position had nowhere to put it and could only open the file and give up on the line.
+    /// That is exactly what #68's route palette did.
+    ///
+    /// Doing it per feature is how three subtly different jump paths appear, each with its
+    /// own answer to the tab-already-open case and its own clamping. There is one answer
+    /// here: `EditorView::reveal`, reached identically whether the tab was loaded just now
+    /// or was already in front of the user.
+    ///
+    /// The target is a [`Point`], not a byte offset. A line number is what every producer
+    /// actually has — a route index, an LSP position, a stack frame — and resolving it to
+    /// an offset needs the buffer, which does not exist until the load finishes.
+    pub fn open_path_at(&mut self, path: PathBuf, target: Option<Point>, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
+            // A file already open still has to move: "go to definition" on something in the
+            // current file is the common case, and leaving the cursor where it was would
+            // make the command look broken.
+            if let Some(target) = target {
+                self.tabs[index].editor.update(cx, |editor, cx| {
+                    editor.reveal(target);
+                    cx.notify();
+                });
+            }
             cx.notify();
             return;
         }
@@ -387,6 +451,12 @@ impl WorkspaceView {
                             Ok(document) => {
                                 let text = document.buffer.text();
                                 let editor = cx.new(|cx| EditorView::new(document, cx));
+                                // Before the tab is pushed, so the first frame the user sees
+                                // is already at the target rather than painting the top of
+                                // the file and jumping a frame later.
+                                if let Some(target) = target {
+                                    editor.update(cx, |editor, _| editor.reveal(target));
+                                }
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
                                 this.status = None;
@@ -816,7 +886,11 @@ impl WorkspaceView {
                     for path in files {
                         let Ok(source) = std::fs::read_to_string(&path) else { continue };
                         for route in extract_routes(&source).routes {
-                            items.push((route_label(&route), path.display().to_string()));
+                            // `route.line` is 1-based; `Point` rows are 0-based.
+                            items.push((
+                                route_label(&route),
+                                target_id(&path, route.line.saturating_sub(1)),
+                            ));
                         }
                     }
                     items
@@ -1132,11 +1206,13 @@ impl WorkspaceView {
         self.dismiss_palette(window, cx);
 
         match mode {
-            // Routes carry the file that declares them; opening it is the whole
-            // navigation for now. ponytail: the route's line is known and not used —
-            // `open_path` loads asynchronously and has nowhere to put a cursor target,
-            // so jumping to the line means threading one through that load.
-            Some(PaletteMode::Files | PaletteMode::Routes) => self.open_path(PathBuf::from(id), cx),
+            // Both modes hand back a path, and routes append the line that declares them.
+            // Quick open's ids are bare paths and decode to no target, which opens the file
+            // and leaves the cursor at the top — the behaviour it always had.
+            Some(PaletteMode::Files | PaletteMode::Routes) => {
+                let (path, target) = split_target_id(&id);
+                self.open_path_at(path, target, cx);
+            }
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -1642,6 +1718,44 @@ mod tests {
                 "icons::ICONS is out of order: every panel would get the wrong glyph"
             );
         }
+    }
+
+    // --- palette ids that carry a place -------------------------------------------
+
+    #[test]
+    fn a_target_id_round_trips_through_the_palette() {
+        // The palette can only carry a string, so a jump target has to survive being
+        // flattened into one and parsed back. Row 0 is included because `saturating_sub`
+        // on a 1-based line number produces it and `0` must not be read as "no target".
+        for row in [0, 1, 41, 100_000] {
+            let id = target_id(std::path::Path::new("/srv/app/routes/web.php"), row);
+            let (path, target) = split_target_id(&id);
+            assert_eq!(path, PathBuf::from("/srv/app/routes/web.php"));
+            assert_eq!(target, Some(Point::new(row, 0)), "row {row} did not survive the id");
+        }
+    }
+
+    #[test]
+    fn a_bare_path_decodes_to_no_target() {
+        // Quick open's ids are plain paths and must keep opening at the top of the file.
+        // Both kinds of row reach the same confirm handler, so this is not a hypothetical.
+        let (path, target) = split_target_id("/srv/app/Models/User.php");
+        assert_eq!(path, PathBuf::from("/srv/app/Models/User.php"));
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn a_colon_in_a_filename_is_not_read_as_a_row() {
+        // A colon is legal in a macOS filename. Splitting on it unconditionally would open
+        // the wrong path — silently, and only for the user who names files this way.
+        let (path, target) = split_target_id("/srv/notes:draft.php");
+        assert_eq!(path, PathBuf::from("/srv/notes:draft.php"));
+        assert_eq!(target, None, "the suffix is not all digits, so it is part of the name");
+
+        // And the same name *with* a row still splits at the last colon.
+        let (path, target) = split_target_id("/srv/notes:draft.php:7");
+        assert_eq!(path, PathBuf::from("/srv/notes:draft.php"));
+        assert_eq!(target, Some(Point::new(7, 0)));
     }
 
     /// Stands in for a `Task`, recording its own cancellation.

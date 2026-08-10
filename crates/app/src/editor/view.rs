@@ -80,6 +80,19 @@ impl EditorView {
         self.diagnostics = diagnostics;
     }
 
+    /// Puts the cursor at `target` and scrolls it on screen.
+    ///
+    /// The one place a navigation lands, so every jump — a route, a definition, a
+    /// reference, a symbol — leaves the editor in the same state. `point_to_offset` clamps
+    /// both row and column, which is what makes a stale target (a line number from an
+    /// index built before the file shrank) a cursor at the end of the file rather than a
+    /// panic.
+    pub fn reveal(&mut self, target: Point) {
+        let offset = self.document.buffer.point_to_offset(target);
+        self.document.move_to(offset, false);
+        self.scroll_cursor_into_view();
+    }
+
     /// Where the text column starts, as measured at prepaint.
     ///
     /// Exposed for the render tests: the click arithmetic depends on this being a *measured*
