@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use elle_core::CommandRegistry;
+use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
 use elle_workspace::{CancelFlag, FileTree, index_files, read_file, write_file};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions, SharedString,
@@ -37,7 +38,43 @@ enum Job {
     OpenFile,
     Save,
     QuickOpenIndex,
+    RouteIndex,
     ClosePrompt,
+}
+
+/// One palette row for a route: `GET       /users/{user}  users.show`.
+///
+/// The whole point of `Resolved<T>` is that this cannot quietly turn "we could not read
+/// this" into something that looks like an answer. An unresolved URI renders as the
+/// expression that defeated the parser, in angle brackets — `<$legacyUri>` tells the reader
+/// both that it is dynamic *and* what to go look at, where an empty cell or a guessed path
+/// would be a lie they might act on (RISKS.md #4).
+fn route_label(route: &Route) -> String {
+    fn show(value: &Resolved<String>) -> String {
+        match value {
+            Resolved::Known(text) => text.clone(),
+            Resolved::Unknown(source) => format!("<{source}>"),
+        }
+    }
+
+    // Spelled out rather than `{:?}`: Debug renders the data-carrying variants as
+    // `Resource("GET")` and `Match(["PUT", "PATCH"])`, which leaks Rust syntax into the UI
+    // and blows past the column width that keeps the list scannable.
+    let method = match &route.method {
+        HttpMethod::Match(verbs) => verbs.join("|"),
+        // A resource entry maps to one verb; which one is all the reader needs.
+        HttpMethod::Resource(verb) => (*verb).to_string(),
+        other => format!("{other:?}").to_uppercase(),
+    };
+    let mut label = format!("{method:<8}{}", show(&route.uri));
+    // A route that never called ->name() gets no name column at all; one that called it with
+    // an expression we could not read gets the expression. Those are different facts and the
+    // row should not flatten them together.
+    if let Some(name) = &route.name {
+        label.push_str("  ");
+        label.push_str(&show(name));
+    }
+    label
 }
 
 /// One in-flight [`Task`] per [`Job`].
@@ -571,8 +608,8 @@ impl WorkspaceView {
                 .iter()
                 .map(|command| (command.title.to_string(), command.id.0.to_string()))
                 .collect(),
-            // Files arrive asynchronously — the palette opens empty and fills in.
-            PaletteMode::Files => Vec::new(),
+            // Files and routes arrive asynchronously — the palette opens empty and fills in.
+            PaletteMode::Files | PaletteMode::Routes => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -589,8 +626,10 @@ impl WorkspaceView {
         window.focus(&palette.read(cx).focus_handle(cx));
         self.palette = Some(palette.clone());
 
-        if mode == PaletteMode::Files {
-            self.load_quick_open_items(palette, cx);
+        match mode {
+            PaletteMode::Files => self.load_quick_open_items(palette, cx),
+            PaletteMode::Routes => self.load_route_items(palette, cx),
+            PaletteMode::Commands => {}
         }
 
         cx.notify();
@@ -632,6 +671,49 @@ impl WorkspaceView {
         self.jobs.start(Job::QuickOpenIndex, task);
     }
 
+    /// Parses `routes/*.php` on the background executor and fills the palette.
+    ///
+    /// Same shape as the quick-open walk above: tree-sitter over every route file is not
+    /// instant on a real project, and blocking on it would stall the palette open.
+    ///
+    /// A project with no `routes/` is the common case — most folders anyone opens are not
+    /// Laravel projects — so an empty list is a normal outcome here, not an error worth
+    /// telling the user about.
+    fn load_route_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        let task = cx.spawn(async move |this, cx| {
+            let items = cx
+                .background_spawn(async move {
+                    let mut items = Vec::new();
+                    let Ok(entries) = std::fs::read_dir(root.join("routes")) else {
+                        return items;
+                    };
+
+                    let mut files: Vec<_> = entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.extension().is_some_and(|ext| ext == "php"))
+                        .collect();
+                    // Stable order, so the list does not reshuffle between opens.
+                    files.sort();
+
+                    for path in files {
+                        let Ok(source) = std::fs::read_to_string(&path) else { continue };
+                        for route in extract_routes(&source).routes {
+                            items.push((route_label(&route), path.display().to_string()));
+                        }
+                    }
+                    items
+                })
+                .await;
+
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
+    }
+
     /// Stops any quick-open walk. Called whenever the palette that would consume its
     /// results goes away — dismissed *or* replaced by a different mode.
     fn cancel_quick_open_walk(&mut self) {
@@ -657,7 +739,11 @@ impl WorkspaceView {
         self.dismiss_palette(window, cx);
 
         match mode {
-            Some(PaletteMode::Files) => self.open_path(PathBuf::from(id), cx),
+            // Routes carry the file that declares them; opening it is the whole
+            // navigation for now. ponytail: the route's line is known and not used —
+            // `open_path` loads asynchronously and has nowhere to put a cursor target,
+            // so jumping to the line means threading one through that load.
+            Some(PaletteMode::Files | PaletteMode::Routes) => self.open_path(PathBuf::from(id), cx),
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -667,6 +753,7 @@ impl WorkspaceView {
                     Dispatch::Save => self.save(&Save, window, cx),
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
+                    Dispatch::Routes => self.toggle_palette(PaletteMode::Routes, window, cx),
                     Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
                     Dispatch::ToggleTerminal => self.toggle_terminal(&ToggleTerminal, window, cx),
                     Dispatch::ToggleTheme => self.toggle_theme(&ToggleTheme, window, cx),
@@ -1201,5 +1288,48 @@ mod tests {
         }
         assert_eq!(h.slots.slots.len(), all.len());
         assert!(h.cancelled().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod route_label_tests {
+    use super::*;
+
+    /// The row must never present an unreadable value as if it were read. This is RISKS.md
+    /// #4 at the last step before pixels: everything upstream can be honest and a label that
+    /// prints `Unknown` as an empty string throws it all away.
+    #[test]
+    fn an_unresolved_uri_shows_the_expression_that_defeated_us() {
+        let route = Route {
+            method: elle_laravel::HttpMethod::Get,
+            uri: Resolved::Unknown("$legacyUri".into()),
+            name: Some(Resolved::Unknown("$legacyName".into())),
+            action: Resolved::Unknown("[$c, 'h']".into()),
+            middleware: vec![],
+            line: 36,
+        };
+        let label = route_label(&route);
+        assert!(label.contains("<$legacyUri>"), "got {label:?}");
+        assert!(label.contains("<$legacyName>"), "got {label:?}");
+        assert!(!label.contains("  <$legacyUri>  \n"), "no empty placeholder");
+    }
+
+    /// `None` (never called ->name()) and `Some(Unknown)` (called it with an expression) are
+    /// different facts. Flattening them into one blank column loses the distinction the
+    /// extractor went to trouble to preserve.
+    #[test]
+    fn a_route_with_no_name_gets_no_name_column() {
+        let route = Route {
+            method: elle_laravel::HttpMethod::Post,
+            uri: Resolved::Known("/users".into()),
+            name: None,
+            action: Resolved::Known(elle_laravel::RouteAction::Closure),
+            middleware: vec![],
+            line: 7,
+        };
+        let label = route_label(&route);
+        assert!(label.contains("/users"));
+        assert!(!label.contains('<'), "nothing unresolved here: {label:?}");
+        assert_eq!(label.trim_end(), label, "no trailing pad for an absent name");
     }
 }

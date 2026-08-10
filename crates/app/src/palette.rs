@@ -12,6 +12,7 @@ use crate::theme::{Metrics, Themed};
 pub enum PaletteMode {
     Commands,
     Files,
+    Routes,
 }
 
 impl PaletteMode {
@@ -19,6 +20,7 @@ impl PaletteMode {
         match self {
             PaletteMode::Commands => "Run a command…",
             PaletteMode::Files => "Open a file…",
+            PaletteMode::Routes => "Go to a route…",
         }
     }
 }

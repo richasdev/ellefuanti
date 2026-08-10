@@ -32,6 +32,7 @@ elle-core.workspace = true
 elle-text.workspace = true
 elle-syntax.workspace = true
 elle-workspace.workspace = true
+elle-laravel.workspace = true
 elle-terminal.workspace = true
 
 gpui.workspace = true
