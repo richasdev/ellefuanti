@@ -1,4 +1,4 @@
-//! The activity bar's icons, and the asset source gpui loads them through.
+//! Every UI glyph the app draws, and the asset source gpui loads them through.
 //!
 //! gpui's `svg()` element does not take bytes; it takes a path that it hands to the
 //! `AssetSource` installed on the `Application`. So there has to be a source, and the only
@@ -7,19 +7,37 @@
 //! They are `include_str!`-ed rather than read from `assets/` at runtime, for the same
 //! reason `elle_syntax` embeds its highlight queries: a file that is missing at runtime
 //! fails *quietly*. `paint_svg` logs and paints nothing, so a bad path is a blank 16x16
-//! hole in the activity bar with no crash and no visible error — which is precisely the
-//! silent-degradation failure this issue rejected an icon font to avoid. Embedded, a
-//! missing file is a compile error and a wrong name is a compile error.
+//! hole with no crash and no visible error — which is precisely the silent-degradation
+//! failure this issue rejected an icon font to avoid. Embedded, a missing file is a compile
+//! error and a wrong name is a compile error.
 //!
 //! The cost is that the icons cannot be themed by dropping files into a directory. That is
 //! a real feature to give up, and it goes when a settings crate exists to make it
 //! coherent; until then it would be a runtime failure mode bought for nobody.
+//!
+//! # Two tables, not one
+//!
+//! [`ICONS`] is everything the binary carries and is what [`Icons`] serves. The activity
+//! bar's seven live in [`ACTIVITY_ICONS`], a **prefix slice** of it, because
+//! `render_activity_bar` zips that against its panel array positionally. Before the file
+//! tree needed icons those were the same list; keeping them the same list would mean every
+//! new file-type glyph silently shifted the activity bar (`zip` stops at the shorter side,
+//! so the failure is a panel vanishing, not an error). `panels_and_icons_stay_aligned` in
+//! `workspace_view.rs` guards the prefix.
+//!
+//! # Icons are never the only signal
+//!
+//! A file's type is already stated by its name — `.php` is right there in the text. The
+//! icon is reinforcement for scanning, never the sole carrier of the fact, and none of the
+//! mapping below distinguishes anything by colour: gpui fills every one of these from
+//! `style.text.color`, so they are all one flat theme colour by construction.
 
 use std::borrow::Cow;
+use std::path::Path;
 
 use gpui::{AssetSource, Result, SharedString};
 
-/// The seven activity-bar panels, in the order they appear.
+/// One embedded SVG.
 ///
 /// `path` is what `svg().path(..)` is given and what [`Icons::load`] matches on. Keeping
 /// the two in one table is why a typo cannot happen: there is only one string.
@@ -38,8 +56,119 @@ macro_rules! icons {
 }
 
 /// Every icon the app can draw. Also the lookup table for [`Icons`].
-pub const ICONS: &[Icon] =
-    icons!["explorer", "search", "git", "laravel", "database", "docker", "tests"];
+///
+/// The first seven are the activity bar's, in panel order — see [`ACTIVITY_ICONS`]. The
+/// rest are the file tree's and the tab bar's, and their order carries no meaning.
+pub const ICONS: &[Icon] = icons![
+    // Activity bar, in panel order. Do not reorder or insert.
+    "explorer",
+    "search",
+    "git",
+    "laravel",
+    "database",
+    "docker",
+    "tests",
+    // Tree structure.
+    "chevron-down",
+    "chevron-right",
+    "folder",
+    "folder-opened",
+    // File types.
+    "file",
+    "file-code",
+    "file-markup",
+    "file-json",
+    "file-markdown",
+    "file-style",
+    "file-media",
+    "file-lock",
+    "file-shell",
+    "file-config",
+];
+
+/// How many of [`ICONS`] belong to the activity bar, from the front.
+const ACTIVITY_ICON_COUNT: usize = 7;
+
+/// The activity bar's icons, in panel order.
+///
+/// A prefix of [`ICONS`] rather than a second `icons![..]` invocation, so the bytes are
+/// embedded once and there is still exactly one place a name is written.
+pub const ACTIVITY_ICONS: &[Icon] = ICONS.split_at(ACTIVITY_ICON_COUNT).0;
+
+/// The paths the tree and tabs draw, as `svg().path(..)` arguments.
+///
+/// Consts rather than bare strings at each call site: a typo in a path is a blank square at
+/// runtime, not a compile error, because `AssetSource::load` returns `Ok(None)` for an
+/// unknown path and `paint_svg` logs and paints nothing. `every_named_path_is_in_the_table`
+/// turns each of these into a test failure instead.
+pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
+pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+pub const FOLDER: &str = "icons/folder.svg";
+pub const FOLDER_OPENED: &str = "icons/folder-opened.svg";
+pub const FILE: &str = "icons/file.svg";
+
+/// The icon for a file, chosen from its name.
+///
+/// # Why Codicons for PHP and Blade rather than the language's own mark
+///
+/// Codicons has no PHP elephant and no Laravel mark, and this is deliberate on Microsoft's
+/// part — the set is monochrome UI furniture, not a logo sheet. Three reasons not to reach
+/// for the brand marks anyway:
+///
+/// 1. **Licence.** Laravel's logo is not CC-licensed and PHP's elephant carries its own
+///    terms; neither is granted by this repository's Apache-2.0, and #67 already rejected
+///    them on the same grounds for the activity bar.
+/// 2. **Rendering.** gpui keeps only the alpha channel and fills it with one flat theme
+///    colour. A brand mark is defined by its colour; flattened it is both wrong and, in the
+///    lighter theme variants, unreadable.
+/// 3. **Consistency.** Every other glyph in the window is a 16px Codicon. One logo among
+///    them reads as a mistake.
+///
+/// So `.php` gets `file-code` and `.blade.php` gets `file-markup` (`</>`), which is honest:
+/// it says "source" and "markup", which is what they are. It does mean PHP shares its glyph
+/// with JS and TS — but unlike the `D`/`D` collision #67 fixed, nothing here *depends* on
+/// the icon to tell them apart, because the extension is in the row's text beside it.
+///
+/// # Matching
+///
+/// The whole name, lowercased, not just the extension. `.blade.php` is a double extension
+/// that a naive `Path::extension` reads as `php`, and `composer.lock` / `package-lock.json`
+/// are recognised by name. Order matters: the most specific suffix has to be tested first.
+pub fn for_file(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+
+    // Double extensions and whole names first: `Path::extension` on `x.blade.php` is
+    // `php`, so testing the extension first would give every Blade view a PHP glyph.
+    if lower.ends_with(".blade.php") {
+        return "icons/file-markup.svg";
+    }
+    if lower.ends_with(".lock") || lower.ends_with("-lock.json") {
+        return "icons/file-lock.svg";
+    }
+    if lower == ".env" || lower.starts_with(".env.") {
+        return "icons/file-config.svg";
+    }
+
+    let extension =
+        Path::new(&lower).extension().and_then(|e| e.to_str()).unwrap_or_default().to_string();
+
+    match extension.as_str() {
+        "php" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "rs" | "py" | "rb" | "go"
+        | "java" | "sql" => "icons/file-code.svg",
+        "html" | "htm" | "xml" | "vue" | "svg" => "icons/file-markup.svg",
+        "json" => "icons/file-json.svg",
+        "md" | "markdown" | "mdx" => "icons/file-markdown.svg",
+        "css" | "scss" | "sass" | "less" => "icons/file-style.svg",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "avif" => "icons/file-media.svg",
+        "sh" | "bash" | "zsh" | "fish" => "icons/file-shell.svg",
+        "yml" | "yaml" | "toml" | "ini" | "conf" | "cfg" | "editorconfig" => {
+            "icons/file-config.svg"
+        }
+        // Unknown is a *generic file*, never nothing. A row with no glyph where its
+        // neighbours have one reads as a broken icon, and the indentation stops lining up.
+        _ => FILE,
+    }
+}
 
 /// Serves the embedded icons to gpui.
 ///
@@ -68,7 +197,7 @@ impl AssetSource for Icons {
 mod tests {
     use super::*;
 
-    /// The activity bar draws all seven; a missing one is a blank square, not a crash.
+    /// Every icon is drawn somewhere; a missing one is a blank square, not a crash.
     #[test]
     fn every_icon_loads_by_its_own_path() {
         for icon in ICONS {
@@ -104,5 +233,180 @@ mod tests {
                 icon.path
             );
         }
+    }
+
+    /// No two entries in the table share a path.
+    ///
+    /// `AssetSource::load` is a `find`, so a duplicate is not an error — the first wins and
+    /// the second is dead weight in the binary that nothing can ever reach. Copying a file
+    /// under two names is how that happens.
+    #[test]
+    fn no_two_icons_claim_the_same_path() {
+        let mut paths: Vec<&str> = ICONS.iter().map(|icon| icon.path).collect();
+        paths.sort_unstable();
+        let before = paths.len();
+        paths.dedup();
+        assert_eq!(before, paths.len(), "two entries in ICONS share a path");
+    }
+
+    /// The activity bar's slice is a genuine prefix of the full table.
+    ///
+    /// `split_at` cannot produce a non-prefix, so this is really guarding the *count*: if
+    /// a file-type icon were inserted above `tests` in the `icons!` list, `ACTIVITY_ICONS`
+    /// would still be seven long and every panel after the insertion point would draw the
+    /// wrong glyph, with no test failing. Naming the last one pins it.
+    #[test]
+    fn the_activity_bar_slice_ends_where_the_activity_bar_does() {
+        assert_eq!(ACTIVITY_ICONS.len(), ACTIVITY_ICON_COUNT);
+        assert_eq!(
+            ACTIVITY_ICONS.last().map(|icon| icon.path),
+            Some("icons/tests.svg"),
+            "a file-type icon was inserted among the activity bar's; every panel after it \
+             now draws the wrong glyph"
+        );
+    }
+
+    /// Every path named as a const or returned by `for_file` exists in the table.
+    ///
+    /// This is the test that makes the whole scheme safe. A path is a string, and a wrong
+    /// string is a silently blank square at runtime — `load` returns `Ok(None)` and
+    /// `paint_svg` logs. Walking a wide sample of names through `for_file` and asserting
+    /// each answer loads turns every one of those into a compile-time-ish failure.
+    #[test]
+    fn every_named_path_is_in_the_table() {
+        let mut paths = vec![CHEVRON_DOWN, CHEVRON_RIGHT, FOLDER, FOLDER_OPENED, FILE];
+
+        for name in [
+            "User.php",
+            "welcome.blade.php",
+            "app.js",
+            "app.mjs",
+            "app.cjs",
+            "main.ts",
+            "App.tsx",
+            "App.jsx",
+            "main.rs",
+            "script.py",
+            "app.rb",
+            "main.go",
+            "Main.java",
+            "schema.sql",
+            "index.html",
+            "index.htm",
+            "config.xml",
+            "App.vue",
+            "logo.svg",
+            "composer.json",
+            "README.md",
+            "notes.markdown",
+            "page.mdx",
+            "app.css",
+            "app.scss",
+            "app.sass",
+            "app.less",
+            "logo.png",
+            "photo.jpg",
+            "photo.jpeg",
+            "anim.gif",
+            "img.webp",
+            "favicon.ico",
+            "old.bmp",
+            "new.avif",
+            "deploy.sh",
+            "run.bash",
+            "profile.zsh",
+            "run.fish",
+            "docker-compose.yml",
+            "ci.yaml",
+            "Cargo.toml",
+            "php.ini",
+            "nginx.conf",
+            "app.cfg",
+            "composer.lock",
+            "package-lock.json",
+            ".env",
+            ".env.example",
+            "Makefile",
+            "LICENSE",
+            "unknown.qqq",
+            "",
+        ] {
+            paths.push(for_file(name));
+        }
+
+        for path in paths {
+            assert!(
+                Icons.load(path).unwrap().is_some(),
+                "{path} is drawn somewhere but is not in ICONS: it renders as a blank square"
+            );
+        }
+    }
+
+    /// A Blade view is markup, not PHP.
+    ///
+    /// `Path::extension` on `welcome.blade.php` is `php`, so an implementation that reached
+    /// for the extension first would give every Blade file in a Laravel project the PHP
+    /// glyph — the single most common file type in the tree this editor exists for, all
+    /// wrong. The order of the checks in `for_file` is the whole fix.
+    #[test]
+    fn blade_is_not_read_as_php() {
+        assert_eq!(for_file("welcome.blade.php"), "icons/file-markup.svg");
+        assert_eq!(for_file("User.php"), "icons/file-code.svg");
+        assert_ne!(
+            for_file("welcome.blade.php"),
+            for_file("User.php"),
+            "a Blade view and a PHP class must not draw the same glyph"
+        );
+    }
+
+    /// Matching is case-insensitive, because macOS filenames are.
+    ///
+    /// `README.MD` and `Photo.JPG` are ordinary on a case-insensitive volume, and a
+    /// lowercase-only match would drop both to the generic file icon.
+    #[test]
+    fn the_extension_match_ignores_case() {
+        assert_eq!(for_file("README.MD"), for_file("readme.md"));
+        assert_eq!(for_file("Photo.JPG"), for_file("photo.jpg"));
+        assert_eq!(for_file("Welcome.Blade.PHP"), for_file("welcome.blade.php"));
+    }
+
+    /// An unrecognised name gets the generic file icon, never an empty string.
+    ///
+    /// A row with no glyph beside rows that have one reads as a rendering bug, and its
+    /// text starts at a different x than its neighbours'. `Makefile` and `LICENSE` have no
+    /// extension at all and are the ordinary case here, not an edge one.
+    #[test]
+    fn an_unknown_file_still_gets_an_icon() {
+        for name in ["Makefile", "LICENSE", "unknown.qqq", "", "no-extension"] {
+            assert_eq!(for_file(name), FILE, "{name:?} got no icon");
+        }
+    }
+
+    /// Lock files are recognised by name, in both the shapes this ecosystem produces.
+    ///
+    /// `package-lock.json` is JSON and would otherwise take the JSON glyph, which is not
+    /// wrong so much as unhelpful — a lock file is a generated artefact you do not edit,
+    /// and that is the useful thing to signal.
+    #[test]
+    fn lock_files_are_recognised_by_name() {
+        assert_eq!(for_file("composer.lock"), "icons/file-lock.svg");
+        assert_eq!(for_file("package-lock.json"), "icons/file-lock.svg");
+        assert_eq!(for_file("yarn.lock"), "icons/file-lock.svg");
+        // A plain JSON file is still JSON.
+        assert_eq!(for_file("composer.json"), "icons/file-json.svg");
+    }
+
+    /// `.env` and its variants are config, and they are dotfiles with no extension.
+    ///
+    /// `Path::extension` on `.env` is `None` (a leading dot is a hidden-file marker, not a
+    /// separator), and on `.env.example` it is `example`. Both would fall through to the
+    /// generic icon without the explicit check.
+    #[test]
+    fn dotenv_files_are_config() {
+        assert_eq!(for_file(".env"), "icons/file-config.svg");
+        assert_eq!(for_file(".env.example"), "icons/file-config.svg");
+        assert_eq!(for_file(".env.local"), "icons/file-config.svg");
+        // Not everything starting with a dot is an env file.
+        assert_eq!(for_file(".gitignore"), FILE);
     }
 }
