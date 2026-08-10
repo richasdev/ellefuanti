@@ -15,9 +15,14 @@
 mod grid;
 mod keys;
 mod manager;
+mod selection;
 mod session;
 
 pub use grid::{Cell, CellColor, CursorPos, GridSnapshot};
-pub use keys::{Key, Modifiers, encode};
+pub use keys::{Key, Modifiers, TermFlags, encode, encode_paste};
 pub use manager::TerminalManager;
+pub use selection::{
+    GridGeometry, Selection, SelectionMode, SelectionPoint, cell_at, select_all, selected_columns,
+    selected_text,
+};
 pub use session::{SCROLLBACK_LINES, Session, SessionId, SessionStatus};

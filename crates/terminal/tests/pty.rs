@@ -84,11 +84,21 @@ fn wait_for_text(session: &Session, needle: &str) -> String {
 /// keeps the tests parallel and simply waits out a transient limit. Swap it if the retries
 /// start dominating the runtime.
 fn spawn(rows: u16, cols: u16) -> Session {
+    spawn_in(SessionId(1), None, rows, cols)
+}
+
+/// [`spawn`] with an explicit id and cwd, for the tests that need one.
+///
+/// Every direct `Session::spawn` in this file must go through here. Two of them did not,
+/// and those two — the cwd test and the fd-leak check — were exactly the ones reported as
+/// flaky under parallel load (#43): they took the raw call, so a transient `openpty`
+/// failure was a test failure rather than a retry.
+fn spawn_in(id: SessionId, cwd: Option<&Path>, rows: u16, cols: u16) -> Session {
     let deadline = Instant::now() + TIMEOUT;
     let mut last_error = None;
 
     while Instant::now() < deadline {
-        match Session::spawn(SessionId(1), None, Some(test_shell()), rows, cols) {
+        match Session::spawn(id, cwd, Some(test_shell()), rows, cols) {
             Ok(session) => return session,
             Err(err) => {
                 last_error = Some(format!("{err:#}"));
@@ -357,8 +367,7 @@ fn a_pty_that_cannot_spawn_reports_an_error() {
 #[test]
 fn a_session_starts_in_the_requested_directory() {
     let dir = std::env::temp_dir().canonicalize().unwrap();
-    let mut session = Session::spawn(SessionId(1), Some(&dir), Some(test_shell()), 24, 80)
-        .expect("spawn in temp dir");
+    let mut session = spawn_in(SessionId(1), Some(&dir), 24, 80);
 
     assert_eq!(session.cwd().canonicalize().unwrap(), dir);
 
@@ -495,8 +504,7 @@ fn closing_sessions_does_not_leak_file_descriptors() {
 }
 
 fn spawn_for_leak_check(id: u64) -> Session {
-    Session::spawn(SessionId(id), None, Some(test_shell()), 24, 80)
-        .unwrap_or_else(|err| panic!("session {id} failed to spawn: {err:#}"))
+    spawn_in(SessionId(id), None, 24, 80)
 }
 
 /// Number of file descriptors this process has open.
@@ -556,4 +564,94 @@ fn a_session_survives_a_flood_of_output_without_blocking_the_reader() {
 
     assert!(saw_end, "the tail of a large output stream should arrive");
     assert!(session.status().is_running(), "a flood must not kill the session");
+}
+
+/// DECCKM, through the real parser rather than a hand-fed byte string.
+///
+/// The unit test in `keys.rs` proves the *encoder* switches to SS3; this proves the flag
+/// actually reaches it. A program sets application cursor mode by emitting `ESC [ ? 1 h`,
+/// which the shell here does with `printf` — so the path under test is PTY -> alacritty's
+/// parser -> `Term::mode()` -> `Session::flags()`, which is where the bug lived.
+#[test]
+fn application_cursor_mode_reaches_the_key_encoder() {
+    let mut session = spawn(24, 80);
+
+    // Not set until something asks for it.
+    assert!(!session.flags().application_cursor, "a fresh shell is in normal cursor mode");
+
+    session.write_str("printf '\\033[?1h'; echo ready\n").unwrap();
+    wait_for_occurrences(&session, "ready", 2);
+
+    let flags = session.flags();
+    assert!(flags.application_cursor, "DECCKM set by the program must be visible to the view");
+    assert_eq!(
+        elle_terminal::encode(&elle_terminal::Key::Up, elle_terminal::Modifiers::NONE, flags)
+            .unwrap(),
+        b"\x1bOA",
+        "the arrow keys must follow the mode the program asked for"
+    );
+
+    // And it turns back off, so a program exiting does not leave every later arrow wrong.
+    session.write_str("printf '\\033[?1l'; echo done\n").unwrap();
+    wait_for_occurrences(&session, "done", 2);
+    assert!(!session.flags().application_cursor);
+}
+
+/// The other half of `Term::mode()` this crate reads: bracketed paste.
+#[test]
+fn bracketed_paste_mode_reaches_the_paste_encoder() {
+    let mut session = spawn(24, 80);
+    assert!(!session.flags().bracketed_paste, "/bin/sh does not request it on its own");
+
+    session.write_str("printf '\\033[?2004h'; echo armed\n").unwrap();
+    wait_for_occurrences(&session, "armed", 2);
+
+    let flags = session.flags();
+    assert!(flags.bracketed_paste);
+    // A two-line paste must arrive wrapped, or the shell runs the first line on its own.
+    let bytes = elle_terminal::encode_paste("one\ntwo", flags);
+    assert!(bytes.starts_with(b"\x1b[200~"));
+    assert!(bytes.ends_with(b"\x1b[201~"));
+}
+
+/// Selection and copy against real shell output, which is the case the feature exists for.
+///
+/// The unit tests in `selection.rs` work on a hand-built snapshot; this proves the same
+/// maths lines up with what alacritty actually puts in the grid — including where the
+/// cursor and the prompt sit, which a synthetic snapshot cannot get wrong.
+#[test]
+fn a_selection_over_real_output_copies_exactly_that_text() {
+    use elle_terminal::{GridGeometry, Selection, SelectionMode, SelectionPoint};
+
+    let mut session = spawn(24, 80);
+    // Portuguese, because a mid-codepoint selection is a panic in a debug build.
+    session.write_str("printf 'ação-marker\\n'\n").unwrap();
+    wait_for_occurrences(&session, "ação-marker", 2);
+
+    let snapshot = session.snapshot();
+    let geometry = GridGeometry::of(&snapshot);
+
+    // Find the row the *output* landed on — the last one holding the marker, since the
+    // echoed command line holds it too.
+    let row = snapshot
+        .to_text()
+        .iter()
+        .rposition(|line| line.contains("ação-marker"))
+        .expect("the marker must be on screen");
+    let column = snapshot.to_text()[row].find("ação-marker").unwrap();
+    // `find` gives a byte offset; the grid is addressed in cells, and the two differ the
+    // moment a multibyte character sits to the left. Counting chars is the correct one.
+    let column = snapshot.to_text()[row][..column].chars().count();
+
+    // Double-click anywhere inside it: `-` is not a word separator, so the whole token
+    // comes out.
+    let selection = Selection::new(
+        SelectionPoint::new(geometry.top_line + row, column + 2),
+        SelectionMode::Word,
+    );
+    assert_eq!(
+        elle_terminal::selected_text(&selection, &snapshot, geometry),
+        "ação-marker",
+        "a double-click on real output must copy the whole token, bytes intact"
+    );
 }

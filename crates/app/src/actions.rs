@@ -159,6 +159,12 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-c", Copy, Some(context::EDITOR)),
         KeyBinding::new("cmd-x", Cut, Some(context::EDITOR)),
         KeyBinding::new("cmd-v", Paste, Some(context::EDITOR)),
+        // Terminal. Copy and paste are on ⌘, never ⌃: ⌃C must reach the shell as SIGINT,
+        // which is the whole reason macOS terminals moved copy to the command key. There
+        // is no `Cut` — a terminal's scrollback is not editable.
+        KeyBinding::new("cmd-c", Copy, Some(context::TERMINAL)),
+        KeyBinding::new("cmd-v", Paste, Some(context::TERMINAL)),
+        KeyBinding::new("cmd-a", SelectAll, Some(context::TERMINAL)),
     ]);
 
     let mut registry = CommandRegistry::new();
