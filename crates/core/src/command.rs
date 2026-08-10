@@ -140,6 +140,7 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("editor.close", "Close Tab"),
     Command::new("palette.toggle", "Command Palette"),
     Command::new("palette.quick_open", "Quick Open File"),
+    Command::new("laravel.routes", "Go to Route…"),
     Command::new("terminal.new", "New Terminal"),
     Command::new("terminal.toggle", "Toggle Terminal"),
     Command::new("theme.toggle", "Switch Theme"),

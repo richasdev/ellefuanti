@@ -1693,6 +1693,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "elle-core",
+ "elle-laravel",
  "elle-syntax",
  "elle-terminal",
  "elle-text",
