@@ -406,6 +406,25 @@ fn name_style(node: Node, parent: Node) -> Option<HighlightStyle> {
                 _ => Function,
             }
         }
+        // `Foo::BAR` and `Foo::bar` without a call. tree-sitter parses these as a constant
+        // access, not a scoped call, so neither half was coloured before — a method
+        // reference gained its colour only once the `()` was typed, and the class name lost
+        // its own in the meantime.
+        //
+        // The scope is the class; what follows `::` is `Property`. Not a new `Constant`
+        // style: #47 considered one and left it out, because a bare `PHP_EOL` is just a
+        // `name` and indistinguishable from a class reference, so half of them would be
+        // miscoloured. Here the position after `::` makes it unambiguous, and `Property` is
+        // the closest existing style — `Foo::BAR` and `$foo->bar` are both "a member of
+        // something", which is what the colour communicates.
+        // By position, not by field: unlike `scoped_call_expression` this node exposes no
+        // `scope` field, so the two `name` children are told apart by which comes first.
+        "class_constant_access_expression" => {
+            match parent.child(0).filter(|first| first.id() == node.id()) {
+                Some(_) => Type,
+                None => Property,
+            }
+        }
         // Declaration sites.
         "function_definition" | "method_declaration" => Function,
         "class_declaration"
@@ -589,6 +608,17 @@ mod tests {
     }
 
     #[test]
+    fn a_static_reference_colours_both_halves_without_parentheses() {
+        // Reported from use: `User::findOrFail` stayed uncoloured until the `()` was typed.
+        // tree-sitter parses a call as `scoped_call_expression` but a bare reference as
+        // `class_constant_access_expression`, and only the former was mapped — so the class
+        // name lost its colour too, not just the member.
+        let src = "<?php\n$u = User::findOrFail;\n";
+        let spans = spans_of(Language::Php, src);
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"User"), "{spans:?}");
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"findOrFail"));
+    }
+
     fn highlights_operators() {
         let src = "<?php $a = ['k' => 1]; $b = $a ?? 2; $c = $a->d; $e = Foo::F; $f = 1 + 2;";
         let spans = spans_of(Language::Php, src);

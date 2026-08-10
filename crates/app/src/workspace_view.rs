@@ -585,6 +585,16 @@ impl WorkspaceView {
                         // First of the three refresh triggers (#64). The other two are
                         // save and window focus; there is no timer.
                         this.refresh_git_status(cx);
+                        // An open terminal points at wherever it was started, which before
+                        // this was the *previous* project — or nowhere, for a panel opened
+                        // before any folder was. Sessions already running keep their own
+                        // directory: a shell has state and its own `cd`, and moving it out
+                        // from under someone mid-command would be worse than leaving it.
+                        // New sessions land in the new project.
+                        let root = this.tree.as_ref().map(|tree| tree.root().to_path_buf());
+                        if let Some(terminal) = this.terminal.as_ref() {
+                            terminal.update(cx, |terminal, _| terminal.set_cwd(root));
+                        }
                     }
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
