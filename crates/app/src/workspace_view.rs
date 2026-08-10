@@ -4031,6 +4031,15 @@ impl WorkspaceView {
                                         svg()
                                             .path(icon)
                                             .size(px(16.0))
+                                            // The theme colour first, then the icon's own
+                                            // if it has one. `svg()` paints its alpha mask
+                                            // with `style.text.color`, and a row does not
+                                            // pass one down — so a monochrome icon left
+                                            // with `when_some(None)` was painted with no
+                                            // colour at all and simply did not appear.
+                                            // Only the Ayu icons, which carry their own,
+                                            // were visible.
+                                            .text_color(text)
                                             .when_some(icon_color, |el, c| el.text_color(rgb(c))),
                                     ),
                                 )
@@ -4108,6 +4117,15 @@ impl WorkspaceView {
                             svg()
                                 .path(icon)
                                 .size(px(16.0))
+                                // Set here, not inherited: `svg()` fills its alpha mask
+                                // from `style.text.color` on the element itself, and the
+                                // tab's own `text_color` does not reach it. Without this a
+                                // Codicon had no colour and painted nothing.
+                                .text_color(if index == active {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                })
                                 .when_some(icon_color, |el, c| el.text_color(rgb(c))),
                         ),
                     )
