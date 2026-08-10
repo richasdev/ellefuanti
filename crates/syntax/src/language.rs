@@ -118,6 +118,55 @@ impl Language {
     pub fn has_blade_directives(&self) -> bool {
         matches!(self, Language::Blade)
     }
+
+    /// The token that starts a line comment, or `None` for a language that has none.
+    ///
+    /// This is the mapping #69 deferred ⌘/ for, and it lives here rather than in the editor
+    /// because the language is what decides it — the editor already asks this crate what a
+    /// file is, and asking it twice in two places is how the two answers drift apart.
+    ///
+    /// **JSON returns `None`, and that is the deliberate part.** JSON has no comment syntax
+    /// at all: `//` in a `.json` file is a parse error, and every tool that reads
+    /// `composer.json` would reject the file. An editor that "helpfully" inserted one would
+    /// be corrupting a config on a keystroke the user pressed out of habit, and the damage
+    /// only surfaces later at `composer install`. So ⌘/ in JSON does *nothing* — see
+    /// [`Document::toggle_comment`]. `.jsonc`/`.json5`, where `//` is legal, are not mapped
+    /// to `Language::Json` in the first place (see `language_for_path`), so this rule costs
+    /// nothing to the people who do have comments.
+    ///
+    /// Blade takes `{{-- --}}` rather than PHP's `//`: a Blade file is mostly markup, and
+    /// `//` outside a `<?php` block is literal text on the page, not a comment. The Blade
+    /// comment is the only one that works everywhere in the file, and unlike an HTML
+    /// comment it is stripped before the response is sent.
+    pub fn line_comment(&self) -> Option<&'static str> {
+        match self {
+            Language::Php | Language::JavaScript | Language::TypeScript => Some("//"),
+            Language::Toml | Language::Yaml | Language::Shell => Some("#"),
+            // CSS has only `/* */`, HTML only `<!-- -->`, and Blade's `{{-- --}}` is a
+            // block form too. They comment through `block_comment` instead.
+            Language::Css | Language::Html | Language::Blade => None,
+            // See the doc comment: JSON genuinely has no comment syntax.
+            Language::Json => None,
+            Language::PlainText => None,
+        }
+    }
+
+    /// The delimiters that open and close a block comment, or `None` if there are none.
+    ///
+    /// Used only where there is no line comment to fall back on — a language with both
+    /// (PHP, JS) toggles per line, which is what every editor does and what keeps the
+    /// toggle reversible line by line.
+    pub fn block_comment(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Language::Css => Some(("/*", "*/")),
+            Language::Html => Some(("<!--", "-->")),
+            Language::Blade => Some(("{{--", "--}}")),
+            // PHP and JS have `/* */` too, but they have `//`, so the line form wins.
+            // Listing them here would never be reached and would only invite the reader to
+            // wonder which one applies.
+            _ => None,
+        }
+    }
 }
 
 /// Every language, listed once.
@@ -307,6 +356,51 @@ mod tests {
         assert_eq!(ALL_LANGUAGES.len(), 11, "a new Language needs adding to ALL_LANGUAGES");
         for (i, a) in ALL_LANGUAGES.iter().enumerate() {
             assert!(!ALL_LANGUAGES[i + 1..].contains(a), "{} is listed twice", a.name());
+        }
+    }
+
+    #[test]
+    fn comment_syntax_is_the_languages_own() {
+        assert_eq!(Language::Php.line_comment(), Some("//"));
+        assert_eq!(Language::JavaScript.line_comment(), Some("//"));
+        assert_eq!(Language::TypeScript.line_comment(), Some("//"));
+        assert_eq!(Language::Yaml.line_comment(), Some("#"));
+        assert_eq!(Language::Toml.line_comment(), Some("#"));
+        assert_eq!(Language::Shell.line_comment(), Some("#"));
+
+        // The block-only ones: no line form, so ⌘/ has to wrap instead.
+        assert_eq!(Language::Css.line_comment(), None);
+        assert_eq!(Language::Css.block_comment(), Some(("/*", "*/")));
+        assert_eq!(Language::Html.block_comment(), Some(("<!--", "-->")));
+        assert_eq!(Language::Blade.block_comment(), Some(("{{--", "--}}")));
+    }
+
+    #[test]
+    fn json_has_no_comment_syntax_at_all() {
+        // The deliberate one. `//` in a .json file is a parse error, so ⌘/ there must have
+        // nothing to insert rather than something plausible — inserting `//` into
+        // composer.json breaks `composer install` and the user finds out much later.
+        assert_eq!(Language::Json.line_comment(), None);
+        assert_eq!(Language::Json.block_comment(), None);
+    }
+
+    #[test]
+    fn a_language_with_no_line_comment_has_a_block_one_or_no_grammar() {
+        // The property that keeps ⌘/ meaningful: every language the editor can *parse*
+        // offers some way to comment, except the ones that genuinely have none. Stated as
+        // a loop so a new grammar cannot quietly arrive with neither.
+        for language in ALL_LANGUAGES {
+            let has_either =
+                language.line_comment().is_some() || language.block_comment().is_some();
+            match language {
+                // JSON has no comment syntax; plain text has no language to have one.
+                Language::Json | Language::PlainText => assert!(
+                    !has_either,
+                    "{} is expected to have no comment syntax",
+                    language.name()
+                ),
+                _ => assert!(has_either, "{} has no way to comment", language.name()),
+            }
         }
     }
 

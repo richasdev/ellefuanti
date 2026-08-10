@@ -59,6 +59,7 @@ actions!(
         OpenLineAbove,
         Outdent,
         Indent,
+        ToggleComment,
         Undo,
         Redo,
         Copy,
@@ -172,6 +173,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("shift-tab", Outdent, Some(context::EDITOR)),
         KeyBinding::new("cmd-]", Indent, Some(context::EDITOR)),
         KeyBinding::new("cmd-[", Outdent, Some(context::EDITOR)),
+        // ⌘/ is the toggle in both PhpStorm and VS Code. On a US layout `/` is unshifted,
+        // so one binding covers it; other layouts reach it through the same physical key
+        // because gpui binds the layout-independent label.
+        KeyBinding::new("cmd-/", ToggleComment, Some(context::EDITOR)),
         KeyBinding::new("cmd-a", SelectAll, Some(context::EDITOR)),
         KeyBinding::new("cmd-z", Undo, Some(context::EDITOR)),
         KeyBinding::new("cmd-shift-z", Redo, Some(context::EDITOR)),

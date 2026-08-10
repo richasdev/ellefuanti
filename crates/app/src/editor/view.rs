@@ -21,7 +21,7 @@ use crate::actions::{
     MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent,
     Paste, Redo, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft,
     SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
-    Undo, context,
+    ToggleComment, Undo, context,
 };
 use crate::editor::state::Document;
 use crate::fonts::Fonts;
@@ -145,7 +145,13 @@ impl EditorView {
             return;
         }
 
-        self.document.insert(text);
+        // Brackets and quotes first: wrapping a selection, typing over a closer, and
+        // auto-closing all replace the plain insert. `insert_with_pairs` reports whether it
+        // handled the keystroke rather than deciding here, because what counts as a pair is
+        // domain knowledge and `Document` is where that lives.
+        if !self.document.insert_with_pairs(text) {
+            self.document.insert(text);
+        }
         self.scroll_cursor_into_view();
         cx.notify();
     }
@@ -168,7 +174,14 @@ impl EditorView {
     }
 
     fn newline(&mut self, _: &Newline, _w: &mut Window, cx: &mut Context<Self>) {
-        self.document.insert("\n");
+        self.document.newline_with_indent();
+        self.after_edit(cx);
+    }
+
+    fn toggle_comment(&mut self, _: &ToggleComment, _w: &mut Window, cx: &mut Context<Self>) {
+        // The false case is JSON, which has no comment syntax. Nothing happens, and that is
+        // the whole behaviour — see `Language::line_comment`.
+        self.document.toggle_comment();
         self.after_edit(cx);
     }
 
@@ -517,6 +530,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::open_line_above))
             .on_action(cx.listener(Self::indent))
             .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
@@ -552,6 +566,11 @@ impl EditorView {
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
         let selection = self.document.selection.range();
+
+        // Once per frame, not once per row: the lookup is a tree descent, and the answer is
+        // the same for every visible row. Both offsets are document-wide; `line_runs` clips
+        // them the same way it clips a syntax span.
+        let brackets = self.document.matching_bracket();
 
         // Highlight once for the whole visible band rather than per row: one tree walk
         // instead of N, and the spans are already sorted so slicing per row is cheap.
@@ -625,6 +644,7 @@ impl EditorView {
                         line_start,
                         &spans,
                         &row_diagnostics,
+                        brackets,
                         &theme,
                         if is_cursor_row { Some(cursor.column) } else { None },
                     )))
@@ -656,10 +676,12 @@ fn styled_line(
     line_start: usize,
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
+    brackets: Option<(usize, usize)>,
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> StyledText {
-    let (text, highlights) = line_runs(line, line_start, spans, diagnostics, theme, cursor_column);
+    let (text, highlights) =
+        line_runs(line, line_start, spans, diagnostics, brackets, theme, cursor_column);
     StyledText::new(SharedString::from(text)).with_highlights(highlights)
 }
 
@@ -675,6 +697,7 @@ fn line_runs(
     line_start: usize,
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
+    brackets: Option<(usize, usize)>,
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
@@ -734,6 +757,66 @@ fn line_runs(
         highlights = merge_underline(highlights, start..end, underline);
     }
 
+    // Indent guides and the trailing-whitespace tint, both computed from this line's own
+    // bytes and nothing else — no buffer scan, no state carried between rows. That is what
+    // keeps them viewport-scoped: `render_rows` calls this once per *visible* row, so the
+    // cost is the same for a 50-line file and a 50,000-line one.
+    //
+    // They go in before the cursor so the cursor's `retain` below removes any that overlap
+    // it, which is the same precedence the syntax colours already get.
+    //
+    // Each is dropped where a run already exists rather than splitting one. Whitespace is
+    // normally uncoloured, so this almost never fires — but a multi-line block comment
+    // *does* span a line's own indent, and a guide pushed on top of it would be a second
+    // run over the same bytes, which gpui paints unpredictably. Losing a guide inside a
+    // comment is invisible; an overlapping run is not.
+    let mut decorations: Vec<(Range<usize>, GpuiHighlight)> = Vec::new();
+    for range in indent_guide_columns(&text) {
+        decorations.push((
+            range,
+            GpuiHighlight { background_color: Some(theme.indent_guide), ..Default::default() },
+        ));
+    }
+
+    // `line`, not `text`: the padding space a cursor at end-of-line adds is not the file's
+    // trailing whitespace, and tinting it would mark every line the cursor rests on.
+    if let Some(range) = trailing_whitespace_range(line) {
+        decorations.push((
+            range,
+            GpuiHighlight {
+                background_color: Some(theme.trailing_whitespace),
+                ..Default::default()
+            },
+        ));
+    }
+
+    decorations.retain(|(range, _)| {
+        highlights.iter().all(|(taken, _)| taken.end <= range.start || taken.start >= range.end)
+    });
+    highlights.append(&mut decorations);
+
+    // The matching pair. Unlike the guides this one *must* win over the syntax colour
+    // underneath it — a bracket is nearly always inside a coloured node, so dropping it on
+    // overlap would mean never drawing it at all. Same `retain`-then-push shape the cursor
+    // uses below, and for the same reason.
+    if let Some((a, b)) = brackets {
+        for at in [a, b] {
+            if at < line_start || at >= line_end {
+                continue;
+            }
+            let start = floor_boundary(&text, at - line_start);
+            let end = ceil_boundary(&text, (start + 1).min(text.len()));
+            if start >= end {
+                continue;
+            }
+            highlights.retain(|(range, _)| range.end <= start || range.start >= end);
+            highlights.push((
+                start..end,
+                GpuiHighlight { background_color: Some(theme.selection), ..Default::default() },
+            ));
+        }
+    }
+
     if let Some(column) = cursor_column {
         let start = floor_boundary(&text, column.min(text.len()));
         let end = ceil_boundary(&text, (start + 1).min(text.len()));
@@ -754,6 +837,52 @@ fn line_runs(
 
     highlights.sort_by_key(|(range, _)| range.start);
     (text, highlights)
+}
+
+/// One byte range per indent guide: the single space at columns 4, 8, 12… of the indent.
+///
+/// A guide is drawn as a background on one space rather than as a positioned rule, for the
+/// same reason the cursor is a background and not a caret (see [`styled_line`]): no absolute
+/// layout and no measuring, so it stays put on a proportional fallback font.
+///
+/// Only *leading* whitespace produces guides, and only where the indent actually reaches
+/// that column — a line indented 8 columns gets guides at 0 and 4, never at 8, because a
+/// guide at the first code character would sit under the code.
+///
+/// ponytail: four columns, hardcoded, matching `indent_lines` and `EditorView::tab`. All of
+/// them read the setting together (#60), and a guide at a width the indenter does not use
+/// would be visibly wrong, so they must move as one.
+///
+/// Tabs are counted as one column, not expanded. A tab-indented file therefore gets a guide
+/// only every fourth tab, which is under-drawn rather than wrong; expanding them properly
+/// means a tab width setting, which is the same #60 change.
+fn indent_guide_columns(text: &str) -> Vec<Range<usize>> {
+    const INDENT: usize = 4;
+
+    // Bytes of leading whitespace. ASCII space and tab only: any other whitespace is not
+    // indentation anyone typed, and treating it as such would put a guide inside a
+    // non-breaking space someone pasted.
+    let indent_bytes = text.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+
+    // A whitespace-only line has no code to align to, so guides on it would be a grid over
+    // nothing. Skipping is also what makes a blank line between two blocks stay blank.
+    if indent_bytes == text.len() {
+        return Vec::new();
+    }
+
+    // ASCII throughout, so byte offsets are column offsets here and no boundary snapping is
+    // needed — which is exactly why the take_while above excludes multi-byte whitespace.
+    (0..indent_bytes).step_by(INDENT).map(|column| column..column + 1).collect()
+}
+
+/// The trailing whitespace at the end of `line`, if any.
+///
+/// `None` for a line that is entirely whitespace: an empty line in the middle of a function
+/// is normal, and tinting every one of them turns a file into a barcode. What this is for is
+/// the space left after `return $x; ` — the one that shows up as a diff hunk nobody meant.
+fn trailing_whitespace_range(line: &str) -> Option<Range<usize>> {
+    let trimmed = line.trim_end_matches([' ', '\t']);
+    (!trimmed.is_empty() && trimmed.len() < line.len()).then(|| trimmed.len()..line.len())
 }
 
 /// Adds an underline over `span`, splitting any colour runs it partly covers.
@@ -991,13 +1120,19 @@ mod tests {
         theme: &Theme,
         cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], theme, cursor_column)
+        super::line_runs(line, line_start, spans, &[], None, theme, cursor_column)
     }
 
-    /// Byte ranges carrying a foreground colour, ignoring the cursor's inverted run.
-    fn coloured(runs: &[(Range<usize>, GpuiHighlight)], theme: &Theme) -> Vec<Range<usize>> {
+    /// Byte ranges carrying a foreground colour.
+    ///
+    /// Filters on `color` rather than listing the backgrounds to exclude: the cursor, the
+    /// indent guides, the trailing-whitespace tint and the bracket match are all
+    /// background-only runs, and a filter that named each one would need editing every time
+    /// a decoration is added — which is how these tests would drift from what they mean.
+    /// What every caller below actually asks is "which bytes got a syntax colour".
+    fn coloured(runs: &[(Range<usize>, GpuiHighlight)]) -> Vec<Range<usize>> {
         runs.iter()
-            .filter(|(_, style)| style.background_color != Some(theme.cursor))
+            .filter(|(_, style)| style.color.is_some() && style.background_color.is_none())
             .map(|(range, _)| range.clone())
             .collect()
     }
@@ -1017,7 +1152,7 @@ mod tests {
         );
 
         assert_eq!(text, "    return $this;");
-        assert_eq!(coloured(&runs, &theme), vec![4..10]);
+        assert_eq!(coloured(&runs), vec![4..10]);
         assert_eq!(&text[4..10], "return");
     }
 
@@ -1034,7 +1169,7 @@ mod tests {
             &theme,
             None,
         );
-        assert!(coloured(&runs, &theme).is_empty());
+        assert!(coloured(&runs).is_empty());
     }
 
     #[test]
@@ -1046,7 +1181,7 @@ mod tests {
         let (text, runs) =
             line_runs(line, 100, &[span(50..200, HighlightStyle::Comment)], &theme, None);
 
-        assert_eq!(coloured(&runs, &theme), vec![0..line.len()]);
+        assert_eq!(coloured(&runs), vec![0..line.len()]);
         assert!(runs.iter().all(|(r, _)| r.end <= text.len()), "no run may exceed the text");
     }
 
@@ -1156,6 +1291,189 @@ mod tests {
         let (text, runs) = line_runs("", 0, &[], &theme, None);
         assert_eq!(text, "");
         assert!(runs.is_empty());
+    }
+
+    // --- indent guides, trailing whitespace, bracket match ---------------------------
+    //
+    // All three are background-only runs, so they are read back by their colour. Same
+    // reasoning as the blocks above: `StyledText` is opaque, and these assert the runs.
+
+    /// Byte ranges painted with `background`.
+    fn backgrounds(
+        runs: &[(Range<usize>, GpuiHighlight)],
+        background: gpui::Hsla,
+    ) -> Vec<Range<usize>> {
+        runs.iter()
+            .filter(|(_, style)| style.background_color == Some(background))
+            .map(|(range, _)| range.clone())
+            .collect()
+    }
+
+    #[test]
+    fn indent_guides_land_at_every_fourth_column_of_the_indent() {
+        let theme = Theme::dark();
+        // Eight spaces then code: guides at columns 0 and 4, and *not* at 8, which is the
+        // first code character.
+        let (_, runs) = line_runs("        return $x;", 0, &[], &theme, None);
+        assert_eq!(backgrounds(&runs, theme.indent_guide), vec![0..1, 4..5]);
+    }
+
+    #[test]
+    fn an_unindented_line_gets_no_guides() {
+        let theme = Theme::dark();
+        let (_, runs) = line_runs("class User {", 0, &[], &theme, None);
+        assert!(backgrounds(&runs, theme.indent_guide).is_empty());
+    }
+
+    #[test]
+    fn a_blank_line_gets_no_guides_and_no_trailing_tint() {
+        // A whitespace-only line has no code to align to, and tinting every blank line
+        // between two methods turns the file into a barcode.
+        let theme = Theme::dark();
+        for line in ["", "    ", "\t\t"] {
+            let (_, runs) = line_runs(line, 0, &[], &theme, None);
+            assert!(backgrounds(&runs, theme.indent_guide).is_empty(), "{line:?}");
+            assert!(backgrounds(&runs, theme.trailing_whitespace).is_empty(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn trailing_whitespace_is_tinted_and_nothing_else_is() {
+        let theme = Theme::dark();
+        let line = "return $x;   ";
+        let (_, runs) = line_runs(line, 0, &[], &theme, None);
+        assert_eq!(backgrounds(&runs, theme.trailing_whitespace), vec![10..13]);
+
+        // A line with none must get none, or the tint means nothing.
+        let (_, runs) = line_runs("return $x;", 0, &[], &theme, None);
+        assert!(backgrounds(&runs, theme.trailing_whitespace).is_empty());
+    }
+
+    #[test]
+    fn the_space_padded_in_for_a_cursor_at_end_of_line_is_not_trailing_whitespace() {
+        // `line_runs` appends a space so an end-of-line cursor has a cell. That space is
+        // this function's own scaffolding, not the file's content — tinting it would mark
+        // every line the cursor rests on as having trailing whitespace.
+        let theme = Theme::dark();
+        let (text, runs) = line_runs("return $x;", 0, &[], &theme, Some(10));
+        assert_eq!(text, "return $x; ", "the padding is there");
+        assert!(backgrounds(&runs, theme.trailing_whitespace).is_empty());
+    }
+
+    #[test]
+    fn a_guide_never_splits_a_multibyte_character() {
+        // Guides are computed from leading ASCII whitespace only, so a line whose *code*
+        // is accented still produces boundary-safe ranges. Asserting it because a guide
+        // range landing mid-codepoint would make StyledText debug-assert.
+        let theme = Theme::dark();
+        let line = "    $m = 'ação';";
+        let (text, runs) = line_runs(line, 0, &[], &theme, None);
+
+        assert_eq!(backgrounds(&runs, theme.indent_guide), vec![0..1]);
+        for (range, _) in &runs {
+            assert!(
+                text.is_char_boundary(range.start) && text.is_char_boundary(range.end),
+                "run {range:?} splits a codepoint in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decorations_never_overlap_a_syntax_run() {
+        // gpui needs sorted, disjoint runs. A multi-line block comment covers a line's own
+        // indent, and a guide pushed on top of it would be a second run over those bytes.
+        let theme = Theme::dark();
+        let line = "        still in the comment   ";
+        let (_, runs) =
+            line_runs(line, 0, &[span(0..line.len(), HighlightStyle::Comment)], &theme, None);
+
+        for pair in runs.windows(2) {
+            assert!(
+                pair[0].0.end <= pair[1].0.start,
+                "runs must be sorted and disjoint: {:?} then {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        assert!(
+            backgrounds(&runs, theme.indent_guide).is_empty(),
+            "the guide is dropped rather than splitting the comment run"
+        );
+    }
+
+    #[test]
+    fn every_theme_makes_the_guide_visible_against_its_own_background() {
+        // The rule #82 names: a guide colour that works on 0x282c34 is invisible on
+        // 0xffffff. Each variant has to differ from its *own* background, and stay quieter
+        // than its own text — which is what "a guide, not a character" means.
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::one_dark_pro(),
+            Theme::github_dark(),
+            Theme::github_light(),
+        ] {
+            assert_ne!(theme.indent_guide, theme.background, "a guide equal to the background");
+            assert_ne!(theme.trailing_whitespace, theme.background, "an invisible tint");
+            assert_ne!(theme.indent_guide, theme.text, "a guide as loud as the text");
+
+            // And the guide is closer to the background than the text is, in both
+            // directions — the light themes run darker, the dark ones lighter.
+            let distance = |a: gpui::Hsla, b: gpui::Hsla| (a.l - b.l).abs();
+            assert!(
+                distance(theme.indent_guide, theme.background)
+                    < distance(theme.text, theme.background),
+                "the guide must be quieter than the text"
+            );
+        }
+    }
+
+    #[test]
+    fn the_matching_pair_is_painted_on_both_brackets() {
+        let theme = Theme::dark();
+        // Both ends on the same line, rebased from document offsets like any other range.
+        let (_, runs) = line_runs_with_brackets("f(1)", 0, Some((1, 3)), &theme);
+        assert_eq!(backgrounds(&runs, theme.selection), vec![1..2, 3..4]);
+    }
+
+    #[test]
+    fn a_partner_on_another_line_paints_only_the_end_that_is_here() {
+        // The common case: a `{` at the top of a method and its `}` forty lines down. Each
+        // row must paint its own end and clip the other, exactly as a syntax span does.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_with_brackets("}", 500, Some((12, 500)), &theme);
+        assert_eq!(backgrounds(&runs, theme.selection), vec![0..1]);
+    }
+
+    #[test]
+    fn the_bracket_highlight_wins_over_the_syntax_colour_beneath_it() {
+        // A bracket is nearly always inside a coloured node, so dropping it on overlap —
+        // which is what the guides do — would mean never drawing it at all.
+        let theme = Theme::dark();
+        let (_, runs) = super::line_runs(
+            "f(1)",
+            0,
+            &[span(0..4, HighlightStyle::Function)],
+            &[],
+            Some((1, 3)),
+            &theme,
+            None,
+        );
+
+        assert_eq!(backgrounds(&runs, theme.selection), vec![1..2, 3..4]);
+        for pair in runs.windows(2) {
+            assert!(pair[0].0.end <= pair[1].0.start, "runs must stay disjoint");
+        }
+    }
+
+    /// `line_runs` with a bracket pair and nothing else.
+    fn line_runs_with_brackets(
+        line: &str,
+        line_start: usize,
+        brackets: Option<(usize, usize)>,
+        theme: &Theme,
+    ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
+        super::line_runs(line, line_start, &[], &[], brackets, theme, None)
     }
 
     // --- diagnostics ----------------------------------------------------------------
@@ -1366,6 +1684,6 @@ mod tests {
         theme: &Theme,
         cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, diagnostics, theme, cursor_column)
+        super::line_runs(line, line_start, spans, diagnostics, None, theme, cursor_column)
     }
 }
