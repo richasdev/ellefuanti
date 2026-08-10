@@ -15,10 +15,11 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, DecreaseFontSize, Dispatch, Find, FindNext, FindPrev, FindReferences, GoToDefinition,
-    GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal,
-    OpenFolder, OpenSettings, Replace, ResetFontSize, Save, ToggleCommandPalette,
-    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
+    CloseTab, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindNext, FindPrev,
+    FindReferences, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack,
+    NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace, ResetFontSize, Save,
+    ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context,
+    dispatch_for,
 };
 use crate::editor::{Document, EditorEvent, EditorView};
 use crate::file_cache;
@@ -50,6 +51,13 @@ enum Job {
     QuickOpenIndex,
     RouteIndex,
     ClosePrompt,
+    /// Resolving a `route()`/`config()`/`view()`/component ⌘click to a file (#83).
+    ///
+    /// Its own slot, not `LspQuery`'s: a Laravel jump and a language-server jump never race
+    /// — `go_to_definition_at_cursor` only asks the server when Laravel declined — and
+    /// sharing the slot would mean a Blade ⌘click cancelled a definition lookup that is
+    /// still the answer to a different question the user asked.
+    LaravelTarget,
     /// One slot for every language-server *query* — definition, references, symbols.
     ///
     /// Shared deliberately. These are all "answer a question about where the cursor is",
@@ -207,6 +215,23 @@ fn first_location(response: &GotoDefinitionResponse) -> Option<(PathBuf, Point)>
     Some((path, Point::new(range.start.line as usize, 0)))
 }
 
+/// Whether a file can hold Laravel references, and if so whether to read it as Blade.
+///
+/// `Some(true)` is Blade, `Some(false)` is PHP, `None` is neither and no Laravel feature
+/// should look at it. The distinction matters because the two are read by completely
+/// different machinery — a tree for PHP, a scanner for Blade (ADR-0006) — and handing a
+/// template to the PHP reader gets a single `text` node and no references at all.
+///
+/// A free function so the gate is one decision shared by ⌘click and completion rather than
+/// two `matches!` that can drift, and so it is testable without a window.
+fn laravel_dialect(path: &std::path::Path) -> Option<bool> {
+    match elle_syntax::language_for_path(path) {
+        elle_syntax::Language::Blade => Some(true),
+        elle_syntax::Language::Php => Some(false),
+        _ => None,
+    }
+}
+
 /// A palette id that carries a place in a file: `path:row`, row 0-based.
 ///
 /// The palette's contract is one string per row, and widening it to a typed payload would
@@ -330,6 +355,13 @@ pub struct WorkspaceView {
     /// is the handle that lets a superseding navigation say `$/cancelRequest` and reclaim
     /// both — ADR-0007's "cancellation, not queueing", which needs the id to mean anything.
     in_flight_query: Option<elle_lsp::RequestId>,
+    /// Byte range the route-name palette will overwrite when confirmed (#83).
+    ///
+    /// Held here rather than recomputed on confirm because the buffer is the thing being
+    /// written to: recomputing would re-read a document the user may have edited while the
+    /// palette was open, and write the name over whatever is at that offset *now*.
+    /// Staleness is still possible and is checked at the point of the edit.
+    completion_target: Option<std::ops::Range<usize>>,
 }
 
 impl WorkspaceView {
@@ -350,6 +382,7 @@ impl WorkspaceView {
             lsp: Lsp::new(),
             history: JumpHistory::default(),
             in_flight_query: None,
+            completion_target: None,
         }
     }
 
@@ -1088,6 +1121,20 @@ impl WorkspaceView {
         self.toggle_palette(PaletteMode::Routes, window, cx);
     }
 
+    /// ⌃space: complete a Laravel route name, or do nothing (#83).
+    ///
+    /// Silence outside a `route('…')` is deliberate. There is no general completion in this
+    /// editor yet, so the alternative is an empty palette that says "No matches" about a
+    /// question the user did not ask.
+    fn complete_laravel(
+        &mut self,
+        _: &CompleteLaravel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.complete_route_name(window, cx);
+    }
+
     /// Opens settings.json in a tab — #60 built the file, so ⌘, edits it as text.
     ///
     /// No settings *UI*: the file is the interface for now, and a form over four keys is
@@ -1126,6 +1173,7 @@ impl WorkspaceView {
             // Everything else arrives asynchronously — the palette opens empty and fills in.
             PaletteMode::Files
             | PaletteMode::Routes
+            | PaletteMode::RouteNames
             | PaletteMode::Symbols
             | PaletteMode::References => Vec::new(),
         };
@@ -1147,6 +1195,7 @@ impl WorkspaceView {
         match mode {
             PaletteMode::Files => self.load_quick_open_items(palette, cx),
             PaletteMode::Routes => self.load_route_items(palette, cx),
+            PaletteMode::RouteNames => self.load_route_name_items(palette, cx),
             PaletteMode::Symbols => self.load_symbol_items(palette, cx),
             // References are filled by the request that opened the palette, not from here:
             // the offset they are about is the cursor position at the moment the user
@@ -1255,6 +1304,64 @@ impl WorkspaceView {
         self.jobs.start(Job::RouteIndex, task);
     }
 
+    /// Fills the palette with route *names*, for completing a `route('…')` (#83).
+    ///
+    /// Only the names that were statically readable, which `route_names` already enforces.
+    /// **An incomplete list is the acceptable failure here** and the reason completion is
+    /// the feature rather than a diagnostic: a route registered by a service provider is
+    /// missing from this list, and the user types it themselves. The same gap expressed as
+    /// "this route does not exist" would be a false claim about working code (RISKS.md #4).
+    ///
+    /// Shares `Job::RouteIndex` with the route palette: both parse the same files for the
+    /// same reason, and only one palette is open at a time, so a second open superseding
+    /// the first is exactly right.
+    fn load_route_name_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        let task = cx.spawn(async move |this, cx| {
+            let names = cx.background_spawn(async move { elle_laravel::route_names(&root) }).await;
+            // Label and id are the same string: what the user reads is exactly what gets
+            // typed, which is the whole contract of a completion.
+            let items = names.into_iter().map(|name| (name.clone(), name)).collect();
+
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
+    }
+
+    /// Offers route-name completion when the cursor sits inside a `route('…')` literal.
+    ///
+    /// Returns whether it took the keystroke. Not a popup: there is no completion widget in
+    /// this editor yet, and building one — anchoring to a text position, intercepting keys,
+    /// dismissing on the right events — is a feature in its own right, not a step on the
+    /// way to this one. The palette already does filtering, async fill and keyboard
+    /// selection, so reusing it is the cheap version that works today, and a popup can
+    /// replace the presentation later without changing where the names come from.
+    fn complete_route_name(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.tabs.get(self.active_tab) else { return false };
+        let Some(path) = tab.path.clone() else { return false };
+        let Some(blade) = laravel_dialect(&path) else { return false };
+
+        let document = &tab.editor.read(cx).document;
+        let source = document.buffer.text();
+        let offset = document.selection.head;
+
+        // The same reader ⌘click uses, so "the cursor is in a route name" means one thing.
+        // An empty `route('')` is the ordinary case for completion and reads as a `Route`
+        // reference with an empty name, which is exactly what should open the list.
+        let Some(reference) = elle_laravel::reference_at(&source, offset, blade) else {
+            return false;
+        };
+        if reference.kind != elle_laravel::ReferenceKind::Route {
+            return false;
+        }
+
+        self.completion_target = Some(reference.range);
+        self.toggle_palette(PaletteMode::RouteNames, window, cx);
+        true
+    }
+
     // --- navigation (#81) -------------------------------------------------------------
     //
     // Every action here is silent with no server running. That is not laziness about error
@@ -1315,6 +1422,68 @@ impl WorkspaceView {
         Some((path, tab.editor.read(cx).document.cursor_point()))
     }
 
+    /// Jumps to a Laravel route, config key, view or component under the cursor (#83).
+    ///
+    /// Returns whether it took the navigation, so the caller can fall through to the
+    /// language server when it did not. It only ever claims a click it can actually
+    /// complete: `elle_laravel::reference_at` returns `None` for anything not a plain
+    /// literal, so a `route($name)` falls through rather than being swallowed.
+    ///
+    /// **Blade is the case this exists for.** `navigation_origin` deliberately excludes
+    /// `.blade.php` — the language server was never told about those files — so before this,
+    /// ⌘click in a template did nothing at all. Reading the reference does not go through
+    /// that gate, which is what makes `@include` and `<x-…>` navigable.
+    ///
+    /// Only the *reading* is synchronous, over a buffer already in memory: a tree-sitter
+    /// parse of one open file, on a click, not a keystroke. Resolution stats the filesystem
+    /// and parses `routes/*.php`, so it goes to the background executor (ADR-0007) — which
+    /// is also why this returns `true` before knowing whether a target was found. Claiming
+    /// the click is the right call either way: the alternative is asking a language server
+    /// about a string literal, which has no answer.
+    fn go_to_laravel_target(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get(self.active_tab) else { return false };
+        let Some(path) = tab.path.clone() else { return false };
+
+        let Some(blade) = laravel_dialect(&path) else { return false };
+
+        let document = &tab.editor.read(cx).document;
+        let source = document.buffer.text();
+        let offset = document.selection.head;
+
+        let Some(reference) = elle_laravel::reference_at(&source, offset, blade) else {
+            return false;
+        };
+
+        let origin = self.current_location(cx);
+        let task = cx.spawn(async move |this, cx| {
+            let found =
+                cx.background_spawn(async move { elle_laravel::resolve(&root, &reference) }).await;
+
+            this.update(cx, |this, cx| {
+                // Nothing found means nothing said. A view comes from a configurable
+                // finder, a component from a registered namespace, a route from any
+                // service provider — so "we could not find it" is the only true statement
+                // available, and it is not worth a status line (RISKS.md #4, §24).
+                let Some(target) = found else { return };
+                if let Some(origin) = origin {
+                    this.history.push(origin);
+                }
+                // `Target::line` is 1-based; `Point` rows are 0-based. `None` opens the
+                // file without moving the cursor, which is the honest result when the key
+                // resolved to a file but not to a line inside it.
+                let point = target.line.map(|line| Point::new(line.saturating_sub(1), 0));
+                this.open_path_at(target.path, point, cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::LaravelTarget, task);
+        true
+    }
+
     /// Go to definition (F12, and the Go menu).
     fn go_to_definition(
         &mut self,
@@ -1330,7 +1499,16 @@ impl WorkspaceView {
     /// Shared by F12 and ⌘click rather than duplicated, so the two cannot drift into
     /// answering differently — the click has already moved the cursor by the time this
     /// runs, which is what makes "wherever the cursor is" the right question for both.
+    ///
+    /// Laravel goes first, and only because it answers a *different* question: `route('x')`
+    /// is a string literal, so a language server has nothing to say about it, and the two
+    /// can never both have an answer for the same click. When Laravel has none the request
+    /// goes to the server exactly as before, so nothing that worked before this stops.
     fn go_to_definition_at_cursor(&mut self, cx: &mut Context<Self>) {
+        if self.go_to_laravel_target(cx) {
+            return;
+        }
+
         let Some((uri, offset)) = self.navigation_origin(cx) else { return };
         let Some(client) = self.lsp.client_mut() else { return };
 
@@ -1862,6 +2040,10 @@ impl WorkspaceView {
         // A walk still running is now pure waste — nothing will consume its results.
         self.cancel_quick_open_walk();
         self.palette = None;
+        // An escaped completion must not leave a range behind for a later confirm to write
+        // into. `confirm_palette` takes the target before calling this, so what is cleared
+        // here is only ever an abandoned one.
+        self.completion_target = None;
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -1869,6 +2051,11 @@ impl WorkspaceView {
     /// Runs whatever the palette confirmed.
     fn confirm_palette(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.palette.as_ref().map(|p| p.read(cx).mode());
+        // Taken *before* dismissing, which clears it: dismissal is also the escape path,
+        // where an abandoned range must not survive, and the two orders are indistinguishable
+        // until you notice that confirming dismisses first. Written the other way round, the
+        // completion silently never fired.
+        let completion_target = self.completion_target.take();
         self.dismiss_palette(window, cx);
 
         match mode {
@@ -1893,6 +2080,8 @@ impl WorkspaceView {
                 }
                 self.open_path_at(path, target, cx);
             }
+            // The one mode that writes into the buffer instead of opening a file (#83).
+            Some(PaletteMode::RouteNames) => self.insert_route_name(completion_target, &id, cx),
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -1903,6 +2092,9 @@ impl WorkspaceView {
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
                     Dispatch::Routes => self.toggle_palette(PaletteMode::Routes, window, cx),
+                    Dispatch::CompleteRouteName => {
+                        self.complete_laravel(&CompleteLaravel, window, cx)
+                    }
                     Dispatch::GoToSymbol => self.go_to_symbol(&GoToSymbol, window, cx),
                     Dispatch::GoToDefinition => self.go_to_definition(&GoToDefinition, window, cx),
                     Dispatch::FindReferences => self.find_references(&FindReferences, window, cx),
@@ -1928,6 +2120,48 @@ impl WorkspaceView {
             }
             None => {}
         }
+    }
+
+    /// Writes a chosen route name over the literal the completion was opened on (#83).
+    ///
+    /// The range is re-validated against the buffer as it is *now*, not as it was when the
+    /// palette opened. The palette is modal so ordinary typing cannot have moved it, but an
+    /// asynchronous reload of the file can, and writing a route name into the middle of
+    /// unrelated code because an offset went stale is a far worse outcome than a completion
+    /// that declines to fire.
+    ///
+    /// The bounds check is the only guard that is cheap *and* meaningful. It cannot prove the
+    /// range still spans the same literal — only that writing there will not panic — and a
+    /// stronger check would mean re-reading the reference, which is the work the palette was
+    /// opened to avoid repeating. The exposure is small: the palette holds focus for its whole
+    /// life, so the tab cannot be switched under it from the keyboard.
+    fn insert_route_name(
+        &mut self,
+        target: Option<std::ops::Range<usize>>,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // `None` should not happen — reaching this mode goes through `complete_route_name`,
+        // which sets the range before opening the palette, whether it was reached by ⌃space
+        // or through the command row. Declining is still the right response to the case that
+        // should not arise: inserting at the cursor instead would drop a route name into
+        // whatever the user happened to be editing.
+        let Some(range) = target else { return };
+        let Some(editor) = self.active_editor().cloned() else { return };
+
+        editor.update(cx, |editor, cx| {
+            let document = &mut editor.document;
+            if range.end > document.buffer.len_bytes() {
+                return;
+            }
+            // Selecting the old literal and inserting over it, rather than a bare buffer
+            // splice, so the edit joins the undo history and moves the cursor the way every
+            // other insertion does — ⌘Z after a completion undoes exactly the completion.
+            document.move_to(range.start, false);
+            document.move_to(range.end, true);
+            document.insert(name);
+            cx.notify();
+        });
     }
 }
 
@@ -2051,6 +2285,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_prev))
             .on_action(cx.listener(Self::go_to_route))
+            .on_action(cx.listener(Self::complete_laravel))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::find_references))
@@ -2995,5 +3230,94 @@ mod route_label_tests {
         assert!(label.contains("/users"));
         assert!(!label.contains('<'), "nothing unresolved here: {label:?}");
         assert_eq!(label.trim_end(), label, "no trailing pad for an absent name");
+    }
+}
+
+/// The app-side half of Laravel navigation (#83): which files it looks at, and how a click
+/// that Laravel declines still reaches the language server.
+///
+/// Resolution itself is `elle-laravel`'s and tested there against a real project tree. What
+/// can only be wrong *here* is the gate and the fall-through.
+#[cfg(test)]
+mod laravel_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn only_php_and_blade_are_read_for_laravel_references() {
+        assert_eq!(laravel_dialect(std::path::Path::new("routes/web.php")), Some(false));
+        assert_eq!(
+            laravel_dialect(std::path::Path::new("resources/views/x.blade.php")),
+            Some(true),
+            ".blade.php must be read as Blade, not PHP — the two use different readers"
+        );
+
+        // Everything else is not a Laravel source file, and ⌘click there must go straight
+        // to the language server as it always did.
+        for path in ["app.js", "composer.json", "README.md", "style.css", "Makefile"] {
+            assert_eq!(laravel_dialect(std::path::Path::new(path)), None, "{path}");
+        }
+    }
+
+    /// The fall-through contract, at the level it can actually be checked: a click that is
+    /// not on a readable Laravel literal produces no reference, which is what makes
+    /// `go_to_laravel_target` return `false` and the LSP request go out.
+    ///
+    /// This is the property that keeps #88's go-to-definition working. Laravel claiming a
+    /// click it cannot complete would break navigation for every ordinary PHP symbol.
+    #[test]
+    fn a_click_that_is_not_a_laravel_reference_leaves_the_click_to_the_language_server() {
+        let source = "<?php\nclass User extends Model {}\n$u = new User();\nroute($dynamic);\n";
+
+        for needle in ["User", "Model", "new", "$dynamic"] {
+            let offset = source.find(needle).expect(needle);
+            assert_eq!(
+                elle_laravel::reference_at(source, offset, false),
+                None,
+                "{needle:?} is the language server's to answer, not ours"
+            );
+        }
+    }
+
+    /// A Blade template is the case that did not work at all before this: the language
+    /// server is never told about `.blade.php`, so `navigation_origin` returns `None` and
+    /// F12 was silent there. The Laravel reader does not go through that gate.
+    #[test]
+    fn a_blade_template_is_navigable_even_though_the_language_server_ignores_it() {
+        let path = std::path::Path::new("resources/views/welcome.blade.php");
+        assert!(!crate::lsp_session::handles(path), "the premise: no server sees this file");
+        assert_eq!(laravel_dialect(path), Some(true), "but Laravel navigation still reads it");
+
+        let source = "@include('partials.header')\n";
+        let offset = source.find("partials.header").unwrap();
+        let reference = elle_laravel::reference_at(source, offset, true).expect("an include");
+        assert_eq!(reference.name, "partials.header");
+    }
+
+    /// The completion writes over the literal, so the range it carries has to be the
+    /// literal's own bytes — an off-by-one here rewrites the quote characters and produces
+    /// `route(users.showx')`.
+    #[test]
+    fn the_completion_range_covers_the_literal_and_not_its_quotes() {
+        let source = "<?php\n$url = route('users.show');\n";
+        let offset = source.find("users.show").unwrap();
+        let reference = elle_laravel::reference_at(source, offset, false).expect("a route");
+
+        assert_eq!(&source[reference.range.clone()], "users.show");
+        assert_eq!(source.as_bytes()[reference.range.start - 1], b'\'');
+        assert_eq!(source.as_bytes()[reference.range.end], b'\'');
+    }
+
+    /// An empty `route('')` is the normal state when someone has just typed the call and
+    /// wants the list. It must read as a route reference with an empty name rather than as
+    /// no reference at all, or ⌃space would do nothing exactly when it is most wanted.
+    #[test]
+    fn an_empty_route_literal_still_opens_the_completion() {
+        let source = "<?php\n$url = route('');\n";
+        let offset = source.find("''").unwrap() + 1;
+        let reference = elle_laravel::reference_at(source, offset, false).expect("a route");
+
+        assert_eq!(reference.kind, elle_laravel::ReferenceKind::Route);
+        assert_eq!(reference.name, "");
+        assert!(reference.range.is_empty(), "nothing to overwrite, so the range is empty");
     }
 }

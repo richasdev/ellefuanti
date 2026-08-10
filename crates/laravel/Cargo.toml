@@ -8,3 +8,9 @@ license.workspace = true
 elle-syntax.workspace = true
 elle-text.workspace = true
 tree-sitter.workspace = true
+
+[dev-dependencies]
+# Resolution answers "is this file there", so the tests have to build a project tree that
+# really is. Asserting on the path this *would* return proves only that string joining
+# works — the whole point is the `is_file` check, and a fake root cannot exercise it.
+tempfile = "3"

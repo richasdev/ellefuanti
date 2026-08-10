@@ -152,6 +152,9 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("palette.toggle", "Command Palette"),
     Command::new("palette.quick_open", "Quick Open File"),
     Command::new("laravel.routes", "Go to Route…"),
+    // #83. Named for what it does rather than "Complete", because it completes exactly one
+    // thing and a row promising general completion would be the lie §24 warns about.
+    Command::new("laravel.route_name", "Insert Route Name…"),
     // Navigation (#81). These have keybindings too — a command id is what makes them
     // findable by someone who does not know the chord, and what lets the Go menu name them.
     Command::new("navigate.symbol", "Go to Symbol in File…"),
