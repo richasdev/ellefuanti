@@ -24,6 +24,7 @@ use crate::actions::{
     SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
     ToggleComment, Undo, context,
 };
+use crate::editor::caret::Caret;
 use crate::editor::state::Document;
 use crate::fonts::Fonts;
 use crate::lsp_session::Severity;
@@ -59,7 +60,41 @@ pub struct EditorView {
     /// a panel is added, resized or collapsed, so it is measured from the laid-out element
     /// instead. `None` until the first prepaint, which is before any click can arrive.
     text_origin_x: Option<Pixels>,
+    /// Whether the caret is in its visible half of the blink cycle.
+    ///
+    /// Starts `true` so a freshly-opened editor shows a caret before the first tick.
+    caret_visible: bool,
+    /// The blink loop. Dropping it cancels it, which is the whole cancellation mechanism —
+    /// see [`EditorView::stop_blinking`]. `None` means the caret is held solid: either
+    /// nothing is focused, or the user is mid-keystroke.
+    blink: Option<gpui::Task<()>>,
+    /// Holds the window-activation observer that stops the blink when the window
+    /// deactivates. Registered on first render for the same reason `WorkspaceView` does it:
+    /// `observe_window_activation` needs a `&mut Window`, and `new` has none.
+    window_activation: Option<gpui::Subscription>,
 }
+
+/// Half the blink period: the caret is shown for this long, then hidden for this long.
+///
+/// 530ms is the macOS system default (`NSTextInsertionPointBlinkPeriod`), so the editor's
+/// caret beats in time with every native text field on the screen rather than slightly
+/// against them.
+///
+/// **This interval is the entire cost of the feature.** Each tick is a `cx.notify()`, and
+/// gpui has no partial repaint — `App::notify` sets the window's `dirty` flag and the next
+/// frame redraws the whole window (`window.rs`, `WindowInvalidator::invalidate_view`).
+/// There is no damage-rect API at the platform layer to reach for instead. So the lever
+/// available is *frequency*, not *area*: ~1.9 repaints/second while the caret is idle and
+/// focused, against the 60/second `with_animation` would drive — which is precisely why #71
+/// rejected that pattern and why this is a timer rather than an animation.
+const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(530);
+
+/// How long after the last keystroke the caret starts blinking again.
+///
+/// A caret that blinks *while* you type is worse than one that does not blink at all: the
+/// motion competes with the character appearing under it. Every keystroke therefore holds
+/// the caret solid and restarts this delay, so the blink only resumes once you have stopped.
+const BLINK_RESUME_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl EditorView {
     pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
@@ -70,7 +105,55 @@ impl EditorView {
             visible_rows: 0..0,
             diagnostics: Vec::new(),
             text_origin_x: None,
+            caret_visible: true,
+            blink: None,
+            window_activation: None,
         }
+    }
+
+    /// Holds the caret solid and restarts the blink after a pause.
+    ///
+    /// Called from every path that moves the cursor or edits the buffer. Two things happen
+    /// and both matter: the caret is forced *visible* (so a keystroke never lands during
+    /// the dark half of the cycle, which reads as a dropped character), and the blink task
+    /// is replaced — dropping the old one cancels it, so holding a key down keeps
+    /// rescheduling the same single task rather than accumulating one per keystroke.
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_visible = true;
+        self.blink = Some(cx.spawn(async move |this, cx| {
+            // The pause before blinking resumes. A keystroke arriving inside this window
+            // drops this task and starts a new one, so the caret stays solid for as long
+            // as typing continues.
+            cx.background_executor().timer(BLINK_RESUME_DELAY).await;
+            loop {
+                if this
+                    .update(cx, |this, cx| {
+                        this.caret_visible = !this.caret_visible;
+                        // Notifies *this* entity, not the window. gpui still redraws the
+                        // whole window (there is no partial repaint), but marking only the
+                        // editor dirty is what lets any `.cached()` sibling view reuse its
+                        // element tree instead of re-rendering.
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    // The editor is gone — the tab closed or the window did. Falling out
+                    // of the loop lets the task finish and stops the wakeups.
+                    return;
+                }
+                cx.background_executor().timer(BLINK_INTERVAL).await;
+            }
+        }));
+    }
+
+    /// Stops the blink and leaves the caret hidden.
+    ///
+    /// Dropping the `Task` cancels it, so this genuinely stops the timer rather than
+    /// leaving it running against a flag — **the idle editor must cost nothing**, which is
+    /// what the perf gate's 2% CPU limit is there to enforce (#93, #79).
+    fn stop_blinking(&mut self) {
+        self.blink = None;
+        self.caret_visible = false;
     }
 
     /// Replaces the diagnostics painted over this document.
@@ -92,6 +175,41 @@ impl EditorView {
         let offset = self.document.buffer.point_to_offset(target);
         self.document.move_to(offset, false);
         self.scroll_cursor_into_view();
+    }
+
+    /// Whether a blink timer is currently running.
+    ///
+    /// Exposed for the render tests because this is the *perf* property, not a cosmetic
+    /// one: an editor that keeps a timer alive while unfocused is a repaint on a timer on
+    /// an idle window, which is the cost #93's gate exists to bound. A test can assert the
+    /// task is gone; it cannot see CPU.
+    #[cfg(test)]
+    pub fn is_blinking_for_test(&self) -> bool {
+        self.blink.is_some()
+    }
+
+    /// Whether the caret is in the visible half of its cycle.
+    #[cfg(test)]
+    pub fn caret_visible_for_test(&self) -> bool {
+        self.caret_visible
+    }
+
+    /// Puts the caret in its hidden half, standing in for a timer tick.
+    ///
+    /// The blink is driven by a real timer on the background executor, so a test that
+    /// wanted to observe a genuine tick would have to advance a clock and wait. What the
+    /// test actually needs to pin is the *reaction* to an edit — that it forces the caret
+    /// visible from wherever it was — and that is testable by putting it in the dark half
+    /// directly.
+    #[cfg(test)]
+    pub fn set_caret_hidden_for_test(&mut self) {
+        self.caret_visible = false;
+    }
+
+    /// Runs the post-edit path a keystroke takes.
+    #[cfg(test)]
+    pub fn after_edit_for_test(&mut self, cx: &mut Context<Self>) {
+        self.after_edit(cx);
     }
 
     /// Where the text column starts, as measured at prepaint.
@@ -167,6 +285,8 @@ impl EditorView {
             self.document.insert(text);
         }
         self.scroll_cursor_into_view();
+        // The case the blink exists to get right: a caret must not blink mid-keystroke.
+        self.restart_blink(cx);
         cx.notify();
     }
 
@@ -445,11 +565,16 @@ impl EditorView {
         // version check inside makes this a comparison when nothing has changed.
         self.document.refresh_search();
         self.scroll_cursor_into_view();
+        self.restart_blink(cx);
         cx.notify();
     }
 
     fn after_move(&mut self, cx: &mut Context<Self>) {
         self.scroll_cursor_into_view();
+        // Motion holds the caret solid too, not just typing: holding ↓ to scroll through a
+        // file with the caret strobing is the same distraction, and arriving somewhere with
+        // the caret in its dark half means not being able to see where you landed.
+        self.restart_blink(cx);
         cx.notify();
     }
 
@@ -508,7 +633,38 @@ impl EditorView {
         if event.modifiers.platform {
             cx.emit(EditorEvent::GoToDefinition);
         }
+        // Clicking is how you find the cursor when you have lost it; the caret must be
+        // solid at the moment the click lands rather than possibly dark.
+        self.restart_blink(cx);
         cx.notify();
+    }
+
+    /// Stops the blink when the window deactivates and restarts it on return.
+    ///
+    /// **A blinking caret in a window you are not looking at is pure cost** — it is the
+    /// repaint-on-a-timer #79 spent three wrong conclusions chasing and #93's gate now
+    /// bounds. Registered on the first render rather than in `new`, because
+    /// `observe_window_activation` needs a `&mut Window`; `WorkspaceView::observe_window_focus`
+    /// does the same thing for the same reason and documents the trade.
+    ///
+    /// Idempotent by the `is_some` guard, so this costs one branch per frame after the
+    /// first.
+    fn observe_window_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.window_activation.is_some() {
+            return;
+        }
+        self.window_activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                // Only if this editor still holds focus: returning to the window with the
+                // palette open must not start a caret blinking behind it.
+                if this.focus_handle.is_focused(window) {
+                    this.restart_blink(cx);
+                }
+            } else {
+                this.stop_blinking();
+                cx.notify();
+            }
+        }));
     }
 }
 
@@ -531,11 +687,32 @@ impl Focusable for EditorView {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
         let row_count = self.document.buffer.len_lines();
         let cursor = self.document.cursor_point();
+
+        self.observe_window_focus(window, cx);
+
+        // The caret is drawn only when this editor holds keyboard focus *and* the window is
+        // active. A caret in an unfocused editor claims input goes there when it does not —
+        // which is #95's bug ("navigation leaves focus behind") made visible rather than
+        // silent, and the reason #98 lists the two issues together.
+        let focused = self.focus_handle.is_focused(window) && window.is_window_active();
+
+        // Start the blink lazily, on the first frame this editor is focused, rather than in
+        // `new`: a background tab must not run a timer, and `new` cannot see focus anyway.
+        // The `blink.is_none()` guard makes this one branch per frame, not a restart.
+        if focused && self.blink.is_none() {
+            self.restart_blink(cx);
+        } else if !focused && self.blink.is_some() {
+            self.stop_blinking();
+        }
+
+        // Solid whenever unfocused, so the caret is simply absent rather than frozen
+        // mid-cycle in whatever half the timer happened to stop in.
+        let caret_visible = focused && self.caret_visible;
         let entity = cx.entity();
 
         div()
@@ -595,7 +772,9 @@ impl Render for EditorView {
                 // uniform_list calls back only for visible rows, so a 50k-line file costs
                 // the same per frame as a 50-line one.
                 uniform_list("editor-rows", row_count, move |range, _window, cx| {
-                    entity.update(cx, |editor, cx| editor.render_rows(range, cursor, cx))
+                    entity.update(cx, |editor, cx| {
+                        editor.render_rows(range, cursor, caret_visible, cx)
+                    })
                 })
                 .track_scroll(self.scroll.clone())
                 .size_full(),
@@ -609,6 +788,7 @@ impl EditorView {
         &mut self,
         range: Range<usize>,
         cursor: Point,
+        caret_visible: bool,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         // Capture the visible band for scroll-into-view, which runs outside render.
@@ -712,16 +892,30 @@ impl EditorView {
                             .text_color(if is_cursor_row { theme.text } else { theme.text_muted })
                             .child(SharedString::from((row + 1).to_string())),
                     )
-                    .child(div().flex_1().child(styled_line(
-                        &line,
-                        line_start,
-                        &spans,
-                        &row_diagnostics,
-                        brackets,
-                        &row_matches,
-                        &theme,
-                        if is_cursor_row { Some(cursor.column) } else { None },
-                    )))
+                    .child(
+                        // `relative` so the caret's absolute position is resolved against
+                        // the start of the text, not the window. The caret is a sibling of
+                        // the text rather than something `styled_line` knows about: it is
+                        // painted, not a colour run, and keeping it out of `line_runs`
+                        // leaves that function's four documented overlays
+                        // (matches → guides → bracket → cursor) intact minus the one that
+                        // no longer exists.
+                        div()
+                            .flex_1()
+                            .relative()
+                            .child(styled_line(
+                                &line,
+                                line_start,
+                                &spans,
+                                &row_diagnostics,
+                                brackets,
+                                &row_matches,
+                                &theme,
+                            ))
+                            .when(is_cursor_row && caret_visible, |el| {
+                                el.child(Caret::new(&line, cursor.column, theme.cursor, &fonts))
+                            }),
+                    )
                     .into_any_element()
             })
             .collect()
@@ -737,14 +931,14 @@ impl EditorView {
     }
 }
 
-/// Renders one line with syntax colours, and a visible cursor when it is the cursor row.
+/// Renders one line with syntax colours, diagnostics, search hits and the matching bracket.
 ///
-/// The cursor is drawn as a background highlight on the character under it rather than a
-/// separate positioned element: no absolute layout, no measuring, and it stays correct on
-/// a proportional fallback font. A real caret (thin, blinking, between characters) needs
-/// pixel positioning via `LineLayout::x_for_index`.
-/// ponytail: block cursor for now; swap in a caret when the editor gets its own custom
-/// `Element` impl, which is the same change that unlocks IME (see MILESTONE-1 task 11).
+/// The cursor is **not** here any more. It used to be a background highlight on the
+/// character under it — cheap, needing no measurement, and correct even on a proportional
+/// fallback font, which is why it lasted — but a block sits *on* the next character rather
+/// than between two, and at end-of-line it had nothing to paint on without appending a
+/// padding space. It is now a painted quad positioned by measurement; see
+/// [`crate::editor::caret::Caret`], which `render_rows` overlays as a sibling of this text.
 fn styled_line(
     line: &str,
     line_start: usize,
@@ -753,10 +947,9 @@ fn styled_line(
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
-    cursor_column: Option<usize>,
 ) -> StyledText {
     let (text, highlights) =
-        line_runs(line, line_start, spans, diagnostics, brackets, matches, theme, cursor_column);
+        line_runs(line, line_start, spans, diagnostics, brackets, matches, theme);
     StyledText::new(SharedString::from(text)).with_highlights(highlights)
 }
 
@@ -778,14 +971,13 @@ fn line_runs(
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
-    cursor_column: Option<usize>,
 ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
     let line_end = line_start + line.len();
 
-    // A cursor at end-of-line has no character to paint under, so pad with one space.
-    // Doing it up front means the highlight logic below has a single code path.
-    let cursor_at_end = cursor_column.is_some_and(|column| column >= line.len());
-    let text = if cursor_at_end { format!("{line} ") } else { line.to_string() };
+    // No padding space any more. The block cursor needed one so a cursor at end-of-line had
+    // a character to paint a background on; a caret is positioned past the last glyph by
+    // `x_for_index` returning the line width, so the line is now rendered as it is.
+    let text = line.to_string();
 
     let mut highlights: Vec<(Range<usize>, GpuiHighlight)> = Vec::new();
 
@@ -841,16 +1033,21 @@ fn line_runs(
     // keyword. `merge_background` splits the runs underneath rather than replacing them,
     // so a match that covers half a token keeps that half's colour.
     //
-    // First of the four overlays below, and the order of all four is deliberate (#80 and
-    // #87 both added one, and they interact):
+    // First of the three overlays below, and the order is deliberate (#80 and #87 each
+    // added one, and they interact):
     //
-    //   matches → guides → bracket → cursor
+    //   matches → guides → bracket
     //
     // Matches go first because they *merge* rather than replace, so everything after can
     // still win its own bytes. The guides come next and are dropped where any run already
     // exists — which now includes a match, so a hit on an indented line hides the guide
-    // under it rather than fighting it, and that is the right way round. The bracket and
-    // the cursor both win outright over what is beneath.
+    // under it rather than fighting it, and that is the right way round. The bracket wins
+    // outright over what is beneath.
+    //
+    // The cursor used to be a fourth layer here and is now painted on top of the whole
+    // line as a quad (#98), so it no longer competes for bytes with any of these — which
+    // also means a caret inside a search hit or on a bracket is drawn over it rather than
+    // erasing it, the bug shape #80-on-#87 documents two of below.
     for (range, is_current) in matches {
         if range.end <= line_start || range.start >= line_end {
             continue;
@@ -937,24 +1134,6 @@ fn line_runs(
                 start..end,
                 GpuiHighlight {
                     background_color: Some(theme.bracket_match()),
-                    ..Default::default()
-                },
-            ));
-        }
-    }
-
-    if let Some(column) = cursor_column {
-        let start = floor_boundary(&text, column.min(text.len()));
-        let end = ceil_boundary(&text, (start + 1).min(text.len()));
-        if start < end {
-            // The cursor must win the overlap with any syntax colour underneath, so it is
-            // pushed last and later spans are dropped rather than blended.
-            highlights.retain(|(range, _)| range.end <= start || range.start >= end);
-            highlights.push((
-                start..end,
-                GpuiHighlight {
-                    background_color: Some(theme.cursor),
-                    color: Some(theme.background),
                     ..Default::default()
                 },
             ));
@@ -1262,16 +1441,15 @@ mod tests {
     /// pre-existing test means.
     ///
     /// A wrapper rather than `&[]` threaded through nine call sites: those tests are about
-    /// syntax colours and the cursor, and empty diagnostics and match arguments in each
-    /// would be noise in the one place their arguments should read as the thing under test.
+    /// syntax colours, and empty diagnostics and match arguments in each would be noise in
+    /// the one place their arguments should read as the thing under test.
     fn line_runs(
         line: &str,
         line_start: usize,
         spans: &[HighlightSpan],
         theme: &Theme,
-        cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, &[], theme, cursor_column)
+        super::line_runs(line, line_start, spans, &[], None, &[], theme)
     }
 
     /// `line_runs` with search matches, spelled out.
@@ -1281,9 +1459,8 @@ mod tests {
         spans: &[HighlightSpan],
         matches: &[(Range<usize>, bool)],
         theme: &Theme,
-        cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, matches, theme, cursor_column)
+        super::line_runs(line, line_start, spans, &[], None, matches, theme)
     }
 
     /// Byte ranges carrying a foreground colour.
@@ -1306,13 +1483,8 @@ mod tests {
         // Line 3 of a document, starting at byte 100. A span at document byte 104..108
         // must paint at line-local 4..8, not 104..108 — getting this wrong paints the
         // wrong word, or panics past the end of a short line.
-        let (text, runs) = line_runs(
-            "    return $this;",
-            100,
-            &[span(104..110, HighlightStyle::Keyword)],
-            &theme,
-            None,
-        );
+        let (text, runs) =
+            line_runs("    return $this;", 100, &[span(104..110, HighlightStyle::Keyword)], &theme);
 
         assert_eq!(text, "    return $this;");
         assert_eq!(coloured(&runs), vec![4..10]);
@@ -1330,7 +1502,6 @@ mod tests {
                 span(200..250, HighlightStyle::Comment), // entirely after
             ],
             &theme,
-            None,
         );
         assert!(coloured(&runs).is_empty());
     }
@@ -1341,8 +1512,7 @@ mod tests {
         // A block comment opening on an earlier line and closing on a later one: the
         // visible part must still colour, clipped at both ends rather than overflowing.
         let line = "still inside";
-        let (text, runs) =
-            line_runs(line, 100, &[span(50..200, HighlightStyle::Comment)], &theme, None);
+        let (text, runs) = line_runs(line, 100, &[span(50..200, HighlightStyle::Comment)], &theme);
 
         assert_eq!(coloured(&runs), vec![0..line.len()]);
         assert!(runs.iter().all(|(r, _)| r.end <= text.len()), "no run may exceed the text");
@@ -1354,8 +1524,7 @@ mod tests {
         // "ção" — the span deliberately ends mid-codepoint, which StyledText
         // debug-asserts against. It must snap to a boundary instead of panicking.
         let line = "$mensagem = 'ação';";
-        let (text, runs) =
-            line_runs(line, 0, &[span(13..17, HighlightStyle::String)], &theme, None);
+        let (text, runs) = line_runs(line, 0, &[span(13..17, HighlightStyle::String)], &theme);
 
         for (range, _) in &runs {
             assert!(
@@ -1365,51 +1534,46 @@ mod tests {
         }
     }
 
+    // The three tests that used to sit here — the cursor winning the overlap with a syntax
+    // colour, a cursor at end-of-line getting a padding cell, and a cursor landing on a
+    // whole multibyte character — all asserted properties of the *block cursor*, which
+    // #98 deleted. They are not ported, because each one now tests something that cannot
+    // fail by construction rather than something that could:
+    //
+    //   - "wins the overlap" — the caret is a quad painted after the text, not a colour
+    //     run competing for bytes. There is no overlap to lose.
+    //   - "padded at end of line" — the padding space is gone; `x_for_index` returns the
+    //     line width for an index past the last glyph.
+    //   - "lands on a whole multibyte character" — this one still matters and moved to
+    //     where the arithmetic now lives, as `an_offset_inside_a_multibyte_character_snaps_down`
+    //     in `editor::caret`.
+    //
+    // What is *not* covered anywhere, and is stated rather than quietly dropped: whether
+    // the caret is at the right pixel. gpui's headless text system is a fake monospace
+    // (see `crate::render_tests`), so no test here can tell a correct `x_for_index` from an
+    // inverted one. That stays on #35's human list.
+
     #[test]
-    fn the_cursor_paints_over_the_syntax_colour_beneath_it() {
+    fn no_run_carries_the_cursor_colour_any_more() {
         let theme = Theme::dark();
-        // Cursor inside a keyword: it must win the overlap, or it becomes invisible
-        // exactly where the user is looking.
-        let (_, runs) =
-            line_runs("return $x;", 0, &[span(0..6, HighlightStyle::Keyword)], &theme, Some(2));
+        // The block cursor was a background run in `theme.cursor`. If one ever reappears
+        // here, two things are drawing the cursor and they will disagree.
+        let (_, runs) = line_runs("return $x;", 0, &[span(0..6, HighlightStyle::Keyword)], &theme);
 
-        let cursor: Vec<_> =
-            runs.iter().filter(|(_, s)| s.background_color == Some(theme.cursor)).collect();
-        assert_eq!(cursor.len(), 1, "exactly one cursor run");
-        assert_eq!(cursor[0].0, 2..3);
-
-        // And nothing else may overlap it.
-        for (range, style) in &runs {
-            if style.background_color != Some(theme.cursor) {
-                assert!(range.end <= 2 || range.start >= 3, "run {range:?} overlaps the cursor");
-            }
-        }
+        assert!(
+            runs.iter().all(|(_, style)| style.background_color != Some(theme.cursor)),
+            "the caret is painted as a quad, not as a colour run"
+        );
     }
 
     #[test]
-    fn a_cursor_past_the_end_of_the_line_still_has_something_to_paint() {
+    fn a_line_is_rendered_without_a_padding_space() {
         let theme = Theme::dark();
-        // At end-of-line there is no character under the cursor, so the line is padded.
-        // Without this the cursor silently vanishes at the end of every line.
-        let (text, runs) = line_runs("ab", 0, &[], &theme, Some(2));
-
-        assert_eq!(text, "ab ", "padded so the cursor has a cell");
-        let cursor = runs.iter().find(|(_, s)| s.background_color == Some(theme.cursor));
-        assert_eq!(cursor.expect("a cursor run").0, 2..3);
-    }
-
-    #[test]
-    fn the_cursor_lands_on_a_whole_multibyte_character() {
-        let theme = Theme::dark();
-        // Cursor on "ç" (2 bytes). A 1-byte cursor run would split it and panic.
-        let line = "ação";
-        let (text, runs) = line_runs(line, 0, &[], &theme, Some(1));
-
-        let (range, _) = runs
-            .iter()
-            .find(|(_, s)| s.background_color == Some(theme.cursor))
-            .expect("a cursor run");
-        assert_eq!(&text[range.clone()], "ç");
+        // The block cursor appended a space so it had a cell to paint at end-of-line. That
+        // space was real text as far as everything downstream was concerned — it shifted
+        // the trailing-whitespace tint and widened the line. The caret needs no such cell.
+        let (text, _) = line_runs("ab", 0, &[], &theme);
+        assert_eq!(text, "ab", "no padding cell");
     }
 
     #[test]
@@ -1425,7 +1589,6 @@ mod tests {
                 span(32..35, HighlightStyle::String),
             ],
             &theme,
-            Some(8),
         );
 
         for pair in runs.windows(2) {
@@ -1451,7 +1614,7 @@ mod tests {
     #[test]
     fn an_empty_line_produces_no_runs() {
         let theme = Theme::dark();
-        let (text, runs) = line_runs("", 0, &[], &theme, None);
+        let (text, runs) = line_runs("", 0, &[], &theme);
         assert_eq!(text, "");
         assert!(runs.is_empty());
     }
@@ -1477,14 +1640,14 @@ mod tests {
         let theme = Theme::dark();
         // Eight spaces then code: guides at columns 0 and 4, and *not* at 8, which is the
         // first code character.
-        let (_, runs) = line_runs("        return $x;", 0, &[], &theme, None);
+        let (_, runs) = line_runs("        return $x;", 0, &[], &theme);
         assert_eq!(backgrounds(&runs, theme.indent_guide), vec![0..1, 4..5]);
     }
 
     #[test]
     fn an_unindented_line_gets_no_guides() {
         let theme = Theme::dark();
-        let (_, runs) = line_runs("class User {", 0, &[], &theme, None);
+        let (_, runs) = line_runs("class User {", 0, &[], &theme);
         assert!(backgrounds(&runs, theme.indent_guide).is_empty());
     }
 
@@ -1494,7 +1657,7 @@ mod tests {
         // between two methods turns the file into a barcode.
         let theme = Theme::dark();
         for line in ["", "    ", "\t\t"] {
-            let (_, runs) = line_runs(line, 0, &[], &theme, None);
+            let (_, runs) = line_runs(line, 0, &[], &theme);
             assert!(backgrounds(&runs, theme.indent_guide).is_empty(), "{line:?}");
             assert!(backgrounds(&runs, theme.trailing_whitespace).is_empty(), "{line:?}");
         }
@@ -1504,24 +1667,20 @@ mod tests {
     fn trailing_whitespace_is_tinted_and_nothing_else_is() {
         let theme = Theme::dark();
         let line = "return $x;   ";
-        let (_, runs) = line_runs(line, 0, &[], &theme, None);
+        let (_, runs) = line_runs(line, 0, &[], &theme);
         assert_eq!(backgrounds(&runs, theme.trailing_whitespace), vec![10..13]);
 
         // A line with none must get none, or the tint means nothing.
-        let (_, runs) = line_runs("return $x;", 0, &[], &theme, None);
+        let (_, runs) = line_runs("return $x;", 0, &[], &theme);
         assert!(backgrounds(&runs, theme.trailing_whitespace).is_empty());
     }
 
-    #[test]
-    fn the_space_padded_in_for_a_cursor_at_end_of_line_is_not_trailing_whitespace() {
-        // `line_runs` appends a space so an end-of-line cursor has a cell. That space is
-        // this function's own scaffolding, not the file's content — tinting it would mark
-        // every line the cursor rests on as having trailing whitespace.
-        let theme = Theme::dark();
-        let (text, runs) = line_runs("return $x;", 0, &[], &theme, Some(10));
-        assert_eq!(text, "return $x; ", "the padding is there");
-        assert!(backgrounds(&runs, theme.trailing_whitespace).is_empty());
-    }
+    // `the_space_padded_in_for_a_cursor_at_end_of_line_is_not_trailing_whitespace` used to
+    // sit here. It guarded a real bug — the block cursor's padding space being tinted as
+    // trailing whitespace, marking every line the cursor rested on — but the padding space
+    // no longer exists, so the test can only assert that a thing that cannot happen does
+    // not. `a_line_is_rendered_without_a_padding_space` above pins the replacement
+    // invariant: the text is the line, unmodified.
 
     #[test]
     fn a_guide_never_splits_a_multibyte_character() {
@@ -1530,7 +1689,7 @@ mod tests {
         // range landing mid-codepoint would make StyledText debug-assert.
         let theme = Theme::dark();
         let line = "    $m = 'ação';";
-        let (text, runs) = line_runs(line, 0, &[], &theme, None);
+        let (text, runs) = line_runs(line, 0, &[], &theme);
 
         assert_eq!(backgrounds(&runs, theme.indent_guide), vec![0..1]);
         for (range, _) in &runs {
@@ -1547,8 +1706,7 @@ mod tests {
         // indent, and a guide pushed on top of it would be a second run over those bytes.
         let theme = Theme::dark();
         let line = "        still in the comment   ";
-        let (_, runs) =
-            line_runs(line, 0, &[span(0..line.len(), HighlightStyle::Comment)], &theme, None);
+        let (_, runs) = line_runs(line, 0, &[span(0..line.len(), HighlightStyle::Comment)], &theme);
 
         for pair in runs.windows(2) {
             assert!(
@@ -1621,7 +1779,6 @@ mod tests {
             Some((1, 3)),
             &[],
             &theme,
-            None,
         );
 
         assert_eq!(backgrounds(&runs, theme.bracket_match()), vec![1..2, 3..4]);
@@ -1637,7 +1794,7 @@ mod tests {
         brackets: Option<(usize, usize)>,
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, &[], &[], brackets, &[], theme, None)
+        super::line_runs(line, line_start, &[], &[], brackets, &[], theme)
     }
 
     // --- diagnostics ----------------------------------------------------------------
@@ -1660,7 +1817,7 @@ mod tests {
     fn a_diagnostic_underlines_its_range_in_the_severity_colour() {
         let theme = Theme::dark();
         let (_, runs) =
-            line_runs_with("$undefined = 1;", 0, &[], &[(0..10, Severity::Error)], &theme, None);
+            line_runs_with("$undefined = 1;", 0, &[], &[(0..10, Severity::Error)], &theme);
 
         assert_eq!(underlined(&runs), vec![(0..10, Some(theme.error))]);
     }
@@ -1676,7 +1833,7 @@ mod tests {
                 (Severity::Information, theme.information),
                 (Severity::Hint, theme.hint),
             ] {
-                let (_, runs) = line_runs_with("abcd", 0, &[], &[(0..4, severity)], &theme, None);
+                let (_, runs) = line_runs_with("abcd", 0, &[], &[(0..4, severity)], &theme);
                 assert_eq!(
                     underlined(&runs),
                     vec![(0..4, Some(expected))],
@@ -1699,7 +1856,6 @@ mod tests {
             &[span(0..6, HighlightStyle::Keyword)],
             &[(0..6, Severity::Error)],
             &theme,
-            None,
         );
 
         let (range, style) = runs.iter().find(|(r, _)| r.start == 0).expect("a run at 0");
@@ -1723,7 +1879,6 @@ mod tests {
             &[span(0..8, HighlightStyle::Keyword)],
             &[(4..8, Severity::Warning)],
             &theme,
-            None,
         );
 
         assert_eq!(underlined(&runs), vec![(4..8, Some(theme.warning))]);
@@ -1738,8 +1893,7 @@ mod tests {
         // Plain text carries no syntax span, so there is no run to merge into. The gap has
         // to become a run of its own or the squiggle silently does not render.
         let theme = Theme::dark();
-        let (_, runs) =
-            line_runs_with("plain words", 0, &[], &[(6..11, Severity::Hint)], &theme, None);
+        let (_, runs) = line_runs_with("plain words", 0, &[], &[(6..11, Severity::Hint)], &theme);
 
         assert_eq!(underlined(&runs), vec![(6..11, Some(theme.hint))]);
     }
@@ -1759,7 +1913,6 @@ mod tests {
             ],
             &[(3..10, Severity::Error), (30..36, Severity::Warning)],
             &theme,
-            Some(20),
         );
 
         for pair in runs.windows(2) {
@@ -1777,8 +1930,7 @@ mod tests {
         // Ranges are document-wide byte offsets; forgetting to clip paints one file's
         // squiggle across every visible row.
         let theme = Theme::dark();
-        let (_, runs) =
-            line_runs_with("this line", 100, &[], &[(0..50, Severity::Error)], &theme, None);
+        let (_, runs) = line_runs_with("this line", 100, &[], &[(0..50, Severity::Error)], &theme);
 
         assert!(underlined(&runs).is_empty());
     }
@@ -1787,7 +1939,7 @@ mod tests {
     fn a_multiline_diagnostic_is_clipped_to_the_visible_line() {
         let theme = Theme::dark();
         let line = "middle";
-        let (_, runs) = line_runs_with(line, 100, &[], &[(50..200, Severity::Error)], &theme, None);
+        let (_, runs) = line_runs_with(line, 100, &[], &[(50..200, Severity::Error)], &theme);
 
         assert_eq!(underlined(&runs), vec![(0..line.len(), Some(theme.error))]);
     }
@@ -1797,7 +1949,7 @@ mod tests {
         // A server pointing *between* two characters — "expected ; here". An empty range
         // would produce no run at all, so the user is told nothing.
         let theme = Theme::dark();
-        let (_, runs) = line_runs_with("$x = 1", 0, &[], &[(3..3, Severity::Error)], &theme, None);
+        let (_, runs) = line_runs_with("$x = 1", 0, &[], &[(3..3, Severity::Error)], &theme);
 
         let marks = underlined(&runs);
         assert_eq!(marks.len(), 1, "a zero-width diagnostic must still be visible");
@@ -1810,7 +1962,7 @@ mod tests {
         // StyledText debug-assert. Portuguese source is where this actually happens.
         let theme = Theme::dark();
         let line = "$mensagem = 'ação';";
-        let (text, runs) = line_runs_with(line, 0, &[], &[(13..17, Severity::Error)], &theme, None);
+        let (text, runs) = line_runs_with(line, 0, &[], &[(13..17, Severity::Error)], &theme);
 
         for (range, _) in &runs {
             assert!(
@@ -1827,8 +1979,8 @@ mod tests {
         // language server is permanently in.
         let theme = Theme::dark();
         let spans = [span(0..6, HighlightStyle::Keyword)];
-        let (text, with) = line_runs_with("return $x;", 0, &spans, &[], &theme, Some(2));
-        let (plain_text, without) = line_runs("return $x;", 0, &spans, &theme, Some(2));
+        let (text, with) = line_runs_with("return $x;", 0, &spans, &[], &theme);
+        let (plain_text, without) = line_runs("return $x;", 0, &spans, &theme);
 
         assert_eq!(text, plain_text);
         assert_eq!(with.len(), without.len());
@@ -1846,9 +1998,8 @@ mod tests {
         spans: &[HighlightSpan],
         diagnostics: &[(Range<usize>, Severity)],
         theme: &Theme,
-        cursor_column: Option<usize>,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, diagnostics, None, &[], theme, cursor_column)
+        super::line_runs(line, line_start, spans, diagnostics, None, &[], theme)
     }
 
     // --- search match highlighting (#80) --------------------------------------------
@@ -1879,7 +2030,6 @@ mod tests {
             &[span(0..6, HighlightStyle::Keyword)],
             &[(7..12, false)],
             &theme,
-            None,
         );
 
         assert_eq!(backgrounded(&runs, theme.search_match()), vec![7..12]);
@@ -1900,7 +2050,6 @@ mod tests {
             &[span(0..6, HighlightStyle::Keyword)],
             &[(0..6, false)],
             &theme,
-            None,
         );
 
         let run = runs.iter().find(|(r, _)| *r == (0..6)).expect("the covered run exists");
@@ -1918,7 +2067,6 @@ mod tests {
             &[span(0..8, HighlightStyle::Keyword)],
             &[(0..6, false)],
             &theme,
-            None,
         );
 
         assert_eq!(backgrounded(&runs, theme.search_match()), vec![0..6]);
@@ -1938,7 +2086,6 @@ mod tests {
             &[],
             &[(0..1, false), (2..3, true), (4..5, false)],
             &theme,
-            None,
         );
 
         assert_eq!(backgrounded(&runs, theme.search_match()), vec![0..1, 4..5]);
@@ -1952,11 +2099,11 @@ mod tests {
         // visible part, in line-local coordinates.
         let theme = Theme::dark();
         let line = "middle";
-        let (_, runs) = line_runs_matching(line, 100, &[], &[(95..103, false)], &theme, None);
+        let (_, runs) = line_runs_matching(line, 100, &[], &[(95..103, false)], &theme);
         assert_eq!(backgrounded(&runs, theme.search_match()), vec![0..3]);
 
         // And one entirely outside is dropped rather than painting at a clamped offset.
-        let (_, runs) = line_runs_matching(line, 100, &[], &[(0..50, false)], &theme, None);
+        let (_, runs) = line_runs_matching(line, 100, &[], &[(0..50, false)], &theme);
         assert!(backgrounded(&runs, theme.search_match()).is_empty());
     }
 
@@ -1970,7 +2117,7 @@ mod tests {
         let line = "$msg = 'ação';";
         assert!(!line.is_char_boundary(12), "12 must be inside ã for this test to mean anything");
 
-        let (text, runs) = line_runs_matching(line, 0, &[], &[(8..12, false)], &theme, None);
+        let (text, runs) = line_runs_matching(line, 0, &[], &[(8..12, false)], &theme);
         for (range, _) in &runs {
             assert!(text.is_char_boundary(range.start), "{range:?} starts mid-codepoint");
             assert!(text.is_char_boundary(range.end), "{range:?} ends mid-codepoint");
@@ -1980,21 +2127,31 @@ mod tests {
         assert_eq!(&text[8..13], "açã");
 
         // And an exact, unclipped match paints exactly itself.
-        let (_, runs) = line_runs_matching(line, 0, &[], &[(8..14, false)], &theme, None);
+        let (_, runs) = line_runs_matching(line, 0, &[], &[(8..14, false)], &theme);
         assert_eq!(backgrounded(&runs, theme.search_match()), vec![8..14]);
     }
 
     #[test]
-    fn the_cursor_still_wins_over_a_match_underneath_it() {
-        // The current match *is* the selection, so the caret sits inside it. If the match
-        // background won, the caret would vanish exactly where the user is looking.
+    fn a_match_under_the_caret_is_painted_whole() {
+        // This replaces `the_cursor_still_wins_over_a_match_underneath_it`, and the reason
+        // it is not simply deleted is that the *original* concern was real: the current
+        // match is the selection, so the cursor always sits inside it, and the block cursor
+        // and the match background were two runs fighting for the same bytes. #87-on-#80
+        // documents the resulting bug — a `retain` that dropped any run straddling the
+        // cursor wiped the match's background off the line.
+        //
+        // The caret cannot lose that fight because it is no longer in it: it is a quad
+        // painted over the finished line. So the property worth pinning flipped. It is no
+        // longer "the cursor survives the match" but "the match is now painted whole,
+        // because nothing punches a hole in it any more".
         let theme = Theme::dark();
-        let (_, runs) = line_runs_matching("needle", 0, &[], &[(0..6, true)], &theme, Some(2));
-        let cursor = runs
-            .iter()
-            .find(|(_, style)| style.background_color == Some(theme.cursor))
-            .expect("the cursor run survived the match");
-        assert_eq!(cursor.0, 2..3);
+        let (_, runs) = line_runs_matching("needle", 0, &[], &[(0..6, true)], &theme);
+
+        assert_eq!(
+            backgrounded(&runs, theme.current_search_match()),
+            vec![0..6],
+            "an unbroken match; the block cursor used to split this into 0..2 and 3..6"
+        );
         assert_sorted_and_disjoint(&runs);
     }
 
@@ -2011,7 +2168,6 @@ mod tests {
             None,
             &[(0..3, false)],
             &theme,
-            None,
         );
         let run = runs.iter().find(|(r, _)| *r == (0..3)).expect("the covered run exists");
         assert!(run.1.underline.is_some(), "the diagnostic underline survived the match");
@@ -2025,8 +2181,8 @@ mod tests {
         // search must not change a single run there.
         let theme = Theme::dark();
         let spans = [span(0..6, HighlightStyle::Keyword)];
-        let (text, with) = line_runs_matching("return $x;", 0, &spans, &[], &theme, Some(2));
-        let (plain_text, without) = line_runs("return $x;", 0, &spans, &theme, Some(2));
+        let (text, with) = line_runs_matching("return $x;", 0, &spans, &[], &theme);
+        let (plain_text, without) = line_runs("return $x;", 0, &spans, &theme);
 
         assert_eq!(text, plain_text);
         assert_eq!(with.len(), without.len());
@@ -2067,7 +2223,7 @@ mod tests {
         );
 
         let (_, runs) =
-            super::line_runs("f(1)", 0, &[], &[], Some((1, 3)), &[(0..4, true)], &theme, None);
+            super::line_runs("f(1)", 0, &[], &[], Some((1, 3)), &[(0..4, true)], &theme);
 
         assert_eq!(
             backgrounds(&runs, theme.bracket_match()),
