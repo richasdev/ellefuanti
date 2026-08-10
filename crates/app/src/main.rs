@@ -2,6 +2,7 @@
 
 mod actions;
 mod editor;
+mod file_cache;
 mod icons;
 mod palette;
 mod perf;
