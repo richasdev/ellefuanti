@@ -48,6 +48,12 @@ pub struct Line {
     caret: Option<(usize, gpui::Hsla)>,
     /// Forces a fixed advance per glyph. `Some` for the terminal grid, `None` for text.
     cell_width: Option<Pixels>,
+    /// Byte offsets to draw a one-pixel indent guide before, and their colour.
+    ///
+    /// Painted rather than coloured: a guide used to be a *character background*, which is a
+    /// block one character wide — the grey rectangles reported twice (#108). A rule is what
+    /// the feature has always meant, and it needs a measured x, which only an element has.
+    guides: (Vec<usize>, gpui::Hsla),
 }
 
 impl Line {
@@ -57,7 +63,15 @@ impl Line {
         font_size: Pixels,
         line_height: Pixels,
     ) -> Self {
-        Self { text: text.into(), runs, font_size, line_height, caret: None, cell_width: None }
+        Self {
+            text: text.into(),
+            runs,
+            font_size,
+            line_height,
+            caret: None,
+            cell_width: None,
+            guides: (Vec::new(), gpui::black()),
+        }
     }
 
     /// Forces every glyph to one cell wide, for the terminal grid.
@@ -67,6 +81,12 @@ impl Line {
     /// fallback there should look like text, not like a table.
     pub fn with_cell_width(mut self, width: Pixels) -> Self {
         self.cell_width = Some(width);
+        self
+    }
+
+    /// Draws a one-pixel rule before each byte offset.
+    pub fn with_guides(mut self, columns: Vec<usize>, color: gpui::Hsla) -> Self {
+        self.guides = (columns, color);
         self
     }
 
@@ -155,6 +175,22 @@ impl Element for Line {
         // `line_height` is passed, not inherited. gpui centres the glyphs within it, so the
         // text sits in the middle of exactly the box `request_layout` asked for.
         let _ = shaped.paint(bounds.origin, self.line_height, window, cx);
+
+        // Under the text: a guide sits in the indent, where there is nothing to cover, and
+        // drawing it over a glyph would be wrong if one ever overlapped.
+        let (columns, color) = &self.guides;
+        for &byte in columns {
+            if !self.text.is_char_boundary(byte) {
+                continue;
+            }
+            window.paint_quad(gpui::fill(
+                Bounds::new(
+                    gpui::point(bounds.origin.x + shaped.x_for_index(byte), bounds.origin.y),
+                    gpui::size(gpui::px(1.0), self.line_height),
+                ),
+                *color,
+            ));
+        }
 
         // After the text, so the caret is over it rather than under. `x_for_index` measures
         // the same shaped line, so the caret lands on a real glyph boundary even on a

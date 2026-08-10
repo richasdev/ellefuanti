@@ -254,8 +254,14 @@ impl Document {
             if head == 0 {
                 return;
             }
-            // Step back one *character*, not one byte, or a multi-byte char corrupts.
-            self.prev_char_offset(head)..head
+            match self.indent_backspace_target(head) {
+                // Inside a line's leading whitespace: back up to the previous tab stop
+                // rather than one space at a time, which is what every editor does and what
+                // makes a blank indented line one keystroke to clear instead of four.
+                Some(target) => target..head,
+                // Step back one *character*, not one byte, or a multi-byte char corrupts.
+                None => self.prev_char_offset(head)..head,
+            }
         } else {
             self.selection.range()
         };
@@ -263,6 +269,45 @@ impl Document {
         self.selection = Selection::at(edit.range.start);
         self.goal_column = None;
         self.sync_syntax();
+    }
+
+    /// Where backspace should land when the cursor sits inside a line's leading whitespace.
+    ///
+    /// `None` means "delete one character", the ordinary case.
+    ///
+    /// The rule is Zed's, and it is not "jump to column zero": back up to the previous
+    /// multiple of the indent width. `((column - 1) / width) * width` — so from column 8 you
+    /// land on 4, from 7 on 4, from 4 on 0. A line of nothing but indentation clears in one
+    /// keystroke per level instead of one per space, and a cursor sitting at an odd column
+    /// (someone typed a space by hand) is pulled back into alignment rather than staying
+    /// off-grid.
+    ///
+    /// Only *leading* whitespace qualifies. A space in the middle of a line is a space
+    /// someone typed between words, and eating four of them would be the editor guessing.
+    /// Tabs are one column each here, matching how `indent_guide_columns` counts them —
+    /// expanding them properly needs a tab-width setting (#60), and both must move together.
+    fn indent_backspace_target(&self, head: usize) -> Option<usize> {
+        const WIDTH: usize = 4;
+
+        let point = self.buffer.offset_to_point(head);
+        if point.column == 0 {
+            return None;
+        }
+
+        // Everything before the cursor on this line must be indentation. `line` includes the
+        // whole row, so it is sliced to the cursor first — a cursor in the middle of `x = 1`
+        // is not indentation even though the line starts with spaces.
+        let line = self.buffer.line(point.row);
+        let before = line.get(..point.column)?;
+        if !before.chars().all(|c| c == ' ' || c == '\t') {
+            return None;
+        }
+
+        let target_column = ((point.column - 1) / WIDTH) * WIDTH;
+        if target_column == point.column {
+            return None;
+        }
+        Some(self.buffer.point_to_offset(Point::new(point.row, target_column)))
     }
 
     /// Forward delete.
@@ -1558,6 +1603,50 @@ mod tests {
     // Asserting it here because it is invisible until a user presses ⌘Z and is surprised.
 
     #[test]
+    fn backspace_in_indentation_goes_to_the_previous_tab_stop() {
+        // The behaviour every editor has and this one did not: a blank indented line takes
+        // one keystroke per level, not one per space.
+        let mut d = doc("        \nx");
+        d.move_to(8, false);
+        d.backspace();
+        assert_eq!(d.buffer.text(), "    \nx", "column 8 lands on 4, not 7");
+        d.backspace();
+        assert_eq!(d.buffer.text(), "\nx", "and 4 lands on 0");
+    }
+
+    #[test]
+    fn backspace_off_the_tab_grid_pulls_back_into_alignment() {
+        // Five spaces: someone typed one by hand. The first backspace aligns to 4 rather
+        // than removing the whole level, which is `((5 - 1) / 4) * 4`.
+        let mut d = doc("     x");
+        d.move_to(5, false);
+        d.backspace();
+        assert_eq!(d.buffer.text(), "    x");
+    }
+
+    #[test]
+    fn backspace_after_code_deletes_one_character() {
+        // The rule is *leading* whitespace only. A space between words is one someone typed,
+        // and eating four of them would be the editor guessing.
+        // Column 7 is the space between `$a` and `=`. Backspace removes that one space —
+        // if the leading-whitespace check were missing it would jump to column 4 and eat
+        // `$a` with it.
+        let mut d = doc("    $a = 1;");
+        d.move_to(7, false);
+        d.backspace();
+        assert_eq!(d.buffer.text(), "    $a= 1;", "one space, not back to column 4");
+    }
+
+    #[test]
+    fn backspace_still_steps_over_a_multibyte_character() {
+        // The path this feature routes around: outside indentation nothing changed, and a
+        // byte-wise step here would corrupt the codepoint.
+        let mut d = doc("ação");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.backspace();
+        assert_eq!(d.buffer.text(), "açã");
+    }
+
     fn deleting_a_word_undoes_in_one_step() {
         let mut d = doc("alpha beta gamma");
         d.move_to(d.buffer.len_bytes(), false);
