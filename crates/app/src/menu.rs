@@ -126,6 +126,9 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 Item::command("Replace…", "editor.replace", |label| {
                     MenuItem::action(label, crate::actions::Replace)
                 }),
+                Item::command("Find in Project…", "editor.find_in_project", |label| {
+                    MenuItem::action(label, crate::actions::FindInProject)
+                }),
                 // ponytail: the #73 motions (Move Line Up, Duplicate Line, Delete Line,
                 // Indent/Outdent) are deliberately not here. They are keyboard verbs used
                 // mid-flow — reaching for a menu to duplicate a line is not a thing anyone

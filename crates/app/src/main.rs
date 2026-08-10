@@ -13,6 +13,7 @@ mod palette;
 mod perf;
 #[cfg(test)]
 mod render_tests;
+mod search_panel;
 mod settings;
 mod terminal_view;
 mod test_view;

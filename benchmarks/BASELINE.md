@@ -272,6 +272,61 @@ A wall-clock assertion there would be a flaky test that teaches nothing when it 
 
 ---
 
+## Find in project — measured on real projects (#80)
+
+Recorded 2026-08-10. Also not a `cargo bench` target, and for the same reason: `crates/app`
+is a binary crate. The harness is an `#[ignore]`d test **in the module it measures**, so it
+runs the real `search_project` rather than a reproduction of it:
+
+```sh
+ELLE_SEARCH_ROOT=~/pacademy/crm-livewire-v3 \
+  cargo test --release --bin ellefuanti -- --ignored --nocapture measure_project_search
+```
+
+Medians of 5 warm runs, Apple Silicon, release. The whole call: walk, then read and scan
+every non-ignored file.
+
+| project                   | files | bytes  |       walk | `$user` | `function` | `\$\w+` regex | no hits |
+| ------------------------- | ----: | ------ | ---------: | ------: | ---------: | ------------: | ------: |
+| crm-livewire-v3 (Laravel) |   279 | 0.8 MB | **2.9 ms** |  7.2 ms |     8.0 ms |        6.1 ms |  7.0 ms |
+| ellefuanti (this repo)    |   156 | 1.8 MB | **1.4 ms** |  4.3 ms |     4.6 ms |        4.8 ms |  4.3 ms |
+
+**A disagreement, and what it turned out to be.** The first run reported the walk at
+10.6 ms — larger than the entire 7.5 ms search that contains it, which cannot be true. The
+walk was being timed **cold, once**, against searches timed **warm, five times**: 10.6 ms
+cold and 2.9 ms warm on the same directory, a 7× gap that is the page cache rather than the
+code. This is the third entry in this file's history of a number that measured the harness,
+and the only reason it was caught is that two readings of nested things disagreed. Both are
+printed separately now.
+
+The same run also reported "no hits" finding **2 matches** when pointed at this repo,
+because the nonsense string chosen as the no-hits query had by then been written into the
+source file being searched. Also fixed in the harness; also only visible because a number
+that should have been zero was not.
+
+**The cost tracks the file count, not the byte count.** 156 files holding 1.8 MB search
+_faster_ than 279 files holding 0.8 MB. The per-file `metadata` + `read` syscall pair
+dominates; the matching itself is the regex crate's literal prefilter, which is a `memchr`
+sweep. Two consequences, both in the code:
+
+- `MAX_FILE_BYTES` (512 KB) does very little for the total, and is there to keep one
+  committed database dump from costing 40 MB of allocation per keystroke — not for speed.
+- Pruning `vendor/`/`node_modules/` at the directory boundary (`ALWAYS_SKIPPED`, #41) is
+  worth far more than any per-file optimisation, because it removes files rather than bytes.
+
+**The number that shaped the UI is the `no hits` column: 7.0 ms**, which is 84% of an 8.3 ms
+frame _before the search finds anything_. That settles both scheduling questions without
+argument — it cannot run on the UI thread, and it must be debounced rather than merely
+cancelled, because cancellation stops waste accumulating and not starting. `SEARCH_DEBOUNCE`
+(250 ms, `workspace_view.rs`) is derived from it.
+
+**Per-frame cost is again not in this table**, and again for a structural reason: the result
+list is a `uniform_list` over a flattened row vector built once per result change, so a
+frame lays out the visible window regardless of whether there are 3 hits or the 1,000-hit
+cap. Same property as the file tree (#10).
+
+---
+
 ## Application — measured with `ELLE_PERF=1`
 
 Release build, measured from process entry (`ELLE_PERF=1 ./target/release/ellefuanti`).
