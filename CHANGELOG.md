@@ -18,6 +18,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- Syntax highlighting for **HTML, TOML, YAML and shell**, and with them the extensionless
+  files a Laravel project keeps at its root: `artisan` (PHP, detected by name — it has no
+  extension to match on and used to open grey) and `.env` / `.env.example` (#53)
+- `.env` rides on the bash grammar rather than getting one of its own. It is `KEY=value`
+  with `#` comments, which is a subset of what bash already parses, and shells source these
+  files literally. What it rules out: a value containing shell metacharacters colours as a
+  pipeline. `Dockerfile` was considered and **skipped** — `tree-sitter-dockerfile` is at
+  0.2.0, unmaintained, and outside the org that keeps the rest of these current; `.xml`
+  (phpunit.xml) was skipped because the HTML grammar hard-codes HTML's void and raw-text
+  elements, so it parses XML wrong rather than approximately (#53)
 - Syntax highlighting for **JSON, JavaScript, TypeScript and CSS**. Before this, every file
   that was not `.php`/`.phtml`/`.blade.php` resolved to `PlainText` and rendered with no
   colour at all — in a Laravel project that is `composer.json`, `package.json`, `app.js`,

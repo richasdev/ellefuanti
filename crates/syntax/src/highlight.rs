@@ -738,6 +738,17 @@ mod tests {
                 "function f(): string { return 'x'; }\n",
             ),
             (Language::Css, "/* h */\n.a { color: red; }\n", ".cls { margin: 1px; }\n"),
+            (
+                Language::Html,
+                "<!-- h -->\n<p class=\"a\">x</p>\n",
+                "<div id=\"k\"><span>y</span></div>\n",
+            ),
+            // TOML's filler has to be pairs at the top level, not tables: a `[table]`
+            // header opens a node that every following pair nests inside, so growth would
+            // deepen the tree the head sits next to rather than lengthen it.
+            (Language::Toml, "# h\na = 1\nb = \"x\"\n", "k = \"v\"\n"),
+            (Language::Yaml, "# h\na: 1\nb: \"x\"\n", "k: v\n"),
+            (Language::Shell, "# h\nA=1\nB=\"x\"\n", "echo \"y\" > /dev/null\n"),
         ];
 
         for (language, head, filler) in cases {
@@ -783,6 +794,10 @@ mod tests {
             (Language::JavaScript, "const a = 1; // c"),
             (Language::TypeScript, "const a: number = 1; // c"),
             (Language::Css, ".a { color: red; }"),
+            (Language::Html, "<div class=\"a\">x</div>"),
+            (Language::Toml, "[t]\na = 1"),
+            (Language::Yaml, "a: 1\nb: \"x\""),
+            (Language::Shell, "NAME=app # c"),
         ];
 
         for (language, src) in samples {
@@ -988,6 +1003,151 @@ mod tests {
         let spans = tree.highlights(&buffer, 0..buffer.len_bytes());
         let vars: Vec<_> = spans.iter().filter(|s| s.style == HighlightStyle::Variable).collect();
         assert_eq!(vars.len(), 500, "every custom property must match the ^-- predicate");
+    }
+
+    #[test]
+    fn html_separates_tags_attributes_and_values() {
+        let src = "<!DOCTYPE html>\n<!-- c -->\n<div class=\"a\" id=x>hi</div>\n";
+        let spans = spans_of(Language::Html, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"<!-- c -->"));
+        assert!(styled(src, &spans, HighlightStyle::Tag).contains(&"div"));
+        assert!(styled(src, &spans, HighlightStyle::Attribute).contains(&"class"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"a\""));
+        // An unquoted attribute value is still a value, and it is a different node kind
+        // from the quoted one — both arms are needed or `id=x` loses its colour.
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"x"));
+        // The doctype reads as markup, not as a number. Upstream calls it @constant, which
+        // this editor's `capture_style` would land on Number; html.scm overrides it.
+        assert!(styled(src, &spans, HighlightStyle::Tag).contains(&"<!DOCTYPE html>"));
+        // Text content between tags stays plain — colouring prose is not the job.
+        assert!(!styled(src, &spans, HighlightStyle::String).contains(&"hi"));
+    }
+
+    #[test]
+    fn toml_keys_do_not_swallow_their_values() {
+        // The regression this query was rewritten for. Upstream's `(pair (bare_key))
+        // @property` puts the capture on the *pair*, so under this editor's last-wins rule
+        // the whole `name = "app"` came back as one Property span and the string vanished.
+        let src = "# c\n[package]\nname = \"app\"\nver = 2\nok = true\n";
+        let spans = spans_of(Language::Toml, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"# c"));
+        // A table header is the structure; a key is content. They must not be one colour.
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"package"));
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"name"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"app\""));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"2"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"true"));
+        assert!(styled(src, &spans, HighlightStyle::Operator).contains(&"="));
+    }
+
+    #[test]
+    fn toml_handles_dotted_keys_and_table_arrays() {
+        let src = "[[bin]]\na.b = 1.5\n\"quoted\" = 1\n";
+        let spans = spans_of(Language::Toml, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"bin"));
+        // A dotted key nests bare_keys, so the plain `(pair (bare_key))` arm never reaches
+        // them — both halves have to come out coloured.
+        let props = styled(src, &spans, HighlightStyle::Property);
+        assert!(props.contains(&"a"), "got {props:?}");
+        assert!(props.contains(&"b"), "got {props:?}");
+        assert!(props.contains(&"\"quoted\""), "got {props:?}");
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"1.5"));
+    }
+
+    #[test]
+    fn yaml_keys_are_a_different_colour_from_their_values() {
+        // docker-compose.yml and .github/workflows/*.yml are why YAML is here, and in both
+        // almost every token is an unquoted scalar. If keys and values share a style the
+        // file is one flat block — the same failure json.scm exists to avoid.
+        let src = "# c\nversion: \"3\"\nservices:\n  web:\n    ports:\n      - 80\n    \
+                   tty: true\n    x: null\n";
+        let spans = spans_of(Language::Yaml, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"# c"));
+        let props = styled(src, &spans, HighlightStyle::Property);
+        assert!(props.contains(&"version"), "got {props:?}");
+        assert!(props.contains(&"services"), "got {props:?}");
+        assert!(props.contains(&"ports"), "got {props:?}");
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"3\""));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"80"));
+        // Upstream calls these @boolean and @constant.builtin, neither of which this
+        // editor maps — `true` would render plain and `null` would render as a Number.
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"true"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"null"));
+    }
+
+    #[test]
+    fn yaml_anchors_and_aliases_read_as_variables() {
+        // The `&defaults` / `*defaults` pair is how a docker-compose file avoids repeating
+        // itself. Upstream captures them as @label, which this editor has no style for, so
+        // without the remap they are invisible.
+        let src = "base: &anc v\nuse: *anc\n";
+        let spans = spans_of(Language::Yaml, src);
+        let vars = styled(src, &spans, HighlightStyle::Variable);
+        assert_eq!(vars, vec!["anc", "anc"], "both the anchor and the alias must colour");
+    }
+
+    #[test]
+    fn shell_separates_commands_variables_and_strings() {
+        let src = "#!/bin/bash\n# c\nNAME=\"app\"\nif [ -f x ]; then\n  echo \"$NAME\"\nfi\n\
+                   f() { echo hi; }\n";
+        let spans = spans_of(Language::Shell, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"# c"));
+        // A shebang is a comment to this grammar, which is the right answer for colour.
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"#!/bin/bash"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"if"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"fi"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"echo"));
+        // A function's declaration site, which needs its own arm — the name is a bare
+        // `word`, the same kind as every command argument in the file.
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"f"));
+        // Upstream gives variable_name @property; in shell there is nothing else competing
+        // for the word "variable", so it reads as one.
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"NAME"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"$NAME\""));
+        assert!(styled(src, &spans, HighlightStyle::Operator).contains(&"="));
+    }
+
+    #[test]
+    fn env_files_colour_both_sides_of_the_assignment() {
+        // `.env` has no grammar of its own and rides on bash (see `Language::Shell`). Its
+        // values are bare words, which upstream's query captures nowhere — so before the
+        // `value: (word)` arm this file came out with keys coloured and values plain,
+        // which is exactly half a feature.
+        let src = "# c\nAPP_NAME=Laravel\nDB_PORT=3306\nAPP_KEY=\n";
+        let spans = spans_of(Language::Shell, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"APP_NAME"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"Laravel"));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"3306"));
+        // An empty value is valid `.env` and must not break the parse around it.
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"APP_KEY"));
+    }
+
+    #[test]
+    fn artisan_highlights_as_php_despite_the_shebang() {
+        // `artisan` is detected by filename (it has no extension), and it opens with
+        // `#!/usr/bin/env php` — which is not PHP. The grammar is loaded with LANGUAGE_PHP
+        // rather than PHP_ONLY precisely so text outside `<?php` parses as inline HTML
+        // instead of erroring, so the shebang should cost nothing. Asserted rather than
+        // assumed: if it did error, the whole file would come back with no spans, which is
+        // the #53 symptom wearing a different hat.
+        let src = "#!/usr/bin/env php\n<?php\n\nrequire __DIR__.'/vendor/autoload.php';\n\
+                   define('LARAVEL_START', microtime(true));\n";
+        let spans = spans_of(Language::Php, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"require"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"define"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"'LARAVEL_START'"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"microtime"));
+
+        // The shebang itself stays plain. It is not PHP, and the grammar parses it as inline
+        // text — which is the point: it does not become an error node that unstyles the rest.
+        assert!(spans.iter().all(|s| !src[s.range.clone()].starts_with("#!")));
     }
 
     #[test]

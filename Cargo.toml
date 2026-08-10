@@ -41,6 +41,12 @@ tree-sitter-json = "0.24"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-css = "0.25"
+tree-sitter-html = "0.23"
+# `tree-sitter-toml` on crates.io is 0.20 and abandoned; `-ng` is the tree-sitter-grammars
+# org's maintained fork and the one that still tracks the current ABI.
+tree-sitter-toml-ng = "0.7"
+tree-sitter-bash = "0.25"
+tree-sitter-yaml = "0.7"
 ignore = "0.4"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"

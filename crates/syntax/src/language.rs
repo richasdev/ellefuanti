@@ -25,6 +25,26 @@ pub enum Language {
     JavaScript,
     TypeScript,
     Css,
+    Html,
+    Toml,
+    Yaml,
+    /// `sh`, `bash`, and `.env`.
+    ///
+    /// `.env` is not shell and has no grammar of its own, but the subset Laravel writes —
+    /// `KEY=value`, `#` comments, occasional quoting — is exactly what the bash grammar
+    /// already parses, and `.env` files are literally sourced by shells. Reusing the
+    /// grammar costs nothing; a dedicated one would be another ~200 KB for a format with
+    /// two token types. What it rules out: a value containing shell metacharacters
+    /// (`DB_PASSWORD=a|b`) parses as a pipeline rather than a string, so it colours oddly.
+    /// That is a worse failure than plain text only if it is common, and it is not.
+    ///
+    /// This is the expensive one. `tree-sitter-bash` compiles to a 1.5 MB rlib — 34× TOML,
+    /// 29× HTML, and most of the 1.6 MB this batch of grammars adds to the binary. Bash's
+    /// grammar is genuinely that large (word expansion, here-docs and a hand-written
+    /// external scanner), so it is the price of shell at all, not something to tune. It is
+    /// also what makes `.env` free rather than a fifth grammar, which is part of why the
+    /// reuse above is worth doing rather than merely clever.
+    Shell,
     /// Recognised extension with no grammar wired up yet: renders as plain text.
     PlainText,
 }
@@ -38,6 +58,10 @@ impl Language {
             Language::JavaScript => "JavaScript",
             Language::TypeScript => "TypeScript",
             Language::Css => "CSS",
+            Language::Html => "HTML",
+            Language::Toml => "TOML",
+            Language::Yaml => "YAML",
+            Language::Shell => "Shell",
             Language::PlainText => "Plain Text",
         }
     }
@@ -53,6 +77,10 @@ impl Language {
             Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
             Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Language::Css => Some(tree_sitter_css::LANGUAGE.into()),
+            Language::Html => Some(tree_sitter_html::LANGUAGE.into()),
+            Language::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
+            Language::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
+            Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
             Language::PlainText => None,
         }
     }
@@ -78,6 +106,10 @@ impl Language {
                 include_str!("../queries/typescript.scm")
             )),
             Language::Css => Some(include_str!("../queries/css.scm")),
+            Language::Html => Some(include_str!("../queries/html.scm")),
+            Language::Toml => Some(include_str!("../queries/toml.scm")),
+            Language::Yaml => Some(include_str!("../queries/yaml.scm")),
+            Language::Shell => Some(include_str!("../queries/bash.scm")),
             Language::Php | Language::Blade | Language::PlainText => None,
         }
     }
@@ -97,25 +129,53 @@ impl Language {
 /// [`Language::name`] is what keeps it complete: an exhaustive match, so a new variant
 /// is a compile error pointing at the function, and the length assertion in
 /// `the_list_covers_every_language` catches the half the compiler cannot.
-pub const ALL_LANGUAGES: [Language; 7] = [
+pub const ALL_LANGUAGES: [Language; 11] = [
     Language::Php,
     Language::Blade,
     Language::Json,
     Language::JavaScript,
     Language::TypeScript,
     Language::Css,
+    Language::Html,
+    Language::Toml,
+    Language::Yaml,
+    Language::Shell,
     Language::PlainText,
 ];
 
 /// Picks a language from a file path.
 ///
 /// Blade is checked before PHP because `.blade.php` also ends in `.php`.
+///
+/// Whole-name matches come before extensions because the files a Laravel project keeps at
+/// its root mostly have no extension to match on: `artisan` is PHP, `.env` is shell-shaped,
+/// `Dockerfile` is neither. Before this, every one of them opened as plain text — which is
+/// exactly the #53 complaint, just for the files that happen to sit where you see them
+/// first.
 pub fn language_for_path(path: &Path) -> Language {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
 
     if name.ends_with(".blade.php") {
         return Language::Blade;
     }
+
+    match name.as_str() {
+        // Laravel's CLI entry point: a PHP file with a `#!/usr/bin/env php` shebang and no
+        // extension. The PHP grammar handles the shebang (it parses as text before the
+        // `<?php` tag, same as the HTML around a template).
+        "artisan" => return Language::Php,
+        // `.env`, `.env.example`, `.env.testing` — see the `Shell` variant for why the bash
+        // grammar and not a dedicated one.
+        n if n == ".env" || n.starts_with(".env.") => return Language::Shell,
+        // Dotfiles that are shell by convention rather than by extension.
+        ".bashrc" | ".bash_profile" | ".profile" | ".zshrc" => return Language::Shell,
+        // `Dockerfile` is conspicuously absent, and it is the other obvious candidate #53
+        // named. `tree-sitter-dockerfile` is at 0.2.0, last released against a tree-sitter
+        // three majors back, and sits outside the tree-sitter-grammars org that maintains
+        // everything else here. One file per project is not worth an unmaintained parser.
+        _ => {}
+    }
+
     match name.rsplit_once('.').map(|(_, ext)| ext) {
         Some("php" | "phtml") => Language::Php,
         // `.jsonc` and `.json5` are deliberately absent: the JSON grammar rejects the
@@ -131,6 +191,17 @@ pub fn language_for_path(path: &Path) -> Language {
         // `.scss`/`.less` are supersets this grammar does not accept — nesting and `$vars`
         // parse as errors. Plain text is the honest answer until a SCSS grammar lands.
         Some("css") => Language::Css,
+        // `.vue` and `.svelte` are absent: they are single-file components whose `<script>`
+        // and `<style>` blocks need tree-sitter injections to parse, and the HTML grammar
+        // alone renders their whole body as one attribute-less text node.
+        Some("html" | "htm" | "xhtml") => Language::Html,
+        // `.xml` is NOT here, and phpunit.xml is the reason to want it: the HTML grammar
+        // accepts XML syntactically but hard-codes HTML's void elements and raw-text
+        // elements (`<script>`, `<style>`), so an XML document using those names parses
+        // wrong rather than approximately. An XML grammar is the fix, not this one.
+        Some("toml") => Language::Toml,
+        Some("yml" | "yaml") => Language::Yaml,
+        Some("sh" | "bash" | "zsh") => Language::Shell,
         _ => Language::PlainText,
     }
 }
@@ -174,6 +245,28 @@ mod tests {
             ("app.ts", Language::TypeScript),
             ("types.d.ts", Language::TypeScript),
             ("app.css", Language::Css),
+            ("welcome.html", Language::Html),
+            ("docker-compose.yml", Language::Yaml),
+            (".github/workflows/ci.yaml", Language::Yaml),
+            ("deploy.sh", Language::Shell),
+            ("rustfmt.toml", Language::Toml),
+        ];
+        for (name, want) in cases {
+            assert_eq!(language_for_path(&PathBuf::from(name)), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn laravel_root_files_with_no_extension_are_still_detected() {
+        // The files sitting at the top of every Laravel project, none of which the
+        // extension split can see. `artisan` was the specific one called out in #53's
+        // follow-up: it is PHP, it is the first thing many people open, and matching on
+        // `.php` misses it entirely.
+        let cases = [
+            ("artisan", Language::Php),
+            (".env", Language::Shell),
+            (".env.example", Language::Shell),
+            (".env.testing", Language::Shell),
         ];
         for (name, want) in cases {
             assert_eq!(language_for_path(&PathBuf::from(name)), want, "{name}");
@@ -192,12 +285,14 @@ mod tests {
             "App.tsx",        // needs LANGUAGE_TSX, not LANGUAGE_TYPESCRIPT
             "app.scss",       // nesting and $vars are not CSS
             "theme.less",     // likewise
-            "docker-compose.yml",
+            "App.vue",        // a single-file component needs injections, not the HTML grammar
+            "App.svelte",     // likewise
+            "phpunit.xml",    // the HTML grammar hard-codes HTML's void and raw-text elements
+            "Dockerfile",     // tree-sitter-dockerfile is 0.2.0 and unmaintained
+            "Dockerfile.prod",
             "README.md",
             "schema.sql",
-            "Cargo.toml",
             "main.rs",
-            ".env",
         ] {
             assert_eq!(language_for_path(&PathBuf::from(name)), Language::PlainText, "{name}");
         }
@@ -209,7 +304,7 @@ mod tests {
         // never named. What it cannot catch is a new variant missing from ALL_LANGUAGES,
         // which would silently shrink the coverage of every test that iterates it —
         // including the viewport-cost one, which is the expensive property to lose.
-        assert_eq!(ALL_LANGUAGES.len(), 7, "a new Language needs adding to ALL_LANGUAGES");
+        assert_eq!(ALL_LANGUAGES.len(), 11, "a new Language needs adding to ALL_LANGUAGES");
         for (i, a) in ALL_LANGUAGES.iter().enumerate() {
             assert!(!ALL_LANGUAGES[i + 1..].contains(a), "{} is listed twice", a.name());
         }
