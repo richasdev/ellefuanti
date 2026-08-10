@@ -804,6 +804,16 @@ impl WorkspaceView {
         self.dismiss_find(window, cx);
     }
 
+    /// Parks focus on the workspace root, the state a dismissed palette leaves behind.
+    ///
+    /// Focus is what #95 is about, so a test asserting an open *restores* it has to be able
+    /// to take it away first — otherwise the tab's own open already focused the editor and
+    /// the assertion holds regardless.
+    #[cfg(test)]
+    pub fn focus_root_for_test(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+    }
+
     /// Publishes diagnostics as if a server had sent them, and pushes them to the editors.
     ///
     /// This is the tail of `apply_lsp_events` with the server removed, for the same reason
@@ -842,10 +852,19 @@ impl WorkspaceView {
     /// `open_path` reads from disk on the background executor, which a render test cannot
     /// drive without a real file and a real await. This is the same tail of that function
     /// with the IO removed, so the view under test reaches the state a real open produces.
+    ///
+    /// That includes focus. Leaving it out would make this helper a *different* open from
+    /// the real one, and #95 is precisely the bug where two opens disagreed about focus.
     #[cfg(test)]
-    pub fn open_document_for_test(&mut self, document: Document, cx: &mut Context<Self>) {
+    pub fn open_document_for_test(
+        &mut self,
+        document: Document,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let path = document.path.clone();
-        let editor = self.new_editor(document, cx);
+        let editor = self.new_editor(document, window, cx);
+        window.focus(&editor.read(cx).focus_handle(cx));
         self.tabs.push(Tab { path, editor });
         self.active_tab = self.tabs.len() - 1;
         cx.notify();
@@ -856,21 +875,28 @@ impl WorkspaceView {
     /// Every tab goes through here so none can be created without the subscription — a
     /// ⌘click that silently does nothing in tabs opened one particular way is the kind of
     /// bug that survives a long time, because the feature demonstrably works elsewhere.
-    fn new_editor(&self, document: Document, cx: &mut Context<Self>) -> Entity<EditorView> {
+    fn new_editor(
+        &self,
+        document: Document,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<EditorView> {
         let editor = cx.new(|cx| EditorView::new(document, cx));
-        cx.subscribe(&editor, |this, _editor, event, cx| match event {
+        // `subscribe_in` rather than `subscribe`: a ⌘click ends in an open, and an open now
+        // has to move focus (#95), which needs a window all the way down.
+        cx.subscribe_in(&editor, window, |this, _editor, event, window, cx| match event {
             // The editor has already moved the cursor, so the origin this reads is the
             // clicked position — which is both where the query is about and where Back
             // should return to.
-            EditorEvent::GoToDefinition => this.go_to_definition_at_cursor(cx),
+            EditorEvent::GoToDefinition => this.go_to_definition_at_cursor(window, cx),
         })
         .detach();
         editor
     }
 
     /// Opens a file in a tab, or activates the tab already showing it.
-    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.open_path_at(path, None, cx);
+    pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_path_at(path, None, window, cx);
     }
 
     /// Opens a file and, if `target` is given, puts the cursor there.
@@ -891,7 +917,22 @@ impl WorkspaceView {
     /// The target is a [`Point`], not a byte offset. A line number is what every producer
     /// actually has — a route index, an LSP position, a stack frame — and resolving it to
     /// an offset needs the buffer, which does not exist until the load finishes.
-    pub fn open_path_at(&mut self, path: PathBuf, target: Option<Point>, cx: &mut Context<Self>) {
+    ///
+    /// # Why this takes a `Window`
+    ///
+    /// Opening a file is also a focus change, and #95 is what it costs to treat those as
+    /// separate concerns: this function landed the cursor on the right line and left the
+    /// keyboard wherever it was, so every command-driven jump — F12, ⇧F12, ⌘⇧O, the route
+    /// palette — looked like it had worked and then swallowed the next keystroke. The tree's
+    /// click path focused because it happened to have a `Window`; this one did not have one
+    /// to focus with. Both doors now lead here, so there is one answer for both.
+    pub fn open_path_at(
+        &mut self,
+        path: PathBuf,
+        target: Option<Point>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
             // A file already open still has to move: "go to definition" on something in the
@@ -903,32 +944,41 @@ impl WorkspaceView {
                     cx.notify();
                 });
             }
+            // The common case for go-to-definition, and so the one that has to focus: the
+            // tab was already in front of the user and nothing else would move focus for us.
+            window.focus(&self.tabs[index].editor.read(cx).focus_handle(cx));
             cx.notify();
             return;
         }
 
         let load_path = path.clone();
-        let task = cx.spawn(async move |this, cx| {
+        // `spawn_in` rather than `spawn`: the focus below happens after an await, so the
+        // task needs a window context to reach it.
+        let task = cx.spawn_in(window, async move |this, cx| {
             let loaded = cx.background_spawn(async move { read_file(&load_path) }).await;
 
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 match loaded {
                     Ok(file) => {
                         match Document::new(Some(path.clone()), &file.text, file.trailing_newline) {
                             Ok(document) => {
                                 let text = document.buffer.text();
-                                let editor = this.new_editor(document, cx);
+                                let editor = this.new_editor(document, window, cx);
                                 // Before the tab is pushed, so the first frame the user sees
                                 // is already at the target rather than painting the top of
                                 // the file and jumping a frame later.
                                 if let Some(target) = target {
                                     editor.update(cx, |editor, _| editor.reveal(target));
                                 }
+                                window.focus(&editor.read(cx).focus_handle(cx));
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
                                 this.status = None;
                                 this.open_on_lsp(&path, &text);
                             }
+                            // Focus stays where it was on a failure: the file the user asked
+                            // for is not on screen, so moving the keyboard into whatever is
+                            // would type into the wrong buffer.
                             Err(err) => this.status = Some(format!("{err:#}").into()),
                         }
                     }
@@ -951,12 +1001,14 @@ impl WorkspaceView {
     /// Unlike `open_path` there is no dedup: ⌘N twice means the user wants two scratch
     /// buffers, and they have no path to match on anyway.
     ///
-    /// Takes no `Window` — nothing here needs one, and leaving it out is what lets a test
-    /// call the real handler rather than a copy of it.
-    pub fn new_file(&mut self, cx: &mut Context<Self>) {
+    /// Takes a `Window` because a new buffer, like an opened file, has to end up holding the
+    /// keyboard — ⌘N followed by typing must land in the scratch buffer, not wherever focus
+    /// happened to be (#95).
+    pub fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match Document::untitled() {
             Ok(document) => {
-                let editor = self.new_editor(document, cx);
+                let editor = self.new_editor(document, window, cx);
+                window.focus(&editor.read(cx).focus_handle(cx));
                 self.tabs.push(Tab { path: None, editor });
                 self.active_tab = self.tabs.len() - 1;
                 self.status = None;
@@ -1613,9 +1665,9 @@ impl WorkspaceView {
     ///
     /// No settings *UI*: the file is the interface for now, and a form over four keys is
     /// the kind of thing that has to be rebuilt the moment a fifth key is not a string.
-    fn open_settings(&mut self, _: &OpenSettings, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         match crate::settings::path_for_editing(cx) {
-            Some(path) => self.open_path(path, cx),
+            Some(path) => self.open_path(path, window, cx),
             // Only when HOME is unset or the file is unparseable — both already logged, and
             // both mean there is no file it would be safe to open.
             None => {
@@ -1914,7 +1966,7 @@ impl WorkspaceView {
     /// is also why this returns `true` before knowing whether a target was found. Claiming
     /// the click is the right call either way: the alternative is asking a language server
     /// about a string literal, which has no answer.
-    fn go_to_laravel_target(&mut self, cx: &mut Context<Self>) -> bool {
+    fn go_to_laravel_target(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else {
             return false;
         };
@@ -1932,11 +1984,11 @@ impl WorkspaceView {
         };
 
         let origin = self.current_location(cx);
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let found =
                 cx.background_spawn(async move { elle_laravel::resolve(&root, &reference) }).await;
 
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 // Nothing found means nothing said. A view comes from a configurable
                 // finder, a component from a registered namespace, a route from any
                 // service provider — so "we could not find it" is the only true statement
@@ -1949,7 +2001,7 @@ impl WorkspaceView {
                 // file without moving the cursor, which is the honest result when the key
                 // resolved to a file but not to a line inside it.
                 let point = target.line.map(|line| Point::new(line.saturating_sub(1), 0));
-                this.open_path_at(target.path, point, cx);
+                this.open_path_at(target.path, point, window, cx);
                 cx.notify();
             })
             .ok();
@@ -1962,10 +2014,10 @@ impl WorkspaceView {
     fn go_to_definition(
         &mut self,
         _: &GoToDefinition,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.go_to_definition_at_cursor(cx);
+        self.go_to_definition_at_cursor(window, cx);
     }
 
     /// Go to definition from wherever the cursor is.
@@ -1978,8 +2030,8 @@ impl WorkspaceView {
     /// is a string literal, so a language server has nothing to say about it, and the two
     /// can never both have an answer for the same click. When Laravel has none the request
     /// goes to the server exactly as before, so nothing that worked before this stops.
-    fn go_to_definition_at_cursor(&mut self, cx: &mut Context<Self>) {
-        if self.go_to_laravel_target(cx) {
+    fn go_to_definition_at_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.go_to_laravel_target(window, cx) {
             return;
         }
 
@@ -2001,10 +2053,10 @@ impl WorkspaceView {
 
         let origin = self.current_location(cx);
         let query = id.clone();
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let found = Self::poll_query::<GotoDefinitionResponse>(&this, &query, cx).await;
 
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.status = None;
                 // Answered, so there is nothing left to cancel. Clearing it keeps a later
                 // navigation from sending `$/cancelRequest` for an id the server has
@@ -2020,7 +2072,7 @@ impl WorkspaceView {
                             if let Some(origin) = origin {
                                 this.history.push(origin);
                             }
-                            this.open_path_at(path, Some(point), cx);
+                            this.open_path_at(path, Some(point), window, cx);
                         }
                         None => this.status = Some("No definition found".into()),
                     },
@@ -2203,22 +2255,22 @@ impl WorkspaceView {
     }
 
     /// Back (⌃-): return to where the last jump started.
-    fn navigate_back(&mut self, _: &NavigateBack, _window: &mut Window, cx: &mut Context<Self>) {
+    fn navigate_back(&mut self, _: &NavigateBack, window: &mut Window, cx: &mut Context<Self>) {
         let Some(here) = self.current_location(cx) else { return };
         let Some((path, point)) = self.history.back(here) else { return };
-        self.open_path_at(path, Some(point), cx);
+        self.open_path_at(path, Some(point), window, cx);
     }
 
     /// Forward (⌃⇧-): undo a Back.
     fn navigate_forward(
         &mut self,
         _: &NavigateForward,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(here) = self.current_location(cx) else { return };
         let Some((path, point)) = self.history.forward(here) else { return };
-        self.open_path_at(path, Some(point), cx);
+        self.open_path_at(path, Some(point), window, cx);
     }
 
     // --- language server ------------------------------------------------------------
@@ -2552,7 +2604,7 @@ impl WorkspaceView {
                 {
                     self.history.push(origin);
                 }
-                self.open_path_at(path, target, cx);
+                self.open_path_at(path, target, window, cx);
             }
             // The one mode that writes into the buffer instead of opening a file (#83).
             Some(PaletteMode::RouteNames) => self.insert_route_name(completion_target, &id, cx),
@@ -2561,7 +2613,7 @@ impl WorkspaceView {
                 // a keybinding cannot drift apart.
                 match dispatch_for(elle_core::CommandId(leak_id(&self.registry, &id))) {
                     Dispatch::OpenFolder => self.open_folder(&OpenFolder, window, cx),
-                    Dispatch::NewFile => self.new_file(cx),
+                    Dispatch::NewFile => self.new_file(window, cx),
                     Dispatch::Save => self.save(&Save, window, cx),
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
@@ -2761,7 +2813,7 @@ impl Render for WorkspaceView {
             .key_context(context::WORKSPACE)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::open_folder))
-            .on_action(cx.listener(|this, _: &NewFile, _window, cx| this.new_file(cx)))
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| this.new_file(window, cx)))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_command_palette))
@@ -3007,12 +3059,12 @@ impl WorkspaceView {
                                 .active(|el| el.bg(pressed))
                                 .cursor_pointer()
                                 .text_color(if is_dir { text } else { muted })
-                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                                     entity.update(cx, |this, cx| {
                                         if is_dir {
                                             this.toggle_tree_entry(index, cx);
                                         } else {
-                                            this.open_path(path.clone(), cx);
+                                            this.open_path(path.clone(), window, cx);
                                         }
                                     });
                                 })
