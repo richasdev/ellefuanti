@@ -3193,31 +3193,36 @@ impl Render for WorkspaceView {
     }
 }
 
+/// The activity bar's entries, in order, and which sidebar each one selects.
+///
+/// Later panels are shown disabled rather than hidden (`None`), so the shape of the product
+/// is legible from the first commit (§6) without pretending they work. Git was turned on by
+/// #64; **Search by #80**, which needed no new mechanism — #64 had already built the exact
+/// abstraction, a `Sidebar` the activity bar selects, so find-in-project became a variant
+/// rather than a second switch beside it.
+///
+/// Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned` is what
+/// keeps that honest — a `zip` stops at the shorter side, so an added panel with no icon
+/// would silently vanish off the bar rather than fail.
+///
+/// A const rather than a local inside `render_activity_bar`, since #80: that test was
+/// checking `icons::ICONS` against a list of names **retyped inside the test**, which
+/// guards the icons and leaves the array the renderer actually zips unguarded. Renaming a
+/// panel here would have kept the test green while every glyph shifted one place. There is
+/// one list now, and the test reads it.
+const ACTIVITY_PANELS: [(&str, Option<Sidebar>); 7] = [
+    ("Explorer", Some(Sidebar::Explorer)),
+    ("Search", Some(Sidebar::Search)),
+    ("Git", Some(Sidebar::Git)),
+    ("Laravel", None),
+    ("Database", None),
+    ("Docker", None),
+    ("Tests", None),
+];
+
 impl WorkspaceView {
     fn render_activity_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        // Later panels are shown disabled rather than hidden, so the shape of the product
-        // is legible from the first commit (§6) without pretending they work.
-        //
-        // **Git is now enabled** — this is the issue that turns it on (#64). The third
-        // element is the sidebar it selects; `None` means still disabled.
-        //
-        // **Search is now enabled too** (#80), which is the third `Some` here. Nothing else
-        // about this function changed: #64 already built the exact abstraction find-in-
-        // project needed — a `Sidebar` the activity bar selects — so the panel became a
-        // variant rather than a second mechanism beside it.
-        //
-        // Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned`
-        // below is what keeps that honest — a zip would silently drop a panel if the two
-        // ever fell out of step.
-        let panels = [
-            ("Explorer", Some(Sidebar::Explorer)),
-            ("Search", Some(Sidebar::Search)),
-            ("Git", Some(Sidebar::Git)),
-            ("Laravel", None),
-            ("Database", None),
-            ("Docker", None),
-            ("Tests", None),
-        ];
+        let panels = ACTIVITY_PANELS;
 
         let entity = cx.entity();
         let active = self.sidebar;
@@ -3623,20 +3628,42 @@ mod tests {
     /// against the wrong panel.
     #[test]
     fn panels_and_icons_stay_aligned() {
-        let expected = ["explorer", "search", "git", "laravel", "database", "docker", "tests"];
-
         assert_eq!(
             icons::ICONS.len(),
-            expected.len(),
+            ACTIVITY_PANELS.len(),
             "the activity bar renders {} panels; add the matching icon to icons::ICONS",
-            expected.len()
+            ACTIVITY_PANELS.len()
         );
 
-        for (icon, name) in icons::ICONS.iter().zip(expected) {
+        for (icon, (name, _)) in icons::ICONS.iter().zip(ACTIVITY_PANELS) {
             assert_eq!(
                 icon.path,
-                format!("icons/{name}.svg"),
+                format!("icons/{}.svg", name.to_lowercase()),
                 "icons::ICONS is out of order: every panel would get the wrong glyph"
+            );
+        }
+    }
+
+    /// Every enabled panel selects a *distinct* sidebar, and every `Sidebar` is reachable.
+    ///
+    /// Two failure modes, neither of which the alignment test above can see. Two entries
+    /// pointing at the same variant would light up together and switch to the same panel;
+    /// a variant with no entry would be a sidebar the user has no way to reach — which is
+    /// exactly what `Sidebar::Search` was between #64 and #80, and the reason the enum was
+    /// worth reading rather than a bool.
+    #[test]
+    fn every_enabled_panel_selects_a_distinct_and_reachable_sidebar() {
+        let targets: Vec<Sidebar> = ACTIVITY_PANELS.iter().filter_map(|(_, t)| *t).collect();
+
+        let mut unique = targets.clone();
+        unique.sort_by_key(|s| format!("{s:?}"));
+        unique.dedup();
+        assert_eq!(unique.len(), targets.len(), "two entries select the same sidebar: {targets:?}");
+
+        for sidebar in [Sidebar::Explorer, Sidebar::Search, Sidebar::Git] {
+            assert!(
+                targets.contains(&sidebar),
+                "{sidebar:?} has no activity-bar entry, so nothing can select it"
             );
         }
     }

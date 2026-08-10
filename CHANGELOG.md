@@ -262,24 +262,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
   Clicking a result goes through `open_path_at` (#88), not a second jump path.
 
-  The activity bar's Explorer and Search icons are now a real two-way switch with a click
-  handler, which is the first time pressing one could honestly do anything.
+  **The Search panel is a `Sidebar` variant, not a mechanism beside one.** #64 landed the
+  git panel and with it the abstraction this needed — an enum the activity bar selects and
+  the sidebar renders — while #80 was in flight. Rebasing onto it deleted more of this
+  branch than it added: a parallel `Option<Entity<SearchPanel>>`-drives-the-sidebar switch,
+  a second `render_tree_panel`, and a bespoke selected-state tuple all became
+  `Sidebar::Search`. The panel is now **kept once built** rather than dropped on close, for
+  the reason the git panel is: switching to Explorer and back must not re-walk the project
+  to rebuild a list you already had. Only work still _in flight_ is cancelled when the
+  sidebar changes — results you can see survive, work you cannot see does not.
 
-### Fixed
+  It is built lazily rather than eagerly in `WorkspaceView::new` like the git panel, and
+  that difference is forced: a result click opens a file, opening focuses the editor since
+  #102, and focusing needs a `Window` — so the subscription must be `subscribe_in`, and
+  `new` has no window to give it. Git's events never open anything.
 
-- **`scripts/perf-gate.sh` did not notice `clippy-driver`**, and reported a contaminated
-  number rather than refusing (#84, found while measuring #80). The guard names compilers
-  individually — `pgrep -x 'cargo|rustc|cc1plus|clang'` — and rustc's toolchain ships more
-  front ends than that list knows about. The gate printed **idle CPU at 8.00%, four times
-  its own 2% limit**, while `pgrep` said the machine was clear and two `clippy-driver`
-  processes were burning 114% between them.
-
-  That is precisely the failure the guard exists to prevent, arriving through the guard.
-  `clippy-driver` and `rustdoc` are named now, but a list is only as good as the names on
-  it, so a **load-average check** backs it up: above 4.0 the gate refuses regardless of what
-  is running. A machine at load 9 is contaminated whether or not the thing loading it is a
-  compiler, and the reading that prompted this was taken at 8.7 with three sibling agents
-  building at once.
+  `panels_and_icons_stay_aligned` was checking `icons::ICONS` against a list of names
+  **retyped inside the test**, which guards the icons and leaves the array the renderer
+  actually zips unguarded — renaming a panel would keep it green while every glyph shifted.
+  The list is a module-level `ACTIVITY_PANELS` const now and the test reads it, plus a new
+  one asserting every enabled entry selects a distinct sidebar and every `Sidebar` variant
+  is reachable. That second property is what `Sidebar::Search` failed between #64 and #80.
 
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —
