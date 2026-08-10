@@ -96,14 +96,14 @@ async fn the_workspace_renders_with_a_file_open(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
     // Open a real PHP document through the same path the UI uses.
-    view.update(cx, |workspace, cx| {
+    view.update_in(cx, |workspace, window, cx| {
         let document = Document::new(
             Some(std::path::PathBuf::from("User.php")),
             "<?php\n\nclass User extends Model\n{\n    protected $table = 'users';\n}\n",
             true,
         )
         .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
     });
 
     draw(cx);
@@ -119,8 +119,8 @@ async fn a_new_untitled_buffer_opens_dirty_free_pathless_and_renders(cx: &mut Te
     let registry = registry();
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
-    let editor = workspace.update(cx, |workspace, cx| {
-        workspace.new_file(cx);
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.new_file(window, cx);
         workspace.active_editor_for_test().expect("⌘N must leave the new buffer active")
     });
 
@@ -240,14 +240,14 @@ async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut 
     let registry = registry();
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
-    let editor = workspace.update(cx, |workspace, cx| {
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
         let document = Document::new(
             Some(std::path::PathBuf::from("click.php")),
             "<?php\n$first = 1;\n$second = 2;\n$third = 3;\n",
             true,
         )
         .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
         workspace.active_editor_for_test().expect("the opened document is active")
     });
 
@@ -401,14 +401,14 @@ async fn switching_the_theme_at_runtime_repaints_every_surface(cx: &mut TestAppC
     let registry = registry();
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
-    workspace.update(cx, |workspace, cx| {
+    workspace.update_in(cx, |workspace, window, cx| {
         let document = Document::new(
             Some(std::path::PathBuf::from("User.php")),
             "<?php\n\nclass User extends Model\n{\n    protected $table = 'users';\n}\n",
             true,
         )
         .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
     });
 
     cx.update(|window, cx| {
@@ -455,14 +455,14 @@ async fn the_workspace_renders_normally_with_no_language_server(cx: &mut TestApp
     let registry = registry();
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
-    workspace.update(cx, |workspace, cx| {
+    workspace.update_in(cx, |workspace, window, cx| {
         let document = Document::new(
             Some(std::path::PathBuf::from("User.php")),
             "<?php\n\nclass User\n{\n    public $name;\n}\n",
             true,
         )
         .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
     });
 
     workspace.read_with(cx, |workspace, _cx| {
@@ -503,7 +503,7 @@ async fn an_editor_with_diagnostics_renders(cx: &mut TestAppContext) {
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
     let path = std::path::PathBuf::from("User.php");
-    workspace.update(cx, |workspace, cx| {
+    workspace.update_in(cx, |workspace, window, cx| {
         let document = Document::new(
             Some(path.clone()),
             // Line 4 carries multibyte characters, so a UTF-16 range over it is the case
@@ -512,7 +512,7 @@ async fn an_editor_with_diagnostics_renders(cx: &mut TestAppContext) {
             true,
         )
         .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
     });
 
     workspace.update(cx, |workspace, cx| {
@@ -558,10 +558,10 @@ fn workspace_with_php<'a>(
     let registry = registry();
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
     let text = text.to_string();
-    workspace.update(cx, |workspace, cx| {
+    workspace.update_in(cx, |workspace, window, cx| {
         let document = Document::new(Some(std::path::PathBuf::from("User.php")), &text, true)
             .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
     });
     (workspace, cx)
 }
@@ -737,14 +737,14 @@ async fn switching_tabs_with_the_bar_open_searches_the_new_file(cx: &mut TestApp
     draw(cx);
 
     // A second tab, with three hits instead of one.
-    workspace.update(cx, |workspace, cx| {
+    workspace.update_in(cx, |workspace, window, cx| {
         let document = Document::new(
             Some(std::path::PathBuf::from("Post.php")),
             "<?php\n$user = 1;\n$user = 2;\n$user = 3;\n",
             true,
         )
         .expect("php grammar loads");
-        workspace.open_document_for_test(document, cx);
+        workspace.open_document_for_test(document, window, cx);
     });
     draw(cx);
 
@@ -756,6 +756,94 @@ async fn switching_tabs_with_the_bar_open_searches_the_new_file(cx: &mut TestApp
             "the query followed the user to the newly active file"
         );
     });
+}
+
+#[gpui::test]
+async fn navigating_by_command_leaves_the_keyboard_in_the_editor(cx: &mut TestAppContext) {
+    // #95, reported from real use: a command-driven jump landed on the right line and then
+    // ignored the keyboard until the user clicked. `open_path_at` had no `Window` and so
+    // could not focus anything, while the file tree's `open_path` did — the same action
+    // through two doors, one of which left focus behind.
+    //
+    // The assertion is typing, not `window.focused()`. Focus is only interesting here
+    // because keystrokes follow it, and a test that checks the handle would still pass if
+    // `EditorView` stopped tracking that handle in `render`.
+    let (workspace, cx) = workspace_with_php(cx, "<?php\n$user = 1;\n$user = 2;\n");
+    draw(cx);
+
+    // Focus starts on the workspace root, not the editor — the state after dismissing a
+    // palette, which is exactly how ⌘⇧O and the route palette reach an open. Without this
+    // the editor would already hold focus from the open that built the tab, and the test
+    // would pass no matter what `open_path_at` did.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.focus_root_for_test(window, cx);
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        let editor = workspace.active_editor_for_test().expect("a tab is open");
+        assert!(
+            !gpui::Focusable::focus_handle(editor.read(cx), cx).is_focused(window),
+            "the editor must start unfocused or this test proves nothing"
+        );
+    });
+
+    // The already-open branch: go-to-definition within the file you are reading, which is
+    // the common case and the one that looks most like the command simply worked.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_path_at(
+            std::path::PathBuf::from("User.php"),
+            Some(elle_text::Point { row: 2, column: 0 }),
+            window,
+            cx,
+        );
+    });
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the jump kept the tab active");
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(editor.document.cursor_point().row, 2, "the jump moved the cursor");
+    });
+
+    cx.simulate_input("x");
+    editor.read_with(cx, |editor, _cx| {
+        assert!(
+            editor.document.buffer.text().contains('x'),
+            "typing straight after a command-driven jump must reach the buffer — it did not, \
+             so focus was left behind and the user has to click first (#95)"
+        );
+    });
+}
+
+#[gpui::test]
+async fn opening_a_file_from_disk_also_lands_the_keyboard_in_it(cx: &mut TestAppContext) {
+    // The other half of #95. The freshly-loaded branch focuses *after* an await, so it needs
+    // `spawn_in`/`update_in` rather than the plain `spawn` it had — a different mechanism
+    // from the already-open branch above, and so worth its own test rather than assuming
+    // one fix covered both.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("Post.php");
+    std::fs::write(&path, "<?php\nclass Post {}\n").expect("write the fixture");
+
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_path(path.clone(), window, cx);
+    });
+    // The read happens on the background executor, so the tab does not exist yet.
+    cx.run_until_parked();
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the file loaded into a tab");
+    workspace.update_in(cx, |_workspace, window, cx| {
+        assert!(
+            gpui::Focusable::focus_handle(editor.read(cx), cx).is_focused(window),
+            "a file opened from disk must hold the keyboard without a click (#95)"
+        );
+    });
+    draw(cx);
 }
 
 #[gpui::test]

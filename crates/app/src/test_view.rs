@@ -52,7 +52,7 @@ impl RunState {
 ///
 /// A named type because the workspace is what owns the tabs: the panel holds a callback
 /// into it rather than opening files itself, so there stays exactly one jump path (#88).
-type JumpHandler = Box<dyn Fn(&TestCase, &mut App)>;
+type JumpHandler = Box<dyn Fn(&TestCase, &mut Window, &mut App)>;
 
 /// The bottom test panel.
 pub struct TestView {
@@ -82,7 +82,7 @@ impl TestView {
     /// A callback rather than the panel opening the file itself: the panel does not own the
     /// tabs, and `open_path_at` is the workspace's single jump path (#88). Inventing a
     /// second one here is exactly what that issue exists to prevent.
-    pub fn on_jump(&mut self, jump: impl Fn(&TestCase, &mut App) + 'static) {
+    pub fn on_jump(&mut self, jump: impl Fn(&TestCase, &mut Window, &mut App) + 'static) {
         self.on_jump = Some(Box::new(jump));
     }
 
@@ -251,14 +251,14 @@ impl TestView {
                     .when(clickable, |el| {
                         el.cursor_pointer().hover(|el| el.bg(theme.hover)).on_mouse_down(
                             MouseButton::Left,
-                            move |_event, _window, cx| {
+                            move |_event, window, cx| {
                                 entity.update(cx, |this, cx| {
                                     let Some(test) = this.report.tests.get(index) else {
                                         return;
                                     };
                                     if let Some(jump) = &this.on_jump {
                                         let test = test.clone();
-                                        jump(&test, cx);
+                                        jump(&test, window, cx);
                                     }
                                 });
                             },
