@@ -20,12 +20,14 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
 use anyhow::{Context as _, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::grid::{Cell, CellColor, CursorPos, GridSnapshot};
+use crate::keys::TermFlags;
+use crate::selection::GridGeometry;
 
 /// Scrollback depth, in lines.
 ///
@@ -239,6 +241,40 @@ impl Session {
     pub fn snapshot(&self) -> GridSnapshot {
         let mut term = self.shared.term.lock().unwrap_or_else(|e| e.into_inner());
         snapshot_of(&mut term)
+    }
+
+    /// The grid's shape and scroll position, without copying any cells.
+    ///
+    /// A mouse move during a drag needs `display_offset` to know which buffer line the
+    /// pointer is over, and calling [`Session::snapshot`] for that would copy the whole
+    /// visible grid on every move event — a per-event cost against the frame budget (§21)
+    /// to read three integers.
+    pub fn geometry(&self) -> GridGeometry {
+        self.with_term(|term| {
+            let grid = term.grid();
+            GridGeometry::new(
+                grid.history_size(),
+                grid.display_offset(),
+                grid.screen_lines(),
+                grid.columns(),
+            )
+        })
+    }
+
+    /// The DEC private modes that change how input is encoded.
+    ///
+    /// Read per key press rather than cached: a program turns DECCKM on the instant it
+    /// starts (vim does it in its init sequence), and a stale copy means the first few
+    /// arrow presses after launching it go out in the wrong form. The read is a lock the
+    /// reader thread holds only in short bursts, plus a bitflag test.
+    pub fn flags(&self) -> TermFlags {
+        self.with_term(|term| {
+            let mode = term.mode();
+            TermFlags {
+                application_cursor: mode.contains(TermMode::APP_CURSOR),
+                bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            }
+        })
     }
 
     /// Scrolls the viewport by `delta` lines; positive scrolls up into history.
