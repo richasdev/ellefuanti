@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use elle_core::{BUILTIN_COMMANDS, CommandRegistry};
-use gpui::{TestAppContext, VisualTestContext, px, size};
+use gpui::{Focusable, TestAppContext, VisualTestContext, px, size};
 
 use crate::editor::{Document, EditorView};
 use crate::find_bar::{FindEvent, Status};
@@ -225,6 +225,78 @@ async fn the_editor_measures_its_text_origin_during_layout(cx: &mut TestAppConte
     // click handler is back to guessing.
     let gutter = cx.update(|_window, cx| Fonts::get(cx).gutter_width());
     assert!(origin >= gutter, "text should start at or after the gutter, measured {origin:?}");
+}
+
+#[gpui::test]
+async fn an_unfocused_editor_runs_no_blink_timer(cx: &mut TestAppContext) {
+    install_theme(cx);
+    // **This is the perf property, and it is the one worth a test.** A blink is a repaint
+    // on a timer; #79 spent three wrong conclusions on exactly that class of cost and #93's
+    // gate now bounds idle CPU at 2%. gpui has no partial repaint, so the only thing that
+    // makes the blink affordable is that it *stops* — and "stops" here means the `Task` is
+    // dropped, not that a flag is checked inside a still-running loop.
+    //
+    // The editor is created but never focused, which is the state a background tab is in.
+    //
+    // **Read this before trusting the test.** gpui's test platform hardcodes
+    // `is_active() -> false` (`platform/test/window.rs`), so no headless window is ever
+    // active. This therefore proves the teardown path runs and leaves no task behind — a
+    // real regression if someone makes `render` start a timer unconditionally — but it
+    // cannot prove the *inverse*, that a focused editor does start one, because focus can
+    // never be satisfied here. That half was verified by measuring idle CPU on the real
+    // binary with `scripts/perf-gate.sh`, which is the only place it means anything.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("idle.php")), "<?php\n$a = 1;\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    draw(cx);
+
+    assert!(
+        !view.read_with(cx, |editor, _cx| editor.is_blinking_for_test()),
+        "an editor without focus must not hold a blink timer"
+    );
+}
+
+#[gpui::test]
+async fn typing_holds_the_caret_solid(cx: &mut TestAppContext) {
+    install_theme(cx);
+    // A caret that blinks mid-keystroke is worse than one that does not blink at all: the
+    // motion competes with the character appearing under it, and a keystroke landing during
+    // the dark half reads as a dropped character. Every edit therefore forces the caret
+    // visible and restarts the pause before blinking resumes.
+    //
+    // **What this test cannot do, and why it is shaped like this.** gpui's test platform
+    // hardcodes `is_active() -> false` (`platform/test/window.rs`), so a headless window is
+    // never active and `render` — correctly — tears the blink down every frame. There is
+    // therefore no way to observe the blink *through a draw* from here. An earlier version
+    // of this test focused the view and drew first; it failed, and it failed for the right
+    // reason. So this drives the edit path directly and asserts its post-condition, which
+    // is the part that carries the behaviour anyway.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(Some(std::path::PathBuf::from("type.php")), "<?php\n", true)
+            .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        // Force the caret into its hidden half, the way a timer tick would.
+        editor.set_caret_hidden_for_test();
+        // An edit through the same path a keystroke takes.
+        editor.document.insert("$");
+        editor.after_edit_for_test(cx);
+
+        assert!(
+            editor.caret_visible_for_test(),
+            "an edit must force the caret visible rather than leave it mid-cycle"
+        );
+        assert!(
+            editor.is_blinking_for_test(),
+            "and must schedule the resume, not stop blinking altogether"
+        );
+    });
 }
 
 #[gpui::test]

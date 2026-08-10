@@ -9,6 +9,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- **A real caret: thin, between characters, blinking** (#98). The block cursor — a background
+  highlight on the character _under_ the cursor — is gone. `crates/app/src/editor/caret.rs`
+  is this repo's first `Element` implementation, which is the point: `Element` is the only
+  place in gpui where text can be measured, so the caret's x comes from
+  `LineLayout::x_for_index` on the actually-shaped line rather than from arithmetic.
+
+  **Why measuring rather than `column * cell_width`.** The editor font is verified monospaced,
+  so multiplying would have been shorter and right for ASCII. It is wrong twice: `crates/app/src/fonts.rs`
+  documents that a missing family silently falls back to a _proportional_ face, under which an
+  arithmetic caret drifts further from the text with every column; and `column` is a **byte**
+  offset, so `ação` (6 bytes, 4 characters) would put the caret past the end of the word.
+
+  Two things came free from `x_for_index` returning the line width past the last glyph: a caret
+  at end-of-line, and the deletion of the padding space `line_runs` used to append so the block
+  had a cell to paint on. The documented overlay order is now `matches → guides → bracket`; the
+  cursor left that list entirely, so a caret inside a search hit or on a bracket is drawn _over_
+  it rather than punching a hole in it — which is the bug shape #80-on-#87 recorded two of.
+
+- **Blink on a timer that stops** (#98). 530ms half-period, matching macOS's own
+  `NSTextInsertionPointBlinkPeriod`. It holds solid while typing and while moving, resuming
+  500ms after you stop: a caret that blinks mid-keystroke competes with the character
+  appearing under it.
+
+  **The cost is the interval, because it cannot be the area.** gpui 0.2.2 has no partial
+  repaint — `App::notify` sets the window's `dirty` flag and the next frame redraws everything,
+  and there is no damage-rect API at the platform layer to reach for instead. So the blink is a
+  `Task` on the background executor at ~1.9 repaints/second, not `with_animation`'s 60 — the
+  pattern #71 rejected for exactly this reason. It is torn down (the `Task` **dropped**, not a
+  flag checked inside a still-running loop) whenever the editor loses focus or the window
+  deactivates, so a background tab and an unfocused window cost nothing.
+
+  Measured with `scripts/perf-gate.sh --build`, idle CPU **0.60% → 0.70%** against a 2% gate
+  (gpui's own display-link floor is ~0.5–0.9%). Measured a second way, on the real bundle with
+  an active window, the caret build read **1.10%** against the block cursor's **1.25%** — i.e.
+  inside the noise of the method, which is the honest reading rather than a claimed improvement.
+
 - **A source control panel: git status and diff, read-only** (#64, items 1 and 2). The **Git**
   entry in the activity bar is no longer disabled. A new `crates/git/` wraps `git2` behind
   plain blocking functions — no gpui, no async (ADR-0004, ADR-0007) — and `crates/app` holds
