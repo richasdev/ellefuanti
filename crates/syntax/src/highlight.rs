@@ -15,8 +15,15 @@ pub enum HighlightStyle {
     Type,
     Function,
     Variable,
+    /// Member being accessed: the `name` in `$user->name` or `Foo::$bar`. Distinct from
+    /// `Variable` because `$user` and `name` are different things wearing one expression.
+    Property,
     String,
     Number,
+    /// `=>`, `->`, `::`, `??`, arithmetic and comparison operators.
+    Operator,
+    /// `#[Route(...)]` — the brackets and the attribute's name.
+    Attribute,
     Comment,
     /// PHP `<?php` / `?>` tags and HTML markup around them.
     Tag,
@@ -93,13 +100,35 @@ fn collect(root: &Node, range: &Range<usize>, out: &mut Vec<HighlightSpan>) {
 
     let mut cursor = root.walk();
 
+    // Ancestors of the node under the cursor, innermost last, so `name_style` can be handed
+    // a parent without asking for one. `Node::parent()` is not a field read — tree-sitter
+    // re-descends from the root — and `name`, the kind that needs a parent, is among the
+    // most common nodes in PHP. Calling it per node measured 38 → 66 µs on
+    // `highlights/viewport_80_rows`; reading it only when stepping out was worse still
+    // (~125 µs, and no longer flat). Both attributed by ablation rather than guessed at.
+    //
+    // Depth-bounded, not size-bounded: one entry per nesting level under the cursor, so it
+    // cannot reintroduce a cost that grows with the file.
+    let mut ancestors: Vec<Node> = Vec::new();
+
     // Seek to the deepest node containing the start of the range. Each step binary-searches
     // one child list, so reaching the viewport costs O(depth · log breadth), not O(nodes).
     // Styled ancestors passed on the way are recorded: a comment or string that opens above
     // the viewport must still colour its visible remainder.
-    while cursor.goto_first_child_for_byte(range.start).is_some() {
+    //
+    // The invariant, kept identical on both paths: `ancestors.last()` is the parent of the
+    // node under the cursor. So the node we are *leaving* is pushed before descending, and
+    // the node we arrive at is never pushed — the loop below re-visits it and needs its
+    // parent on top, not itself. Getting this wrong styled `$user` with `$` as its own
+    // parent and dropped the property in `$user->name` entirely.
+    loop {
+        let parent = cursor.node();
+        if cursor.goto_first_child_for_byte(range.start).is_none() {
+            break;
+        }
+        ancestors.push(parent);
         let node = cursor.node();
-        if let Some(style) = style_for(node.kind()) {
+        if let Some(style) = node_style(node, parent) {
             out.push(HighlightSpan { range: node.start_byte()..node.end_byte(), style });
         }
     }
@@ -112,31 +141,47 @@ fn collect(root: &Node, range: &Range<usize>, out: &mut Vec<HighlightSpan>) {
             return;
         }
         if node.end_byte() > range.start
-            && let Some(style) = style_for(node.kind())
+            && let Some(style) = node_style(node, *ancestors.last().unwrap_or(root))
         {
             out.push(HighlightSpan { range: node.start_byte()..node.end_byte(), style });
         }
 
         if cursor.goto_first_child() {
+            ancestors.push(node);
             continue;
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return;
             }
+            ancestors.pop();
         }
     }
 }
 
-/// Maps a tree-sitter PHP node kind to a style. `None` means "no style of its own".
-fn style_for(kind: &str) -> Option<HighlightStyle> {
+/// Maps a tree-sitter PHP node to a style. `None` means "no style of its own".
+///
+/// Takes the node rather than just its kind because PHP's most common tokens are not
+/// distinguishable by kind alone: the property in `$user->name`, the callee in `f()`, the
+/// class in `class C`, and a bare constant are *all* the kind `name`. Only the parent (and
+/// which field of the parent it occupies) separates them, so that is what `name_style`
+/// looks at. Everything else still switches on the kind.
+///
+/// The container nodes stay unstyled on purpose. `member_access_expression` spans all of
+/// `$user->name`, and `flatten()` keeps the outermost span at a shared start — styling the
+/// container would swallow the variable and the property into one colour. The tokens are
+/// coloured as leaves instead, which is what makes them come out different.
+fn node_style(node: Node, parent: Node) -> Option<HighlightStyle> {
     use HighlightStyle::*;
-    Some(match kind {
+    Some(match node.kind() {
         "comment" => Comment,
         "string" | "encapsed_string" | "string_content" | "heredoc" | "nowdoc" => String,
         "integer" | "float" => Number,
+        // Hex/binary/octal and `1_000` are all `integer` to this grammar — no extra arms.
         "variable_name" | "$" => Variable,
-        "name" => return None, // too generic on its own; parent context decides
+        // `$this` is not its own kind: it parses as `variable_name` containing `name
+        // "this"`, so it already reads as Variable and needs no arm. Checked, not assumed.
+        "name" => return name_style(node, parent),
         "php_tag" | "text_interpolation" | "?>" => Tag,
         "class_declaration"
         | "interface_declaration"
@@ -149,6 +194,17 @@ fn style_for(kind: &str) -> Option<HighlightStyle> {
         "function_call_expression" | "member_call_expression" | "scoped_call_expression" => {
             return None;
         }
+        // Attributes. `#[` and `]` are children of attribute_group, and the attribute's
+        // name is reached via name_style; styling `attribute_list` itself would swallow
+        // the arguments, which should keep their own string/number colours.
+        "#[" => Attribute,
+        // Operators. Anonymous nodes named literally, like the keywords below. `->`, `::`
+        // and `=>` are the ones that carry meaning; the arithmetic set is included so a
+        // line of maths does not read as undifferentiated text.
+        "->" | "?->" | "::" | "=>" | "??" | "?" | "=" | "+" | "-" | "*" | "/" | "%" | "**"
+        | "." | "==" | "===" | "!=" | "!==" | "<>" | "<" | ">" | "<=" | ">=" | "<=>" | "&&"
+        | "||" | "!" | "??=" | "+=" | "-=" | "*=" | "/=" | ".=" | "%=" | "++" | "--" | "|"
+        | "&" | "^" | "<<" | ">>" | "~" => Operator,
         // Keywords: tree-sitter-php exposes these as anonymous nodes named literally.
         "abstract" | "and" | "array" | "as" | "break" | "callable" | "case" | "catch" | "class"
         | "clone" | "const" | "continue" | "declare" | "default" | "do" | "echo" | "else"
@@ -158,6 +214,57 @@ fn style_for(kind: &str) -> Option<HighlightStyle> {
         | "print" | "private" | "protected" | "public" | "readonly" | "require"
         | "require_once" | "return" | "static" | "switch" | "throw" | "trait" | "try" | "use"
         | "var" | "while" | "yield" | "xor" | "null" | "true" | "false" => Keyword,
+        _ => return None,
+    })
+}
+
+/// Disambiguates a bare `name` node by what contains it.
+///
+/// tree-sitter-php spends one kind, `name`, on nearly every identifier: property, method,
+/// function, class, parameter label, constant. The parent is the only thing separating
+/// them, so `collect` passes it in — see there for why it is not looked up here.
+///
+/// Anything not listed stays `None` (plain text) rather than guessing. That is deliberate:
+/// a wrong colour is worse than no colour, and the ambiguous cases below are ambiguous in
+/// the tree, not merely unimplemented.
+fn name_style(node: Node, parent: Node) -> Option<HighlightStyle> {
+    use HighlightStyle::*;
+
+    Some(match parent.kind() {
+        // `$user->name` / `$user?->name` — the `name` field is the property. The object is
+        // a sibling `variable_name` and keeps Variable, which is the whole point.
+        "member_access_expression" | "nullsafe_member_access_expression" => Property,
+        // `$user->name()` — the callee reads as a call, not a field.
+        "member_call_expression" | "nullsafe_member_call_expression" => Function,
+        // `f()` and `Foo::bar()`: only the `function`/`name` field is the callee. In
+        // `Foo::bar()` the `scope` field is also a `name` and must stay a Type.
+        "function_call_expression" | "scoped_call_expression" => {
+            match parent.child_by_field_name("scope") {
+                Some(scope) if scope.id() == node.id() => Type,
+                _ => Function,
+            }
+        }
+        // Declaration sites.
+        "function_definition" | "method_declaration" => Function,
+        "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
+        | "enum_declaration" => Type,
+        // `new User()`, `use App\Models\User`, `implements Foo`, a type annotation.
+        "object_creation_expression"
+        | "qualified_name"
+        | "namespace_name"
+        | "namespace_use_clause"
+        | "base_clause"
+        | "class_interface_clause"
+        | "named_type" => Type,
+        // `Foo::$bar` — the scope is the class, the property is the sibling variable_name.
+        "scoped_property_access_expression" => Type,
+        // `#[Route(...)]` — the attribute's own name. Its arguments are separate nodes and
+        // keep their string/number colours.
+        "attribute" => Attribute,
+        // `name: 'y'` in an argument list is a parameter label, not a value.
+        "argument" => return None,
         _ => return None,
     })
 }
@@ -266,6 +373,136 @@ mod tests {
         let spans = spans_of(Language::Php, src);
         assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"$name"));
         assert!(styled(src, &spans, HighlightStyle::String).contains(&"'ana'"));
+    }
+
+    #[test]
+    fn variable_and_property_get_different_styles() {
+        // The case this issue exists for. `$user->name` is one member_access_expression;
+        // colouring the expression would make both tokens one colour, and colouring only
+        // the `$` would leave `user` plain. The variable and the property must differ.
+        let src = "<?php $user->name;";
+        let spans = spans_of(Language::Php, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"$user"));
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"name"));
+
+        let style_of = |needle: &str| {
+            let at = src.find(needle).unwrap();
+            spans.iter().find(|s| s.range.start == at).map(|s| s.style)
+        };
+        assert_ne!(
+            style_of("$user"),
+            style_of("name"),
+            "the variable and the property must not share a style"
+        );
+    }
+
+    #[test]
+    fn property_access_is_not_a_method_call() {
+        // `$user->name` is a field, `$user->save()` is a call. Same node kind for the
+        // `name` child; only the parent separates them.
+        let src = "<?php $user->name; $user->save();";
+        let spans = spans_of(Language::Php, src);
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"name"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"save"));
+    }
+
+    #[test]
+    fn this_reads_as_a_variable() {
+        // tree-sitter-php gives `$this` no distinct kind — it is a plain `variable_name`
+        // wrapping `name "this"`. Pinned so a future arm does not accidentally reclassify.
+        let src = "<?php $this->name;";
+        let spans = spans_of(Language::Php, src);
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"$this"));
+    }
+
+    #[test]
+    fn highlights_numbers_in_every_base() {
+        let src = "<?php $a = 42; $b = 1.5; $c = 0x1f; $d = 0b11; $e = 1_000;";
+        let spans = spans_of(Language::Php, src);
+        let nums = styled(src, &spans, HighlightStyle::Number);
+        for want in ["42", "1.5", "0x1f", "0b11", "1_000"] {
+            assert!(nums.contains(&want), "expected {want} to be a Number, got {nums:?}");
+        }
+    }
+
+    #[test]
+    fn highlights_operators() {
+        let src = "<?php $a = ['k' => 1]; $b = $a ?? 2; $c = $a->d; $e = Foo::F; $f = 1 + 2;";
+        let spans = spans_of(Language::Php, src);
+        let ops = styled(src, &spans, HighlightStyle::Operator);
+        for want in ["=>", "??", "->", "::", "+", "="] {
+            assert!(ops.contains(&want), "expected {want} to be an Operator, got {ops:?}");
+        }
+    }
+
+    #[test]
+    fn attributes_are_not_comments() {
+        // `#[Route(...)]` starts with `#`, which is also a PHP line-comment opener. The
+        // point of the Attribute style is that these stop looking alike.
+        let src = "<?php #[Route('/users')] class C {}";
+        let spans = spans_of(Language::Php, src);
+
+        let attrs = styled(src, &spans, HighlightStyle::Attribute);
+        assert!(attrs.contains(&"#["), "expected the `#[` opener, got {attrs:?}");
+        assert!(attrs.contains(&"Route"), "expected the attribute name, got {attrs:?}");
+        assert!(
+            !spans.iter().any(|s| s.style == HighlightStyle::Comment),
+            "an attribute must not be styled as a comment"
+        );
+        // Arguments inside keep their own styles rather than being swallowed.
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"'/users'"));
+    }
+
+    #[test]
+    fn scoped_call_keeps_the_class_and_the_method_apart() {
+        // In `Foo::bar()` both `Foo` and `bar` are `name` nodes; the `scope` field is the
+        // only thing distinguishing them.
+        let src = "<?php Foo::bar();";
+        let spans = spans_of(Language::Php, src);
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"Foo"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"bar"));
+    }
+
+    #[test]
+    fn parent_tracking_survives_deep_nesting_and_backtracking() {
+        // `collect` maintains an ancestor stack instead of calling `Node::parent()`, so a
+        // mismatched push/pop hands `name_style` the wrong parent and mis-colours silently
+        // rather than crashing. Nesting plus repeated stepping-out is what desynchronises
+        // it, so assert styles still land after both.
+        let src = "<?php\nclass C {\n  public function m() {\n    if (true) {\n      \
+                   return $this->a->b;\n    }\n    return Foo::bar();\n  }\n}\n";
+        let spans = spans_of(Language::Php, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"b"));
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"$this"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"bar"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"Foo"));
+        // `m` is a declaration site several levels up from where the walk ends.
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"m"));
+    }
+
+    #[test]
+    fn styles_are_the_same_whether_seeked_to_or_walked_into() {
+        // Two ways into the same node: the binary-search seek (viewport starting mid-file)
+        // and the forward walk (viewport starting at 0). They must agree, or the ancestor
+        // stack is built differently on the two paths — which it was: the seek pushed the
+        // node it landed on, so `$user` got `$` as its own parent and `name` lost Property.
+        let src = "<?php\n$pad = 1;\n$user->name;\n";
+        let buffer = Buffer::new(src);
+        let tree = SyntaxTree::new(Language::Php, &buffer).unwrap();
+
+        let at = src.find("$user").unwrap();
+        let end = at + "$user->name".len();
+        let seeked = tree.highlights(&buffer, at..end);
+        let walked: Vec<_> = tree
+            .highlights(&buffer, 0..buffer.len_bytes())
+            .into_iter()
+            .filter(|s| s.range.start >= at && s.range.end <= end)
+            .collect();
+
+        assert_eq!(seeked, walked, "seek and walk must agree on styles");
+        assert!(seeked.iter().any(|s| s.style == HighlightStyle::Property));
     }
 
     #[test]
