@@ -1,8 +1,16 @@
 # assets/icons
 
-In-app UI glyphs for the activity bar, the file tree and the tab bar (issue #50). Different
-from `../app-icon.svg`, which is the product's own identity and is consumed by the operating
-system — see `../README.md`.
+In-app UI glyphs for the activity bar, the file tree and the tab bar (issues #50, #115).
+Different from `../app-icon.svg`, which is the product's own identity and is consumed by the
+operating system — see `../README.md`.
+
+**Two sets, working in opposite ways.** Know which you are editing:
+
+- **this directory** — monochrome Codicons, coloured by the theme (#50, #67). Every glyph in
+  the window except the one below.
+- **`file-types/`** — Ayu file-type icons, each painted in its own identifying colour and
+  deliberately ignoring the theme (#115). Tried first for a file; the Codicons here are the
+  fallback for the types Ayu has no SVG for. See the section at the bottom.
 
 ## Activity bar
 
@@ -113,6 +121,9 @@ letters were, but they are _distinguishable_ placeholders, which the letters wer
 
 ## Rendering
 
+Both sets go through this same path. The difference is only which colour fills the mask:
+these seven take `theme.text`, `file-types/` takes a colour declared per icon — see below.
+
 gpui rasterises these with resvg and uses only the **alpha channel**, filling the resulting
 mask with `style.text.color`. Two consequences:
 
@@ -140,3 +151,106 @@ row takes (4.0–4.4:1) — so the thinnest glyph in the set sits on the stronge
 
 This is not a substitute for looking at the running app. It proves the bytes rasterise to a
 legible distinct shape; it cannot prove the layout around them is right.
+
+---
+
+# assets/icons/file-types
+
+File-type icons for the file tree and the tab bar (issue #115), from the **Ayu** icon theme.
+
+## Attribution
+
+> Ayu — Copyright (c) 2016 Ike Kurghinyan
+> <https://github.com/dempfi/ayu>
+> Licensed under the **MIT Licence**.
+
+The full licence text is in `LICENSE-ayu.txt`, which is what MIT's "the above copyright
+notice and this permission notice shall be included in all copies" requires. The files are
+unmodified upstream SVGs from `teabyii.ayu` 1.1.12, renamed from `file_type_<name>.svg` to
+`<name>.svg` and nothing else. MIT is compatible with this repository's Apache-2.0.
+
+## Why 19 and not all 53
+
+Ayu ships 53 SVGs. An icon nothing maps to is bytes in the binary that can never appear on
+screen, so only the set a Laravel project can actually reach is vendored.
+`crates/app/src/file_icons.rs` has a test in each direction — every mapping points at a
+vendored icon, and every vendored icon is reachable from some mapping — so this set cannot
+silently drift in either direction.
+
+The rest of Ayu's 53 are for languages nobody opens here (Haxe, Haskell, Groovy, Dart,
+Kotlin, Swift, Perl, C#, Jupyter, …). They are one `cp` away if that changes.
+
+Ayu's own `default.svg` is **not** among them: the Codicon `file.svg` in the parent directory
+is the fallback, so Ayu's generic sheet became unreachable the moment the two sets met, and
+the reachability test above is what said so.
+
+**`npm` and `svelte` were vendored and then removed**, and the reason is specific to how
+these are painted: both draw their identity as a lighter shape _on top of_ a darker one
+(svelte's white `S` over a red blob, npm's `n` inside a red square). Filled as a
+single-colour mask, both come out as a solid coloured rectangle with no glyph in it. Every
+test passed on them — this was caught by rendering the set and looking at it. So
+`package.json` gets the JSON icon and `.svelte` falls through to the Codicons.
+
+## What Ayu has no SVG for — which is why both sets exist
+
+Ayu ships these as **`@2x.png` only**, and a PNG cannot go through gpui's SVG path:
+
+`html` · `blade` · `composer` · `docker` · `sql` · `xml` · `text` · `log` · `settings`
+
+Those are exactly the files a Laravel project is full of, which is the argument for keeping
+the Codicons rather than replacing them: **Ayu first for identity, Codicons behind it for
+coverage.** `.html` and `.blade.php` get `file-markup`, `.sql` gets `file-code`,
+`phpunit.xml` gets `file-markup`, and an unknown file still gets `file.svg`.
+
+Three cases worth calling out, all decided against an earlier draft of this PR:
+
+- **`composer.json` shows the JSON icon**, not a Composer icon — correct, just less specific
+  than VS Code.
+- **`.blade.php` shows `file-markup` (`</>`)**, not the PHP elephant. Ayu has no Blade glyph,
+  so the choice was PHP-or-nothing until the Codicons arrived; a Blade file is markup with
+  PHP in it, which is what #119 argued when it picked that glyph. The check still runs first,
+  because `.blade.php` also ends in `.php`.
+- **`.env` and lock files stay on Codicons.** `language_for_path` reads `.env` with the bash
+  grammar, so Ayu's shell icon would have been _consistent_ — but `.env` is configuration you
+  edit, not a script you run, and `file-config` says that. `package-lock.json` declines Ayu
+  before the `.json` rule can claim it, so a lock file still reads as a generated artefact.
+
+## These ignore the theme, on purpose
+
+Every icon in the parent directory is monochrome and coloured by the theme. **These are the
+opposite: their colour is their identity.** Yellow JS and purple PHP are recognisable
+_because_ of the colour, and flattening them to one theme foreground would leave 19
+identical grey shapes — which is precisely the generic Codicon they sit in front of, bought
+for 50 KB.
+
+They are still drawn with `svg()`, which keeps only the alpha channel (see Rendering above) —
+so each one is painted as a mask filled with **one** colour, declared per icon in
+`crates/app/src/file_icons.rs` and taken from Ayu's own dominant fill for that glyph. The
+internal detail is lost; the silhouette and the identifying hue are not, and at 16 px that
+detail was never visible anyway.
+
+gpui's `img()` _does_ keep the full multi-colour buffer, and this was built that way first.
+It costs **+1.86 MB** — 15.73 MB → 17.55 MB as measured before #119 landed, past the 17 MB limit `scripts/perf-gate.sh`
+blocks on. Not because of the icons (all 19 are 50 KB) but because the first `img()` call
+makes gpui's JPEG/GIF/WebP/PNG decoders reachable, so LTO stops stripping them: **3 decoder
+symbols in the binary before, 592 after**. That is the trade recorded in `file_icons.rs`; if
+the full-colour version is ever wanted, it needs the perf gate raised or a pre-rasterisation
+path that skips the decoders.
+
+## Legibility on the light themes
+
+Ayu's palette was drawn for dark backgrounds, so this was measured, against the panel colour
+the tree actually draws on (`#f6f8fa` GitHub Light, `#f1f2f6` Light):
+
+|                                    | contrast   |
+| ---------------------------------- | ---------- |
+| best (`toml`)                      | 5.28:1     |
+| median                             | ~2.7:1     |
+| **worst — `js`, `yaml`, `python`** | **1.85:1** |
+
+The yellows are genuinely faint on a light panel. They are kept because **nothing here is
+signalled by colour alone** — the file name sits beside the icon and is the real label, so a
+washed-out glyph loses a redundant cue, not information. Using these icons anywhere the name
+is absent would break that argument.
+
+> > > > > > > 0688a89 (feat(ui): Ayu file-type icons in the tree and tabs, one colour each)

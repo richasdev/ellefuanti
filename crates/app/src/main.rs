@@ -4,6 +4,7 @@ mod actions;
 mod completion;
 mod editor;
 mod file_cache;
+mod file_icons;
 mod find_bar;
 mod fonts;
 mod git_panel;
