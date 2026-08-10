@@ -2,6 +2,7 @@
 
 mod actions;
 mod editor;
+mod icons;
 mod palette;
 mod perf;
 #[cfg(test)]
@@ -37,7 +38,11 @@ fn main() {
     // starts the event loop and calls back. Measuring only inside the closure attributed
     // both to one "gpui_init" bucket, which is the sort of label that sends someone
     // optimising the wrong half.
-    let app = Application::new();
+    // The asset source has to be installed here, before any window exists: `svg()` resolves
+    // its path through whatever source the Application was built with, and the default
+    // `AssetSource for ()` returns None for everything — which paints nothing at all rather
+    // than failing, so forgetting this looks like "the icons don't work".
+    let app = Application::new().with_assets(icons::Icons);
     startup.phase("platform_init");
 
     app.run(move |cx: &mut App| {
