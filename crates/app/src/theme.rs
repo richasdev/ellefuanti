@@ -38,6 +38,16 @@ pub struct Theme {
     pub accent: Hsla,
     pub hover: Hsla,
     pub selected: Hsla,
+
+    /// The background of a control while the mouse is held down on it (#71).
+    ///
+    /// A third step past `hover`, not a reuse of `selected`: those two mean different
+    /// things and collide on themes where they are the same colour — `one_dark_pro` sets
+    /// `hover` and `selected` to the same `0x2c313a`, so a pressed state borrowing either
+    /// would be invisible on exactly the theme most likely to be in use. Each variant
+    /// pushes one step further from its own background, which is the only way a press
+    /// reads on both `0x16171d` and `0xffffff`.
+    pub pressed: Hsla,
     pub cursor: Hsla,
     pub selection: Hsla,
     pub status_bar: Hsla,
@@ -203,6 +213,8 @@ impl Theme {
             accent: rgb(0xff5c8a).into(),
             hover: rgb(0x24272f).into(),
             selected: rgb(0x2d313c).into(),
+            // One step past `selected`, continuing the same ramp away from the background.
+            pressed: rgb(0x383d4a).into(),
             cursor: rgb(0xff5c8a).into(),
             selection: rgb(0x33405c).into(),
             status_bar: rgb(0x1b1d24).into(),
@@ -273,6 +285,9 @@ impl Theme {
             accent: rgb(0xd6336c).into(),
             hover: rgb(0xe6e8ef).into(),
             selected: rgb(0xdcdfe9).into(),
+            // On a light theme the ramp runs *darker* to move away from the background,
+            // which is the whole reason this is a per-variant value and not a filter.
+            pressed: rgb(0xccd0dd).into(),
             cursor: rgb(0xd6336c).into(),
             selection: rgb(0xc7d7f5).into(),
             status_bar: rgb(0xf1f2f6).into(),
@@ -364,6 +379,10 @@ impl Theme {
             accent: rgb(0x61afef).into(),
             hover: rgb(0x2c313a).into(),
             selected: rgb(0x2c313a).into(),
+            // Upstream gives `hover` and `selected` the same value, so a press has to be a
+            // colour neither of them is or it would not be visible on this theme at all.
+            // Derived like the rest of this theme's UI colours, from its own background.
+            pressed: rgb(0x3a4150).into(),
             cursor: rgb(0x528bff).into(),
             selection: rgb(0x3e4451).into(),
             status_bar: rgb(0x21252b).into(),
@@ -440,6 +459,9 @@ impl Theme {
             accent: rgb(0x2f81f7).into(),
             hover: rgb(0x161b22).into(),
             selected: rgb(0x21262d).into(),
+            // GitHub's own `--button-default-bgColor-active`, which is the right neighbour
+            // for this: it is literally what GitHub paints on a held button.
+            pressed: rgb(0x30363d).into(),
             cursor: rgb(0x2f81f7).into(),
             selection: rgb(0x264f78).into(),
             status_bar: rgb(0x010409).into(),
@@ -506,6 +528,8 @@ impl Theme {
             accent: rgb(0x0969da).into(),
             hover: rgb(0xeaeef2).into(),
             selected: rgb(0xd0d7de).into(),
+            // The light counterpart, again from GitHub's active-button token.
+            pressed: rgb(0xafb8c1).into(),
             cursor: rgb(0x0969da).into(),
             selection: rgb(0xb6dcff).into(),
             status_bar: rgb(0xf6f8fa).into(),
@@ -730,6 +754,41 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_theme_makes_a_press_visible_against_what_it_sits_on() {
+        // A pressed state is the acknowledgement that a click landed (#71), and it is worth
+        // exactly nothing if it is the same colour as the surface underneath it. The two it
+        // can collide with are `hover` — because a press always happens *through* a hover,
+        // so an equal value means the button does not change at the moment of clicking —
+        // and the `panel` it is painted on.
+        //
+        // Unlike the syntax rule above there is **no exemption for ported themes**. These
+        // are UI colours, which the ports already derive rather than read from the theme
+        // file (see `one_dark_pro`'s doc comment) — so there is no upstream decision here
+        // to be faithful to, and One Dark Pro is precisely the theme where the trap is
+        // real: it gives `hover` and `selected` the same value, so a pressed state copied
+        // from either would be invisible on it.
+        //
+        // Distinctness is not the same as *legibility*, which needs a contrast ratio and
+        // an eye. Nobody has seen any of these on a screen (#35).
+        for variant in ALL_VARIANTS {
+            let theme = variant.build();
+
+            assert_ne!(
+                theme.pressed,
+                theme.hover,
+                "{}: a press looks identical to the hover it happens through",
+                variant.label()
+            );
+            assert_ne!(
+                theme.pressed,
+                theme.panel,
+                "{}: a press is invisible against the panel behind it",
+                variant.label()
+            );
         }
     }
 

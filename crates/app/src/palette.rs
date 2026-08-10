@@ -240,6 +240,7 @@ impl Render for Palette {
                                         .cursor_pointer()
                                         .when(index == selected, |el| el.bg(theme.selected))
                                         .hover(|el| el.bg(theme.hover))
+                                        .active(|el| el.bg(theme.pressed))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             move |_ev, _window, cx| {

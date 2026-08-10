@@ -7,8 +7,8 @@ use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions, SharedString,
-    Task, Window, div, prelude::*, px, svg, uniform_list,
+    App, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
+    SharedString, Task, Window, div, prelude::*, px, svg, uniform_list,
 };
 
 use crate::actions::{
@@ -1278,8 +1278,31 @@ impl WorkspaceView {
                     .items_center()
                     .justify_center()
                     .rounded_md()
-                    .when(enabled, |el| el.bg(theme.selected).text_color(theme.accent))
-                    .when(!enabled, |el| el.text_color(theme.text_muted))
+                    .when(enabled, |el| {
+                        el.bg(theme.selected)
+                            .text_color(theme.accent)
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme.hover))
+                            .active(|el| el.bg(theme.pressed))
+                    })
+                    // A disabled panel says so by *not* responding: no hover, no pointer.
+                    // The `not-allowed` cursor is what distinguishes "not ready yet" from
+                    // "your click missed", and it is not a colour — the dimmer glyph alone
+                    // would leave anyone who cannot separate the two greys with no signal
+                    // at all (#71). `opacity` on top of the muted text is the second,
+                    // non-colour channel: a disabled icon is visibly fainter in any theme.
+                    .when(!enabled, |el| {
+                        el.text_color(theme.text_muted)
+                            .opacity(0.5)
+                            .cursor(CursorStyle::OperationNotAllowed)
+                    })
+                    // ponytail: no click handler. Explorer is the only enabled panel and it
+                    // is already the sidebar you are looking at, so the only honest thing a
+                    // click could do is collapse it — and that is a layout feature with
+                    // persisted state, not interaction feedback. Pressing it acknowledges
+                    // the press and changes nothing, which is what it should do until there
+                    // is a second panel to switch to.
+                    //
                     // 16px inside a 32px hit target: the icon is the glyph, the square is
                     // the thing you can hit, and VS Code uses the same ratio.
                     //
@@ -1338,6 +1361,7 @@ impl WorkspaceView {
         let text = theme.text;
         let muted = theme.text_muted;
         let hover = theme.hover;
+        let pressed = theme.pressed;
 
         uniform_list("file-tree", count, move |range, _window, cx| {
             entity.update(cx, |this, _cx| {
@@ -1360,6 +1384,7 @@ impl WorkspaceView {
                                 // Indent by depth; the flat list makes this just arithmetic.
                                 .pl(px(8.0 + entry.depth as f32 * 12.0))
                                 .hover(|el| el.bg(hover))
+                                .active(|el| el.bg(pressed))
                                 .cursor_pointer()
                                 .text_color(if is_dir { text } else { muted })
                                 .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
@@ -1418,7 +1443,14 @@ impl WorkspaceView {
                     .when(index == active, |el| {
                         el.bg(theme.background).border_b_2().border_color(theme.accent)
                     })
-                    .when(index != active, |el| el.text_color(theme.text_muted))
+                    // Hover only on the tabs you can actually switch to. The active tab
+                    // lighting up under the pointer would suggest clicking it does
+                    // something, and it does not.
+                    .when(index != active, |el| {
+                        el.text_color(theme.text_muted)
+                            .hover(|el| el.bg(theme.hover).text_color(theme.text))
+                            .active(|el| el.bg(theme.pressed))
+                    })
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                         entity.update(cx, |this, cx| {
                             this.active_tab = index;
@@ -1440,7 +1472,9 @@ impl WorkspaceView {
                             .rounded_sm()
                             .text_color(if dirty { theme.accent } else { theme.text_muted })
                             .child(if dirty { "•" } else { "✕" })
+                            .cursor_pointer()
                             .hover(|el| el.bg(theme.hover).text_color(theme.text))
+                            .active(|el| el.bg(theme.pressed))
                             .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                                 close_entity.update(cx, |this, cx| {
                                     this.close_tab_at(index, window, cx);
