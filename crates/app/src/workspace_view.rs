@@ -16,13 +16,13 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindNext, FindPrev,
+    CloseTab, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext, FindPrev,
     FindReferences, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack,
     NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace, RerunFailedTests,
     ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette, ToggleHiddenFiles,
     ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context, dispatch_for,
 };
-use crate::editor::{Document, EditorEvent, EditorView};
+use crate::editor::{Document, EditorEvent, EditorView, search_project};
 use crate::file_cache;
 use crate::find_bar::{FindBar, FindEvent, Status};
 use crate::fonts::Fonts;
@@ -31,19 +31,22 @@ use crate::icons;
 use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
+use crate::search_panel::{SearchPanel, SearchPanelEvent, SearchState};
 use crate::terminal_view::TerminalView;
 use crate::test_view::{RunState, TestView};
 use crate::theme::{Metrics, Theme, Themed};
 
 /// Which panel the sidebar is showing.
 ///
-/// Two variants because two panels are enabled; the other five in the activity bar are
+/// Three variants because three panels are enabled; the other four in the activity bar are
 /// still disabled and still have nothing to switch to. An enum rather than a bool so the
-/// third one is a compile error at the match rather than an inverted flag.
+/// next one is a compile error at the match rather than an inverted flag — which is what
+/// #80 got for free when it added `Search` to the enum #64 had already introduced.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Sidebar {
     #[default]
     Explorer,
+    Search,
     Git,
 }
 
@@ -66,6 +69,16 @@ enum Job {
     QuickOpenIndex,
     RouteIndex,
     ClosePrompt,
+    /// A find-in-project sweep, and the debounce timer in front of it (#80).
+    ///
+    /// **One slot for both on purpose.** The timer and the search it starts are the same
+    /// piece of work seen at two moments, and a keystroke has to supersede whichever of the
+    /// two is currently live. Two slots would let a keystroke cancel a pending timer while a
+    /// search started by the *previous* timer carried on and landed with a stale query — the
+    /// exact "queueing instead of cancelling" ADR-0007 rules out. The [`CancelFlag`] handles
+    /// the half a dropped task cannot: dropping the task stops us awaiting, not the blocking
+    /// walk behind it.
+    ProjectSearch,
     /// Resolving a `route()`/`config()`/`view()`/component ⌘click to a file (#83).
     ///
     /// Its own slot, not `LspQuery`'s: a Laravel jump and a language-server jump never race
@@ -160,6 +173,31 @@ const NAVIGATION_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// A bound rather than an unbounded `Vec`, because this grows for the whole life of the
 /// session and nothing else ever trims it. Fifty is far past what anyone retraces by hand.
 const MAX_HISTORY: usize = 50;
+
+/// How long a keystroke in the project-search field waits before searching (#80).
+///
+/// **Derived from the measurement, not picked round.** `editor::project_search` records a
+/// full sweep at **7.2 ms** on crm-livewire-v3 (279 files) and 4.3 ms on this repo, of which
+/// 2.9 ms and 1.4 ms are the directory walk. Those are the numbers this interval has to
+/// clear, and the reasoning runs in both directions:
+///
+/// - **Why debounce at all**, when the search is already cancellable and already off the UI
+///   thread? Because cancellation stops waste *accumulating*, not *starting*. Sustained
+///   typing is roughly 8 keystrokes per second — 125 ms apart — so an undebounced field
+///   starts a fresh walk of the whole project every 125 ms and cancels it 125 ms later,
+///   having read a few hundred files for nothing. On a project several times the size of
+///   the one measured, the searches never finish and the user sees only "Searching…".
+/// - **Why not longer.** The whole search is 7 ms. An interval much past a typing pause
+///   would mean the wait, not the work, is what the user is watching — the panel would feel
+///   slower than the thing it is protecting. 250 ms is a hair above the ~200 ms gap between
+///   words that separates "still typing" from "stopped", which is the signal being detected.
+/// - **Why not shorter.** At 100 ms a moderate typist still triggers on gaps between
+///   keystrokes rather than between words, which is most of the cost with none of the
+///   benefit.
+///
+/// Return and the three option toggles skip it entirely — those are statements that the
+/// query is finished, and making them wait would be the control ignoring an explicit act.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Where the cursor has been, so Back and Forward can retrace it.
 ///
@@ -358,6 +396,23 @@ pub struct WorkspaceView {
     /// what keeps ⌘F from resurrecting a stale query when you switch tabs. Switching tabs
     /// re-applies the query to the newly active document rather than closing the bar.
     find: Option<Entity<FindBar>>,
+    /// The find-in-project panel (#80). Built on first use and kept thereafter.
+    ///
+    /// Not eagerly in [`WorkspaceView::new`] like `git` beside it, and the difference is
+    /// forced rather than stylistic: a result click has to *open a file*, opening focuses
+    /// the editor since #102, and focusing needs a `Window` — so the subscription must be
+    /// `subscribe_in`, and `new` has no window to give it. The git panel's events never
+    /// open anything, so plain `subscribe` suffices there.
+    ///
+    /// Kept once built, for the reason the git panel is: switching to Explorer and back
+    /// must not throw away a results list that cost a project walk to produce. Selecting a
+    /// different sidebar does cancel any search still *in flight* — the results you can see
+    /// survive, the work you can no longer see does not.
+    search_panel: Option<Entity<SearchPanel>>,
+    /// Cancels the project search in flight. Separate from [`Job::ProjectSearch`] for the
+    /// reason `quick_open_cancel` is separate from its slot: dropping a `Task` stops the
+    /// await, not the blocking walk behind it.
+    search_cancel: Option<CancelFlag>,
     /// The bottom terminal panel. `Some` only while it is open — a panel that is closed is
     /// absent, not hidden, so its poll timer and its shells stop existing with it.
     terminal: Option<Entity<TerminalView>>,
@@ -451,6 +506,8 @@ impl WorkspaceView {
             active_tab: 0,
             palette: None,
             find: None,
+            search_panel: None,
+            search_cancel: None,
             terminal: None,
             tests: None,
             test_cancel: None,
@@ -812,6 +869,55 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn focus_root_for_test(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
+    }
+
+    /// ⌘⇧F through the real handler (#80). Toggles, like the action does.
+    #[cfg(test)]
+    pub fn find_in_project_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_in_project(&FindInProject, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn search_panel_for_test(&self) -> Option<Entity<SearchPanel>> {
+        self.search_panel.clone()
+    }
+
+    /// Whether the sidebar is currently showing the search panel.
+    ///
+    /// Not `search_panel_for_test().is_some()`, and the difference is the whole point since
+    /// #64's `Sidebar` enum: the panel is **kept** once built, so its existence says nothing
+    /// about what is on screen. A test asserting the toggle worked has to ask which sidebar
+    /// is selected, or it passes whether or not the toggle does anything.
+    #[cfg(test)]
+    pub fn search_panel_is_showing_for_test(&self) -> bool {
+        self.sidebar == Sidebar::Search
+    }
+
+    /// Points the workspace at a folder without going through the file dialog.
+    ///
+    /// The tail of `open_folder` with the prompt and the background read removed, which is
+    /// the same shape as `open_document_for_test`. A project search needs a root, and there
+    /// is no other way for a headless test to give it one.
+    #[cfg(test)]
+    pub fn open_folder_for_test(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.tree = FileTree::new(root).ok();
+        cx.notify();
+    }
+
+    /// Clicks a result row, through the same handler the row's mouse-down uses.
+    ///
+    /// Takes a `Window` since #102: opening a result now focuses the editor it opened, and
+    /// a test seam that skipped that would be testing a *different* open from the real one
+    /// — which is the bug #95 was about.
+    #[cfg(test)]
+    pub fn open_search_result_for_test(
+        &mut self,
+        file: usize,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_search_result(file, line, window, cx);
     }
 
     /// Publishes diagnostics as if a server had sent them, and pushes them to the editors.
@@ -1621,6 +1727,203 @@ impl WorkspaceView {
 
     fn find_prev(&mut self, _: &FindPrev, _window: &mut Window, cx: &mut Context<Self>) {
         self.navigate_match(false, cx);
+    }
+
+    // --- find in project (#80) -----------------------------------------------------
+
+    /// ⌘⇧F, the Search activity-bar entry, and the `editor.find_in_project` command.
+    ///
+    /// A **toggle**, matching what the activity bar does everywhere else: pressing it with
+    /// Search already selected *and focused* goes back to the file tree. Pressing it while
+    /// the panel is showing but unfocused refocuses instead — the same rule ⌘F follows, and
+    /// for the same reason: ⌘⇧F after clicking into the editor must not send the user back
+    /// to the tree when what they meant was "put me in the search field".
+    fn find_in_project(&mut self, _: &FindInProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_search_panel(window, cx);
+    }
+
+    fn toggle_search_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.show_search_panel(window, cx);
+        let handle = panel.read(cx).focus_handle(cx);
+
+        // Already showing *and* focused: the press means "put it away".
+        if self.sidebar == Sidebar::Search && handle.is_focused(window) {
+            self.sidebar = Sidebar::Explorer;
+            // The results stay on the panel — only work still in flight is abandoned, since
+            // nothing will be on screen to receive it.
+            self.cancel_project_search();
+            window.focus(&self.focus_handle);
+            cx.notify();
+            return;
+        }
+
+        self.sidebar = Sidebar::Search;
+        window.focus(&handle);
+
+        // Seed from the selection, the way ⌘F does — but only when it actually changed the
+        // query, so reopening on the same word does not re-walk the project, and an empty
+        // selection does not kick off a search for the empty string.
+        let seeded = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).document.selected_text())
+            .is_some_and(|text| panel.update(cx, |panel, _cx| panel.seed(&text)));
+        if seeded {
+            // Immediately, not debounced: the user selected the word and pressed the key,
+            // which is as explicit a "search for this" as pressing return.
+            self.schedule_project_search(false, cx);
+        }
+        cx.notify();
+    }
+
+    /// The search panel, built on first use.
+    ///
+    /// Lazy because the subscription has to be `subscribe_in` — a result click opens a file
+    /// and opening focuses (#102), which needs a `Window` all the way down — and
+    /// `WorkspaceView::new` has no window to hand it. The git panel is built eagerly there
+    /// because its events never open anything.
+    fn show_search_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SearchPanel> {
+        if let Some(panel) = self.search_panel.clone() {
+            return panel;
+        }
+
+        let panel = cx.new(SearchPanel::new);
+        cx.subscribe_in(&panel, window, |this, _panel, event, window, cx| match event {
+            SearchPanelEvent::QueryChanged => this.schedule_project_search(true, cx),
+            SearchPanelEvent::SearchNow => this.schedule_project_search(false, cx),
+            SearchPanelEvent::OpenResult { file, line } => {
+                this.open_search_result(*file, *line, window, cx)
+            }
+            SearchPanelEvent::Dismissed => this.unfocus_search_panel(window, cx),
+        })
+        .detach();
+
+        self.search_panel = Some(panel.clone());
+        panel
+    }
+
+    /// Escape in the panel: focus goes back to the editor, the panel and its results stay.
+    ///
+    /// Deliberately not `close_search_panel`. The find bar's escape closes and clears
+    /// because its matches are painted over the document and there is no other way to be
+    /// rid of them; a project-search result list is a thing you read while editing, and
+    /// destroying a second of work on a stray key is the opposite of what escape should do.
+    fn unfocus_search_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor().cloned() {
+            window.focus(&editor.read(cx).focus_handle(cx));
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// Starts a project search, after `SEARCH_DEBOUNCE` when `debounce` is set.
+    ///
+    /// The three things ADR-0007 and #80 require, in one place:
+    ///
+    /// - **Cancellation, not queueing.** The old search's flag is raised before the new one
+    ///   is built, so a superseded sweep abandons within one file rather than finishing and
+    ///   overwriting the newer results. `Job::ProjectSearch` then drops the old task.
+    /// - **Off the UI thread.** `cx.background_spawn`; the measured 7 ms would drop a frame.
+    /// - **Debounced.** See [`SEARCH_DEBOUNCE`] for the interval and why it is that number.
+    ///
+    /// The panel goes to `Searching` immediately — *before* the debounce elapses, not after
+    /// — so the header changes on the keystroke rather than a quarter second later. It keeps
+    /// showing the previous results underneath while it does, which is why `SearchState`
+    /// carries them.
+    fn schedule_project_search(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        let Some(panel) = self.search_panel.clone() else { return };
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        self.cancel_project_search();
+
+        let query = panel.read(cx).query().clone();
+        if query.is_empty() {
+            // Not "search for nothing": an empty field means the panel goes back to Idle
+            // without walking the project. `search_project` would return early anyway; the
+            // point is not to spawn a task and not to say "Searching…".
+            panel.update(cx, |panel, cx| panel.set_state(SearchState::Idle, cx));
+            return;
+        }
+
+        let previous = match panel.read(cx).state() {
+            SearchState::Idle => Default::default(),
+            SearchState::Searching(results) | SearchState::Done(results) => results.clone(),
+        };
+        panel.update(cx, |panel, cx| panel.set_state(SearchState::Searching(previous), cx));
+
+        let cancel = CancelFlag::new();
+        self.search_cancel = Some(cancel.clone());
+
+        let task = cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+                // The timer is inside the task rather than in a separate slot precisely so
+                // that a superseding keystroke drops it here, before any work starts.
+                if cancel.is_cancelled() {
+                    return;
+                }
+            }
+
+            let scan_cancel = cancel.clone();
+            let results = cx
+                .background_spawn(async move { search_project(&root, &query, &scan_cancel) })
+                .await;
+
+            // A cancelled sweep returns whatever it had. Showing a partial list for a query
+            // the user has already typed past is worse than showing the previous complete
+            // one, so it is dropped rather than displayed.
+            if cancel.is_cancelled() || results.cancelled {
+                return;
+            }
+
+            panel.update(cx, |panel, cx| panel.set_state(SearchState::Done(results), cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::ProjectSearch, task);
+    }
+
+    fn cancel_project_search(&mut self) {
+        if let Some(cancel) = self.search_cancel.take() {
+            cancel.cancel();
+        }
+        self.jobs.cancel(Job::ProjectSearch);
+    }
+
+    /// Clicking a result row: open the file and put the cursor on the hit.
+    ///
+    /// `open_path_at` (#88), not a second jump path. The plumbing that carries an optional
+    /// `Point` through the asynchronous open already exists and already handles the file
+    /// being open, not open, or open in another tab — reimplementing it here is how two
+    /// jump paths drift into behaving differently.
+    fn open_search_result(
+        &mut self,
+        file: usize,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.search_panel.as_ref() else { return };
+        let Some(results) = (match panel.read(cx).state() {
+            SearchState::Idle => None,
+            SearchState::Searching(results) | SearchState::Done(results) => Some(results),
+        }) else {
+            return;
+        };
+        let Some(matches) = results.files.get(file) else { return };
+        let Some(hit) = matches.lines.get(line) else { return };
+
+        // Both zero-based: `LineMatch::row` is, and `column` is a *byte* offset in the raw
+        // line, which is what `Point` means by a column everywhere else in this codebase.
+        let point = Point::new(hit.row as usize, hit.column as usize);
+        let path = matches.path.clone();
+        // `open_path_at` takes a `Window` since #102, and this is one of the callers that
+        // change anticipated: a result click is a command-driven jump, so the keyboard has
+        // to follow the cursor into the file or the next keystroke goes nowhere.
+        self.open_path_at(path, Some(point), window, cx);
     }
 
     // --- palette -----------------------------------------------------------------
@@ -2647,6 +2950,7 @@ impl WorkspaceView {
                     Dispatch::RerunFailedTests => {
                         self.rerun_failed_tests(&RerunFailedTests, window, cx)
                     }
+                    Dispatch::FindInProject => self.find_in_project(&FindInProject, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -2824,6 +3128,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::replace))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_prev))
+            .on_action(cx.listener(Self::find_in_project))
             .on_action(cx.listener(Self::go_to_route))
             .on_action(cx.listener(Self::complete_laravel))
             .on_action(cx.listener(Self::go_to_symbol))
@@ -2888,26 +3193,36 @@ impl Render for WorkspaceView {
     }
 }
 
+/// The activity bar's entries, in order, and which sidebar each one selects.
+///
+/// Later panels are shown disabled rather than hidden (`None`), so the shape of the product
+/// is legible from the first commit (§6) without pretending they work. Git was turned on by
+/// #64; **Search by #80**, which needed no new mechanism — #64 had already built the exact
+/// abstraction, a `Sidebar` the activity bar selects, so find-in-project became a variant
+/// rather than a second switch beside it.
+///
+/// Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned` is what
+/// keeps that honest — a `zip` stops at the shorter side, so an added panel with no icon
+/// would silently vanish off the bar rather than fail.
+///
+/// A const rather than a local inside `render_activity_bar`, since #80: that test was
+/// checking `icons::ICONS` against a list of names **retyped inside the test**, which
+/// guards the icons and leaves the array the renderer actually zips unguarded. Renaming a
+/// panel here would have kept the test green while every glyph shifted one place. There is
+/// one list now, and the test reads it.
+const ACTIVITY_PANELS: [(&str, Option<Sidebar>); 7] = [
+    ("Explorer", Some(Sidebar::Explorer)),
+    ("Search", Some(Sidebar::Search)),
+    ("Git", Some(Sidebar::Git)),
+    ("Laravel", None),
+    ("Database", None),
+    ("Docker", None),
+    ("Tests", None),
+];
+
 impl WorkspaceView {
     fn render_activity_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        // Later panels are shown disabled rather than hidden, so the shape of the product
-        // is legible from the first commit (§6) without pretending they work.
-        //
-        // **Git is now enabled** — this is the issue that turns it on (#64). The third
-        // element is the sidebar it selects; `None` means still disabled.
-        //
-        // Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned`
-        // below is what keeps that honest — a zip would silently drop a panel if the two
-        // ever fell out of step.
-        let panels = [
-            ("Explorer", Some(Sidebar::Explorer)),
-            ("Search", None),
-            ("Git", Some(Sidebar::Git)),
-            ("Laravel", None),
-            ("Database", None),
-            ("Docker", None),
-            ("Tests", None),
-        ];
+        let panels = ACTIVITY_PANELS;
 
         let entity = cx.entity();
         let active = self.sidebar;
@@ -2960,9 +3275,23 @@ impl WorkspaceView {
                     // Now there *is* a second panel to switch to, which is what the note
                     // here used to say was missing. Only the enabled ones take a click; a
                     // disabled panel still acknowledges the press and changes nothing.
+                    //
+                    // Search takes the same door ⌘⇧F does rather than just assigning the
+                    // variant: the panel is built lazily and its query field has to take
+                    // focus, or clicking the icon shows a text field that swallows typing.
+                    // Leaving the sidebar cancels any search still in flight — results you
+                    // can see survive, work you can no longer see does not.
                     .when_some(target, |el, target| {
-                        el.on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        el.on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                             entity.update(cx, |this, cx| {
+                                if target == Sidebar::Search {
+                                    this.show_search_panel(window, cx);
+                                    if let Some(panel) = this.search_panel.clone() {
+                                        window.focus(&panel.read(cx).focus_handle(cx));
+                                    }
+                                } else if this.sidebar == Sidebar::Search {
+                                    this.cancel_project_search();
+                                }
                                 this.sidebar = target;
                                 cx.notify();
                             });
@@ -2980,6 +3309,12 @@ impl WorkspaceView {
             }))
     }
 
+    /// The sidebar: the file tree, source control, or find-in-project.
+    ///
+    /// One sidebar with several possible contents rather than stacked columns, which is
+    /// what VS Code does and what keeps the editor area the same width whichever is
+    /// showing. The header names whichever panel is up, so there is never ambiguity about
+    /// what the column below it is a list *of*.
     fn render_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let header = match self.sidebar {
             Sidebar::Explorer => self
@@ -2988,6 +3323,7 @@ impl WorkspaceView {
                 .map(|tree| tree.root_name().to_uppercase())
                 .unwrap_or_else(|| "NO FOLDER OPEN".to_string()),
             Sidebar::Git => "SOURCE CONTROL".to_string(),
+            Sidebar::Search => "SEARCH".to_string(),
         };
 
         div()
@@ -2995,12 +3331,14 @@ impl WorkspaceView {
             .flex_none()
             .flex()
             .flex_col()
+            .overflow_hidden()
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
             .child(
                 div()
                     .h(Metrics::TAB_HEIGHT)
+                    .flex_none()
                     .flex()
                     .items_center()
                     .px_3()
@@ -3012,6 +3350,24 @@ impl WorkspaceView {
                 // re-read the repository — the refresh is event-driven and a rebuilt
                 // panel would have no event to wait for.
                 Sidebar::Git => self.git.clone().into_any_element(),
+                // Same reasoning for search: switching to Explorer and back must not throw
+                // away a results list that cost a project walk to produce.
+                //
+                // Searching with no folder open would walk nothing, so the hint stands in
+                // rather than a panel that answers "No results" to every query — which
+                // reads as a broken search rather than a missing project.
+                Sidebar::Search if self.tree.is_none() => div()
+                    .p_3()
+                    .text_color(theme.text_muted)
+                    .child("Press ⌘O to open a folder")
+                    .into_any_element(),
+                // `None` is unreachable in practice — the sidebar only becomes `Search` by
+                // way of `show_search_panel`, which builds it. Rendering nothing rather
+                // than unwrapping, because a panic in a render is the worst place for one.
+                Sidebar::Search => match self.search_panel.clone() {
+                    Some(panel) => panel.into_any_element(),
+                    None => div().into_any_element(),
+                },
                 Sidebar::Explorer => match self.tree.as_ref() {
                     Some(tree) if !tree.is_empty() => {
                         self.render_tree_rows(tree.len(), theme, cx).into_any_element()
@@ -3272,20 +3628,42 @@ mod tests {
     /// against the wrong panel.
     #[test]
     fn panels_and_icons_stay_aligned() {
-        let expected = ["explorer", "search", "git", "laravel", "database", "docker", "tests"];
-
         assert_eq!(
             icons::ICONS.len(),
-            expected.len(),
+            ACTIVITY_PANELS.len(),
             "the activity bar renders {} panels; add the matching icon to icons::ICONS",
-            expected.len()
+            ACTIVITY_PANELS.len()
         );
 
-        for (icon, name) in icons::ICONS.iter().zip(expected) {
+        for (icon, (name, _)) in icons::ICONS.iter().zip(ACTIVITY_PANELS) {
             assert_eq!(
                 icon.path,
-                format!("icons/{name}.svg"),
+                format!("icons/{}.svg", name.to_lowercase()),
                 "icons::ICONS is out of order: every panel would get the wrong glyph"
+            );
+        }
+    }
+
+    /// Every enabled panel selects a *distinct* sidebar, and every `Sidebar` is reachable.
+    ///
+    /// Two failure modes, neither of which the alignment test above can see. Two entries
+    /// pointing at the same variant would light up together and switch to the same panel;
+    /// a variant with no entry would be a sidebar the user has no way to reach — which is
+    /// exactly what `Sidebar::Search` was between #64 and #80, and the reason the enum was
+    /// worth reading rather than a bool.
+    #[test]
+    fn every_enabled_panel_selects_a_distinct_and_reachable_sidebar() {
+        let targets: Vec<Sidebar> = ACTIVITY_PANELS.iter().filter_map(|(_, t)| *t).collect();
+
+        let mut unique = targets.clone();
+        unique.sort_by_key(|s| format!("{s:?}"));
+        unique.dedup();
+        assert_eq!(unique.len(), targets.len(), "two entries select the same sidebar: {targets:?}");
+
+        for sidebar in [Sidebar::Explorer, Sidebar::Search, Sidebar::Git] {
+            assert!(
+                targets.contains(&sidebar),
+                "{sidebar:?} has no activity-bar entry, so nothing can select it"
             );
         }
     }

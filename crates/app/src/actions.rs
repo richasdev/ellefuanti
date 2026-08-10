@@ -109,6 +109,10 @@ actions!(
         RunTests,
         RunTestsInFile,
         RerunFailedTests,
+        // Find in project (#80's second half). Opens the Search panel in the sidebar and
+        // focuses its query field; pressing it again with the panel already open returns
+        // to the file tree, which is what the activity bar's Search icon does too.
+        FindInProject,
     ]
 );
 
@@ -127,6 +131,12 @@ pub mod context {
     /// The test results panel (#25). Its own context so a rerun key means "rerun" only
     /// while the panel has focus, and does not shadow anything in the editor.
     pub const TESTS: &str = "Tests";
+    /// The find-in-project panel (#80). Its own context rather than `FIND`: `enter` there
+    /// runs the search rather than advancing to a next match, `escape` returns focus to
+    /// the editor without closing the panel, and there is no replace field for ⇥ to reach.
+    /// Sharing `FIND` would have meant three handlers that begin by asking which one they
+    /// are in — the shape a second widget wears when it is pretending to be the first.
+    pub const SEARCH_PANEL: &str = "SearchPanel";
 }
 
 /// Registers the default keymap and the palette's command list.
@@ -216,6 +226,21 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-alt-c", ToggleCaseSensitive, Some(context::FIND)),
         KeyBinding::new("cmd-alt-w", ToggleWholeWord, Some(context::FIND)),
         KeyBinding::new("cmd-alt-r", ToggleRegex, Some(context::FIND)),
+        // Find in project. ⌘⇧F is the binding in VS Code, PhpStorm and Sublime alike, and
+        // it is workspace-scoped for the same reason ⌘F is: it opens a panel that belongs
+        // to the project, not to whatever currently has keyboard focus.
+        KeyBinding::new("cmd-shift-f", FindInProject, Some(context::WORKSPACE)),
+        // Inside the panel. `enter` runs the search *now* rather than waiting out the
+        // debounce — a deliberate "I have finished typing" must not be ignored for another
+        // quarter second. `escape` gives focus back to the editor and leaves the results
+        // standing, unlike the find bar's escape, which clears: a list that took a second
+        // to populate must not vanish on a stray key.
+        KeyBinding::new("escape", Cancel, Some(context::SEARCH_PANEL)),
+        KeyBinding::new("enter", Confirm, Some(context::SEARCH_PANEL)),
+        KeyBinding::new("backspace", Backspace, Some(context::SEARCH_PANEL)),
+        KeyBinding::new("cmd-alt-c", ToggleCaseSensitive, Some(context::SEARCH_PANEL)),
+        KeyBinding::new("cmd-alt-w", ToggleWholeWord, Some(context::SEARCH_PANEL)),
+        KeyBinding::new("cmd-alt-r", ToggleRegex, Some(context::SEARCH_PANEL)),
         //
         // Overlay
         KeyBinding::new("escape", Cancel, Some(context::PALETTE)),
@@ -336,6 +361,7 @@ pub enum Dispatch {
     RunTests,
     RunTestsInFile,
     RerunFailedTests,
+    FindInProject,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -367,6 +393,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "tests.run" => Dispatch::RunTests,
         "tests.run_file" => Dispatch::RunTestsInFile,
         "tests.rerun_failed" => Dispatch::RerunFailedTests,
+        "editor.find_in_project" => Dispatch::FindInProject,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

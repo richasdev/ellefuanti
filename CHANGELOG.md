@@ -198,23 +198,91 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   **Find in project (⌘⇧F) is not in this change.** It is the expensive one, it wants the
   `crates/index` walk, `CancelFlag` and streaming results the issue describes, and it
   deserves its own PR built on what this one learned. The Search entry in the activity bar
-  stays disabled until then.
+  stays disabled until then. — _landed below._
 
-### Fixed
+- **Find in project (⌘⇧F) (#80).** The Search entry in the activity bar is enabled, and it
+  is the second thing the sidebar can show. Type and results arrive grouped by file, with
+  the hit highlighted inside the line; clicking a row opens the file with the cursor on the
+  match. The same three toggles as the find bar — case-sensitive, whole-word, regex — and
+  the same `SearchQuery`, so a literal is still escaped with `regex::escape` and the
+  case-folding rules cannot drift between in-file and project search. Escape hands focus
+  back to the editor and **leaves the results standing**, unlike the find bar's escape: a
+  list that took a second to populate must not vanish on a stray key.
 
-- **`scripts/perf-gate.sh` did not notice `clippy-driver`**, and reported a contaminated
-  number rather than refusing (#84, found while measuring #80). The guard names compilers
-  individually — `pgrep -x 'cargo|rustc|cc1plus|clang'` — and rustc's toolchain ships more
-  front ends than that list knows about. The gate printed **idle CPU at 8.00%, four times
-  its own 2% limit**, while `pgrep` said the machine was clear and two `clippy-driver`
-  processes were burning 114% between them.
+  **Replace in project is deliberately not here, and is not "later work" in the usual
+  sense.** It writes to files that are not open and that the user has mostly not read, and
+  its undo story is not `Document::undo` — it is a multi-file transaction or a
+  preview-and-apply flow with its own confirmation. Shipping a button that edits forty files
+  with no way back would be the most destructive thing in this editor. Its own PR.
 
-  That is precisely the failure the guard exists to prevent, arriving through the guard.
-  `clippy-driver` and `rustdoc` are named now, but a list is only as good as the names on
-  it, so a **load-average check** backs it up: above 4.0 the gate refuses regardless of what
-  is running. A machine at load 9 is contaminated whether or not the thing loading it is a
-  compiler, and the reading that prompted this was taken at 8.7 with three sibling agents
-  building at once.
+  **The measurement decided the design.** `search_project` was measured against two real
+  projects rather than estimated: **7.2 ms** for a whole sweep of a 279-file Laravel app
+  (crm-livewire-v3), 4.3 ms for this repo's 156 files, of which 2.9 ms and 1.4 ms are the
+  directory walk alone. The number that matters is the **no-hits** case — 7.0 ms, 84% of an
+  8.3 ms frame, spent _before the search finds anything_. That settles two questions with no
+  argument left: it cannot run on the UI thread, and it must be **debounced** rather than
+  merely cancelled, because cancellation stops waste accumulating while debouncing stops it
+  starting. `SEARCH_DEBOUNCE` is 250 ms, derived from that figure and from the ~200 ms gap
+  between typed words; ⏎ and the option toggles skip it, because those are explicit
+  statements that the query is finished.
+
+  **A disagreement in the harness, caught the way `BASELINE.md` says to catch one.** The
+  first run reported the walk at 10.6 ms — larger than the 7.5 ms search containing it,
+  which is impossible. The walk was timed cold once against searches timed warm five times:
+  10.6 ms cold, 2.9 ms warm, a 7× gap that is the page cache and not the code. The same run
+  reported the "no hits" query finding two hits, because the nonsense string it searched for
+  had by then been written into the file being searched. Both are fixed in the harness,
+  which is an `#[ignore]`d test _in the module it measures_ so the numbers can be re-taken
+  rather than inherited: `ELLE_SEARCH_ROOT=… cargo test --release --bin ellefuanti --
+--ignored --nocapture measure_project_search`.
+
+  What the numbers say about the shape: **cost tracks the file count, not the byte count** —
+  156 files holding 1.8 MB search faster than 279 holding 0.8 MB, because the per-file
+  `metadata` + `read` syscall pair dominates the matching. So pruning `vendor/` and
+  `node_modules/` at the directory boundary is worth far more than any per-file
+  optimisation, and `MAX_FILE_BYTES` (512 KB) exists to bound allocation on a committed
+  database dump rather than to make anything faster.
+
+  Cancellation is `CancelFlag`, checked once per file, so a superseded sweep abandons within
+  one file's work instead of finishing and overwriting newer results. One `Job::ProjectSearch`
+  slot holds **both** the debounce timer and the search it starts, because they are the same
+  work at two moments — two slots would let a keystroke cancel a pending timer while a search
+  from the previous timer landed with a stale query, which is exactly the queueing ADR-0007
+  rules out. Results render through `uniform_list` over a row vector flattened once per result
+  change, so a frame lays out the visible window whether there are three hits or the
+  thousand-hit cap, and the cap is reported (`showing the first 1000`) rather than silently
+  applied.
+
+  Traversal reuses `index_files` rather than adding a second walk, so search obeys the same
+  `.gitignore`, hidden-file and `vendor/`/`node_modules/`/`.git` rules as the file tree and
+  quick open — a result the tree hides and quick open will not open would be incoherent.
+  Binary files (NUL in the first 8 KB, git's heuristic and `read_file`'s) and non-UTF-8 files
+  are skipped rather than lossily converted, because a lossy conversion reports a column that
+  is a lie about a file the editor then refuses to open.
+
+  Clicking a result goes through `open_path_at` (#88), not a second jump path.
+
+  **The Search panel is a `Sidebar` variant, not a mechanism beside one.** #64 landed the
+  git panel and with it the abstraction this needed — an enum the activity bar selects and
+  the sidebar renders — while #80 was in flight. Rebasing onto it deleted more of this
+  branch than it added: a parallel `Option<Entity<SearchPanel>>`-drives-the-sidebar switch,
+  a second `render_tree_panel`, and a bespoke selected-state tuple all became
+  `Sidebar::Search`. The panel is now **kept once built** rather than dropped on close, for
+  the reason the git panel is: switching to Explorer and back must not re-walk the project
+  to rebuild a list you already had. Only work still _in flight_ is cancelled when the
+  sidebar changes — results you can see survive, work you cannot see does not.
+
+  It is built lazily rather than eagerly in `WorkspaceView::new` like the git panel, and
+  that difference is forced: a result click opens a file, opening focuses the editor since
+  #102, and focusing needs a `Window` — so the subscription must be `subscribe_in`, and
+  `new` has no window to give it. Git's events never open anything.
+
+  `panels_and_icons_stay_aligned` was checking `icons::ICONS` against a list of names
+  **retyped inside the test**, which guards the icons and leaves the array the renderer
+  actually zips unguarded — renaming a panel would keep it green while every glyph shifted.
+  The list is a module-level `ACTIVITY_PANELS` const now and the test reads it, plus a new
+  one asserting every enabled entry selects a distinct sidebar and every `Sidebar` variant
+  is reachable. That second property is what `Sidebar::Search` failed between #64 and #80.
 
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —

@@ -43,6 +43,7 @@ use crate::editor::{Document, EditorView};
 use crate::find_bar::{FindEvent, Status};
 use crate::fonts::Fonts;
 use crate::palette::{Palette, PaletteMode};
+use crate::search_panel::SearchState;
 use crate::terminal_view::TerminalView;
 use crate::theme::{Metrics, ThemeVariant, Themed, set_theme};
 use crate::workspace_view::WorkspaceView;
@@ -1083,4 +1084,290 @@ async fn splitting_does_not_start_a_second_timer(cx: &mut TestAppContext) {
         assert_eq!(terminal.session_count(), 0);
         assert!(!terminal.is_polling_for_test(), "an empty panel must not keep polling");
     });
+}
+
+// --- find in project (#80) ---------------------------------------------------------
+
+/// A small on-disk project, so a project search has something real to walk.
+///
+/// A temp directory rather than a fixture in the repo: the search's rules are about
+/// `.gitignore`, hidden files and `vendor/`, and none of those can be exercised against a
+/// tree that this repo's own `.gitignore` is already governing.
+fn project_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("app/Models")).unwrap();
+    std::fs::create_dir_all(root.join("vendor/laravel")).unwrap();
+    std::fs::write(root.join(".gitignore"), "/vendor\n").unwrap();
+    std::fs::write(
+        root.join("app/Models/User.php"),
+        "<?php\nclass User\n{\n    public $needle = 1;\n    // needle again\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("app/Models/Post.php"), "<?php\n// nothing to see\n").unwrap();
+    // Accented text on disk, which is where a byte/char confusion actually bites.
+    std::fs::write(root.join("notas.txt"), "a função needle\nsem nada\n").unwrap();
+    std::fs::write(root.join("vendor/laravel/Str.php"), "<?php $needle;").unwrap();
+
+    dir
+}
+
+/// A workspace pointed at `root`, with the search panel open.
+fn workspace_searching(
+    cx: &mut TestAppContext,
+    root: std::path::PathBuf,
+) -> (gpui::Entity<WorkspaceView>, &mut VisualTestContext) {
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    workspace.update(cx, |workspace, cx| workspace.open_folder_for_test(root, cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_in_project_for_test(window, cx);
+    });
+    (workspace, cx)
+}
+
+/// Lets the debounce fire and the background sweep land.
+///
+/// `advance_clock` past `SEARCH_DEBOUNCE` and then park: the timer and the walk are both
+/// on gpui's executor (ADR-0007), so the test controls time rather than sleeping — a real
+/// sleep here would be a flaky test that measures the machine.
+fn finish_search(cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn the_search_panel_opens_finds_hits_and_renders_them(cx: &mut TestAppContext) {
+    let dir = project_fixture();
+    let (workspace, cx) = workspace_searching(cx, dir.path().to_path_buf());
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("⌘⇧F opens the panel");
+
+    // The empty panel paints before any query — the state a user sees first.
+    draw(cx);
+
+    panel.update(cx, |panel, cx| panel.type_query_for_test("needle", cx));
+    finish_search(cx);
+
+    panel.read_with(cx, |panel, _cx| {
+        let SearchState::Done(results) = panel.state() else {
+            panic!("the search should have finished: {:?}", panel.state());
+        };
+        // User.php has two, notas.txt has one. vendor/ is gitignored and must not appear.
+        assert_eq!(results.file_count(), 2, "{:?}", results.files);
+        assert_eq!(results.match_count(), 3);
+        assert!(!results.files.iter().any(|f| f.relative.starts_with("vendor/")));
+        // Three lines plus two file headers.
+        assert_eq!(panel.row_count_for_test(), 5);
+    });
+
+    // And a full layout/paint pass with the results in the list, in both themes.
+    draw(cx);
+}
+
+#[gpui::test]
+async fn clicking_a_result_opens_the_file_at_the_line(cx: &mut TestAppContext) {
+    // The whole point of the feature: a result is a jump. This asserts the row's `Point`
+    // reaches `open_path_at` and lands where the hit is, which is the plumbing #88 built
+    // and this must not reimplement.
+    let dir = project_fixture();
+    let (workspace, cx) = workspace_searching(cx, dir.path().to_path_buf());
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("the panel is open");
+    panel.update(cx, |panel, cx| panel.type_query_for_test("needle", cx));
+    finish_search(cx);
+
+    // The User.php row whose line is `    // needle again` — row 4, zero-based.
+    let (file, line, path, row, column) = panel.read_with(cx, |panel, _cx| {
+        let SearchState::Done(results) = panel.state() else { panic!("not finished") };
+        let file = results
+            .files
+            .iter()
+            .position(|f| f.relative.ends_with("User.php"))
+            .expect("User.php has hits");
+        let matches = &results.files[file];
+        let line = matches
+            .lines
+            .iter()
+            .position(|l| l.text.starts_with("// needle"))
+            .expect("the comment line is a hit");
+        let hit = &matches.lines[line];
+        (file, line, matches.path.clone(), hit.row, hit.column)
+    });
+    assert!(path.ends_with("User.php"), "{path:?}");
+    assert_eq!(row, 4, "`// needle again` is the fifth line, zero-based 4");
+    assert_eq!(column, 7, "byte column in the *untrimmed* line: four spaces plus `// `");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_search_result_for_test(file, line, window, cx)
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace.active_editor_for_test().expect("the click opened a tab");
+        let point = editor.read(cx).document.cursor_point();
+        assert_eq!(point.row, 4, "the cursor landed on the matching line");
+        assert_eq!(point.column, 7);
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn typing_supersedes_the_search_in_flight_rather_than_queueing_it(cx: &mut TestAppContext) {
+    // ADR-0007's rule, and the reason there is one `Job::ProjectSearch` slot rather than
+    // two. Three queries typed inside the debounce window must produce exactly one search,
+    // for the *last* query — not three searches racing to overwrite each other.
+    let dir = project_fixture();
+    let (workspace, cx) = workspace_searching(cx, dir.path().to_path_buf());
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("the panel is open");
+
+    for pattern in ["n", "ne", "needle"] {
+        panel.update(cx, |panel, cx| panel.type_query_for_test(pattern, cx));
+        // Less than the debounce, so each keystroke drops the timer before it fires.
+        cx.executor().advance_clock(std::time::Duration::from_millis(50));
+    }
+    finish_search(cx);
+
+    panel.read_with(cx, |panel, _cx| {
+        let SearchState::Done(results) = panel.state() else { panic!("not finished") };
+        // If an earlier query's search had landed, this would be the hit count for `n` or
+        // `ne`, both of which match far more than three times in the fixture.
+        assert_eq!(results.match_count(), 3, "the last query is the one that ran");
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn an_emptied_query_returns_the_panel_to_idle_without_walking(cx: &mut TestAppContext) {
+    let dir = project_fixture();
+    let (workspace, cx) = workspace_searching(cx, dir.path().to_path_buf());
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("the panel is open");
+    panel.update(cx, |panel, cx| panel.type_query_for_test("needle", cx));
+    finish_search(cx);
+    panel.read_with(cx, |panel, _cx| assert!(matches!(panel.state(), SearchState::Done(_))));
+
+    // Backspacing to nothing must not say "Searching…" and must not walk the project.
+    panel.update(cx, |panel, cx| panel.type_query_for_test("", cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert!(matches!(panel.state(), SearchState::Idle), "{:?}", panel.state());
+        assert_eq!(panel.state().summary().0, "");
+        assert_eq!(panel.row_count_for_test(), 0);
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn an_accented_hit_renders_without_slicing_a_codepoint(cx: &mut TestAppContext) {
+    // A match landing mid-codepoint is a debug-build panic the moment the row is laid out,
+    // and this repo's own corpus is Portuguese. Searching for the accented word itself is
+    // the case where a byte/char confusion produces one.
+    let dir = project_fixture();
+    let (workspace, cx) = workspace_searching(cx, dir.path().to_path_buf());
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("the panel is open");
+    panel.update(cx, |panel, cx| panel.type_query_for_test("função", cx));
+    finish_search(cx);
+
+    panel.read_with(cx, |panel, _cx| {
+        let SearchState::Done(results) = panel.state() else { panic!("not finished") };
+        assert_eq!(results.match_count(), 1);
+        let hit = &results.files[0].lines[0];
+        assert_eq!(&hit.text[hit.ranges[0].clone()], "função");
+    });
+    // The paint pass is the assertion: it slices `text` with `ranges` for real.
+    draw(cx);
+}
+
+#[gpui::test]
+async fn the_search_panel_toggles_with_the_file_tree_and_keeps_its_results(
+    cx: &mut TestAppContext,
+) {
+    // ⌘⇧F is a toggle over the sidebar #64 introduced: pressing it again goes back to the
+    // tree. What it must *not* do is destroy the results — the panel outlives being hidden,
+    // for the same reason the git panel does, because re-running a project walk to show a
+    // list you already had is the cost this whole feature is trying to avoid.
+    let dir = project_fixture();
+    let (workspace, cx) = workspace_searching(cx, dir.path().to_path_buf());
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("⌘⇧F opens the panel");
+    panel.update(cx, |panel, cx| panel.type_query_for_test("needle", cx));
+    finish_search(cx);
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.search_panel_is_showing_for_test(), "the sidebar is showing Search");
+    });
+    draw(cx);
+
+    // ⌘⇧F again, with the panel focused, returns the tree.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_in_project_for_test(window, cx);
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            !workspace.search_panel_is_showing_for_test(),
+            "the second press went back to the tree"
+        );
+    });
+    draw(cx);
+
+    // The results survived being hidden. Asserting on the panel rather than on the
+    // sidebar, because this is the half a `sidebar == Explorer` check cannot see.
+    panel.read_with(cx, |panel, _cx| {
+        let SearchState::Done(results) = panel.state() else {
+            panic!("hiding the panel threw the results away: {:?}", panel.state());
+        };
+        assert_eq!(results.match_count(), 3, "the same results are still there");
+    });
+
+    // And a third press brings them back without re-searching.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_in_project_for_test(window, cx);
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.search_panel_is_showing_for_test());
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+async fn searching_with_no_folder_open_renders_a_hint_rather_than_no_results(
+    cx: &mut TestAppContext,
+) {
+    // There is nothing to walk, so every query would answer "No results" — which reads as
+    // a broken search rather than a missing project.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_in_project_for_test(window, cx);
+    });
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.search_panel_for_test())
+        .expect("the panel still opens; it is the *results* that need a folder");
+
+    panel.update(cx, |panel, cx| panel.type_query_for_test("needle", cx));
+    finish_search(cx);
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(matches!(panel.state(), SearchState::Idle), "no root means no search at all");
+    });
+    draw(cx);
 }

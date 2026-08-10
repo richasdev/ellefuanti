@@ -82,6 +82,11 @@ impl SearchQuery {
         Self { pattern: pattern.to_string(), ..Default::default() }
     }
 
+    /// True when there is nothing to search for.
+    pub fn is_empty(&self) -> bool {
+        self.pattern.is_empty()
+    }
+
     /// A `Regex` for this query, or `None` when the pattern is empty.
     ///
     /// Everything goes through `regex`, including literal search — a literal is compiled
@@ -93,7 +98,13 @@ impl SearchQuery {
     /// Returns `Err` for an unparseable regex, which is a thing the user is *mid-typing*
     /// most of the time — `[a-` is not an error to report loudly, it is a query that does
     /// not match anything yet.
-    fn compile(&self) -> Option<Result<Regex, regex::Error>> {
+    /// `pub(super)` rather than private since #80's project search: `project_search.rs`
+    /// compiles the query **once for the whole project** instead of once per file, which
+    /// is the difference between 33 µs and 16 ms across 500 files. Going through this
+    /// function rather than building its own regex is what keeps the escaping,
+    /// case-folding and whole-word rules identical between in-file and project search —
+    /// two `Regex::new` call sites is exactly how those drift.
+    pub(super) fn compile(&self) -> Option<Result<Regex, regex::Error>> {
         if self.pattern.is_empty() {
             return None;
         }
