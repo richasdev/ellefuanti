@@ -886,6 +886,12 @@ impl EditorView {
                     })
                     .flex()
                     .h(fonts.line_height())
+                    // Set here and not only on the root: `uniform_list` builds its rows in a
+                    // callback, and `StyledText` resolves its line height from
+                    // `window.text_style()` at layout time rather than from an ancestor div.
+                    // A root-level `.line_height()` therefore never reaches these rows, which
+                    // is why setting it there alone did not fix the overflow.
+                    .line_height(fonts.line_height())
                     .w_full()
                     .when(row_selected, |el| el.bg(theme.selection))
                     .when(is_cursor_row && !row_selected, |el| el.bg(theme.hover))

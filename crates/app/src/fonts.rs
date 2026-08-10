@@ -225,8 +225,18 @@ impl Fonts {
     /// Derived rather than stored so it cannot drift from the size. The old `LINE_HEIGHT:
     /// px(20.0)` against 13px text was 1.538 — a number someone chose once that stops
     /// meaning anything at 20px, which is why the setting is a multiplier.
+    /// Rounded to a whole pixel, and that is the point rather than tidiness.
+    ///
+    /// gpui's `StyledText` resolves its own height through `line_height_in_pixels`, which
+    /// ends in `.round()`. A row given a fractional `.h()` therefore gets text laid out at a
+    /// *different* height than its box: at 13px the ratio yields 19.5, the box is 19.5 and
+    /// the text is 20. Half a pixel per line, accumulating down the file — a third of a row
+    /// by line 13 and two thirds by line 26, which is where it was reported.
+    ///
+    /// Rounding here means every consumer agrees by construction, because they all read this
+    /// one value and it is already the integer gpui would have picked.
     pub fn line_height(&self) -> Pixels {
-        self.size * self.line_height_ratio
+        gpui::px(f32::from(self.size * self.line_height_ratio).round())
     }
 
     /// One terminal character cell, in pixels: `(width, height)`.
@@ -259,6 +269,17 @@ impl Fonts {
         // PTY, so a cell even slightly narrower than the real glyph buys the shell a column
         // that cannot be drawn. Menlo advances 0.602051 em against the assumed 0.6, and at
         // 13px that one part in 350 hands out one column too many at 53% of window widths.
+        // Neither is rounded, and that is deliberate — it matches what Zed's terminal does.
+        //
+        // The editor rounds (see `line_height`) because its rows go through `StyledText`,
+        // which resolves its own height via gpui's `line_height_in_pixels` and *rounds*
+        // there; a fractional row would disagree with its own text. The terminal grid does
+        // not use that path: it computes a cell and places rows arithmetically, so the
+        // fraction stays consistent all the way down and rounding would only lose precision.
+        //
+        // The width in particular must not round. It is divided into the panel width and
+        // floored to get the column count handed to the PTY, where a fraction of a pixel is
+        // the difference between the right answer and one column too many (#92).
         (self.size * self.advance_ratio(), self.size * TERMINAL_LINE_HEIGHT_RATIO)
     }
 
@@ -475,7 +496,13 @@ mod tests {
         let fonts = Fonts::default();
         assert_eq!(fonts.size, px(13.0));
         assert_eq!(fonts.ui_size, px(12.0));
-        assert_eq!(fonts.line_height(), px(19.5), "the old 20px, as a 1.5 ratio");
+        // Exactly the old `Metrics::LINE_HEIGHT`. #49 replaced that 20px constant with a
+        // 1.5 ratio, which at 13px is 19.5 — and the comment here called it "the old 20px",
+        // which it was not. gpui rounds a text line height to a whole pixel while a `div`
+        // keeps the fraction, so that half pixel put every row's text at a different height
+        // than its box and the error accumulated down the file. Rounding restores the
+        // original 20 and makes the two agree.
+        assert_eq!(fonts.line_height(), px(20.0), "the old Metrics::LINE_HEIGHT, restored");
         assert_eq!(fonts.cell_size().1, px(16.0), "the old TERMINAL_LINE_HEIGHT exactly");
         // The old `Metrics::FONT_SIZE * CELL_WIDTH_RATIO` from `terminal_view`, written as
         // that expression rather than as a decimal literal — 13.0 * 0.6 is not exactly

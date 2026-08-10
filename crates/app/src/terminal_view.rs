@@ -1153,7 +1153,7 @@ fn render_grid(
                 })
                 .unwrap_or(0..0);
 
-            div().h(row_height).flex_none().child(styled_row(
+            div().h(row_height).line_height(row_height).flex_none().child(styled_row(
                 line,
                 cursor_column,
                 selected,
