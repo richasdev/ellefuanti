@@ -14,6 +14,10 @@ pub enum PaletteMode {
     Commands,
     Files,
     Routes,
+    /// Symbols in the active file, from the language server.
+    Symbols,
+    /// Where a symbol is used, from the language server.
+    References,
 }
 
 impl PaletteMode {
@@ -22,6 +26,8 @@ impl PaletteMode {
             PaletteMode::Commands => "Run a command…",
             PaletteMode::Files => "Open a file…",
             PaletteMode::Routes => "Go to a route…",
+            PaletteMode::Symbols => "Go to a symbol…",
+            PaletteMode::References => "Go to a usage…",
         }
     }
 }

@@ -151,6 +151,30 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 // Zoom In/Out: #49, fonts are compile-time constants.
             ],
         ),
+        // Its own menu rather than more rows under View: these are all "take me somewhere",
+        // which is what every IDE calls Go, and View is already the miscellany drawer.
+        (
+            "Go",
+            vec![
+                Item::command("Go to Symbol in File…", "navigate.symbol", |label| {
+                    MenuItem::action(label, crate::actions::GoToSymbol)
+                }),
+                Item::command("Go to Definition", "navigate.definition", |label| {
+                    MenuItem::action(label, crate::actions::GoToDefinition)
+                }),
+                Item::command("Find Usages", "navigate.references", |label| {
+                    MenuItem::action(label, crate::actions::FindReferences)
+                }),
+                Item::command("Back", "navigate.back", |label| {
+                    MenuItem::action(label, crate::actions::NavigateBack)
+                }),
+                Item::command("Forward", "navigate.forward", |label| {
+                    MenuItem::action(label, crate::actions::NavigateForward)
+                }),
+                // ponytail: no "Go to Symbol in Project…" — that needs `workspace/symbol`,
+                // which is not among the typed methods `crates/lsp` has. #81 stops here.
+            ],
+        ),
         (
             "Window",
             vec![

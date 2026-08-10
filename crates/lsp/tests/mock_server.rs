@@ -591,6 +591,103 @@ fn cancelling_notifies_the_server() {
     panic!("expected a $/cancelRequest, saw {:?}", server.methods());
 }
 
+// --- polling, for callers that must not block ------------------------------------------
+
+#[test]
+fn polling_reports_pending_until_the_answer_arrives() {
+    // What the UI does instead of blocking: a cold server takes seconds, and the window
+    // has to keep painting. `wait` cannot serve here — a zero timeout *drops* the pending
+    // entry, so polling with it would cancel the request on the second call.
+    let (mut client, _server) = open_client(full_capabilities(), |method, _| {
+        if method == "textDocument/definition" {
+            Reply::Delayed(
+                Duration::from_millis(120),
+                json!({
+                    "uri": "file:///srv/app/User.php",
+                    "range": { "start": { "line": 4, "character": 2 },
+                               "end": { "line": 4, "character": 8 } }
+                }),
+            )
+        } else {
+            Reply::Silence
+        }
+    });
+    client.did_open(uri(), "php", "<?php\n").unwrap();
+
+    let id = client.request_definition(&uri(), 6).unwrap();
+
+    // Pending, repeatedly. The repetition is the point: a poll that consumed the request
+    // would make the second call return Cancelled and the jump would silently never happen.
+    for _ in 0..3 {
+        let polled: Option<Option<lsp_types::GotoDefinitionResponse>> =
+            client.poll_response(&id).unwrap();
+        assert!(polled.is_none(), "must still be pending");
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(answer) =
+            client.poll_response::<lsp_types::GotoDefinitionResponse>(&id).unwrap()
+        {
+            assert!(answer.is_some(), "the server did answer with a location");
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "the reply never arrived");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn polling_distinguishes_not_yet_answered_from_answered_with_nothing() {
+    // The two layers of Option are different questions, and collapsing them is the bug
+    // this pins: `Some(None)` is "no definition found", a final answer the caller must
+    // stop waiting on. `None` is "keep waiting". A caller that confused them would loop
+    // until the timeout on every symbol the server knows nothing about.
+    let (mut client, _server) = open_client(full_capabilities(), |method, _| {
+        if method == "textDocument/definition" {
+            Reply::Result(Value::Null)
+        } else {
+            Reply::Silence
+        }
+    });
+    client.did_open(uri(), "php", "<?php\n").unwrap();
+
+    let id = client.request_definition(&uri(), 6).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.poll_response::<lsp_types::GotoDefinitionResponse>(&id).unwrap() {
+            Some(answer) => {
+                assert!(answer.is_none(), "a null result is an answer, and it is 'nothing'");
+                return;
+            }
+            None => {
+                assert!(std::time::Instant::now() < deadline, "null was never delivered");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[test]
+fn polling_a_cancelled_request_does_not_hang_forever() {
+    // A superseded navigation cancels its request. Polling it afterwards must terminate
+    // rather than report pending for all time, or the task awaiting it never finishes.
+    let (mut client, _server) = open_client(full_capabilities(), |_, _| Reply::Silence);
+    client.did_open(uri(), "php", "<?php\n").unwrap();
+
+    let id = client.request_definition(&uri(), 6).unwrap();
+    client.cancel(&id);
+
+    let polled: Option<Option<lsp_types::GotoDefinitionResponse>> =
+        client.poll_response(&id).unwrap();
+    assert_eq!(
+        polled.map(|answer| answer.is_none()),
+        Some(true),
+        "a cancelled request must resolve, with no answer"
+    );
+}
+
 #[test]
 fn a_late_reply_to_a_cancelled_request_is_discarded() {
     // The server is allowed to finish and answer anyway. That reply must not be

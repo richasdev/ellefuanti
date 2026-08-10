@@ -102,6 +102,31 @@ pub fn path_to_uri(path: &Path) -> Result<lsp_types::Uri> {
     uri.parse().with_context(|| format!("could not build a file URI for {path}"))
 }
 
+/// Converts a `file:` URI back into a filesystem path.
+///
+/// The inverse of [`path_to_uri`], and needed the moment the server starts *answering* with
+/// locations rather than only being told about them — a go-to-definition response names the
+/// file it found as a URI, and it has to become a path before anything can be opened.
+///
+/// Rejects any other scheme. A server may legitimately answer with `jdt:` or `untitled:`,
+/// and treating those as paths would produce a file the user does not have; refusing is the
+/// honest answer, and the caller shows nothing rather than opening the wrong thing.
+pub fn uri_to_path(uri: &lsp_types::Uri) -> Result<std::path::PathBuf> {
+    let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("file") {
+        anyhow::bail!("{} is not a file: URI", uri.as_str());
+    }
+
+    // `as_estr().decode()` reverses the percent-encoding `path_to_uri` applies. Lossy
+    // because a path that is not valid UTF-8 cannot round-trip through a `str` anyway —
+    // the same limitation `path_to_uri` states.
+    let path = uri.path().as_estr().decode().into_string_lossy().to_string();
+    if path.is_empty() {
+        anyhow::bail!("{} has no path", uri.as_str());
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +189,33 @@ mod tests {
             let uri = path_to_uri(&PathBuf::from(path)).unwrap();
             assert_eq!(decoded_path(&uri), path, "failed to round-trip {path}");
         }
+    }
+
+    #[test]
+    fn uris_convert_back_into_paths() {
+        // The direction navigation needs: a server answers with a URI and it has to name a
+        // file we can open. Anything the encoder can produce must survive the return trip,
+        // or a definition in a directory with a space in it lands nowhere.
+        for path in [
+            "/srv/app/routes/web.php",
+            "/srv/minha app/ação.php",
+            "/srv/app/emoji 😀/x.php",
+            "/srv/app/percent%.php",
+        ] {
+            let uri = path_to_uri(&PathBuf::from(path)).unwrap();
+            assert_eq!(uri_to_path(&uri).unwrap(), PathBuf::from(path), "round trip {path}");
+        }
+    }
+
+    #[test]
+    fn a_non_file_uri_is_refused_rather_than_guessed_at() {
+        // Servers legitimately answer with locations inside archives or virtual documents.
+        // Treating `jdt:/...` as a path would open a file the user does not have, which is
+        // worse than showing nothing: it looks like navigation went to the wrong place.
+        let uri: lsp_types::Uri = "jdt://contents/rt.jar/java.lang/String.class".parse().unwrap();
+        assert!(uri_to_path(&uri).is_err());
+
+        let uri: lsp_types::Uri = "untitled:Untitled-1".parse().unwrap();
+        assert!(uri_to_path(&uri).is_err());
     }
 }

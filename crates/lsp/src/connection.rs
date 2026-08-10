@@ -248,6 +248,57 @@ impl Connection {
         }
     }
 
+    /// Takes the answer to `id` if one has arrived, without blocking or waiting.
+    ///
+    /// # Why this exists alongside [`Connection::wait`]
+    ///
+    /// `wait` blocks, and a zero timeout does not turn it into a poll: it drops the pending
+    /// entry on the way out, so asking "has it answered yet?" that way *cancels the request*
+    /// on the second call. This returns `None` and leaves the request pending instead.
+    ///
+    /// The caller that needs this is the UI. gpui's executor owns the main thread, so a
+    /// navigation waiting on a cold server has to yield between checks rather than block
+    /// (ADR-0007), and the `Client` it would have to hold across an await lives inside the
+    /// view. Polling from a timer is what that leaves.
+    ///
+    /// A closed connection reports the failure rather than pending forever, so a caller
+    /// looping on this cannot spin after the server has died.
+    pub fn poll(&self, id: &RequestId) -> Result<Option<RequestOutcome>> {
+        let mut pending = self.shared.pending.lock().unwrap();
+
+        match pending.get(id) {
+            Some(Some(_)) => {
+                let result = pending.remove(id).flatten().expect("just matched Some(Some)");
+                Ok(Some(match result {
+                    Ok(value) => RequestOutcome::Ok(value),
+                    Err(error)
+                        if error.code == error_codes::REQUEST_CANCELLED
+                            || error.code == error_codes::CONTENT_MODIFIED =>
+                    {
+                        RequestOutcome::Cancelled
+                    }
+                    Err(error) => RequestOutcome::Failed(error),
+                }))
+            }
+            // Cancelled out from under us, by `cancel` or by a previous `wait` timing out.
+            None => Ok(Some(RequestOutcome::Cancelled)),
+            Some(None) => {
+                if self.shared.closed.load(Ordering::SeqCst) {
+                    pending.remove(id);
+                    let reason = self
+                        .shared
+                        .failure
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "the language server exited".to_string());
+                    bail!("{reason}");
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// Convenience: send and wait.
     pub fn request(
         &self,
