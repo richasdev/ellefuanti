@@ -3211,9 +3211,12 @@ impl Render for WorkspaceView {
 /// abstraction, a `Sidebar` the activity bar selects, so find-in-project became a variant
 /// rather than a second switch beside it.
 ///
-/// Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned` is what
-/// keeps that honest — a `zip` stops at the shorter side, so an added panel with no icon
-/// would silently vanish off the bar rather than fail.
+/// Paired with `icons::ACTIVITY_ICONS` positionally, and `panels_and_icons_stay_aligned` is
+/// what keeps that honest — a `zip` stops at the shorter side, so an added panel with no
+/// icon would silently vanish off the bar rather than fail.
+///
+/// The pairing is against `ACTIVITY_ICONS`, not the whole of `icons::ICONS`, since the file
+/// tree gave the binary a dozen more glyphs that have nothing to do with this bar.
 ///
 /// A const rather than a local inside `render_activity_bar`, since #80: that test was
 /// checking `icons::ICONS` against a list of names **retyped inside the test**, which
@@ -3248,75 +3251,77 @@ impl WorkspaceView {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .children(panels.into_iter().zip(icons::ICONS).map(|((name, target), icon)| {
-                let enabled = target.is_some();
-                let is_active = target == Some(active);
-                let entity = entity.clone();
+            .children(panels.into_iter().zip(icons::ACTIVITY_ICONS).map(
+                |((name, target), icon)| {
+                    let enabled = target.is_some();
+                    let is_active = target == Some(active);
+                    let entity = entity.clone();
 
-                div()
-                    .id(name)
-                    .size(px(32.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(enabled, |el| {
-                        el.cursor_pointer()
-                            .hover(|el| el.bg(theme.hover))
-                            .active(|el| el.bg(theme.pressed))
-                    })
-                    // The selected panel is the one whose sidebar you are looking at.
-                    // Before #64 this was every enabled panel, because there was only one.
-                    .when(is_active, |el| el.bg(theme.selected).text_color(theme.accent))
-                    // An enabled but unselected panel: readable, not shouting, and clearly
-                    // not the disabled treatment below — full opacity is the difference.
-                    .when(enabled && !is_active, |el| el.text_color(theme.text))
-                    // A disabled panel says so by *not* responding: no hover, no pointer.
-                    // The `not-allowed` cursor is what distinguishes "not ready yet" from
-                    // "your click missed", and it is not a colour — the dimmer glyph alone
-                    // would leave anyone who cannot separate the two greys with no signal
-                    // at all (#71). `opacity` on top of the muted text is the second,
-                    // non-colour channel: a disabled icon is visibly fainter in any theme.
-                    .when(!enabled, |el| {
-                        el.text_color(theme.text_muted)
-                            .opacity(0.5)
-                            .cursor(CursorStyle::OperationNotAllowed)
-                    })
-                    // Now there *is* a second panel to switch to, which is what the note
-                    // here used to say was missing. Only the enabled ones take a click; a
-                    // disabled panel still acknowledges the press and changes nothing.
-                    //
-                    // Search takes the same door ⌘⇧F does rather than just assigning the
-                    // variant: the panel is built lazily and its query field has to take
-                    // focus, or clicking the icon shows a text field that swallows typing.
-                    // Leaving the sidebar cancels any search still in flight — results you
-                    // can see survive, work you can no longer see does not.
-                    .when_some(target, |el, target| {
-                        el.on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                            entity.update(cx, |this, cx| {
-                                if target == Sidebar::Search {
-                                    this.show_search_panel(window, cx);
-                                    if let Some(panel) = this.search_panel.clone() {
-                                        window.focus(&panel.read(cx).focus_handle(cx));
-                                    }
-                                } else if this.sidebar == Sidebar::Search {
-                                    this.cancel_project_search();
-                                }
-                                this.sidebar = target;
-                                cx.notify();
-                            });
+                    div()
+                        .id(name)
+                        .size(px(32.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .when(enabled, |el| {
+                            el.cursor_pointer()
+                                .hover(|el| el.bg(theme.hover))
+                                .active(|el| el.bg(theme.pressed))
                         })
-                    })
-                    // 16px inside a 32px hit target: the icon is the glyph, the square is
-                    // the thing you can hit, and VS Code uses the same ratio.
-                    //
-                    // The colour is set on this parent, not on the svg. gpui rasterises
-                    // the SVG to an alpha mask and fills it with `style.text.color`, so
-                    // the icon inherits `text_color` above and every theme variant
-                    // recolours it for free. An icon with a hardcoded fill would be
-                    // invisible in at least one of the five.
-                    .child(svg().path(icon.path).size(px(16.0)))
-            }))
+                        // The selected panel is the one whose sidebar you are looking at.
+                        // Before #64 this was every enabled panel, because there was only one.
+                        .when(is_active, |el| el.bg(theme.selected).text_color(theme.accent))
+                        // An enabled but unselected panel: readable, not shouting, and clearly
+                        // not the disabled treatment below — full opacity is the difference.
+                        .when(enabled && !is_active, |el| el.text_color(theme.text))
+                        // A disabled panel says so by *not* responding: no hover, no pointer.
+                        // The `not-allowed` cursor is what distinguishes "not ready yet" from
+                        // "your click missed", and it is not a colour — the dimmer glyph alone
+                        // would leave anyone who cannot separate the two greys with no signal
+                        // at all (#71). `opacity` on top of the muted text is the second,
+                        // non-colour channel: a disabled icon is visibly fainter in any theme.
+                        .when(!enabled, |el| {
+                            el.text_color(theme.text_muted)
+                                .opacity(0.5)
+                                .cursor(CursorStyle::OperationNotAllowed)
+                        })
+                        // Now there *is* a second panel to switch to, which is what the note
+                        // here used to say was missing. Only the enabled ones take a click; a
+                        // disabled panel still acknowledges the press and changes nothing.
+                        //
+                        // Search takes the same door ⌘⇧F does rather than just assigning the
+                        // variant: the panel is built lazily and its query field has to take
+                        // focus, or clicking the icon shows a text field that swallows typing.
+                        // Leaving the sidebar cancels any search still in flight — results you
+                        // can see survive, work you can no longer see does not.
+                        .when_some(target, |el, target| {
+                            el.on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    if target == Sidebar::Search {
+                                        this.show_search_panel(window, cx);
+                                        if let Some(panel) = this.search_panel.clone() {
+                                            window.focus(&panel.read(cx).focus_handle(cx));
+                                        }
+                                    } else if this.sidebar == Sidebar::Search {
+                                        this.cancel_project_search();
+                                    }
+                                    this.sidebar = target;
+                                    cx.notify();
+                                });
+                            })
+                        })
+                        // 16px inside a 32px hit target: the icon is the glyph, the square is
+                        // the thing you can hit, and VS Code uses the same ratio.
+                        //
+                        // The colour is set on this parent, not on the svg. gpui rasterises
+                        // the SVG to an alpha mask and fills it with `style.text.color`, so
+                        // the icon inherits `text_color` above and every theme variant
+                        // recolours it for free. An icon with a hardcoded fill would be
+                        // invisible in at least one of the five.
+                        .child(svg().path(icon.path).size(px(16.0)))
+                },
+            ))
     }
 
     /// The sidebar: the file tree, source control, or find-in-project.
@@ -3413,6 +3418,15 @@ impl WorkspaceView {
                         let entity = entity.clone();
                         let path = entry.path.clone();
                         let is_dir = entry.is_dir();
+                        let expanded = entry.expanded;
+                        // A directory's glyph says open or closed — the same fact the
+                        // chevron carries, deliberately doubled, because that is how VS
+                        // Code draws it and the redundancy costs nothing.
+                        let icon = if is_dir {
+                            if expanded { icons::FOLDER_OPENED } else { icons::FOLDER }
+                        } else {
+                            icons::for_file(&entry.name)
+                        };
 
                         Some(
                             div()
@@ -3436,15 +3450,48 @@ impl WorkspaceView {
                                         }
                                     });
                                 })
-                                .child(SharedString::from(if is_dir {
-                                    format!(
-                                        "{} {}",
-                                        if entry.expanded { "▾" } else { "▸" },
-                                        entry.name
-                                    )
-                                } else {
-                                    format!("  {}", entry.name)
-                                }))
+                                // The disclosure slot. Fixed width whether or not there is
+                                // a chevron in it, so a file's name starts at the same x as
+                                // its sibling folder's — before this the file branch padded
+                                // with two spaces, which only lines up in a monospace font
+                                // and the sidebar is not one.
+                                //
+                                // A file gets an *empty* slot rather than a faint chevron:
+                                // a chevron is an affordance, and drawing one on a row that
+                                // does not expand is a lie about what a click does.
+                                .child(div().w(px(16.0)).flex_none().flex().items_center().when(
+                                    is_dir,
+                                    |el| {
+                                        el.child(
+                                            svg()
+                                                .path(if expanded {
+                                                    icons::CHEVRON_DOWN
+                                                } else {
+                                                    icons::CHEVRON_RIGHT
+                                                })
+                                                .size(px(16.0)),
+                                        )
+                                    },
+                                ))
+                                // The type glyph. Colour comes from `text_color` on the row
+                                // above — gpui rasterises the SVG to an alpha mask and
+                                // fills it with `style.text.color`, so every theme variant
+                                // recolours it for free and nothing here is hardcoded.
+                                //
+                                // Set on the row rather than on the sidebar root because
+                                // this callback runs *outside* the root's style scope
+                                // (`CONTEXT.md`, the `uniform_list` trap that cost four
+                                // line-height PRs). A style that is not on the row is not
+                                // on the row.
+                                .child(
+                                    div()
+                                        .mr_1()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .child(svg().path(icon).size(px(16.0))),
+                                )
+                                .child(SharedString::from(entry.name.clone()))
                                 .into_any_element(),
                         )
                     })
@@ -3469,6 +3516,12 @@ impl WorkspaceView {
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let dirty = tab.editor.read(cx).is_dirty();
                 let title = tab.editor.read(cx).document.title();
+                // The same mapping the tree uses, from the same function — a tab and its
+                // row in the tree showing different glyphs for one file would be worse
+                // than neither having an icon. `title` is the file name (`state.rs:199`),
+                // which is exactly what `for_file` wants; an untitled buffer's "untitled"
+                // has no extension and lands on the generic file icon, which is right.
+                let icon = icons::for_file(&title);
                 let entity = entity.clone();
                 let close_entity = entity.clone();
 
@@ -3497,6 +3550,22 @@ impl WorkspaceView {
                             cx.notify();
                         });
                     })
+                    // The type glyph, ahead of the name.
+                    //
+                    // A *fixed* 16px box, and the reason matters: #40 put the dirty dot and
+                    // the close button in one shared slot precisely so a tab's width never
+                    // changes as it becomes dirty or the pointer crosses it. An icon whose
+                    // width depended on anything — presence, hover, state — would reopen
+                    // that. This one is unconditional and constant, so every tab is exactly
+                    // 16px wider than before and none of them ever move again.
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .child(svg().path(icon).size(px(16.0))),
+                    )
                     .child(SharedString::from(title))
                     .child(
                         // One slot for both the dirty marker and the close button, so the
@@ -3629,29 +3698,76 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// `render_activity_bar` zips its panel list against `icons::ICONS`, and `zip` stops at
-    /// the shorter side — so adding a panel without adding an icon would silently drop the
-    /// last panel off the bar rather than fail. Assert the lengths match.
+    /// `render_activity_bar` zips its panel list against `icons::ACTIVITY_ICONS`, and `zip`
+    /// stops at the shorter side — so adding a panel without adding an icon would silently
+    /// drop the last panel off the bar rather than fail. Assert the lengths match.
     ///
     /// The names are asserted too, because equal lengths in the wrong order is the other
     /// way to get this wrong, and it is the more confusing one: every icon renders, each
     /// against the wrong panel.
+    ///
+    /// The slice, not the whole table: the file tree and tab bar added a dozen glyphs to
+    /// `icons::ICONS` that this bar never draws. `icons.rs` has the matching test that the
+    /// slice really is the bar's seven and stops there.
     #[test]
     fn panels_and_icons_stay_aligned() {
         assert_eq!(
-            icons::ICONS.len(),
+            icons::ACTIVITY_ICONS.len(),
             ACTIVITY_PANELS.len(),
-            "the activity bar renders {} panels; add the matching icon to icons::ICONS",
+            "the activity bar renders {} panels; add the matching icon to icons::ICONS and \
+             widen the ACTIVITY_ICON_COUNT prefix",
             ACTIVITY_PANELS.len()
         );
 
-        for (icon, (name, _)) in icons::ICONS.iter().zip(ACTIVITY_PANELS) {
+        for (icon, (name, _)) in icons::ACTIVITY_ICONS.iter().zip(ACTIVITY_PANELS) {
             assert_eq!(
                 icon.path,
                 format!("icons/{}.svg", name.to_lowercase()),
-                "icons::ICONS is out of order: every panel would get the wrong glyph"
+                "icons::ACTIVITY_ICONS is out of order: every panel would get the wrong glyph"
             );
         }
+    }
+
+    /// The tree and the tab bar choose a file's glyph from the *same* input.
+    ///
+    /// Two mappings would drift — a file would show one icon in the sidebar and another in
+    /// its tab, and whoever noticed would have no way to tell which was right. Both call
+    /// `icons::for_file`, so the only way they can still disagree is by feeding it
+    /// different strings: the tree passes the tree entry's `name`, the tab bar passes
+    /// `document.title()`. This asserts those are the same string for a real path, which is
+    /// the assumption the shared mapping rests on and the one that is not obvious.
+    ///
+    /// Both sides are checked against a real `FileTree` over real files, because the tab's
+    /// half of the claim is `Path::file_name` (`editor/state.rs:199`, what `title()` does)
+    /// and the tree's half is whatever `FileTree` decides to put in `Entry::name`. Asserting
+    /// they agree is only worth anything if one of them is not retyped from the other.
+    #[test]
+    fn a_tab_and_its_tree_row_are_named_the_same_thing() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let names = ["User.php", "welcome.blade.php", "composer.lock", "logo.png", "Makefile"];
+        for name in names {
+            std::fs::write(dir.path().join(name), "").expect("a file");
+        }
+
+        let tree = FileTree::new(dir.path()).expect("a tree");
+        let entries: Vec<_> = tree.entries().iter().filter(|e| !e.is_dir()).collect();
+        assert_eq!(entries.len(), names.len(), "the fixture did not land as expected");
+
+        for entry in entries {
+            // What the tab bar passes to `for_file`, computed from the path independently
+            // of whatever the tree stored.
+            let title = entry.path.file_name().unwrap().to_string_lossy().to_string();
+
+            assert_eq!(
+                icons::for_file(&entry.name),
+                icons::for_file(&title),
+                "{:?} would draw a different glyph in its tab than in the tree",
+                entry.path
+            );
+        }
+        // That each of those paths is actually in `ICONS` — the blank-square failure — is
+        // `icons::tests::every_named_path_is_in_the_table`, which has the trait in scope
+        // and a far wider sample of names than this fixture.
     }
 
     /// Every enabled panel selects a *distinct* sidebar, and every `Sidebar` is reachable.
