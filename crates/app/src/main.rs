@@ -5,6 +5,7 @@ mod editor;
 mod file_cache;
 mod icons;
 mod lsp_session;
+mod menu;
 mod palette;
 mod perf;
 #[cfg(test)]
@@ -64,6 +65,11 @@ fn main() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         startup.phase("keymap");
+
+        // After the keymap, not before: gpui reads the bindings to draw the ⌘S beside
+        // "Save", so a menu installed first renders without any shortcuts at all.
+        menu::init(cx);
+        startup.phase("menus");
 
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         let window = cx.open_window(

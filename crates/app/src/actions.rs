@@ -68,6 +68,10 @@ actions!(
         NewTerminal,
         ToggleTerminal,
         ToggleTheme,
+        // The View menu needs an action for route search; the palette only ever reached
+        // route mode through a command id, never a keybinding, so there was none.
+        GoToRoute,
+        OpenSettings,
     ]
 );
 
@@ -94,6 +98,8 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-shift-p", ToggleCommandPalette, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-p", ToggleQuickOpen, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some(context::WORKSPACE)),
+        // ⌘, is the macOS convention for preferences, and the menu item shows it.
+        KeyBinding::new("cmd-,", OpenSettings, Some(context::WORKSPACE)),
         // ctrl-` is the conventional terminal toggle. It is bound workspace-wide so it
         // also *closes* the panel while the terminal itself has focus.
         KeyBinding::new("ctrl-`", ToggleTerminal, Some(context::WORKSPACE)),
@@ -189,6 +195,8 @@ pub enum Dispatch {
     NewTerminal,
     ToggleTerminal,
     ToggleTheme,
+    ToggleHiddenFiles,
+    OpenSettings,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -206,6 +214,8 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "terminal.new" => Dispatch::NewTerminal,
         "terminal.toggle" => Dispatch::ToggleTerminal,
         "theme.toggle" => Dispatch::ToggleTheme,
+        "workspace.toggle_hidden_files" => Dispatch::ToggleHiddenFiles,
+        "workspace.open_settings" => Dispatch::OpenSettings,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

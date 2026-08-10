@@ -116,6 +116,36 @@ pub fn persist_theme(variant: ThemeVariant, cx: &mut App) {
     .detach();
 }
 
+/// The settings file's path, with the file materialised on disk if it was not there.
+///
+/// For the "Settings…" menu item, which opens the file in the editor: on a fresh install
+/// nothing has persisted a theme yet, so the path names a file that does not exist and
+/// opening it would put a "No such file" in the status bar — a menu item that appears
+/// broken the one time a new user is most likely to try it. Writing the current document
+/// first turns that into an empty-but-valid settings file they can edit.
+///
+/// `None` when there is nothing safe to open: no `HOME`, or a file that failed to parse.
+/// The parse-error case is the important one — [`load_and_apply`] deliberately leaves
+/// [`LiveSettings`] uninstalled so a broken file is never written over, and creating one
+/// here would destroy exactly what that protects.
+///
+/// Blocking, like [`Settings::save`] itself. It runs from a menu click and writes at most
+/// a few hundred bytes, and the alternative — opening the editor on a path that may not
+/// exist yet and racing the write — is worse than the syscall.
+pub fn path_for_editing(cx: &mut App) -> Option<PathBuf> {
+    let live = cx.try_global::<LiveSettings>()?;
+    let (settings, path) = (live.settings.clone(), live.path.clone());
+
+    if !path.exists()
+        && let Err(err) = settings.save(&path)
+    {
+        tracing::error!("could not create {}: {err:#}", path.display());
+        return None;
+    }
+
+    Some(path)
+}
+
 /// The variant the settings named, or the default.
 ///
 /// An unrecognised name logs and falls back rather than failing, and — importantly — does
@@ -162,6 +192,38 @@ mod tests {
 
             assert_eq!(theme_from(&read), variant, "{} did not survive", variant.label());
         }
+    }
+
+    /// The case the "Settings…" menu item hits on a fresh install.
+    ///
+    /// Nothing has persisted a theme yet, so the path names a file that is not there.
+    /// Returning it unmodified would open the editor on a missing file and put "No such
+    /// file" in the status bar — the item looking broken the first time anyone clicks it.
+    #[gpui::test]
+    async fn opening_settings_creates_the_file_when_it_is_missing(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+
+        cx.update(|cx| {
+            cx.set_global(LiveSettings { settings: Settings::default(), path: path.clone() });
+
+            assert!(!path.exists(), "the file should not be there before the menu item runs");
+            assert_eq!(path_for_editing(cx).as_ref(), Some(&path));
+            assert!(path.exists(), "the menu item must leave a file the editor can open");
+        });
+
+        // And it has to be a settings file, not an empty one the next load rejects.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(Settings::parse(&path, &written).unwrap().theme(), Settings::default().theme());
+    }
+
+    /// A file that failed to parse leaves `LiveSettings` uninstalled, and this must not be
+    /// the thing that quietly puts a default document over the top of it.
+    #[gpui::test]
+    async fn opening_settings_writes_nothing_when_the_file_could_not_be_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| assert_eq!(path_for_editing(cx), None));
     }
 
     #[test]
