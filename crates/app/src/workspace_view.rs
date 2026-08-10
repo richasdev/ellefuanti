@@ -1277,7 +1277,7 @@ impl WorkspaceView {
             panel.runner = root.as_deref().and_then(elle_test_runner::detect);
 
             let root = root.clone();
-            panel.on_jump(move |test, cx| {
+            panel.on_jump(move |test, window, cx| {
                 let Some(location) = test.location.clone() else { return };
                 let Some(root) = root.clone() else { return };
                 // Pest prints paths relative to the project root, PHPUnit absolute ones.
@@ -1293,7 +1293,9 @@ impl WorkspaceView {
                 // `Location::line` is 1-based; `Point` rows are 0-based. One jump path for
                 // the whole app (#88), not a second one invented here.
                 let point = Point::new(location.line.saturating_sub(1) as usize, 0);
-                workspace.update(cx, |workspace, cx| workspace.open_path_at(path, Some(point), cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_path_at(path, Some(point), window, cx)
+                });
             });
         });
         panel
