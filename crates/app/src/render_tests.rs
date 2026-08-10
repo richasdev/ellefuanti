@@ -43,6 +43,7 @@ use crate::editor::{Document, EditorView};
 use crate::find_bar::{FindEvent, Status};
 use crate::fonts::Fonts;
 use crate::palette::{Palette, PaletteMode};
+use crate::terminal_view::TerminalView;
 use crate::theme::{Metrics, ThemeVariant, Themed, set_theme};
 use crate::workspace_view::WorkspaceView;
 
@@ -861,4 +862,153 @@ async fn find_on_an_empty_workspace_does_nothing(cx: &mut TestAppContext) {
         assert!(workspace.find_bar_for_test().is_none(), "⌘F with no tab must not open a bar");
     });
     draw(cx);
+}
+
+// --- terminal close and split (#97) -----------------------------------------------------
+
+/// A split panel survives a real layout and paint pass, in every theme.
+///
+/// The reason this is a render test and not a unit test: splitting is layout. The bug it
+/// guards against is a pane laid out at zero width, a `flex_1` that never resolves, or a
+/// grid whose canvas measures itself into a division by zero — none of which a test on the
+/// split *state* would see.
+///
+/// It does **not** prove the two halves look right or sit side by side; per this file's
+/// header, geometry needs a human and stays on #35.
+#[gpui::test]
+async fn a_split_terminal_renders_in_every_theme(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (terminal, cx) = cx.add_window_view(|_window, cx| TerminalView::new(cx));
+
+    terminal.update(cx, |terminal, cx| {
+        terminal.open_shell_for_test("cat", cx);
+    });
+    terminal.update_in(cx, |terminal, window, cx| {
+        terminal.split_for_test(window, cx);
+    });
+
+    terminal.read_with(cx, |terminal, _cx| {
+        assert!(terminal.is_split(), "⌘D with one session open must produce a split");
+        assert_eq!(terminal.session_count(), 2, "a split spawns a second shell, not a second view");
+    });
+
+    draw(cx);
+}
+
+/// ⌘D toggles: a second press returns to one pane and leaves both shells alone.
+///
+/// Unsplitting deliberately does not close anything — the session stays in the tab strip.
+/// Killing a shell is destructive and must go through the confirm prompt, never through a
+/// layout command.
+#[gpui::test]
+async fn unsplitting_keeps_both_sessions(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (terminal, cx) = cx.add_window_view(|_window, cx| TerminalView::new(cx));
+
+    terminal.update(cx, |terminal, cx| terminal.open_shell_for_test("cat", cx));
+    terminal.update_in(cx, |terminal, window, cx| terminal.split_for_test(window, cx));
+    terminal.update_in(cx, |terminal, window, cx| terminal.split_for_test(window, cx));
+
+    terminal.read_with(cx, |terminal, _cx| {
+        assert!(!terminal.is_split(), "a second ⌘D must collapse back to one pane");
+        assert_eq!(
+            terminal.session_count(),
+            2,
+            "unsplitting is a layout change: it must not kill a shell"
+        );
+    });
+
+    draw(cx);
+}
+
+/// Closing the session a split was showing must drop the split, not leave an empty half.
+///
+/// The regression this pins is a stale `SessionId` in `split`: the pane would keep asking
+/// the manager for a session that no longer exists and render nothing beside a live grid.
+#[gpui::test]
+async fn closing_a_split_pane_collapses_the_split(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (terminal, cx) = cx.add_window_view(|_window, cx| TerminalView::new(cx));
+
+    terminal.update(cx, |terminal, cx| terminal.open_shell_for_test("cat", cx));
+    terminal.update_in(cx, |terminal, window, cx| terminal.split_for_test(window, cx));
+
+    // `close_active` rather than the prompt: the prompt is the *question*, and asking it
+    // needs a real dialog. What this test is about is the state after the answer.
+    terminal.update(cx, |terminal, cx| terminal.close_active(cx));
+
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.session_count(), 1, "one shell closed");
+        assert!(!terminal.is_split(), "a split with only one session left is not a split");
+    });
+
+    draw(cx);
+}
+
+/// Splitting with nothing open leaves one pane rather than a split with an empty half.
+#[gpui::test]
+async fn splitting_an_empty_panel_opens_a_single_session(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (terminal, cx) = cx.add_window_view(|_window, cx| TerminalView::new(cx));
+
+    terminal.update_in(cx, |terminal, window, cx| terminal.split_for_test(window, cx));
+
+    terminal.read_with(cx, |terminal, _cx| {
+        assert!(
+            !terminal.is_split(),
+            "there was nothing to split from, so one pane is the honest result"
+        );
+    });
+
+    draw(cx);
+}
+
+/// The perf constraint from #97: two terminals must not mean two timers.
+///
+/// The panel drives repaints from a 16ms poll, and the idle-CPU gate sits at 2% over gpui's
+/// own ~0.5-0.9% display-link floor (#93) — so a timer per pane would be a real, measurable
+/// regression rather than a theoretical one.
+///
+/// It counts timer *spawns* rather than checking `poll.is_some()`. The field is an
+/// `Option`, so "is it set" can only ever answer one, and that version of this test passes
+/// even with `ensure_polling`'s early return deleted — I made that mutation and watched it
+/// stay green before rewriting it this way. The cost being guarded is the spawn, so the
+/// spawn is what is counted.
+///
+/// Honest about its limit: this pins the *invariant*, not a CPU number. Measuring the real
+/// idle cost of a split panel needs the app on a screen with keystrokes driven into it, and
+/// keystroke injection is denied in this environment — so the wall-clock figure stays on
+/// #35's human list alongside the rest of the geometry.
+#[gpui::test]
+async fn splitting_does_not_start_a_second_timer(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (terminal, cx) = cx.add_window_view(|_window, cx| TerminalView::new(cx));
+
+    terminal.update(cx, |terminal, cx| terminal.open_shell_for_test("cat", cx));
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.polls_started_for_test(), 1, "one session starts one timer");
+    });
+
+    terminal.update_in(cx, |terminal, window, cx| terminal.split_for_test(window, cx));
+
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.session_count(), 2, "the split spawned a second shell");
+        assert!(terminal.is_split());
+        assert_eq!(
+            terminal.polls_started_for_test(),
+            1,
+            "a split must reuse the existing timer, not start a second"
+        );
+    });
+
+    // Closing back down to nothing stops it, rather than leaving a timer behind for a panel
+    // with no sessions.
+    terminal.update(cx, |terminal, cx| {
+        terminal.close_active(cx);
+        terminal.close_active(cx);
+    });
+    terminal.read_with(cx, |terminal, _cx| {
+        assert_eq!(terminal.session_count(), 0);
+        assert!(!terminal.is_polling_for_test(), "an empty panel must not keep polling");
+    });
 }
