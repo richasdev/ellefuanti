@@ -35,6 +35,7 @@ elle-workspace.workspace = true
 elle-laravel.workspace = true
 elle-index.workspace = true
 elle-lsp.workspace = true
+elle-settings.workspace = true
 elle-terminal.workspace = true
 
 gpui.workspace = true

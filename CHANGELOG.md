@@ -9,6 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
+  startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`
+  importer is a key mapping over an already-parsed document instead of a second parser
+  (ADR-0009). **Global only** — there is no per-project settings file, stated as a decision
+  because the read path is a merge with precedence or it is not, and retrofitting one
+  touches every accessor. Unlike the index, settings are not a cache and nothing may be
+  discarded: the in-memory value _is_ the parsed document, so a key written by a newer build
+  is still in the file after an older build saves. A malformed file names the file and the
+  position, launches on defaults, and is left untouched on disk — saving is disabled for
+  that session rather than overwriting a config file with defaults as the side effect of a
+  keystroke. A single key of the wrong type falls back to that key's default and costs
+  nothing else. Version field from the first commit. Exactly one key is wired to a real consumer — `theme`, which persists through
+  `set_theme` rather than through the toggle handler, so any future way of switching themes
+  gets persistence without asking for it (#60)
+
 - The modifier layer of the editor keymap, which was missing entirely. Word motions (⌥←/⌥→
   and their ⇧ variants), line and document motions (⌘←/⌘→ with a smart home, ⌘↑/⌘↓),
   deletions (⌥⌫/⌥⌦, ⌘⌫/⌘⌦), line manipulation (⌥↑/⌥↓ to move, ⇧⌥↑/⇧⌥↓ to duplicate, ⌘⇧K to
@@ -21,6 +36,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   surrounding typing with it (part of #69)
 
 ### Changed
+
+- The file index and `settings.json` now resolve their directory through one
+  `elle_settings::support_dir` helper rather than two copies of the same hardcoded string,
+  so they cannot drift onto different roots. Same path as before — no cache is invalidated
+  (part of #60)
 
 - The theme is a value the app holds rather than a constructor each view calls. It lives in
   gpui's global state behind a private newtype, so `cx.theme()` is the only way to read one
