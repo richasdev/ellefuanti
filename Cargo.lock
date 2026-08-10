@@ -1608,6 +1608,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-git"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "tempfile",
+]
+
+[[package]]
 name = "elle-index"
 version = "0.1.0"
 dependencies = [
@@ -1713,6 +1721,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "elle-core",
+ "elle-git",
  "elle-index",
  "elle-laravel",
  "elle-lsp",

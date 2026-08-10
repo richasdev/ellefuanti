@@ -9,6 +9,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- **A source control panel: git status and diff, read-only** (#64, items 1 and 2). The **Git**
+  entry in the activity bar is no longer disabled. A new `crates/git/` wraps `git2` behind
+  plain blocking functions — no gpui, no async (ADR-0004, ADR-0007) — and `crates/app` holds
+  the presentation.
+
+  **Stopped deliberately after item 2.** Stage, unstage, commit, amend, fetch, pull, push,
+  branch, merge, rebase and stash are _not_ here. #64 says item 5 is where the danger is, and
+  the specific danger is that losing uncommitted work is the one thing in this editor a user
+  cannot undo. A panel that only reads cannot lose anyone's work, so it ships before the
+  confirmation machinery the write operations need exists.
+
+  **`git2`, with no CLI fallback for these two operations, and that is a decision not an
+  omission.** The divergences libgit2 is known for — hooks, credential helpers, `include` in
+  config, some worktree layouts — are all about writing or networking. Status and diff read
+  the index, the object database and the working tree, where libgit2 implements what actually
+  matters (`core.excludesFile`, `.gitignore` precedence, `.gitattributes`). It also cancels
+  cooperatively per entry, which killing a child process does not. The fallback question
+  returns for item 4: **a commit must run `pre-commit` and libgit2 does not run hooks**, which
+  is a real reason to shell out for commit specifically, written down now so item 4 need not
+  rediscover it.
+
+  `git2` was **already linked into every build** through `gpui` → `gpui_util`, so this is a
+  Rust facade over an object file the binary already carried. The measured cost is
+  14.59 → 15.48 MB (+0.90 MB), inside the 17 MB gate.
+
+  **Refreshed on folder open, window focus and save — never on a timer.** Those three are
+  exactly when the answer can have changed in a way you are about to look at: a save is the
+  only way this editor changes the working tree, and focus covers every external change
+  because to see a stale panel you must first look at the window. A poll would burn CPU on a
+  panel nobody is looking at, and after #79 and #93 the gate measures idle CPU, so it would
+  register as a regression. It reads 0.00%. The honest cost is a staleness window when another
+  process changes the repo while ellefuanti is already focused, bounded by one click and
+  properly closed by #21's file watcher rather than a timer bolted on here.
+
+  **The diff reuses the editor's syntax highlighter**, which is what item 2 asks for: a PHP
+  diff inside a syntax-aware editor rendered flat looks broken, not plain. Each hunk's two
+  sides are reassembled into two buffers and parsed separately, because `-  $x = 1;` is not
+  valid PHP and interleaved add/remove lines are not a valid program in any language.
+
+  **Nothing is signalled by colour alone.** `+`/`-` on every diff line and git's own
+  `M`/`A`/`D`/`R`/`?`/`!` on every status row are the primary channel; the colours are
+  redundant. Those colours are derived from `Theme` (`string`, `error`, `warning`) rather than
+  added as fields, so all five variants get values already proven legible against their own
+  backgrounds — a hardcoded green cannot clear contrast on both `#ffffff` and `#16171d`.
+
+  **A folder that is not a git repository is the common case, not an error.** `Repo::discover`
+  returns `Option`, the panel says "Not a git repository", and nothing is logged, prompted or
+  hung — verified against real folders as well as unit tests.
+
 - **A performance gate**, `scripts/perf-gate.sh`, blocking on idle RSS and binary size (#84).
   Idle memory drifted 69 → 105 MB over roughly twenty PRs and nothing noticed (#79); each of
   those PRs measured its own viewport cost and was cheap in isolation, so the lesson is that

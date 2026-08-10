@@ -5,6 +5,7 @@ mod editor;
 mod file_cache;
 mod find_bar;
 mod fonts;
+mod git_panel;
 mod icons;
 mod lsp_session;
 mod menu;

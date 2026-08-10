@@ -1,0 +1,29 @@
+[package]
+name = "elle-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `git2` is already linked into every build of this editor: `gpui` depends on `gpui_util`,
+# which depends on `git2 0.20`. `cargo tree -p ellefuanti -i git2` shows the path. So the
+# libgit2 C library, its `libz-sys` and the whole `cc` build of it are costs this binary
+# already pays — declaring the dependency here adds a Rust facade over an object file that
+# is in the executable regardless. That is the single strongest argument for git2 over
+# shelling out for status and diff, and it is worth stating because it is not obvious:
+# the "big C dependency" objection does not apply when the C dependency is already there.
+#
+# No default features. `git2`'s defaults turn on `https` (openssl-sys / security-framework)
+# and `ssh` (libssh2-sys) — transport machinery for fetch, pull and push, which are items 5
+# of #64 and deliberately not built here. Status and diff touch the object database and the
+# working tree only, never a network. Turning the transports off keeps this crate honest
+# about its scope and keeps the feature unification from pulling openssl into the binary on
+# our account.
+git2 = { version = "0.20", default-features = false }
+
+[dev-dependencies]
+# Status and diff are defined by what is on disk. A fake repository would test the mapping
+# from `git2::Status` to our enum and nothing else — and the parts that actually break
+# (a path outside the repo, a repo with no commits, a folder that is not a repo) only exist
+# on a real filesystem.
+tempfile = "3"
