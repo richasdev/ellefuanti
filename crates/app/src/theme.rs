@@ -44,8 +44,11 @@ pub struct Theme {
     pub type_name: Hsla,
     pub function: Hsla,
     pub variable: Hsla,
+    pub property: Hsla,
     pub string: Hsla,
     pub number: Hsla,
+    pub operator: Hsla,
+    pub attribute: Hsla,
     pub comment: Hsla,
     pub tag: Hsla,
     pub blade: Hsla,
@@ -182,8 +185,16 @@ impl Theme {
             type_name: rgb(0x7dd3fc).into(),
             function: rgb(0x82aaff).into(),
             variable: rgb(0xf0a6c8).into(),
+            // Close to `variable` in hue but lighter, so `$user->name` reads as two
+            // related tokens rather than two unrelated ones. Unverified on screen (#35).
+            property: rgb(0xe8c7dd).into(),
             string: rgb(0xa3d977).into(),
             number: rgb(0xffb86c).into(),
+            // Deliberately low-contrast: operators are everywhere and should punctuate,
+            // not compete with the identifiers they sit between.
+            operator: rgb(0x9aa2b1).into(),
+            // Must not read as a comment — that confusion is the reason #47 lists it.
+            attribute: rgb(0xf7c873).into(),
             comment: rgb(0x5c6370).into(),
             tag: rgb(0x8b93a5).into(),
             blade: rgb(0xff9e64).into(),
@@ -241,6 +252,17 @@ impl Theme {
             comment: rgb(0x8a8f9c).into(),
             tag: rgb(0x5c6270).into(),
             blade: rgb(0xb54708).into(),
+            // Property sits deliberately close to `variable`: `$user->name` reads as one
+            // expression, and pulling the two far apart makes a member access look like two
+            // unrelated tokens. Close, not equal — the distinctness test rejects equal.
+            property: rgb(0x8a3f6b).into(),
+            // Operators are punctuation. Louder than `comment`, quieter than any identifier,
+            // because `=>` and `->` appear on nearly every line and should not compete.
+            operator: rgb(0x6b7180).into(),
+            // Attributes borrow the `number` family rather than the comment grey the dark
+            // theme's gold avoids: `#[Route(...)]` is code, and reading as a comment is the
+            // exact confusion this style exists to remove.
+            attribute: rgb(0x9a4b12).into(),
 
             // The dark theme lifts slot 0 off the background and brightens blue, because
             // `0x0000ff` on `0x16171d` is unreadable. Neither fix applies here and copying
@@ -299,8 +321,11 @@ impl Theme {
             HighlightStyle::Type => self.type_name,
             HighlightStyle::Function => self.function,
             HighlightStyle::Variable => self.variable,
+            HighlightStyle::Property => self.property,
             HighlightStyle::String => self.string,
             HighlightStyle::Number => self.number,
+            HighlightStyle::Operator => self.operator,
+            HighlightStyle::Attribute => self.attribute,
             HighlightStyle::Comment => self.comment,
             HighlightStyle::Tag => self.tag,
             HighlightStyle::BladeDirective => self.blade,
@@ -349,6 +374,9 @@ mod tests {
             HighlightStyle::Comment => "comment",
             HighlightStyle::Tag => "tag",
             HighlightStyle::BladeDirective => "blade directive",
+            HighlightStyle::Property => "property",
+            HighlightStyle::Operator => "operator",
+            HighlightStyle::Attribute => "attribute",
         }
     }
 
