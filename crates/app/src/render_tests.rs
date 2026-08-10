@@ -352,6 +352,87 @@ async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut 
 }
 
 #[gpui::test]
+async fn a_double_and_triple_click_reach_word_and_line_selection(cx: &mut TestAppContext) {
+    install_theme(cx);
+    // The *wiring*, not the rule. `Document::select_word_at` and `select_line_at` are unit
+    // tested in `editor/state.rs` against real text, where the answers are exact. What no
+    // unit test can show is that gpui's `click_count` reaches the match in
+    // `on_row_mouse_down` at all — a handler that ignored it would leave every one of those
+    // unit tests green while double-click did nothing in the app.
+    //
+    // **What this cannot check** is *which* word: the click x has to be resolved through
+    // `closest_index_for_x` against the headless text system, which is a fake perfect
+    // monospace (`600.0 * len_utf16`, see the module docs above). So the assertions are on
+    // the *shape* of the selection — empty, a word-sized run on one row, a whole row —
+    // which the fake metrics cannot fake away. Whether the word under the pointer is the
+    // one selected stays on #35's human list.
+    //
+    // gpui's `simulate_click` hardcodes `click_count: 1`
+    // (`gpui-0.2.2/src/app/test_context.rs:776`), so the events are built by hand.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("click.php")),
+            "<?php\n$first = 1;\n$second = 2;\n",
+            true,
+        )
+        .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    draw(cx);
+
+    let fonts = cx.update(|_window, cx| Fonts::get(cx));
+    let origin = view
+        .read_with(cx, |editor, _cx| editor.text_origin_x_for_test())
+        .expect("prepaint records the text origin");
+    // Row 1 (`$first = 1;`), a few pixels into its text.
+    let position = gpui::point(origin + px(4.0), fonts.line_height() * 1.5);
+
+    let click = |cx: &mut VisualTestContext, count: usize| {
+        cx.simulate_event(gpui::MouseDownEvent {
+            position,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::default(),
+            click_count: count,
+            first_mouse: false,
+        });
+    };
+
+    click(cx, 1);
+    view.read_with(cx, |editor, _cx| {
+        assert!(
+            editor.document.selection.is_empty(),
+            "a single click places the cursor and selects nothing"
+        );
+    });
+
+    click(cx, 2);
+    let (word, word_rows) = view.read_with(cx, |editor, _cx| {
+        let text = editor.document.selected_text().unwrap_or_default();
+        let range = editor.document.selection.range();
+        let rows = editor.document.buffer.offset_to_point(range.end).row
+            - editor.document.buffer.offset_to_point(range.start).row;
+        (text, rows)
+    });
+    assert!(!word.is_empty(), "a double click must select something, got nothing");
+    assert!(!word.contains('\n'), "a double click must not cross a line break, got {word:?}");
+    assert_eq!(word_rows, 0, "and must stay on one row");
+
+    click(cx, 3);
+    let line =
+        view.read_with(cx, |editor, _cx| editor.document.selected_text().unwrap_or_default());
+    assert_eq!(
+        line, "$first = 1;\n",
+        "a triple click takes the whole row including its ending, whatever x it landed on"
+    );
+
+    click(cx, 4);
+    let all = view.read_with(cx, |editor, _cx| editor.document.selected_text().unwrap_or_default());
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(all, text, "a fourth click selects the document, the way Zed's `_ =>` arm does");
+}
+
+#[gpui::test]
 async fn typing_reaches_the_document(cx: &mut TestAppContext) {
     install_theme(cx);
     // The full input path: keystroke → gpui dispatch → key_char → Document::insert. Every

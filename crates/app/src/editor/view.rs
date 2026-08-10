@@ -97,6 +97,17 @@ const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(530
 /// the caret solid and restarts this delay, so the blink only resumes once you have stopped.
 const BLINK_RESUME_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Rows of context kept above and below the cursor when the viewport follows it.
+///
+/// Zed's `vertical_scroll_margin`, whose default is `3`
+/// (`zed/assets/settings/default.json:726`, read by
+/// `crates/editor/src/editor_settings.rs:35`). Adopted as the number rather than derived:
+/// it is a tuned default, and the point of reading it from Zed is not to re-derive it.
+///
+/// ponytail: a constant, not a setting. It joins the indent width (#60) whenever the editor
+/// grows a settings surface for these — `crates/settings` already has the file layer.
+const VERTICAL_SCROLL_MARGIN: usize = 3;
+
 impl EditorView {
     pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
         Self {
@@ -227,12 +238,53 @@ impl EditorView {
         self.document.buffer.is_dirty()
     }
 
-    /// Scrolls so the cursor row is on screen. Called after any motion or edit.
+    /// Scrolls so the cursor row is on screen, keeping [`VERTICAL_SCROLL_MARGIN`] rows of
+    /// context beyond it.
+    ///
+    /// This is Zed's `AutoscrollStrategy::Fit`
+    /// (`crates/editor/src/scroll/autoscroll.rs:238-252`), transcribed into row terms:
+    ///
+    /// ```text
+    /// let margin = margin.min(self.scroll_manager.vertical_scroll_margin);
+    /// let target_top = (target_top - margin - ...).max(0.0);
+    /// let target_bottom = target_bottom + margin;
+    /// let needs_scroll_up = target_top < start_row;
+    /// let needs_scroll_down = target_bottom >= end_row;
+    /// if needs_scroll_up && !needs_scroll_down { scroll_position.y = target_top; }
+    /// else if !needs_scroll_up && needs_scroll_down { scroll_position.y = target_bottom - visible_lines; }
+    /// ```
+    ///
+    /// Three properties of that, all of which the previous one-liner got wrong:
+    ///
+    /// 1. **The margin.** Zed widens the cursor's target band by `vertical_scroll_margin`
+    ///    rows on each side, so the viewport moves when the cursor comes *near* an edge, not
+    ///    only once it has left. Arrowing down the file then keeps three lines of what comes
+    ///    next in view instead of putting the caret on the bottom pixel row.
+    /// 2. **Minimal movement, and direction-aware.** Scrolling up puts the target at the top;
+    ///    scrolling down puts it at the bottom. The old call always used
+    ///    [`ScrollStrategy::Top`], which meant a cursor leaving the bottom of a screenful
+    ///    jumped the whole viewport so that row became row zero — a full-page lurch for one
+    ///    line of movement.
+    /// 3. **The `^` case does nothing.** When the row cannot be satisfied at both edges
+    ///    (a viewport shorter than `2 * margin + 1` rows), Zed scrolls neither way rather
+    ///    than oscillating. `needs_scroll_up ^ needs_scroll_down` is what says so, and it is
+    ///    the reason this is written as two booleans rather than two `if`s.
+    ///
+    /// Deliberately *not* delegated to gpui's `scroll_to_item_with_offset`, which looks like
+    /// it does this: its `offset` shrinks the viewport from the top only. In
+    /// `gpui-0.2.2/src/elements/uniform_list.rs`, line 406 adds `offset_pixels` to the
+    /// top comparison while line 409's bottom comparison does not, so the margin would apply
+    /// above the cursor and not below it. Computing it here keeps it symmetric.
+    ///
+    /// Falls back to the old unconditional scroll before the first frame, when
+    /// `visible_rows` is still empty and there is no viewport to reason about.
     fn scroll_cursor_into_view(&mut self) {
         let row = self.document.cursor_point().row;
-        // scroll_to_item is a no-op when the item is already visible, so this is cheap to
-        // call unconditionally and does not fight the user's own scrolling.
-        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
+        let last_row = self.document.buffer.len_lines().saturating_sub(1);
+
+        if let Some((item, strategy)) = autoscroll_fit(row, &self.visible_rows, last_row) {
+            self.scroll.scroll_to_item(item, strategy);
+        }
     }
 
     /// Handles a raw keypress, for characters the action system does not cover.
@@ -625,8 +677,30 @@ impl EditorView {
         };
 
         let offset = self.document.buffer.point_to_offset(Point::new(row, column));
-        // Shift-click extends the existing selection, matching every other editor.
-        self.document.move_to(offset, event.modifiers.shift);
+
+        // Click count, the way Zed branches on it in `begin_selection`
+        // (`crates/editor/src/selection.rs:1277`): 1 places the cursor, 2 takes the
+        // surrounding word, 3 takes the line, and anything beyond takes the document.
+        // gpui counts the repeats and puts the count on the event, so this is a match rather
+        // than a timer — see `MouseDownEvent::click_count` in gpui 0.2.2
+        // (`src/interactive.rs:104`).
+        //
+        // Shift is checked first and only for a single click. Zed routes shift-click to
+        // `extend_selection` (`selection.rs:1179`), which starts from the existing selection
+        // rather than replacing it; shift-double-click there extends *by word*, which needs
+        // the `SelectMode` this editor does not have (one `Selection`, no pending mode —
+        // see the `ponytail` note on `Selection`). Rather than half-implement it,
+        // shift-double-click here falls through to plain word selection, which is at least
+        // not surprising.
+        match event.click_count {
+            1 => {
+                // Shift-click extends the existing selection, matching every other editor.
+                self.document.move_to(offset, event.modifiers.shift);
+            }
+            2 => self.document.select_word_at(offset),
+            3 => self.document.select_line_at(row),
+            _ => self.document.select_all(),
+        }
 
         // ⌘click is go-to-definition, the way it is in every IDE. The cursor moves first
         // either way, so a ⌘click that finds nothing still behaves like the ordinary click
@@ -949,6 +1023,54 @@ impl EditorView {
         let last_row = rows.end.saturating_sub(1).min(buffer.len_lines().saturating_sub(1));
         let end = buffer.point_to_offset(Point::new(last_row, buffer.line_len(last_row)));
         start..end.max(start)
+    }
+}
+
+/// Decides how the viewport should follow `row`, or `None` to leave it alone.
+///
+/// Split out of [`EditorView::scroll_cursor_into_view`] as a pure function purely so it can
+/// be tested: it is arithmetic over row indices, and unlike everything else about scrolling
+/// it does not need a window, a font or a rendered frame to be wrong in a way that matters.
+///
+/// `visible` is the row range the last frame drew, `last_row` the final row of the buffer.
+/// An empty `visible` means no frame has been drawn yet, so there is no viewport to reason
+/// about and the caller falls back to putting the row at the top.
+fn autoscroll_fit(
+    row: usize,
+    visible: &Range<usize>,
+    last_row: usize,
+) -> Option<(usize, ScrollStrategy)> {
+    if visible.is_empty() {
+        return Some((row, ScrollStrategy::Top));
+    }
+
+    // Zed's `margin.min(self.scroll_manager.vertical_scroll_margin)` (`autoscroll.rs:238`),
+    // where its own `margin` is half the viewport: on a viewport too short to hold the
+    // margin twice over, the margin shrinks rather than putting every row out of bounds.
+    let margin = VERTICAL_SCROLL_MARGIN.min(visible.len() / 2);
+
+    let target_top = row.saturating_sub(margin);
+    // Zed's `target_bottom` is the row *after* the cursor (`target_top + 1.`) plus the
+    // margin, and it compares with `>=` — so this is the first row that is allowed to be
+    // past the end of the viewport.
+    let target_bottom = row + 1 + margin;
+
+    let needs_scroll_up = target_top < visible.start;
+    let needs_scroll_down = target_bottom >= visible.end;
+
+    // Zed's `needs_scroll_up ^ needs_scroll_down`: when both are true the row cannot be
+    // satisfied at either edge, and scrolling to one would immediately violate the other.
+    // Doing nothing is what stops that oscillating.
+    if needs_scroll_up && !needs_scroll_down {
+        Some((target_top, ScrollStrategy::Top))
+    } else if needs_scroll_down && !needs_scroll_up {
+        // `Bottom` places the given item at the bottom edge, so the item to name is the
+        // last row that must be visible — the margin row below the cursor — clamped to the
+        // file, since a margin past EOF is rows that do not exist. `target_bottom` is one
+        // past it.
+        Some(((target_bottom - 1).min(last_row), ScrollStrategy::Bottom))
+    } else {
+        None
     }
 }
 
@@ -1412,6 +1534,110 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- autoscroll margin -----------------------------------------------------------
+    //
+    // These test the *decision*, which is arithmetic over row indices and is the part that
+    // can be wrong without a GPU. What they deliberately do NOT test is that the viewport
+    // then moves: `scroll_to_item` defers to `uniform_list`'s prepaint, which needs a real
+    // frame with a real item height, and the headless platform draws none. That half stays
+    // on #35's human list.
+
+    /// `visible` as a range, so a test reads as "rows 10 through 29 are on screen".
+    fn viewport(start: usize, end: usize) -> Range<usize> {
+        start..end
+    }
+
+    #[test]
+    fn a_cursor_in_the_middle_of_the_viewport_does_not_scroll() {
+        // The property that makes this safe to call after every keystroke: it must not
+        // fight the user's own scrolling.
+        assert_eq!(autoscroll_fit(20, &viewport(10, 30), 100), None);
+    }
+
+    #[test]
+    fn a_cursor_within_the_margin_of_the_bottom_edge_scrolls_before_it_leaves() {
+        // The whole point of the margin, and what the previous implementation lacked. Row
+        // 28 is *visible* in 10..30 — the old `scroll_to_item(row, Top)` was a no-op here —
+        // but it has only one row of context below it, so Zed scrolls.
+        let (item, strategy) = autoscroll_fit(28, &viewport(10, 30), 100).expect("must scroll");
+        assert!(matches!(strategy, ScrollStrategy::Bottom));
+        // Three rows of context below the cursor: 28 + 3 = 31 is the last row to reveal.
+        assert_eq!(item, 31);
+    }
+
+    #[test]
+    fn a_cursor_within_the_margin_of_the_top_edge_scrolls_before_it_leaves() {
+        let (item, strategy) = autoscroll_fit(11, &viewport(10, 30), 100).expect("must scroll");
+        assert!(matches!(strategy, ScrollStrategy::Top));
+        // Three rows of context above: 11 - 3 = 8.
+        assert_eq!(item, 8);
+    }
+
+    #[test]
+    fn a_cursor_just_outside_the_margin_does_not_scroll() {
+        // The boundary in both directions, and it is asymmetric because Zed's two
+        // comparisons are (`autoscroll.rs:244-245`): the top is `target_top < start_row`
+        // and the bottom is `target_bottom >= end_row`, with `end_row` exclusive.
+        //
+        // Viewport 10..30, margin 3. Upwards: row 13 gives target_top 10, and `10 < 10` is
+        // false, so it stays. Downwards: row 25 gives target_bottom 29, and `29 >= 30` is
+        // false, so it stays — one row tighter than the top, because `target_bottom` is
+        // already one *past* the last row that must be shown.
+        assert_eq!(autoscroll_fit(13, &viewport(10, 30), 100), None, "top boundary");
+        assert_eq!(autoscroll_fit(25, &viewport(10, 30), 100), None, "bottom boundary");
+        // And one row further out in each direction does scroll.
+        assert!(autoscroll_fit(12, &viewport(10, 30), 100).is_some(), "one past the top");
+        assert!(autoscroll_fit(26, &viewport(10, 30), 100).is_some(), "one past the bottom");
+    }
+
+    #[test]
+    fn scrolling_down_puts_the_row_at_the_bottom_rather_than_the_top() {
+        // The second thing the old one-liner got wrong. `ScrollStrategy::Top` on a cursor
+        // leaving the bottom of a screenful made that row row zero — a full-page lurch for
+        // one line of downward movement. Minimal movement means the *bottom* edge.
+        let (_, strategy) = autoscroll_fit(60, &viewport(10, 30), 100).expect("must scroll");
+        assert!(
+            matches!(strategy, ScrollStrategy::Bottom),
+            "a jump downwards must land at the bottom edge, not scroll the row to the top"
+        );
+    }
+
+    #[test]
+    fn the_bottom_margin_never_names_a_row_past_the_end_of_the_file() {
+        // A cursor on the last line has no three rows below it to reveal. Naming row 102 of
+        // a 101-row file is a row `uniform_list` has no item for.
+        let (item, _) = autoscroll_fit(100, &viewport(10, 30), 100).expect("must scroll");
+        assert_eq!(item, 100);
+    }
+
+    #[test]
+    fn a_viewport_too_short_for_the_margin_still_scrolls() {
+        // Zed's `margin.min(vertical_scroll_margin)`. A 4-row viewport cannot hold three
+        // rows of context on both sides; the margin shrinks to 2 rather than making every
+        // row simultaneously too high and too low, which would scroll nowhere forever.
+        let result = autoscroll_fit(50, &viewport(10, 14), 100);
+        assert!(result.is_some(), "a cursor far below a short viewport must still scroll");
+    }
+
+    #[test]
+    fn a_row_that_cannot_satisfy_both_edges_scrolls_neither_way() {
+        // Zed's `needs_scroll_up ^ needs_scroll_down` (`autoscroll.rs:253`): when the row
+        // plus its margins does not fit in the viewport at all, scrolling to satisfy either
+        // edge immediately violates the other, so it scrolls neither way.
+        //
+        // Viewport 10..14 is 4 rows, so the margin shrinks to 2 — but 2 + 1 + 2 = 5 rows
+        // still do not fit in 4. Row 11: target_top 9 is above 10, *and* target_bottom 14
+        // is at 14. Both true.
+        assert_eq!(autoscroll_fit(11, &viewport(10, 14), 100), None);
+    }
+
+    #[test]
+    fn before_the_first_frame_the_row_goes_to_the_top() {
+        // `visible_rows` is `0..0` until `render_rows` has run once, and a navigation can
+        // arrive before that — opening a file at a line number does exactly this.
+        assert_eq!(autoscroll_fit(42, &viewport(0, 0), 100), Some((42, ScrollStrategy::Top)));
+    }
 
     // --- click-to-column arithmetic -------------------------------------------------
 
