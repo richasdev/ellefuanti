@@ -151,6 +151,21 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 Item::command("New Terminal", "terminal.new", |label| {
                     MenuItem::action(label, NewTerminal)
                 }),
+                // Test runner (#25). Under View with the terminal because the panel is the
+                // same kind of thing; the three run commands are next to it because that is
+                // where someone who just opened the panel will look for them.
+                Item::command("Toggle Test Panel", "tests.toggle", |label| {
+                    MenuItem::action(label, crate::actions::ToggleTestPanel)
+                }),
+                Item::command("Run All Tests", "tests.run", |label| {
+                    MenuItem::action(label, crate::actions::RunTests)
+                }),
+                Item::command("Run Tests in Current File", "tests.run_file", |label| {
+                    MenuItem::action(label, crate::actions::RunTestsInFile)
+                }),
+                Item::command("Rerun Failed Tests", "tests.rerun_failed", |label| {
+                    MenuItem::action(label, crate::actions::RerunFailedTests)
+                }),
                 Item::command("Switch Theme", "theme.toggle", |label| {
                     MenuItem::action(label, ToggleTheme)
                 }),

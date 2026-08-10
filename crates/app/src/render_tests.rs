@@ -315,6 +315,76 @@ async fn the_palette_renders_in_both_modes(cx: &mut TestAppContext) {
     draw(cx);
 }
 
+/// The test panel paints in every state it can be in, under every theme (#25).
+///
+/// The states are the point, not the coverage: an empty panel, a run with passes, failures
+/// and skips, and — the one most likely to be forgotten — a run whose output could not be
+/// parsed at all, which renders the raw text instead of results. A renderer that indexed
+/// into an empty list, or that assumed every failure carries a location, panics here.
+#[gpui::test]
+async fn the_test_panel_renders_in_every_state(cx: &mut TestAppContext) {
+    use elle_test_runner::{Event, Location};
+
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    // Opened, with no run yet — the first thing a user sees.
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_test_panel_for_test(window, cx))
+    });
+    draw(cx);
+
+    // A finished run with one of everything, including a failure with no readable location
+    // and one with a multi-line message.
+    workspace.update(cx, |workspace, cx| {
+        workspace.seed_test_results_for_test(
+            vec![
+                Event::Started { name: "it passes".to_string() },
+                Event::Finished { name: "it passes".to_string(), duration_ms: Some(2) },
+                Event::Started { name: "it fails".to_string() },
+                Event::Failed {
+                    name: "it fails".to_string(),
+                    message: "Failed asserting that 2 is identical to 3.\nsecond line".to_string(),
+                    location: Some(Location {
+                        path: "tests/Unit/ExampleTest.php".to_string(),
+                        line: 8,
+                    }),
+                },
+                Event::Started { name: "it fails nowhere".to_string() },
+                Event::Failed {
+                    name: "it fails nowhere".to_string(),
+                    message: "no location for this one".to_string(),
+                    location: None,
+                },
+                Event::Started { name: "it is skipped".to_string() },
+                Event::Ignored {
+                    name: "it is skipped".to_string(),
+                    message: "not today".to_string(),
+                },
+            ],
+            crate::test_view::RunState::Finished {
+                command: "./vendor/bin/pest --teamcity --colors=never".to_string(),
+                code: Some(1),
+            },
+            cx,
+        );
+    });
+    draw(cx);
+
+    // The degradation path: a runner that printed something we could not read at all.
+    workspace.update(cx, |workspace, cx| {
+        workspace.seed_test_results_for_test(
+            vec![Event::Unparsed { line: "PHP Fatal error: out of memory".to_string() }],
+            crate::test_view::RunState::Failed {
+                message: "No Pest or PHPUnit found in vendor/bin".to_string(),
+            },
+            cx,
+        );
+    });
+    draw(cx);
+}
+
 #[gpui::test]
 async fn switching_the_theme_at_runtime_repaints_every_surface(cx: &mut TestAppContext) {
     // #48's second "done when": switching updates every surface, including the terminal.

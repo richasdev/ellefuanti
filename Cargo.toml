@@ -11,6 +11,7 @@ members = [
     "crates/index",
     "crates/laravel",
     "crates/git",
+    "crates/test-runner",
     "crates/settings",
     "crates/theme",
     "benchmarks",
@@ -33,6 +34,7 @@ elle-lsp = { path = "crates/lsp" }
 elle-index = { path = "crates/index" }
 elle-laravel = { path = "crates/laravel" }
 elle-git = { path = "crates/git" }
+elle-test-runner = { path = "crates/test-runner" }
 elle-settings = { path = "crates/settings" }
 elle-theme = { path = "crates/theme" }
 

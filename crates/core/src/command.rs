@@ -164,6 +164,13 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("navigate.forward", "Forward"),
     Command::new("terminal.new", "New Terminal"),
     Command::new("terminal.toggle", "Toggle Terminal"),
+    // Test runner (#25). Named for what they run rather than "Test", so a project with no
+    // framework shows rows that do nothing rather than rows that promise something absent —
+    // the panel says which framework it found, or that it found none.
+    Command::new("tests.toggle", "Toggle Test Panel"),
+    Command::new("tests.run", "Run All Tests"),
+    Command::new("tests.run_file", "Run Tests in Current File"),
+    Command::new("tests.rerun_failed", "Rerun Failed Tests"),
     Command::new("theme.toggle", "Switch Theme"),
 ];
 
