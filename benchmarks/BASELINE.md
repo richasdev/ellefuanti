@@ -96,7 +96,7 @@ cannot silently return.
 This is the entire argument for writing benchmarks before optimising: the walk _looked_
 viewport-scoped, and the range check at the top of the function made it read as correct.
 
-### Query-driven languages (JSON, JavaScript, TypeScript, CSS)
+### Query-driven languages (JSON, JS, TS, CSS, HTML, TOML, YAML, Shell)
 
 PHP and Blade are highlighted by a hand-written tree walk; the languages added in #53 go
 through a `highlights.scm` query and a `QueryCursor`. Different mechanism, so the viewport
@@ -108,16 +108,25 @@ while the file behind it grows 100× — 40 / 400 / 4000 units:
 
 | Language   | small        | medium       | large        | growth    |
 | ---------- | ------------ | ------------ | ------------ | --------- |
-| JSON       | **39.2 µs**  | **41.2 µs**  | **41.3 µs**  | **1.05×** |
-| JavaScript | **135.7 µs** | **134.4 µs** | **134.6 µs** | **0.99×** |
-| TypeScript | **180.4 µs** | **181.1 µs** | **183.1 µs** | **1.02×** |
-| CSS        | **52.2 µs**  | **52.2 µs**  | **52.6 µs**  | **1.01×** |
+| JSON       | **39.7 µs**  | **41.2 µs**  | **42.1 µs**  | **1.06×** |
+| JavaScript | **135.3 µs** | **136.4 µs** | **142.9 µs** | **1.06×** |
+| TypeScript | **184.5 µs** | **185.6 µs** | **188.6 µs** | **1.02×** |
+| CSS        | **53.0 µs**  | **53.4 µs**  | **53.4 µs**  | **1.01×** |
+| HTML       | **54.2 µs**  | **55.2 µs**  | **55.5 µs**  | **1.02×** |
+| TOML       | **44.5 µs**  | **45.7 µs**  | **46.6 µs**  | **1.05×** |
+| YAML       | **49.9 µs**  | **52.1 µs**  | **53.0 µs**  | **1.06×** |
+| Shell      | **74.0 µs**  | **75.7 µs**  | **76.0 µs**  | **1.03×** |
 
 **Every language is flat**, which is the constraint. The absolute numbers vary by query
 size rather than by file size: TypeScript is the JavaScript query concatenated with its
 own, so it is the largest query and the slowest, and JSON's five patterns are the
 cheapest. A standalone probe over the same PHP fixture put 40 patterns at 87 µs and 5 at
-57 µs, so pattern count is the cost driver — worth knowing before adding YAML or HTML.
+57 µs, so pattern count is the cost driver.
+
+The four added in the second batch confirm that prediction rather than merely re-passing
+the test. HTML, TOML and YAML have small queries and land where JSON and CSS do; Shell is
+the slowest of the four at 76 µs, and its query is also the largest of the four. Nothing
+here approaches TypeScript, and against an 8.3 ms frame budget the worst of them is ~0.9%.
 
 **The query path is ~2.7× more expensive than the hand-written walk** (87 µs against
 32 µs, interleaved A/B in one process over the same PHP fixture). Flatness is the
@@ -141,29 +150,41 @@ so no), and that the query engine ignores `set_byte_range` (a standalone probe m
 1.00× across 100×, so no). **The third thing to suspect should have been the first**,
 which is what this section of the file has now said three times.
 
-### Binary size: what four grammars cost
+### Binary size: what eight grammars cost
 
 Each tree-sitter grammar is compiled C, and its parse tables are static data that link in
 whether or not anyone opens that file type. #53 asked for this to be measured rather than
 assumed, and it is not negligible:
 
-| Release binary           | Size                |
-| ------------------------ | ------------------- |
-| before (PHP only)        | **7.63 MB**         |
-| after (+ JSON/JS/TS/CSS) | **9.64 MB**         |
-| **delta**                | **+2.01 MB (+26%)** |
+| Release binary                    | Size                |
+| --------------------------------- | ------------------- |
+| before (PHP only)                 | **7.63 MB**         |
+| after #56 (+ JSON/JS/TS/CSS)      | **9.64 MB**         |
+| after #53 (+ HTML/TOML/YAML/bash) | **11.21 MB**        |
+| **delta, PHP-only to now**        | **+3.58 MB (+47%)** |
 
-Roughly **500 KB per grammar**, and it lands in `__TEXT.__const` — 3.47 MB of the new
-binary is parse tables. TypeScript is the largest single contributor (its grammar covers
-TSX-adjacent syntax even though only `LANGUAGE_TYPESCRIPT` is used); JSON is the smallest
-by a wide margin.
+The second batch added **+1.57 MB for four grammars**, and it is nothing like evenly
+spread. Compiled rlib size, which is what drives it:
 
-**Stated plainly because it scales:** the remaining priority-2/3 languages in #53 (YAML,
-Markdown, HTML, SQL, TOML, Rust) would plausibly add another 3–4 MB, which would roughly
-double the binary from where it started. That is an argument for deciding whether every
-grammar belongs in the default build — dynamic loading, or a feature flag per language —
-_before_ adding eight more, not after. No such mechanism exists today and none was added
-here; this is a measurement, not a proposal.
+| Grammar | rlib        |
+| ------- | ----------- |
+| bash    | **1.52 MB** |
+| YAML    | 232 KB      |
+| TOML    | 52 KB       |
+| HTML    | 45 KB       |
+
+**Shell is the whole cost.** It is 34× TOML and accounts for ~95% of the batch on its own —
+bash's grammar carries word expansion, here-documents and a hand-written external scanner,
+so it is genuinely that big rather than badly built. HTML and TOML are close to free.
+
+This also corrects a prediction made here after #56: that the remaining six languages in
+#53 would add "3–4 MB". Four of them added 1.57 MB, and one grammar is most of it. The
+useful generalisation is not "≈500 KB per grammar" — that average was an artefact of
+TypeScript and PHP, which are the two largest in the tree. **Grammar size varies by more
+than 30× and should be looked up, not extrapolated.**
+
+The standing question is unchanged: no mechanism exists to leave a grammar out of the
+build, and none was added here. At 11.2 MB it is not yet a problem worth building one for.
 
 ## Workspace — `benches/workspace.rs`
 

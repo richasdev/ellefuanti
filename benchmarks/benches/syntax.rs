@@ -114,7 +114,7 @@ fn blade_highlighting(c: &mut Criterion) {
 
 /// The same viewport claim, for the query-driven languages.
 ///
-/// PHP is measured above on a hand-written tree walk; JSON/JS/TS/CSS go through
+/// PHP is measured above on a hand-written tree walk; every other language goes through
 /// `highlights.scm` and a `QueryCursor`, which is a completely different mechanism with
 /// its own way of failing. `set_byte_range` is what is supposed to keep the query engine
 /// off the rest of the file, and "the API should prune" is exactly the sort of assumption
@@ -130,7 +130,7 @@ fn blade_highlighting(c: &mut Criterion) {
 /// bench measures how much is on screen instead of how big the file is.
 fn query_language_viewport(c: &mut Criterion) {
     // (language, header, one repeatable unit). The unit is what grows.
-    let cases: [(Language, &str, &str); 4] = [
+    let cases: [(Language, &str, &str); 8] = [
         (Language::Json, "{\n", "  \"key_name\": [1, 2, \"three\", true, null],\n"),
         (
             Language::JavaScript,
@@ -146,6 +146,18 @@ fn query_language_viewport(c: &mut Criterion) {
             Language::Css,
             "/* header */\n",
             ".card-item {\n  color: #ff8800;\n  margin: 10px 2em;\n  --local-var: 4;\n}\n",
+        ),
+        (
+            Language::Html,
+            "<!-- header -->\n",
+            "<div class=\"row\" id=\"r\">\n  <span data-x=\"1\">text</span>\n</div>\n",
+        ),
+        (Language::Toml, "# header\n", "key_name = \"value\"\nother_key = 42\nflag_key = true\n"),
+        (Language::Yaml, "# header\n", "key_name: \"value\"\nother_key: 42\nflag_key: true\n"),
+        (
+            Language::Shell,
+            "# header\n",
+            "NAME_VAR=\"value\"\nif [ -f \"$NAME_VAR\" ]; then\n  echo \"$NAME_VAR\" > /dev/null\nfi\n",
         ),
     ];
 
