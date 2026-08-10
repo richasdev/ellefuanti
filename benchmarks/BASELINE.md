@@ -96,6 +96,75 @@ cannot silently return.
 This is the entire argument for writing benchmarks before optimising: the walk _looked_
 viewport-scoped, and the range check at the top of the function made it read as correct.
 
+### Query-driven languages (JSON, JavaScript, TypeScript, CSS)
+
+PHP and Blade are highlighted by a hand-written tree walk; the languages added in #53 go
+through a `highlights.scm` query and a `QueryCursor`. Different mechanism, so the viewport
+claim is re-measured rather than inherited — `set_byte_range` pruning the tree is exactly
+the sort of "the API should do the right thing" assumption this file exists to distrust.
+
+Measured with a **fixed byte window** (15 identical units, same text in every fixture)
+while the file behind it grows 100× — 40 / 400 / 4000 units:
+
+| Language   | small        | medium       | large        | growth    |
+| ---------- | ------------ | ------------ | ------------ | --------- |
+| JSON       | **39.2 µs**  | **41.2 µs**  | **41.3 µs**  | **1.05×** |
+| JavaScript | **135.7 µs** | **134.4 µs** | **134.6 µs** | **0.99×** |
+| TypeScript | **180.4 µs** | **181.1 µs** | **183.1 µs** | **1.02×** |
+| CSS        | **52.2 µs**  | **52.2 µs**  | **52.6 µs**  | **1.01×** |
+
+**Every language is flat**, which is the constraint. The absolute numbers vary by query
+size rather than by file size: TypeScript is the JavaScript query concatenated with its
+own, so it is the largest query and the slowest, and JSON's five patterns are the
+cheapest. A standalone probe over the same PHP fixture put 40 patterns at 87 µs and 5 at
+57 µs, so pattern count is the cost driver — worth knowing before adding YAML or HTML.
+
+**The query path is ~2.7× more expensive than the hand-written walk** (87 µs against
+32 µs, interleaved A/B in one process over the same PHP fixture). Flatness is the
+constraint and it holds; the constant factor is the price of not writing a `node_style`
+function per language. Against an 8.3 ms frame budget, TypeScript's 183 µs is ~2%.
+
+#### A benchmark that was wrong, again
+
+The first version of this bench reported **22 → 189 → 355 µs** for JSON across the size
+range — a 16× growth that looked exactly like the file-size regression the bench exists to
+catch, and would have been a genuine blocker for the whole approach.
+
+It was the measurement. The window was 80 _rows_ clamped with `.min(rows - 1)`, so the
+small fixture got a much narrower window than the large one, and the numbers were tracking
+**how much was on screen**, not how big the file was. Holding the window to a fixed byte
+range with identical content gives **22.8 / 23.7 / 24.4 µs** over the same 100× range.
+
+Two hypotheses were tested and discarded before the harness was suspected — that JSON's
+flat root object defeats the pruning (a nested fixture of the same size grew the same way,
+so no), and that the query engine ignores `set_byte_range` (a standalone probe measured
+1.00× across 100×, so no). **The third thing to suspect should have been the first**,
+which is what this section of the file has now said three times.
+
+### Binary size: what four grammars cost
+
+Each tree-sitter grammar is compiled C, and its parse tables are static data that link in
+whether or not anyone opens that file type. #53 asked for this to be measured rather than
+assumed, and it is not negligible:
+
+| Release binary           | Size                |
+| ------------------------ | ------------------- |
+| before (PHP only)        | **7.63 MB**         |
+| after (+ JSON/JS/TS/CSS) | **9.64 MB**         |
+| **delta**                | **+2.01 MB (+26%)** |
+
+Roughly **500 KB per grammar**, and it lands in `__TEXT.__const` — 3.47 MB of the new
+binary is parse tables. TypeScript is the largest single contributor (its grammar covers
+TSX-adjacent syntax even though only `LANGUAGE_TYPESCRIPT` is used); JSON is the smallest
+by a wide margin.
+
+**Stated plainly because it scales:** the remaining priority-2/3 languages in #53 (YAML,
+Markdown, HTML, SQL, TOML, Rust) would plausibly add another 3–4 MB, which would roughly
+double the binary from where it started. That is an argument for deciding whether every
+grammar belongs in the default build — dynamic loading, or a feature flag per language —
+_before_ adding eight more, not after. No such mechanism exists today and none was added
+here; this is a measurement, not a proposal.
+
 ## Workspace — `benches/workspace.rs`
 
 Fixture: a synthetic Laravel project with ~5000 files under `vendor/`.
@@ -174,14 +243,14 @@ fail the build, precisely because its headline number is untrustworthy.
 
 ### Where the warm-startup miss actually is
 
-The original `gpui_init` phase was measured *inside* `Application::run`'s closure, so it lumped
+The original `gpui_init` phase was measured _inside_ `Application::run`'s closure, so it lumped
 platform construction together with starting the event loop — the kind of label that sends
 someone optimising the wrong half. Split apart, a warm launch decomposes as:
 
 | Phase              | Warm       | What it is                                                      |
 | ------------------ | ---------- | --------------------------------------------------------------- |
 | logging init       | 0.05 ms    | our `tracing_subscriber` setup                                  |
-| `platform_init`    | **48 ms**  | `Application::new()` — NSApplication, Metal device, text system  |
+| `platform_init`    | **48 ms**  | `Application::new()` — NSApplication, Metal device, text system |
 | `event_loop_start` | **16 ms**  | `run()` reaching our callback                                   |
 | keymap             | 0.1 ms     | our action and keybinding registration                          |
 | `window` open      | **152 ms** | `open_window` plus first paint                                  |

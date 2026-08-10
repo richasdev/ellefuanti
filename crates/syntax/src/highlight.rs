@@ -1,10 +1,13 @@
 //! Syntax highlighting: parse tree (plus Blade scanning) to styled byte ranges.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Mutex, OnceLock};
 
 use elle_text::Buffer;
-use tree_sitter::Node;
+use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
+use crate::language::Language;
 use crate::tree::SyntaxTree;
 
 /// A semantic style. Themes map these to colours; the highlighter never names a colour
@@ -42,15 +45,36 @@ impl SyntaxTree {
     /// Highlight spans intersecting `range` (a byte range, normally just the visible
     /// rows — §7 "renderizar apenas regiões necessárias/visíveis").
     ///
-    /// ponytail: maps node kinds to styles directly instead of loading tree-sitter's
-    /// `highlights.scm` query files. No query assets to ship or keep in sync, and it
-    /// covers PHP's common kinds. Move to the query-based `tree_sitter_highlight` when
-    /// a second real grammar lands and the match arms start duplicating.
+    /// Two paths, and the split is measured rather than stylistic.
+    ///
+    /// Languages with a `highlights.scm` go through [`query_spans`]: one query file per
+    /// language instead of one `node_style` function per language, which is what makes
+    /// the fifth grammar as cheap as the second.
+    ///
+    /// PHP and Blade keep the hand-written walk below. The upstream PHP `highlights.scm`
+    /// was tried and **cannot** reproduce what this editor's PHP tests assert — it
+    /// captures no `=`/`=>`/`->`/`::` operators, no `#[` attribute bracket and no
+    /// attribute name, and it tags a class property `$name` as both variable and
+    /// property. Three existing tests fail against it. Rewriting the query to match, then
+    /// pinning it with those same tests, is a real option; swapping in the upstream file
+    /// and relaxing the assertions is not, so PHP stays on the code that is already
+    /// pinned. It is also 2.7× cheaper (32 µs against 87 µs on the 80-row viewport
+    /// bench), which is not the reason but is not nothing.
     pub fn highlights(&self, buffer: &Buffer, range: Range<usize>) -> Vec<HighlightSpan> {
         let mut spans = Vec::new();
 
         if let Some(tree) = self.tree() {
-            collect(&tree.root_node(), &range, &mut spans);
+            match self.language().highlight_query() {
+                Some(source) => query_spans(
+                    self.language(),
+                    source,
+                    &tree.root_node(),
+                    buffer,
+                    &range,
+                    &mut spans,
+                ),
+                None => collect(&tree.root_node(), &range, &mut spans),
+            }
         }
 
         if self.language().has_blade_directives() {
@@ -82,6 +106,144 @@ fn flatten(mut spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
         out.push(span);
     }
     out
+}
+
+/// Maps a `highlights.scm` capture name to a style, or `None` to ignore the capture.
+///
+/// Capture names are the tree-sitter ecosystem's shared vocabulary, and they are dotted
+/// and open-ended: `@function.method`, `@string.special.key`, `@variable.builtin`. Only
+/// the part before the first dot is matched, so a query using a more specific name than
+/// this editor has a style for still colours — `@function.method` lands on Function
+/// rather than falling through to no colour at all.
+///
+/// Unknown names return `None` on purpose: a query capture this editor has no style for
+/// should render as plain text, not as a guess. That is the same rule `name_style`
+/// follows for PHP.
+fn capture_style(name: &str) -> Option<HighlightStyle> {
+    use HighlightStyle::*;
+    Some(match name.split('.').next().unwrap_or(name) {
+        "keyword" => Keyword,
+        "type" | "constructor" => Type,
+        "function" => Function,
+        "variable" => Variable,
+        "property" => Property,
+        "string" => String,
+        "number" | "constant" => Number,
+        "operator" | "escape" => Operator,
+        "attribute" => Attribute,
+        "comment" => Comment,
+        "tag" => Tag,
+        _ => return None,
+    })
+}
+
+/// The compiled `Query` for each language, built once.
+///
+/// Compiling a query parses and optimises the whole `.scm` file, which is far too
+/// expensive to redo per frame. Keyed by `Language` rather than held on `SyntaxTree`
+/// because every open buffer of the same language wants the same query, and a `Query` is
+/// read-only once built.
+///
+/// A `Mutex` around the map and a leaked `&'static Query` out of it, rather than handing
+/// back a guard: the query outlives every borrow anyway (it is never evicted), and
+/// leaking one small allocation per language beats holding a lock across the whole
+/// highlight pass. Bounded by the number of languages, so it is not a growing leak.
+fn compiled_query(language: Language, source: &str) -> Option<&'static Query> {
+    static CACHE: OnceLock<Mutex<HashMap<Language, Option<&'static Query>>>> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+    *cache.entry(language).or_insert_with(|| {
+        let grammar = language.grammar()?;
+        match Query::new(&grammar, source) {
+            Ok(query) => Some(&*Box::leak(Box::new(query))),
+            // A query that does not compile means no colour for that language, not a
+            // crash in the renderer. `every_query_compiles` is what stops this from
+            // being how anyone finds out.
+            Err(error) => {
+                tracing::warn!(language = language.name(), %error, "highlight query failed to compile");
+                None
+            }
+        }
+    })
+}
+
+/// Highlight spans from a `highlights.scm` query, restricted to `range`.
+///
+/// `set_byte_range` is what keeps this viewport-scoped: the query engine skips subtrees
+/// that cannot intersect the range instead of scanning the file. Measured flat at 1.00×
+/// across a 100× file-size range before this was written, because "the API should prune"
+/// is exactly the kind of assumption BASELINE.md exists to warn about.
+///
+/// Later captures win. That is the convention upstream query files are written against —
+/// `(identifier) @variable` first, then the specific patterns that overwrite it — and
+/// getting it backwards paints every call in a JS file as a plain variable. `flatten`
+/// keeps the *outermost* span at a shared start, which is the opposite rule, so the
+/// override is resolved here by last-write-wins into a map before flatten ever sees it.
+fn query_spans(
+    language: Language,
+    source: &str,
+    root: &Node,
+    buffer: &Buffer,
+    range: &Range<usize>,
+    out: &mut Vec<HighlightSpan>,
+) {
+    let Some(query) = compiled_query(language, source) else {
+        return;
+    };
+    let names = query.capture_names();
+
+    // The query engine needs the source text to evaluate `#match?` and `#eq?`
+    // predicates. Slicing the whole buffer would be a per-frame copy of the file, so
+    // the rope's own chunks are handed over instead — the same trick `parse_rope` uses,
+    // for the same reason.
+    let rope = buffer.rope();
+    let text_provider = |node: Node| {
+        let mut offset = node.start_byte();
+        let end = node.end_byte();
+        std::iter::from_fn(move || {
+            if offset >= end {
+                return None;
+            }
+            let (chunk, chunk_start, _, _) = rope.chunk_at_byte(offset);
+            let from = offset - chunk_start;
+            let to = (end - chunk_start).min(chunk.len());
+            offset = chunk_start + to;
+            Some(&chunk.as_bytes()[from..to])
+        })
+    };
+
+    let mut cursor = QueryCursor::new();
+    cursor.set_byte_range(range.clone());
+
+    // Keyed by span, so a later capture on the same node replaces an earlier one.
+    let mut styles: HashMap<(usize, usize), HighlightStyle> = HashMap::new();
+    let mut captures = cursor.captures(query, *root, text_provider);
+    while let Some((m, _)) = captures.next() {
+        for capture in m.captures {
+            let node = capture.node;
+            let span = (node.start_byte(), node.end_byte());
+            if span.0 >= span.1 {
+                continue;
+            }
+            match capture_style(names[capture.index as usize]) {
+                Some(style) => {
+                    styles.insert(span, style);
+                }
+                // An unmapped capture must still *clear* a mapped one it overrides,
+                // or a general pattern's colour survives a specific pattern that
+                // deliberately declined to colour the node.
+                None => {
+                    styles.remove(&span);
+                }
+            }
+        }
+    }
+
+    out.extend(
+        styles.into_iter().map(|((start, end), style)| HighlightSpan { range: start..end, style }),
+    );
 }
 
 /// Depth-first walk, visiting only nodes that intersect the visible range.
@@ -342,7 +504,7 @@ fn blade_spans(buffer: &Buffer, range: &Range<usize>) -> Vec<HighlightSpan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::language::Language;
+    use crate::language::{ALL_LANGUAGES, Language};
 
     fn spans_of(lang: Language, text: &str) -> Vec<HighlightSpan> {
         let buffer = Buffer::new(text);
@@ -546,31 +708,85 @@ mod tests {
         // over top-level declarations would not change the span count, so this instead
         // asserts the *spans* stay constant while the file grows 50×, which only holds if
         // the walk is confined to the viewport.
-        let head = "<?php\n$a = 1;\n$b = 2;\n$c = 3;\n";
+        //
+        // Every language, not just PHP (#53). The two highlight paths fail this
+        // differently and both failures are easy to introduce: the hand-written walk
+        // regresses by iterating siblings instead of seeking, and the query path
+        // regresses by forgetting `set_byte_range`, which makes the engine scan the whole
+        // tree. Neither changes what the viewport *looks* like, so only this notices.
+        //
+        // Each case is (head, filler): the head is the fixed window that gets measured
+        // and the filler is what grows underneath it.
+        let cases: &[(Language, &str, &str)] = &[
+            (Language::Php, "<?php\n$a = 1;\n$b = 2;\n$c = 3;\n", "function f() { return 'x'; }\n"),
+            (
+                Language::Blade,
+                "@extends('l')\n{{ $a }}\n{{ $b }}\n",
+                "<div>@if($x) {{ $y }} @endif</div>\n",
+            ),
+            // JSON has no top-level statement list, so the growth has to go inside the
+            // one root object. The head is the first few pairs of that object.
+            (Language::Json, "{\n\"a\": 1,\n\"b\": 2,\n", "\"k\": \"v\",\n"),
+            (Language::JavaScript, "// h\nlet a = 1;\nlet b = 2;\n", "function f() { return 'x'; }\n"),
+            (Language::TypeScript, "// h\nlet a: number = 1;\nlet b = 2;\n", "function f(): string { return 'x'; }\n"),
+            (Language::Css, "/* h */\n.a { color: red; }\n", ".cls { margin: 1px; }\n"),
+        ];
 
-        let small = {
-            let mut s = String::from(head);
-            s.push_str(&"function f() { return 'x'; }\n".repeat(20));
-            s
-        };
-        let large = {
-            let mut s = String::from(head);
-            s.push_str(&"function f() { return 'x'; }\n".repeat(1000));
-            s
-        };
+        for (language, head, filler) in cases {
+            let build = |repeats: usize| {
+                let mut s = String::from(*head);
+                s.push_str(&filler.repeat(repeats));
+                // JSON's growth lives inside the root object, so it has to be closed.
+                if *language == Language::Json {
+                    s.push_str("\"z\": 0\n}\n");
+                }
+                s
+            };
 
-        let count = |src: &str| {
-            let buffer = Buffer::new(src);
-            let tree = SyntaxTree::new(Language::Php, &buffer).unwrap();
-            // Same byte window in both: the first three statements.
-            tree.highlights(&buffer, 0..head.len()).len()
-        };
+            let count = |src: &str| {
+                let buffer = Buffer::new(src);
+                let tree = SyntaxTree::new(*language, &buffer).unwrap();
+                // Same byte window in both: the head.
+                tree.highlights(&buffer, 0..head.len()).len()
+            };
 
-        assert_eq!(
-            count(&small),
-            count(&large),
-            "a fixed viewport must cost the same regardless of what follows it"
-        );
+            let small = count(&build(20));
+            let large = count(&build(1000));
+
+            assert!(small > 0, "{}: fixture produced no spans to compare", language.name());
+            assert_eq!(
+                small,
+                large,
+                "{}: a fixed viewport must cost the same regardless of what follows it",
+                language.name()
+            );
+        }
+    }
+
+    #[test]
+    fn every_language_highlights_something() {
+        // A grammar that loads but produces no spans is the exact failure #53 is about,
+        // and it is invisible from the outside — the file just renders grey. Each sample
+        // is ordinary code for its language, so zero spans means the wiring is broken.
+        let samples: &[(Language, &str)] = &[
+            (Language::Php, "<?php class C { public $x = 1; }"),
+            (Language::Blade, "@if($a) {{ $b }} @endif"),
+            (Language::Json, "{\"a\": 1}"),
+            (Language::JavaScript, "const a = 1; // c"),
+            (Language::TypeScript, "const a: number = 1; // c"),
+            (Language::Css, ".a { color: red; }"),
+        ];
+
+        for (language, src) in samples {
+            assert!(
+                !spans_of(*language, src).is_empty(),
+                "{}: produced no highlight spans at all",
+                language.name()
+            );
+        }
+
+        // And the one that must stay empty, because the fallback is deliberate.
+        assert!(spans_of(Language::PlainText, "anything at all").is_empty());
     }
 
     #[test]
@@ -621,5 +837,156 @@ mod tests {
     #[test]
     fn plain_text_has_no_spans() {
         assert!(spans_of(Language::PlainText, "@if {{ x }} class").is_empty());
+    }
+
+    /// Every language that claims a query must have one that compiles.
+    ///
+    /// `compiled_query` deliberately degrades to "no colour" on a malformed query rather
+    /// than panicking a render. That is right at runtime and useless in development —
+    /// a typo in a `.scm` would ship as a silently grey file type. This is the test that
+    /// makes it a build failure instead.
+    #[test]
+    fn every_query_compiles() {
+        for language in ALL_LANGUAGES {
+            let Some(source) = language.highlight_query() else {
+                continue;
+            };
+            let grammar = language.grammar().expect("a language with a query has a grammar");
+            if let Err(error) = tree_sitter::Query::new(&grammar, source) {
+                panic!("{}: highlight query does not compile: {error}", language.name());
+            }
+        }
+    }
+
+    #[test]
+    fn json_keys_and_values_are_different_colours() {
+        // The point of colouring JSON at all. Every leaf in composer.json is a string,
+        // so if keys and values share a style the file is one undifferentiated block.
+        // Also the regression test for query pattern order: `(pair key:)` has to come
+        // *after* the general `(string)` arm or it is overwritten and this fails.
+        let src = "{\n  \"name\": \"app\",\n  \"version\": 2,\n  \"ok\": true\n}\n";
+        let spans = spans_of(Language::Json, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"\"name\""));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"app\""));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"2"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"true"));
+        assert!(
+            !styled(src, &spans, HighlightStyle::String).contains(&"\"name\""),
+            "a key must not also read as a value"
+        );
+    }
+
+    #[test]
+    fn javascript_separates_calls_declarations_and_data() {
+        let src = "// c\nimport x from 'y';\nconst f = (a) => { return Foo.bar(a + 1); };\n";
+        let spans = spans_of(Language::JavaScript, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"// c"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"import"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"'y'"));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"1"));
+        // `f` is declared as an arrow function, so it reads as a function, not a variable
+        // — one of the specific patterns that must override `(identifier) @variable`.
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"f"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"bar"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"Foo"));
+        assert!(styled(src, &spans, HighlightStyle::Operator).contains(&"=>"));
+    }
+
+    #[test]
+    fn javascript_members_are_properties_not_variables() {
+        let src = "class K { m() { this.n = 1; } }\n";
+        let spans = spans_of(Language::JavaScript, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"class"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"K"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"m"));
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"n"));
+    }
+
+    #[test]
+    fn typescript_types_beat_the_javascript_variable_default() {
+        // TypeScript's query is appended to JavaScript's, so its `(type_identifier) @type`
+        // lands after `(identifier) @variable` and wins. If the concatenation order in
+        // `highlight_query` is ever flipped, every annotation here goes back to Variable.
+        let src = "interface P { id: number; }\nconst g = (p: P): string => p.id;\nenum E { A }\n";
+        let spans = spans_of(Language::TypeScript, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"interface"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"enum"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"P"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"number"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"string"));
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"id"));
+    }
+
+    #[test]
+    fn typescript_still_highlights_the_javascript_it_is_built_on() {
+        // The other half of the concatenation: TypeScript's own file has no string,
+        // comment or number patterns at all. If only it were loaded, a .ts file would
+        // show types and keywords and nothing else.
+        let src = "// c\nconst s = 'x';\nconst n = 42;\n";
+        let spans = spans_of(Language::TypeScript, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"// c"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"'x'"));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"42"));
+    }
+
+    #[test]
+    fn css_separates_selectors_properties_and_values() {
+        let src = "/* c */\n@media screen {\n  .cls a:hover { color: #fff; margin: 10px; }\n}\n";
+        let spans = spans_of(Language::Css, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"/* c */"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"@media"));
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"cls"));
+        assert!(styled(src, &spans, HighlightStyle::Tag).contains(&"a"));
+        assert!(styled(src, &spans, HighlightStyle::Attribute).contains(&"hover"));
+        assert!(styled(src, &spans, HighlightStyle::Property).contains(&"color"));
+        // A colour literal reads as a value, not as a quoted string.
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"#fff"));
+    }
+
+    #[test]
+    fn css_custom_properties_read_as_variables() {
+        // The `#match? "^--"` predicate arm, which is the one thing in these queries that
+        // needs the text provider to work. If the rope chunking in `query_spans` were
+        // broken, this is the assertion that notices.
+        let src = ":root { --brand: red; }\n";
+        let spans = spans_of(Language::Css, src);
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"--brand"));
+    }
+
+    /// A `#match?` predicate on a node that spans a rope chunk boundary.
+    ///
+    /// `query_spans` feeds the query engine the rope's own chunks rather than one slice,
+    /// the same trade `parse_rope` makes. An off-by-one in that chunking corrupts the
+    /// text the predicate sees, and the failure mode is a silently unstyled token rather
+    /// than a crash — so it needs a fixture big enough to actually span chunks.
+    #[test]
+    fn predicates_work_across_rope_chunk_boundaries() {
+        let mut src = String::from(":root {\n");
+        for i in 0..500 {
+            src.push_str(&format!("  --custom-property-number-{i}: {i}px;\n"));
+        }
+        src.push_str("}\n");
+
+        let buffer = Buffer::new(&src);
+        assert!(buffer.rope().chunks().count() > 1, "fixture must span rope chunks");
+
+        let tree = SyntaxTree::new(Language::Css, &buffer).unwrap();
+        let spans = tree.highlights(&buffer, 0..buffer.len_bytes());
+        let vars: Vec<_> =
+            spans.iter().filter(|s| s.style == HighlightStyle::Variable).collect();
+        assert_eq!(vars.len(), 500, "every custom property must match the ^-- predicate");
+    }
+
+    #[test]
+    fn unknown_extensions_still_fall_back_to_plain_text() {
+        // The `PlainText` fallback is deliberate (#53) and adding four languages must not
+        // have turned an unrecognised file into a parse error.
+        assert!(spans_of(Language::PlainText, "{ \"a\": 1 }").is_empty());
     }
 }

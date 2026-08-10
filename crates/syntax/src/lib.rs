@@ -8,5 +8,5 @@ mod language;
 mod tree;
 
 pub use highlight::{HighlightSpan, HighlightStyle};
-pub use language::{Language, language_for_path};
+pub use language::{ALL_LANGUAGES, Language, language_for_path};
 pub use tree::SyntaxTree;

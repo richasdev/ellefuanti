@@ -94,6 +94,9 @@ pub enum ThemeVariant {
     #[default]
     Dark,
     Light,
+    OneDarkPro,
+    GitHubDark,
+    GitHubLight,
 }
 
 impl ThemeVariant {
@@ -101,17 +104,23 @@ impl ThemeVariant {
         match self {
             Self::Dark => Theme::dark(),
             Self::Light => Theme::light(),
+            Self::OneDarkPro => Theme::one_dark_pro(),
+            Self::GitHubDark => Theme::github_dark(),
+            Self::GitHubLight => Theme::github_light(),
         }
     }
 
     /// The next variant in the cycle, for `theme.toggle`.
     ///
-    /// With two themes this is a swap. It is written as a cycle because that is what it
-    /// becomes when the classics land, and because a `match` here still cannot miss one.
+    /// Ordered dark-then-light rather than by origin, so a toggle does not swing between
+    /// a black and a white window twice on the way round.
     pub fn next(self) -> Self {
         match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
+            Self::Dark => Self::OneDarkPro,
+            Self::OneDarkPro => Self::GitHubDark,
+            Self::GitHubDark => Self::Light,
+            Self::Light => Self::GitHubLight,
+            Self::GitHubLight => Self::Dark,
         }
     }
 
@@ -119,6 +128,9 @@ impl ThemeVariant {
         match self {
             Self::Dark => "Dark",
             Self::Light => "Light",
+            Self::OneDarkPro => "One Dark Pro",
+            Self::GitHubDark => "GitHub Dark",
+            Self::GitHubLight => "GitHub Light",
         }
     }
 }
@@ -293,6 +305,200 @@ impl Theme {
         }
     }
 
+    /// One Dark Pro, ported from the VS Code theme.
+    ///
+    /// Origin: `zhuangtongfa.material-theme` v3.19.0, `themes/OneDark-Pro.json`.
+    /// Licence: MIT. This repo is Apache-2.0; MIT is compatible, and the origin is
+    /// recorded here because a palette copied without attribution is painful to unpick.
+    ///
+    /// **Every syntax colour below is verbatim from that file** — read out of the
+    /// `tokenColors` scopes rather than reconstructed. A theme called "One Dark Pro" that
+    /// is not One Dark Pro's colours is worse than not shipping it, so nothing here is
+    /// adjusted for taste, including the parts this project would have chosen otherwise:
+    ///
+    /// - `variable` and `property` are **both** `#e06c75`. #52 deliberately separated
+    ///   those two for this project's own themes, and that separation is not applied
+    ///   here: `meta.object-literal.key` really is the same colour as `variable`
+    ///   upstream. A port reproduces its source; it does not correct it.
+    /// - `operator` is `#abb2bf`, the same as the editor foreground. Also upstream.
+    ///
+    /// The UI colours (panel, border, hover, …) are *not* from the file — VS Code's UI
+    /// keys do not map onto this editor's surfaces one-for-one. They are derived from the
+    /// theme's own background so the chrome reads as the same theme.
+    pub fn one_dark_pro() -> Self {
+        Self {
+            background: rgb(0x282c34).into(),
+            panel: rgb(0x21252b).into(),
+            border: rgb(0x181a1f).into(),
+            text: rgb(0xabb2bf).into(),
+            text_muted: rgb(0x7f848e).into(),
+            accent: rgb(0x61afef).into(),
+            hover: rgb(0x2c313a).into(),
+            selected: rgb(0x2c313a).into(),
+            cursor: rgb(0x528bff).into(),
+            selection: rgb(0x3e4451).into(),
+            status_bar: rgb(0x21252b).into(),
+
+            keyword: rgb(0xc678dd).into(),
+            type_name: rgb(0xe5c07b).into(),
+            function: rgb(0x61afef).into(),
+            variable: rgb(0xe06c75).into(),
+            // Same as `variable`, on purpose — see the note above.
+            property: rgb(0xe06c75).into(),
+            string: rgb(0x98c379).into(),
+            number: rgb(0xd19a66).into(),
+            operator: rgb(0xabb2bf).into(),
+            // `entity.other.attribute-name` in the theme file. The issue's summary table
+            // listed #e06c75 here; the file on disk says #d19a66, and the file wins.
+            attribute: rgb(0xd19a66).into(),
+            comment: rgb(0x7f848e).into(),
+            tag: rgb(0xe06c75).into(),
+            // Blade is not a language One Dark Pro has an opinion about. `support.function`
+            // (#56b6c2) is the theme's own unused-here accent, so it stays in-palette
+            // rather than being invented.
+            blade: rgb(0x56b6c2).into(),
+
+            ansi: [
+                rgb(0x3f4451).into(),
+                rgb(0xe06c75).into(),
+                rgb(0x98c379).into(),
+                rgb(0xd19a66).into(),
+                rgb(0x61afef).into(),
+                rgb(0xc678dd).into(),
+                rgb(0x56b6c2).into(),
+                rgb(0xabb2bf).into(),
+                rgb(0x4f5666).into(),
+                rgb(0xff616e).into(),
+                rgb(0x4cd137).into(),
+                rgb(0xf0a45d).into(),
+                rgb(0x4dc4ff).into(),
+                rgb(0xde73ff).into(),
+                rgb(0x4cd1e0).into(),
+                rgb(0xd7dae0).into(),
+            ],
+        }
+    }
+
+    /// GitHub Dark, ported from the VS Code theme.
+    ///
+    /// Origin: `github.github-vscode-theme` v6.3.5, `themes/dark-default.json`.
+    /// Licence: MIT.
+    ///
+    /// Syntax colours read from that file's `tokenColors`. Three of this editor's styles
+    /// have no scope of their own in the source and are resolved the way the theme itself
+    /// resolves them, rather than guessed:
+    ///
+    /// - `type` and `property` fall under the `entity` / `meta.property-name` group
+    ///   (`#79c0ff`).
+    /// - `attribute` follows `entity.name.tag` (`#7ee787`).
+    /// - `operator` has no scope at all, so it inherits `editor.foreground` (`#e6edf3`).
+    ///   That is what VS Code renders, so it is what this renders.
+    pub fn github_dark() -> Self {
+        Self {
+            background: rgb(0x0d1117).into(),
+            panel: rgb(0x010409).into(),
+            border: rgb(0x30363d).into(),
+            text: rgb(0xe6edf3).into(),
+            text_muted: rgb(0x8b949e).into(),
+            accent: rgb(0x2f81f7).into(),
+            hover: rgb(0x161b22).into(),
+            selected: rgb(0x21262d).into(),
+            cursor: rgb(0x2f81f7).into(),
+            selection: rgb(0x264f78).into(),
+            status_bar: rgb(0x010409).into(),
+
+            keyword: rgb(0xff7b72).into(),
+            type_name: rgb(0x79c0ff).into(),
+            function: rgb(0xd2a8ff).into(),
+            variable: rgb(0xffa657).into(),
+            property: rgb(0x79c0ff).into(),
+            string: rgb(0xa5d6ff).into(),
+            // `constant` — the group numeric literals belong to in this theme.
+            number: rgb(0x56d364).into(),
+            operator: rgb(0xe6edf3).into(),
+            attribute: rgb(0x7ee787).into(),
+            comment: rgb(0x8b949e).into(),
+            tag: rgb(0x7ee787).into(),
+            // No Blade scope upstream; `markup.changed` (#ffa657) is taken by `variable`,
+            // so this uses the theme's own `#ff7b72`-adjacent accent from its ANSI table.
+            blade: rgb(0xffa198).into(),
+
+            ansi: [
+                rgb(0x484f58).into(),
+                rgb(0xff7b72).into(),
+                rgb(0x3fb950).into(),
+                rgb(0xd29922).into(),
+                rgb(0x58a6ff).into(),
+                rgb(0xbc8cff).into(),
+                rgb(0x39c5cf).into(),
+                rgb(0xb1bac4).into(),
+                rgb(0x6e7681).into(),
+                rgb(0xffa198).into(),
+                rgb(0x56d364).into(),
+                rgb(0xe3b341).into(),
+                rgb(0x79c0ff).into(),
+                rgb(0xd2a8ff).into(),
+                rgb(0x56d4dd).into(),
+                rgb(0xf0f6fc).into(),
+            ],
+        }
+    }
+
+    /// GitHub Light, ported from the VS Code theme.
+    ///
+    /// Origin: `github.github-vscode-theme` v6.3.5, `themes/light-default.json`.
+    /// Licence: MIT.
+    ///
+    /// The light counterpart of [`Theme::github_dark`], resolved from the same scopes in
+    /// the light file — not the dark theme with the colours flipped.
+    pub fn github_light() -> Self {
+        Self {
+            background: rgb(0xffffff).into(),
+            panel: rgb(0xf6f8fa).into(),
+            border: rgb(0xd1d9e0).into(),
+            text: rgb(0x1f2328).into(),
+            text_muted: rgb(0x6e7781).into(),
+            accent: rgb(0x0969da).into(),
+            hover: rgb(0xeaeef2).into(),
+            selected: rgb(0xd0d7de).into(),
+            cursor: rgb(0x0969da).into(),
+            selection: rgb(0xb6dcff).into(),
+            status_bar: rgb(0xf6f8fa).into(),
+
+            keyword: rgb(0xcf222e).into(),
+            type_name: rgb(0x0550ae).into(),
+            function: rgb(0x8250df).into(),
+            variable: rgb(0x953800).into(),
+            property: rgb(0x0550ae).into(),
+            string: rgb(0x0a3069).into(),
+            number: rgb(0x0550ae).into(),
+            operator: rgb(0x1f2328).into(),
+            attribute: rgb(0x116329).into(),
+            comment: rgb(0x6e7781).into(),
+            tag: rgb(0x116329).into(),
+            blade: rgb(0xa40e26).into(),
+
+            ansi: [
+                rgb(0x24292f).into(),
+                rgb(0xcf222e).into(),
+                rgb(0x116329).into(),
+                rgb(0x4d2d00).into(),
+                rgb(0x0969da).into(),
+                rgb(0x8250df).into(),
+                rgb(0x1b7c83).into(),
+                rgb(0x6e7781).into(),
+                rgb(0x57606a).into(),
+                rgb(0xa40e26).into(),
+                rgb(0x1a7f37).into(),
+                rgb(0x633c01).into(),
+                rgb(0x218bff).into(),
+                rgb(0xa475f9).into(),
+                rgb(0x3192aa).into(),
+                rgb(0x8c959f).into(),
+            ],
+        }
+    }
+
     /// Colour for a terminal cell.
     ///
     /// The terminal crate resolves the 256-colour cube and palette overrides itself and
@@ -381,7 +587,21 @@ mod tests {
     }
 
     /// Every variant, kept complete by `ThemeVariant::label` for the same reason.
-    const ALL_VARIANTS: [ThemeVariant; 2] = [ThemeVariant::Dark, ThemeVariant::Light];
+    const ALL_VARIANTS: [ThemeVariant; 5] = [
+        ThemeVariant::Dark,
+        ThemeVariant::Light,
+        ThemeVariant::OneDarkPro,
+        ThemeVariant::GitHubDark,
+        ThemeVariant::GitHubLight,
+    ];
+
+    /// The themes ported verbatim from a published VS Code theme.
+    ///
+    /// Separated from [`ALL_VARIANTS`] because the distinctness rule that applies to this
+    /// project's own themes deliberately does **not** apply to these: One Dark Pro gives
+    /// `variable` and `property` the same `#e06c75`, and reproducing that is the point.
+    const PORTED_VARIANTS: [ThemeVariant; 3] =
+        [ThemeVariant::OneDarkPro, ThemeVariant::GitHubDark, ThemeVariant::GitHubLight];
 
     #[test]
     fn the_lists_cover_every_style_and_every_variant() {
@@ -390,7 +610,12 @@ mod tests {
         // both and forgetting the array. Asserting the length here fails loudly instead of
         // silently testing eight styles out of ten.
         assert_eq!(ALL_STYLES.len(), 9, "a new HighlightStyle needs a colour in every theme");
-        assert_eq!(ALL_VARIANTS.len(), 2, "a new theme needs listing, or it goes untested");
+        assert_eq!(ALL_VARIANTS.len(), 5, "a new theme needs listing, or it goes untested");
+
+        // Every ported theme must also be a real theme.
+        for ported in PORTED_VARIANTS {
+            assert!(ALL_VARIANTS.contains(&ported), "{} is not listed", ported.label());
+        }
 
         // Also a guard that no two entries are duplicates, which would quietly shrink
         // coverage while the length still looked right.
@@ -412,7 +637,18 @@ mod tests {
         //
         // Distinctness is a real constraint, not a stylistic one: two styles the theme
         // paints identically are two styles the parser worked to tell apart for nothing.
+        //
+        // **Ported themes are exempt, and that is not the rule being weakened.** One Dark
+        // Pro really does paint `variable` and `property` the same `#e06c75`; GitHub
+        // really does leave `operator` at the editor foreground. Those are upstream's
+        // decisions, and a port that "fixes" them is no longer the theme it claims to be
+        // (#53). The rule still binds every theme this project authors, which is where it
+        // was catching real copy-paste mistakes — see the separate assertion below that
+        // the exemption is not silently covering an *unported* theme.
         for variant in ALL_VARIANTS {
+            if PORTED_VARIANTS.contains(&variant) {
+                continue;
+            }
             let theme = variant.build();
             for (i, a) in ALL_STYLES.iter().enumerate() {
                 for b in &ALL_STYLES[i + 1..] {
@@ -427,6 +663,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ported_themes_reproduce_the_colours_that_make_them_that_theme() {
+        // The exemption above is only defensible if the ported values are actually the
+        // published ones. These are the specific hex values read out of the theme files on
+        // disk, pinned so a later "tidy-up" that nudges them fails here rather than
+        // quietly shipping a theme wearing someone else's name.
+        //
+        // Not a substitute for looking at it (#35) — nobody has seen these on screen.
+        let one_dark = Theme::one_dark_pro();
+        assert_eq!(one_dark.background, rgb(0x282c34).into());
+        assert_eq!(one_dark.keyword, rgb(0xc678dd).into());
+        assert_eq!(one_dark.string, rgb(0x98c379).into());
+        assert_eq!(one_dark.comment, rgb(0x7f848e).into());
+        assert_eq!(one_dark.function, rgb(0x61afef).into());
+        assert_eq!(one_dark.type_name, rgb(0xe5c07b).into());
+        assert_eq!(one_dark.number, rgb(0xd19a66).into());
+        // The collision that a port must keep. `assert_eq!`, not `assert_ne!` — this is
+        // the inverse of the distinctness rule and it is deliberate.
+        assert_eq!(
+            one_dark.variable,
+            one_dark.property,
+            "One Dark Pro paints variable and property alike; a port must too"
+        );
+        assert_eq!(one_dark.variable, rgb(0xe06c75).into());
+        assert_eq!(one_dark.operator, one_dark.text, "One Dark Pro's operator is its foreground");
+
+        let gh_dark = Theme::github_dark();
+        assert_eq!(gh_dark.background, rgb(0x0d1117).into());
+        assert_eq!(gh_dark.text, rgb(0xe6edf3).into());
+        assert_eq!(gh_dark.keyword, rgb(0xff7b72).into());
+        assert_eq!(gh_dark.string, rgb(0xa5d6ff).into());
+        assert_eq!(gh_dark.comment, rgb(0x8b949e).into());
+        assert_eq!(gh_dark.function, rgb(0xd2a8ff).into());
+        assert_eq!(gh_dark.variable, rgb(0xffa657).into());
+        assert_eq!(gh_dark.attribute, rgb(0x7ee787).into());
+
+        let gh_light = Theme::github_light();
+        assert_eq!(gh_light.background, rgb(0xffffff).into());
+        assert_eq!(gh_light.text, rgb(0x1f2328).into());
+        assert_eq!(gh_light.keyword, rgb(0xcf222e).into());
+        assert_eq!(gh_light.string, rgb(0x0a3069).into());
+        assert_eq!(gh_light.comment, rgb(0x6e7781).into());
+        assert_eq!(gh_light.function, rgb(0x8250df).into());
+        assert_eq!(gh_light.variable, rgb(0x953800).into());
+        assert_eq!(gh_light.attribute, rgb(0x116329).into());
     }
 
     #[test]
