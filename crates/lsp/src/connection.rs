@@ -54,8 +54,23 @@ struct Shared {
     pending: Mutex<HashMap<RequestId, Option<Result<Value, ResponseError>>>>,
     /// Server-initiated traffic the caller has not drained yet.
     inbox: Mutex<Vec<ServerMessage>>,
-    /// Signalled whenever the reader thread stores a reply or the stream ends.
-    arrived: Condvar,
+    /// Signalled whenever a reply lands in `pending`, or the stream ends.
+    ///
+    /// **One condvar per mutex, and these are two different condvars on purpose.** A
+    /// single `Condvar` waited on with two different mutexes is undefined behaviour that
+    /// Rust's std detects and turns into `attempted to use a condition variable with two
+    /// mutexes` — a hard panic, on the thread that happened to wait second.
+    ///
+    /// That is issue #43, and it was never the timing flake it looked like. The suite
+    /// waits on `pending` during `initialize` and on `inbox` in `wait_for_events`, so a
+    /// client that handshakes and then listens for diagnostics — exactly what the app's
+    /// diagnostics wiring does — binds one condvar to both. The panic fired while the
+    /// waiter held `inbox`, poisoning it, and the reader thread died on the next
+    /// `inbox.lock().unwrap()`. The `lock().unwrap()` was the messenger; the shared
+    /// condvar was the bug.
+    replied: Condvar,
+    /// Signalled whenever the reader thread pushes to `inbox`, or the stream ends.
+    pushed: Condvar,
     /// Set once the reader thread stops, for any reason.
     closed: AtomicBool,
     /// Why the stream ended, if it ended badly. Turns "waiting forever" into a
@@ -74,17 +89,17 @@ impl Shared {
         self.closed.store(true, Ordering::SeqCst);
 
         // Waiters block on one of two mutexes — `pending` for a reply, `inbox` for
-        // server-pushed traffic — and both must be woken. Taking each lock before
-        // notifying closes the window where a waiter has checked `closed` but has not
-        // yet started waiting; missing that wakeup would leave it blocked on a
-        // connection that is already dead.
+        // server-pushed traffic — each with its own condvar, and both must be woken.
+        // Taking each lock before notifying closes the window where a waiter has checked
+        // `closed` but has not yet started waiting; missing that wakeup would leave it
+        // blocked on a connection that is already dead.
         {
             let _pending = self.pending.lock().unwrap();
-            self.arrived.notify_all();
+            self.replied.notify_all();
         }
         {
             let _inbox = self.inbox.lock().unwrap();
-            self.arrived.notify_all();
+            self.pushed.notify_all();
         }
     }
 }
@@ -118,7 +133,8 @@ impl Connection {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Vec::new()),
-            arrived: Condvar::new(),
+            replied: Condvar::new(),
+            pushed: Condvar::new(),
             closed: AtomicBool::new(false),
             failure: Mutex::new(None),
         });
@@ -227,7 +243,7 @@ impl Connection {
                 bail!("the language server did not answer within {timeout:?}");
             }
 
-            let (guard, _) = self.shared.arrived.wait_timeout(pending, remaining).unwrap();
+            let (guard, _) = self.shared.replied.wait_timeout(pending, remaining).unwrap();
             pending = guard;
         }
     }
@@ -261,7 +277,7 @@ impl Connection {
                 // an unknown id just makes noise in the server's log.
                 return;
             }
-            self.shared.arrived.notify_all();
+            self.shared.replied.notify_all();
         }
 
         if let Err(err) = self.notify("$/cancelRequest", serde_json::json!({ "id": id })) {
@@ -280,6 +296,9 @@ impl Connection {
     /// condition being waited on. Waiting on a different mutex than the one guarding the
     /// data would make every wakeup a race: the reader thread could push a message in
     /// the window between the check and the wait, and this would sleep through it.
+    ///
+    /// It waits on `pushed`, not on the condvar [`Connection::wait`] uses. Sharing one
+    /// condvar between the two mutexes is what caused #43 — see [`Shared::pushed`].
     pub fn wait_for_inbox(&self, timeout: Duration) -> Vec<ServerMessage> {
         let deadline = Instant::now() + timeout;
         let mut inbox = self.shared.inbox.lock().unwrap();
@@ -299,7 +318,7 @@ impl Connection {
                 return Vec::new();
             }
 
-            let (guard, _) = self.shared.arrived.wait_timeout(inbox, remaining).unwrap();
+            let (guard, _) = self.shared.pushed.wait_timeout(inbox, remaining).unwrap();
             inbox = guard;
         }
     }
@@ -359,7 +378,7 @@ fn read_loop(input: impl Read, shared: &Arc<Shared>) {
                         // entry nobody will ever collect.
                         if let Some(slot) = pending.get_mut(&id) {
                             *slot = Some(result);
-                            shared.arrived.notify_all();
+                            shared.replied.notify_all();
                         } else {
                             tracing::trace!(?id, "discarding a reply to a cancelled request");
                         }
@@ -370,12 +389,12 @@ fn read_loop(input: impl Read, shared: &Arc<Shared>) {
                     Incoming::Notification { method, params } => {
                         let mut inbox = shared.inbox.lock().unwrap();
                         inbox.push(ServerMessage::Notification { method, params });
-                        shared.arrived.notify_all();
+                        shared.pushed.notify_all();
                     }
                     Incoming::Request { id, method, params } => {
                         let mut inbox = shared.inbox.lock().unwrap();
                         inbox.push(ServerMessage::Request { id, method, params });
-                        shared.arrived.notify_all();
+                        shared.pushed.notify_all();
                     }
                 }
             }

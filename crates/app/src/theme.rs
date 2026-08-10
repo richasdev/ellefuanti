@@ -26,6 +26,8 @@ use elle_syntax::HighlightStyle;
 use elle_terminal::CellColor;
 use gpui::{App, Global, Hsla, Pixels, Rgba, px, rgb};
 
+use crate::lsp_session::Severity;
+
 #[derive(Clone)]
 pub struct Theme {
     pub background: Hsla,
@@ -52,6 +54,18 @@ pub struct Theme {
     pub comment: Hsla,
     pub tag: Hsla,
     pub blade: Hsla,
+
+    /// Diagnostic underlines, one per severity the UI distinguishes.
+    ///
+    /// Separate from `accent` and from the ANSI reds even where a variant happens to reuse
+    /// the same hex: an error squiggle and the cursor are different things, and a theme
+    /// that wants to change one without the other has to be able to. Four fields rather
+    /// than an array because `lsp_session::Severity` is a closed enum and a named field
+    /// per variant makes an unhandled severity a compile error instead of an index.
+    pub error: Hsla,
+    pub warning: Hsla,
+    pub information: Hsla,
+    pub hint: Hsla,
 
     /// The sixteen ANSI slots the terminal renders: 0-7 normal, 8-15 bright.
     ///
@@ -211,6 +225,14 @@ impl Theme {
             tag: rgb(0x8b93a5).into(),
             blade: rgb(0xff9e64).into(),
 
+            // Red/amber/blue/grey, in this theme's own register rather than pure hues: a
+            // saturated 0xff0000 on a 0x16171d background vibrates. Hint is close to
+            // `comment` on purpose — an advisory underline should be findable, not loud.
+            error: rgb(0xf7768e).into(),
+            warning: rgb(0xe0af68).into(),
+            information: rgb(0x7dd3fc).into(),
+            hint: rgb(0x6b7280).into(),
+
             // Tuned to this theme rather than the hardware VT100 palette: a literal
             // 0x0000ff blue is unreadable on a dark background, and `ls` uses it for
             // directories on every Laravel project.
@@ -264,6 +286,13 @@ impl Theme {
             comment: rgb(0x8a8f9c).into(),
             tag: rgb(0x5c6270).into(),
             blade: rgb(0xb54708).into(),
+
+            // Darkened against the light background: the dark theme's 0xf7768e is legible
+            // on 0x16171d and washes out on 0xfbfbfd. Contrast, not hue, is what changes.
+            error: rgb(0xc4314b).into(),
+            warning: rgb(0x9a6700).into(),
+            information: rgb(0x0b6e8f).into(),
+            hint: rgb(0x8a8f9c).into(),
             // Property sits deliberately close to `variable`: `$user->name` reads as one
             // expression, and pulling the two far apart makes a member access look like two
             // unrelated tokens. Close, not equal — the distinctness test rejects equal.
@@ -358,6 +387,14 @@ impl Theme {
             // rather than being invented.
             blade: rgb(0x56b6c2).into(),
 
+            // One Dark Pro's own `editorError.foreground` / `editorWarning.foreground`.
+            // Information and hint borrow the theme's blue and comment grey — upstream
+            // leaves both at VS Code's defaults, which are not this theme's colours.
+            error: rgb(0xe06c75).into(),
+            warning: rgb(0xe5c07b).into(),
+            information: rgb(0x61afef).into(),
+            hint: rgb(0x7f848e).into(),
+
             ansi: [
                 rgb(0x3f4451).into(),
                 rgb(0xe06c75).into(),
@@ -423,6 +460,14 @@ impl Theme {
             // so this uses the theme's own `#ff7b72`-adjacent accent from its ANSI table.
             blade: rgb(0xffa198).into(),
 
+            // GitHub Dark's `editorError.foreground` (#ff7b72) and
+            // `editorWarning.foreground` (#d29922), with its `accent` blue for information
+            // and `text_muted` for hints — the same two the theme uses everywhere else.
+            error: rgb(0xff7b72).into(),
+            warning: rgb(0xd29922).into(),
+            information: rgb(0x2f81f7).into(),
+            hint: rgb(0x8b949e).into(),
+
             ansi: [
                 rgb(0x484f58).into(),
                 rgb(0xff7b72).into(),
@@ -477,6 +522,14 @@ impl Theme {
             comment: rgb(0x6e7781).into(),
             tag: rgb(0x116329).into(),
             blade: rgb(0xa40e26).into(),
+
+            // GitHub Light's `editorError.foreground` (#cf222e) and
+            // `editorWarning.foreground` (#9a6700), which are also its keyword red and a
+            // darkened amber — legible on white, where the dark theme's values are not.
+            error: rgb(0xcf222e).into(),
+            warning: rgb(0x9a6700).into(),
+            information: rgb(0x0969da).into(),
+            hint: rgb(0x6e7781).into(),
 
             ansi: [
                 rgb(0x24292f).into(),
@@ -535,6 +588,21 @@ impl Theme {
             HighlightStyle::Comment => self.comment,
             HighlightStyle::Tag => self.tag,
             HighlightStyle::BladeDirective => self.blade,
+        }
+    }
+
+    /// Colour for a diagnostic underline.
+    ///
+    /// The same discipline as [`Theme::syntax`]: the editor asks for a severity and the
+    /// theme answers with a colour, so no renderer names one. Exhaustive over a closed
+    /// enum, so adding a severity is a compile error here rather than a squiggle that
+    /// silently paints as an error.
+    pub fn diagnostic(&self, severity: Severity) -> Hsla {
+        match severity {
+            Severity::Error => self.error,
+            Severity::Warning => self.warning,
+            Severity::Information => self.information,
+            Severity::Hint => self.hint,
         }
     }
 }

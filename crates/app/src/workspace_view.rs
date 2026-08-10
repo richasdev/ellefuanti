@@ -18,6 +18,7 @@ use crate::actions::{
 use crate::editor::{Document, EditorView};
 use crate::file_cache;
 use crate::icons;
+use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::terminal_view::TerminalView;
@@ -42,6 +43,10 @@ enum Job {
     QuickOpenIndex,
     RouteIndex,
     ClosePrompt,
+    /// Starting a language server, and then the loop that drains its notifications. One
+    /// slot for both because they are strictly sequential — the poll loop only exists once
+    /// a start succeeded, and a new start must supersede whatever the old server was doing.
+    Lsp,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -146,6 +151,13 @@ pub struct WorkspaceView {
     /// Cancels an in-flight quick-open walk. Separate from the task slot because dropping a
     /// Task stops the await, not the blocking walk behind it.
     quick_open_cancel: Option<CancelFlag>,
+    /// The language server for the open project, and its diagnostics.
+    ///
+    /// Owned by the workspace rather than by each editor because there is one server per
+    /// *project*, not per file, and because it is the workspace that knows when a folder
+    /// was opened or closed. Dropping the workspace drops this, which shuts the server
+    /// down — that is what keeps a quit from leaving an orphan behind.
+    lsp: Lsp,
 }
 
 impl WorkspaceView {
@@ -162,6 +174,7 @@ impl WorkspaceView {
             jobs: Jobs::default(),
             frames: FrameTimer::new(),
             quick_open_cancel: None,
+            lsp: Lsp::new(),
         }
     }
 
@@ -209,6 +222,9 @@ impl WorkspaceView {
                     Ok(tree) => {
                         this.tree = Some(tree);
                         this.status = None;
+                        // A new project gets a new server, pointed at the new root. The
+                        // old one is dropped by `set_root`, which kills its process.
+                        this.start_lsp(cx);
                     }
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
@@ -287,6 +303,39 @@ impl WorkspaceView {
         self.toggle_theme(&ToggleTheme, window, cx);
     }
 
+    /// Publishes diagnostics as if a server had sent them, and pushes them to the editors.
+    ///
+    /// This is the tail of `apply_lsp_events` with the server removed, for the same reason
+    /// `open_document_for_test` is the tail of `open_path`: a render test cannot spawn
+    /// Intelephense, and the thing worth testing is that diagnostics reach a real layout
+    /// pass — not that a subprocess starts.
+    #[cfg(test)]
+    pub fn publish_diagnostics_for_test(
+        &mut self,
+        path: &std::path::Path,
+        diagnostics: &[elle_lsp::lsp_types::Diagnostic],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(uri) = crate::lsp_session::uri_for(path) else { return };
+        let text = self
+            .tabs
+            .iter()
+            .find(|tab| tab.path.as_deref() == Some(path))
+            .map(|tab| tab.editor.read(cx).document.buffer.text())
+            .unwrap_or_default();
+
+        self.lsp.set_state(LspState::Running);
+        self.lsp.set_diagnostics(uri, diagnostics, &text);
+        self.push_diagnostics_to_editors(cx);
+        cx.notify();
+    }
+
+    /// The status-bar text for the language server, for tests that assert on silence.
+    #[cfg(test)]
+    pub fn lsp_label_for_test(&self) -> String {
+        lsp_label(&self.lsp)
+    }
+
     /// Puts an already-built document into a tab, synchronously.
     ///
     /// `open_path` reads from disk on the background executor, which a render test cannot
@@ -318,10 +367,12 @@ impl WorkspaceView {
                     Ok(file) => {
                         match Document::new(Some(path.clone()), &file.text, file.trailing_newline) {
                             Ok(document) => {
+                                let text = document.buffer.text();
                                 let editor = cx.new(|cx| EditorView::new(document, cx));
-                                this.tabs.push(Tab { path: Some(path), editor });
+                                this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
                                 this.status = None;
+                                this.open_on_lsp(&path, &text);
                             }
                             Err(err) => this.status = Some(format!("{err:#}").into()),
                         }
@@ -375,12 +426,17 @@ impl WorkspaceView {
         let snapshot = editor.read(cx).document.snapshot_for_save();
         let (text, version) = (snapshot.text, snapshot.version);
 
+        let synced = (path.clone(), text.clone());
+
         let task = cx.spawn(async move |this, cx| {
             let written = cx.background_spawn(async move { write_file(&path, &text) }).await;
 
             this.update(cx, |this, cx| {
                 match written {
                     Ok(()) => {
+                        // Resync before marking clean, so a server that answers instantly
+                        // reports on the text that is now on disk.
+                        this.notify_lsp_of_change(&synced.0, &synced.1);
                         // Only clear dirty state after the write actually succeeded, and
                         // only for the text that was actually written.
                         editor
@@ -525,7 +581,10 @@ impl WorkspaceView {
         if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(index);
+        let closed = self.tabs.remove(index);
+        if let Some(path) = closed.path.as_deref() {
+            self.close_on_lsp(path);
+        }
         self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
         cx.notify();
     }
@@ -730,6 +789,284 @@ impl WorkspaceView {
         self.jobs.start(Job::RouteIndex, task);
     }
 
+    // --- language server ------------------------------------------------------------
+
+    /// Starts a language server for the open folder, if one is configured.
+    ///
+    /// Nothing waits on this. The handshake runs on the background executor and can take
+    /// half a minute against a cold Intelephense indexing `vendor/`; the editor is usable
+    /// throughout, which is the whole of §24's "slow to start" case (ADR-0007).
+    ///
+    /// **A failure here is silent.** Not having a language server installed is the normal
+    /// state of a fresh machine, and most folders anyone opens are not PHP projects at
+    /// all. A status-bar error on every folder open would be a permanent complaint about
+    /// software the user never asked for. The failure goes to the log, where someone
+    /// looking for it can find it.
+    fn start_lsp(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        self.lsp.set_root(Some(root.clone()));
+
+        let Some(config) = crate::lsp_session::config_for(&root) else {
+            // `ELLE_LSP_COMMAND=""` — switched off on purpose, so not even a log warning.
+            self.lsp.set_state(LspState::Unavailable);
+            return;
+        };
+
+        self.lsp.set_state(LspState::Starting);
+
+        let task = cx.spawn(async move |this, cx| {
+            let started =
+                cx.background_spawn(async move { crate::lsp_session::start(&config) }).await;
+
+            let client = match started {
+                Ok(client) => client,
+                Err(err) => {
+                    // The common case, and it must stay quiet. `debug` rather than `warn`:
+                    // "intelephense is not installed" is not a warning about this editor.
+                    tracing::debug!("no language server: {err:#}");
+                    this.update(cx, |this, _| this.lsp.set_state(LspState::Unavailable)).ok();
+                    return;
+                }
+            };
+
+            let opened = this.update(cx, |this, cx| {
+                this.lsp.adopt(client);
+                // Tabs opened before the server was ready are unknown to it, so tell it
+                // about them now. Without this, a file open at launch never gets
+                // diagnostics until it is closed and reopened.
+                this.sync_open_documents(cx);
+                cx.notify();
+            });
+
+            if opened.is_err() {
+                return;
+            }
+            Self::poll_lsp(this, cx).await;
+        });
+        self.jobs.start(Job::Lsp, task);
+    }
+
+    /// Drains server notifications until the server dies or the workspace goes away.
+    ///
+    /// # Why this polls instead of blocking on the reader
+    ///
+    /// `Client::wait_for_events` blocks until the server pushes something, which is the
+    /// nicer shape — no timer, no idle wakeups. It cannot be used here. The client lives
+    /// inside the view, so reaching it means `this.update(…)`, and *that closure runs on
+    /// the main thread*: a blocking wait inside it would park the UI for the length of the
+    /// timeout, turning "the server is quiet" into dropped frames. ADR-0007's rule that a
+    /// blocking call must never happen on the render thread is exactly this case, and the
+    /// compiler does not catch it.
+    ///
+    /// So the loop waits on a background timer and then takes whatever has arrived without
+    /// blocking, which is the same pattern `TerminalView` uses for its PTY. The cost is a
+    /// wakeup every [`LSP_POLL_INTERVAL`] while a server is running; the alternative would
+    /// need the client to own a channel into gpui, which is a runtime this crate's domain
+    /// layer deliberately does not have.
+    async fn poll_lsp(this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp) {
+        loop {
+            cx.background_executor().timer(LSP_POLL_INTERVAL).await;
+
+            // `drain_events` takes what is already queued and returns immediately, so the
+            // main thread is held only for as long as applying the batch takes.
+            let keep_going = this.update(cx, |this, cx| {
+                let Some(events) = this.lsp.client_mut().map(|client| client.drain_events()) else {
+                    return false;
+                };
+                this.apply_lsp_events(events, cx)
+            });
+
+            // An error means the workspace is gone — the window closed. Falling out of the
+            // loop lets the task finish, and dropping the `Lsp` field kills the process.
+            match keep_going {
+                Ok(true) => {}
+                _ => return,
+            }
+        }
+    }
+
+    /// Applies a batch of server notifications. Returns whether to keep polling.
+    fn apply_lsp_events(
+        &mut self,
+        events: Vec<elle_lsp::ServerEvent>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = false;
+
+        for event in events {
+            if let elle_lsp::ServerEvent::Diagnostics { uri, diagnostics, .. } = event {
+                // Resolved against our copy of the text, not the server's — the ranges are
+                // painted over our buffer. `lsp_session::set_diagnostics` explains why.
+                let text = self
+                    .tabs
+                    .iter()
+                    .find(|tab| {
+                        tab.path.as_deref().and_then(crate::lsp_session::uri_for).as_ref()
+                            == Some(&uri)
+                    })
+                    .map(|tab| tab.editor.read(cx).document.buffer.text());
+
+                // A publish for a file we do not have open is not an error — servers report
+                // on the whole project. Storing it keeps the status-bar total honest.
+                self.lsp.set_diagnostics(uri, &diagnostics, text.as_deref().unwrap_or(""));
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.push_diagnostics_to_editors(cx);
+            cx.notify();
+        }
+
+        // A server that died between batches must not be polled forever, and the editor
+        // has to carry on without it.
+        if !self.lsp.is_running() {
+            self.handle_lsp_death(cx);
+            return false;
+        }
+        true
+    }
+
+    /// A server that stopped: restart it, or give up and say so.
+    ///
+    /// Restarting is bounded (`MAX_RESTARTS`). An unbounded restart of a server that dies
+    /// on startup is a fork bomb, and an editor spawning processes in a loop is worse than
+    /// an editor with no LSP — which is the state §24 says must always remain workable.
+    fn handle_lsp_death(&mut self, cx: &mut Context<Self>) {
+        let reason = self
+            .lsp
+            .client_mut()
+            .and_then(|client| client.failure())
+            .unwrap_or_else(|| "the language server exited".to_string());
+
+        self.lsp.shut_down();
+        self.push_diagnostics_to_editors(cx);
+
+        if self.lsp.may_restart() {
+            self.lsp.record_restart();
+            tracing::warn!("{reason}; restarting the language server");
+            self.start_lsp(cx);
+            return;
+        }
+
+        // Now it *is* worth telling the user: this is not "you never installed one", it is
+        // "the one you have keeps dying", and they cannot see that from anywhere else.
+        tracing::warn!("{reason}; giving up after {} restarts", self.lsp.restarts());
+        self.lsp.set_state(LspState::Failed(reason));
+        cx.notify();
+    }
+
+    /// Tells the server about every open PHP tab.
+    fn sync_open_documents(&mut self, cx: &mut Context<Self>) {
+        let documents: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let path = tab.path.as_deref()?;
+                if !crate::lsp_session::handles(path) {
+                    return None;
+                }
+                let uri = crate::lsp_session::uri_for(path)?;
+                Some((uri, tab.editor.read(cx).document.buffer.text()))
+            })
+            .collect();
+
+        let Some(client) = self.lsp.client_mut() else { return };
+        for (uri, text) in documents {
+            // §24 all the way down: a notification that fails to send means the server has
+            // gone, and the next poll notices. It is not worth interrupting the user over.
+            if let Err(err) = client.did_open(uri, "php", &text) {
+                tracing::debug!("could not open a document on the language server: {err:#}");
+            }
+        }
+    }
+
+    /// Hands each editor the diagnostics for its own file.
+    ///
+    /// A push rather than a pull: an editor that reached into the workspace for its
+    /// diagnostics would need a handle to it, and every tab would then have an opinion
+    /// about a server dying. See `EditorView::diagnostics`.
+    fn push_diagnostics_to_editors(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            let items = tab
+                .path
+                .as_deref()
+                .and_then(crate::lsp_session::uri_for)
+                .and_then(|uri| self.lsp.diagnostics_for(&uri))
+                .map(|file| {
+                    file.items.iter().map(|d| (d.range.clone(), d.severity)).collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            tab.editor.update(cx, |editor, cx| {
+                editor.set_diagnostics(items);
+                cx.notify();
+            });
+        }
+    }
+
+    /// The diagnostic message under the cursor in the active tab, if any.
+    fn cursor_diagnostic(&self, cx: &App) -> Option<String> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let uri = crate::lsp_session::uri_for(tab.path.as_deref()?)?;
+        let offset = tab.editor.read(cx).document.selection.head;
+
+        self.lsp.diagnostics_for(&uri)?.at(offset).map(|d| d.message.clone())
+    }
+
+    /// Tells the server about one newly opened file.
+    ///
+    /// A no-op with no server running, which is the ordinary case and deliberately not
+    /// worth a branch at the call site.
+    fn open_on_lsp(&mut self, path: &std::path::Path, text: &str) {
+        if !crate::lsp_session::handles(path) {
+            return;
+        }
+        let Some(uri) = crate::lsp_session::uri_for(path) else { return };
+        let Some(client) = self.lsp.client_mut() else { return };
+
+        if let Err(err) = client.did_open(uri, "php", text) {
+            tracing::debug!("could not open a document on the language server: {err:#}");
+        }
+    }
+
+    /// Tells the server a file was closed, so it stops reporting on it.
+    fn close_on_lsp(&mut self, path: &std::path::Path) {
+        let Some(uri) = crate::lsp_session::uri_for(path) else { return };
+        if let Some(client) = self.lsp.client_mut() {
+            let _ = client.did_close(&uri);
+        }
+        // And drop its squiggles. An empty publish is how the rest of this code says
+        // "nothing to report here", so closing a file goes through the same path.
+        self.lsp.set_diagnostics(uri, &[], "");
+    }
+
+    /// Tells the server a document changed.
+    ///
+    /// Full-text resync rather than an incremental change: the workspace sees the buffer
+    /// *after* the edit and has no `Edit` in hand, and reconstructing one to look
+    /// incremental would be a second chance to diverge from the server's copy. PHP files
+    /// are small enough that the bandwidth is not the constraint — see
+    /// `Client::did_change_full`.
+    ///
+    /// ponytail: this is called on save, not on keystroke. Diagnostics therefore update
+    /// when you save, which is a defensible place to start and not where it should end;
+    /// per-keystroke sync wants a debounce, and a debounce wants a timer this does not have
+    /// yet. Doing it on save first means the wiring is exercised without putting a
+    /// notification on the typing path before there is anything to measure it with.
+    fn notify_lsp_of_change(&mut self, path: &std::path::Path, text: &str) {
+        if !crate::lsp_session::handles(path) {
+            return;
+        }
+        let Some(uri) = crate::lsp_session::uri_for(path) else { return };
+        let Some(client) = self.lsp.client_mut() else { return };
+
+        if let Err(err) = client.did_change_full(&uri, text) {
+            tracing::debug!("could not sync a document to the language server: {err:#}");
+        }
+    }
+
     /// Stops any quick-open walk. Called whenever the palette that would consume its
     /// results goes away — dismissed *or* replaced by a different mode.
     fn cancel_quick_open_walk(&mut self) {
@@ -782,6 +1119,35 @@ impl WorkspaceView {
             }
             None => {}
         }
+    }
+}
+
+/// The status-bar text for the language server, which is usually nothing at all.
+///
+/// The rule this encodes is §24's, at the last step before pixels: **not having a language
+/// server is not a problem the user has.** Nobody has Intelephense on a fresh machine and
+/// most folders anyone opens are not PHP projects, so `Unavailable` renders as an empty
+/// string — no icon, no "LSP: off", nothing to dismiss or wonder about. The editor with no
+/// server looks exactly like the editor before this feature existed, which is the point.
+///
+/// What does get said:
+/// - problems, when there are any, because that is the feature;
+/// - `Starting…`, because a server indexing `vendor/` for thirty seconds otherwise looks
+///   like nothing happening;
+/// - a failure, but only after the restart budget is spent — "the server you installed
+///   keeps dying" is something the user cannot learn anywhere else.
+fn lsp_label(lsp: &Lsp) -> String {
+    match lsp.state() {
+        // The two silent states, and the reason this function exists.
+        LspState::Idle | LspState::Unavailable => String::new(),
+        LspState::Starting => "Starting…".to_string(),
+        LspState::Failed(_) => "LSP unavailable".to_string(),
+        LspState::Running => match lsp.totals() {
+            (0, 0) => String::new(),
+            (errors, 0) => format!("{errors} ✕"),
+            (0, warnings) => format!("{warnings} ⚠"),
+            (errors, warnings) => format!("{errors} ✕  {warnings} ⚠"),
+        },
     }
 }
 
@@ -1124,6 +1490,19 @@ impl WorkspaceView {
             })
             .unwrap_or_default();
 
+        let diagnostics = lsp_label(&self.lsp);
+
+        // A squiggle the user cannot read only says "something is wrong near here". Putting
+        // the cursor on it spells it out, which is the cheapest thing that makes the
+        // underlines actually useful — a hover card or a problems panel is a bigger feature
+        // (#59 keeps this to diagnostics only).
+        //
+        // `self.status` wins the cell: a failed save is a thing the user just did, and it
+        // must not be buried under a diagnostic that was already there.
+        let message = self.status.clone().unwrap_or_else(|| {
+            self.cursor_diagnostic(cx).map(SharedString::from).unwrap_or_default()
+        });
+
         div()
             .h(Metrics::STATUS_HEIGHT)
             .flex_none()
@@ -1140,8 +1519,9 @@ impl WorkspaceView {
                     .flex_1()
                     // An error is the one thing in the status bar worth colouring.
                     .when(self.status.is_some(), |el| el.text_color(theme.accent))
-                    .child(self.status.clone().unwrap_or_default()),
+                    .child(message),
             )
+            .child(SharedString::from(diagnostics))
             .child(SharedString::from(terminals))
             .child(SharedString::from(position))
             .child(SharedString::from(language))
@@ -1334,13 +1714,124 @@ mod tests {
         // Guards against a slot count regression: if two distinct jobs ever collided the
         // whole point of keying by job is gone.
         let mut h = Harness::new();
-        let all =
-            [Job::OpenFolder, Job::OpenFile, Job::Save, Job::QuickOpenIndex, Job::ClosePrompt];
+        let all = [
+            Job::OpenFolder,
+            Job::OpenFile,
+            Job::Save,
+            Job::QuickOpenIndex,
+            Job::ClosePrompt,
+            Job::Lsp,
+        ];
         for job in all {
             h.start(job);
         }
         assert_eq!(h.slots.slots.len(), all.len());
         assert!(h.cancelled().is_empty());
+    }
+
+    #[test]
+    fn starting_a_language_server_cancels_only_the_previous_one() {
+        // Opening a second folder must stop the first project's poll loop — it holds a
+        // client for a server pointed at a directory nobody is looking at any more. It
+        // must not touch a save or a walk in flight.
+        let mut h = Harness::new();
+        h.start(Job::Save);
+        h.start(Job::Lsp);
+        h.start(Job::QuickOpenIndex);
+        assert!(h.cancelled().is_empty());
+
+        h.start(Job::Lsp);
+        assert_eq!(h.cancelled(), vec![Job::Lsp]);
+    }
+}
+
+#[cfg(test)]
+mod lsp_status_tests {
+    use super::*;
+    use crate::lsp_session::Lsp;
+
+    /// §24 at the last step before pixels, and the single most important assertion in this
+    /// file: **an editor with no language server must look exactly like an editor from
+    /// before this feature existed.** No icon, no "LSP: off", nothing to dismiss.
+    ///
+    /// This is the path almost every user is on — nobody has Intelephense on a fresh
+    /// machine, and most folders anyone opens are not PHP projects. If it ever starts
+    /// saying something, it says it to everybody, forever.
+    #[test]
+    fn a_missing_language_server_says_nothing_at_all() {
+        let mut lsp = Lsp::new();
+
+        // Never attempted: no folder open.
+        assert_eq!(lsp_label(&lsp), "");
+
+        // Attempted and the binary was not there.
+        lsp.set_state(LspState::Unavailable);
+        assert_eq!(lsp_label(&lsp), "", "a missing server is not the user's problem");
+    }
+
+    #[test]
+    fn a_running_server_with_nothing_to_report_also_says_nothing() {
+        // A clean file is the normal state. "0 problems" is chrome.
+        let mut lsp = Lsp::new();
+        lsp.set_state(LspState::Running);
+        assert_eq!(lsp_label(&lsp), "");
+    }
+
+    #[test]
+    fn a_slow_start_is_visible_because_otherwise_nothing_is_happening() {
+        // Intelephense indexing a large vendor/ tree takes tens of seconds, during which
+        // an empty status bar is indistinguishable from a broken one.
+        let mut lsp = Lsp::new();
+        lsp.set_state(LspState::Starting);
+        assert_eq!(lsp_label(&lsp), "Starting…");
+    }
+
+    #[test]
+    fn a_server_that_kept_dying_is_reported_once_the_budget_is_spent() {
+        // The one failure worth saying out loud: not "you never installed one", but "the
+        // one you have will not stay up", which the user cannot learn anywhere else.
+        let mut lsp = Lsp::new();
+        lsp.set_state(LspState::Failed("it exited".into()));
+        assert_eq!(lsp_label(&lsp), "LSP unavailable");
+    }
+
+    #[test]
+    fn problem_counts_read_as_counts() {
+        use elle_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+        fn at(line: u32, severity: DiagnosticSeverity) -> Diagnostic {
+            Diagnostic {
+                range: Range {
+                    start: Position { line, character: 0 },
+                    end: Position { line, character: 1 },
+                },
+                severity: Some(severity),
+                message: "x".into(),
+                ..Default::default()
+            }
+        }
+
+        let mut lsp = Lsp::new();
+        lsp.set_state(LspState::Running);
+        let uri: elle_lsp::lsp_types::Uri = "file:///a.php".parse().unwrap();
+        let text = "a\nb\nc\n";
+
+        lsp.set_diagnostics(uri.clone(), &[at(0, DiagnosticSeverity::ERROR)], text);
+        assert_eq!(lsp_label(&lsp), "1 ✕");
+
+        lsp.set_diagnostics(
+            uri.clone(),
+            &[at(0, DiagnosticSeverity::ERROR), at(1, DiagnosticSeverity::WARNING)],
+            text,
+        );
+        assert_eq!(lsp_label(&lsp), "1 ✕  1 ⚠");
+
+        lsp.set_diagnostics(uri.clone(), &[at(0, DiagnosticSeverity::WARNING)], text);
+        assert_eq!(lsp_label(&lsp), "1 ⚠");
+
+        // And back to silence when the file is fixed.
+        lsp.set_diagnostics(uri, &[], text);
+        assert_eq!(lsp_label(&lsp), "");
     }
 }
 

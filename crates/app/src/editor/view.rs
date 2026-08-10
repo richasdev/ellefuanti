@@ -24,6 +24,7 @@ use crate::actions::{
     Undo, context,
 };
 use crate::editor::state::Document;
+use crate::lsp_session::Severity;
 use crate::theme::{Metrics, Theme, Themed};
 
 /// Monospace family.
@@ -47,6 +48,14 @@ pub struct EditorView {
     /// Visible row range from the last frame, captured because `uniform_list` exposes it
     /// only to the render closure and scroll-into-view needs it outside of one.
     visible_rows: Range<usize>,
+    /// Diagnostics for this file, as byte ranges in the current buffer.
+    ///
+    /// A copy pushed in by the workspace rather than a handle the editor reads from: the
+    /// workspace owns the language server, and an editor holding a reference to it would
+    /// make "the server died" a thing every open tab has to cope with. A `Vec` it was
+    /// handed cannot go stale in a way that matters — it is simply the last thing the
+    /// server said, and an empty one is the correct rendering when there is no server.
+    diagnostics: Vec<(Range<usize>, Severity)>,
     /// Window x where the text column actually begins, measured at prepaint.
     ///
     /// `MouseDownEvent::position` is window-relative, so mapping a click to a column needs
@@ -65,8 +74,17 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
+            diagnostics: Vec::new(),
             text_origin_x: None,
         }
+    }
+
+    /// Replaces the diagnostics painted over this document.
+    ///
+    /// Called by the workspace when the server publishes, and with an empty slice when the
+    /// server goes away — see `Lsp::shut_down` for why clearing matters more than it looks.
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<(Range<usize>, Severity)>) {
+        self.diagnostics = diagnostics;
     }
 
     /// Where the text column starts, as measured at prepaint.
@@ -552,6 +570,16 @@ impl EditorView {
                 let line_start = self.document.buffer.point_to_offset(Point::new(row, 0));
                 let line_end = line_start + line.len();
 
+                // Sliced per row rather than passed whole: `line_runs` would otherwise
+                // scan every diagnostic in the file for each of the ~40 visible rows.
+                // A file with hundreds of problems is exactly when that starts to matter.
+                let row_diagnostics: Vec<_> = self
+                    .diagnostics
+                    .iter()
+                    .filter(|(range, _)| range.start < line_end && range.end > line_start)
+                    .cloned()
+                    .collect();
+
                 let is_cursor_row = row == cursor.row;
                 let row_selected = !selection.is_empty()
                     && selection.start < line_end.max(line_start + 1)
@@ -600,6 +628,7 @@ impl EditorView {
                         &line,
                         line_start,
                         &spans,
+                        &row_diagnostics,
                         &theme,
                         if is_cursor_row { Some(cursor.column) } else { None },
                     )))
@@ -630,10 +659,11 @@ fn styled_line(
     line: &str,
     line_start: usize,
     spans: &[HighlightSpan],
+    diagnostics: &[(Range<usize>, Severity)],
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> StyledText {
-    let (text, highlights) = line_runs(line, line_start, spans, theme, cursor_column);
+    let (text, highlights) = line_runs(line, line_start, spans, diagnostics, theme, cursor_column);
     StyledText::new(SharedString::from(text)).with_highlights(highlights)
 }
 
@@ -648,6 +678,7 @@ fn line_runs(
     line: &str,
     line_start: usize,
     spans: &[HighlightSpan],
+    diagnostics: &[(Range<usize>, Severity)],
     theme: &Theme,
     cursor_column: Option<usize>,
 ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
@@ -680,6 +711,33 @@ fn line_runs(
         ));
     }
 
+    // Diagnostics underline; they do not recolour. A squiggle that also repainted the
+    // text would fight the syntax highlighting for the same bytes and win, so an error on
+    // a keyword would turn it red and lose the one cue that says it is a keyword. gpui
+    // composes `underline` with a `color` from an earlier run only if they are the *same*
+    // run, so each diagnostic range is merged into the runs already covering it rather
+    // than pushed as a competing one.
+    for (range, severity) in diagnostics {
+        if range.end <= line_start || range.start >= line_end {
+            continue;
+        }
+        let start = floor_boundary(&text, range.start.max(line_start) - line_start);
+        // A zero-width diagnostic (a server pointing *between* two characters) would be
+        // invisible; widen it to one character so there is something to underline.
+        let end = ceil_boundary(&text, (range.end.min(line_end) - line_start).max(start + 1));
+        if start >= end {
+            continue;
+        }
+
+        let underline = Some(gpui::UnderlineStyle {
+            color: Some(theme.diagnostic(*severity)),
+            thickness: px(1.0),
+            wavy: true,
+        });
+
+        highlights = merge_underline(highlights, start..end, underline);
+    }
+
     if let Some(column) = cursor_column {
         let start = floor_boundary(&text, column.min(text.len()));
         let end = ceil_boundary(&text, (start + 1).min(text.len()));
@@ -700,6 +758,68 @@ fn line_runs(
 
     highlights.sort_by_key(|(range, _)| range.start);
     (text, highlights)
+}
+
+/// Adds an underline over `span`, splitting any colour runs it partly covers.
+///
+/// gpui requires sorted, non-overlapping runs, so an underline cannot simply be pushed on
+/// top of the syntax colours — a run half-covered by a diagnostic has to become two runs,
+/// one underlined and one not. That splitting is the whole function, and it is why
+/// diagnostics could not be expressed as "one more span" alongside the highlight spans:
+/// those carry a colour each and never overlap, where a diagnostic overlaps by nature.
+///
+/// Bytes not covered by any existing run still need the underline, so the gaps inside
+/// `span` become runs of their own with no colour — they inherit the element's text colour,
+/// which is what an uncoloured character already renders as.
+fn merge_underline(
+    runs: Vec<(Range<usize>, GpuiHighlight)>,
+    span: Range<usize>,
+    underline: Option<gpui::UnderlineStyle>,
+) -> Vec<(Range<usize>, GpuiHighlight)> {
+    let mut merged: Vec<(Range<usize>, GpuiHighlight)> = Vec::with_capacity(runs.len() + 2);
+    // Where inside `span` the next uncovered byte starts, so gaps between existing runs
+    // get an underline-only run rather than being skipped.
+    let mut uncovered = span.start;
+
+    for (range, style) in runs {
+        if range.end <= span.start || range.start >= span.end {
+            merged.push((range, style));
+            continue;
+        }
+
+        // The part of this run before the diagnostic keeps its style unchanged.
+        if range.start < span.start {
+            merged.push((range.start..span.start, style));
+        }
+
+        // Any gap since the last run, inside the diagnostic, is underline only.
+        if uncovered < range.start.max(span.start) {
+            merged.push((
+                uncovered..range.start.max(span.start),
+                GpuiHighlight { underline, ..Default::default() },
+            ));
+        }
+
+        // The overlap keeps the colour and gains the underline.
+        let overlap = range.start.max(span.start)..range.end.min(span.end);
+        if overlap.start < overlap.end {
+            merged.push((overlap.clone(), GpuiHighlight { underline, ..style }));
+            uncovered = overlap.end;
+        }
+
+        // And the part after it is unchanged again.
+        if range.end > span.end {
+            merged.push((span.end..range.end, style));
+        }
+    }
+
+    // Trailing bytes of the diagnostic that no run covered.
+    if uncovered < span.end {
+        merged.push((uncovered..span.end, GpuiHighlight { underline, ..Default::default() }));
+    }
+
+    merged.sort_by_key(|(range, _)| range.start);
+    merged
 }
 
 /// Turns a window-relative click x into an x relative to the start of the text.
@@ -837,6 +957,21 @@ mod tests {
 
     fn span(range: Range<usize>, style: HighlightStyle) -> HighlightSpan {
         HighlightSpan { range, style }
+    }
+
+    /// `line_runs` with no diagnostics, which is what every pre-existing test means.
+    ///
+    /// A wrapper rather than `&[]` threaded through nine call sites: those tests are about
+    /// syntax colours and the cursor, and an empty diagnostics argument in each would be
+    /// noise in the one place their arguments should read as the thing under test.
+    fn line_runs(
+        line: &str,
+        line_start: usize,
+        spans: &[HighlightSpan],
+        theme: &Theme,
+        cursor_column: Option<usize>,
+    ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
+        super::line_runs(line, line_start, spans, &[], theme, cursor_column)
     }
 
     /// Byte ranges carrying a foreground colour, ignoring the cursor's inverted run.
@@ -1001,5 +1136,216 @@ mod tests {
         let (text, runs) = line_runs("", 0, &[], &theme, None);
         assert_eq!(text, "");
         assert!(runs.is_empty());
+    }
+
+    // --- diagnostics ----------------------------------------------------------------
+    //
+    // Same reasoning as the block above: `StyledText` is opaque, so these assert on the
+    // runs. What they cover is the part that composes — a squiggle has to coexist with the
+    // syntax colour under it, and gpui only honours both if they end up in the *same* run.
+
+    /// Runs carrying a wavy underline, with the colour it was drawn in.
+    fn underlined(
+        runs: &[(Range<usize>, GpuiHighlight)],
+    ) -> Vec<(Range<usize>, Option<gpui::Hsla>)> {
+        runs.iter()
+            .filter(|(_, style)| style.underline.is_some_and(|u| u.wavy))
+            .map(|(range, style)| (range.clone(), style.underline.unwrap().color))
+            .collect()
+    }
+
+    #[test]
+    fn a_diagnostic_underlines_its_range_in_the_severity_colour() {
+        let theme = Theme::dark();
+        let (_, runs) =
+            line_runs_with("$undefined = 1;", 0, &[], &[(0..10, Severity::Error)], &theme, None);
+
+        assert_eq!(underlined(&runs), vec![(0..10, Some(theme.error))]);
+    }
+
+    #[test]
+    fn every_severity_gets_its_own_colour_from_the_theme() {
+        // The rule from the brief: diagnostic colours come from `Theme`, never hardcoded.
+        // If someone inlines an `rgb(0xff0000)` here, this fails against every variant.
+        for theme in [Theme::dark(), Theme::light(), Theme::one_dark_pro()] {
+            for (severity, expected) in [
+                (Severity::Error, theme.error),
+                (Severity::Warning, theme.warning),
+                (Severity::Information, theme.information),
+                (Severity::Hint, theme.hint),
+            ] {
+                let (_, runs) = line_runs_with("abcd", 0, &[], &[(0..4, severity)], &theme, None);
+                assert_eq!(
+                    underlined(&runs),
+                    vec![(0..4, Some(expected))],
+                    "{severity:?} must use the theme's own colour"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_squiggle_keeps_the_syntax_colour_underneath_it() {
+        // The composition case, and the reason diagnostics are not just another span. An
+        // error on a keyword must stay keyword-coloured *and* gain an underline — if the
+        // squiggle replaced the colour, the one cue that says "this is a keyword" is lost
+        // exactly where the user is being told to look.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_with(
+            "return $x;",
+            0,
+            &[span(0..6, HighlightStyle::Keyword)],
+            &[(0..6, Severity::Error)],
+            &theme,
+            None,
+        );
+
+        let (range, style) = runs.iter().find(|(r, _)| r.start == 0).expect("a run at 0");
+        assert_eq!(*range, 0..6);
+        assert_eq!(style.color, Some(theme.keyword), "the syntax colour must survive");
+        assert_eq!(
+            style.underline.and_then(|u| u.color),
+            Some(theme.error),
+            "and the underline must be there too"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_partly_covering_a_span_splits_it() {
+        // gpui needs sorted, disjoint runs. A diagnostic over half a keyword has to become
+        // two runs — underlined and not — or the whole word gets a squiggle it did not earn.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_with(
+            "function name",
+            0,
+            &[span(0..8, HighlightStyle::Keyword)],
+            &[(4..8, Severity::Warning)],
+            &theme,
+            None,
+        );
+
+        assert_eq!(underlined(&runs), vec![(4..8, Some(theme.warning))]);
+        // And the first half kept its colour with no underline.
+        let plain = runs.iter().find(|(r, _)| *r == (0..4)).expect("the unmarked half");
+        assert_eq!(plain.1.color, Some(theme.keyword));
+        assert!(plain.1.underline.is_none());
+    }
+
+    #[test]
+    fn a_diagnostic_over_uncoloured_text_still_underlines() {
+        // Plain text carries no syntax span, so there is no run to merge into. The gap has
+        // to become a run of its own or the squiggle silently does not render.
+        let theme = Theme::dark();
+        let (_, runs) =
+            line_runs_with("plain words", 0, &[], &[(6..11, Severity::Hint)], &theme, None);
+
+        assert_eq!(underlined(&runs), vec![(6..11, Some(theme.hint))]);
+    }
+
+    #[test]
+    fn diagnostic_runs_stay_sorted_and_disjoint() {
+        // The invariant gpui enforces. Several diagnostics over several spans is where a
+        // naive merge produces overlaps that paint unpredictably.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_with(
+            "public function name() { return 'x'; }",
+            0,
+            &[
+                span(0..6, HighlightStyle::Keyword),
+                span(7..15, HighlightStyle::Keyword),
+                span(32..35, HighlightStyle::String),
+            ],
+            &[(3..10, Severity::Error), (30..36, Severity::Warning)],
+            &theme,
+            Some(20),
+        );
+
+        for pair in runs.windows(2) {
+            assert!(
+                pair[0].0.end <= pair[1].0.start,
+                "runs must be sorted and disjoint: {:?} then {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_on_another_line_is_not_painted_on_this_one() {
+        // Ranges are document-wide byte offsets; forgetting to clip paints one file's
+        // squiggle across every visible row.
+        let theme = Theme::dark();
+        let (_, runs) =
+            line_runs_with("this line", 100, &[], &[(0..50, Severity::Error)], &theme, None);
+
+        assert!(underlined(&runs).is_empty());
+    }
+
+    #[test]
+    fn a_multiline_diagnostic_is_clipped_to_the_visible_line() {
+        let theme = Theme::dark();
+        let line = "middle";
+        let (_, runs) = line_runs_with(line, 100, &[], &[(50..200, Severity::Error)], &theme, None);
+
+        assert_eq!(underlined(&runs), vec![(0..line.len(), Some(theme.error))]);
+    }
+
+    #[test]
+    fn a_zero_width_diagnostic_still_shows_something() {
+        // A server pointing *between* two characters — "expected ; here". An empty range
+        // would produce no run at all, so the user is told nothing.
+        let theme = Theme::dark();
+        let (_, runs) = line_runs_with("$x = 1", 0, &[], &[(3..3, Severity::Error)], &theme, None);
+
+        let marks = underlined(&runs);
+        assert_eq!(marks.len(), 1, "a zero-width diagnostic must still be visible");
+        assert!(!marks[0].0.is_empty());
+    }
+
+    #[test]
+    fn a_squiggle_never_splits_a_multibyte_character() {
+        // The same hazard the syntax spans have: a range landing mid-codepoint would make
+        // StyledText debug-assert. Portuguese source is where this actually happens.
+        let theme = Theme::dark();
+        let line = "$mensagem = 'ação';";
+        let (text, runs) = line_runs_with(line, 0, &[], &[(13..17, Severity::Error)], &theme, None);
+
+        for (range, _) in &runs {
+            assert!(
+                text.is_char_boundary(range.start) && text.is_char_boundary(range.end),
+                "run {range:?} splits a codepoint in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_diagnostics_produces_exactly_what_it_did_before() {
+        // The regression guard for everything above: adding diagnostics must not change a
+        // single run when there are none, which is the state every editor without a
+        // language server is permanently in.
+        let theme = Theme::dark();
+        let spans = [span(0..6, HighlightStyle::Keyword)];
+        let (text, with) = line_runs_with("return $x;", 0, &spans, &[], &theme, Some(2));
+        let (plain_text, without) = line_runs("return $x;", 0, &spans, &theme, Some(2));
+
+        assert_eq!(text, plain_text);
+        assert_eq!(with.len(), without.len());
+        for (a, b) in with.iter().zip(&without) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.color, b.1.color);
+            assert!(a.1.underline.is_none());
+        }
+    }
+
+    /// `line_runs` with diagnostics, spelled out.
+    fn line_runs_with(
+        line: &str,
+        line_start: usize,
+        spans: &[HighlightSpan],
+        diagnostics: &[(Range<usize>, Severity)],
+        theme: &Theme,
+        cursor_column: Option<usize>,
+    ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
+        super::line_runs(line, line_start, spans, diagnostics, theme, cursor_column)
     }
 }

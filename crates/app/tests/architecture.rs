@@ -51,6 +51,100 @@ fn only_the_app_crate_depends_on_gpui() {
     );
 }
 
+/// RISKS.md #2, on this side of the client boundary.
+///
+/// `crates/lsp/tests/substitutability.rs` forbids a backend name in the LSP client's
+/// logic, and scans only that crate. Wiring the client up put a backend name in *this*
+/// crate for the first time — `lsp_session::DEFAULT_SERVER` is `"intelephense --stdio"` —
+/// and that is allowed: somebody has to name a default, and a `ServerConfig` value is data
+/// the client cannot tell apart from any other.
+///
+/// What is not allowed is a **branch** on it. The moment `if server == "intelephense"`
+/// exists anywhere, the substitutability the whole design is arranged around is gone on
+/// paper only, which is precisely the failure the risk register describes. So: the name may
+/// appear once, in the constant, and nowhere else in shipped code.
+#[test]
+fn a_backend_is_named_only_where_the_default_is_declared() {
+    const BACKENDS: [&str; 5] = ["intelephense", "phpactor", "psalm", "phpstan", "serenata"];
+
+    let mut violations = Vec::new();
+
+    for file in walk_rust_files(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")) {
+        let text = fs::read_to_string(&file).unwrap();
+
+        for (number, line) in shipped_code(&text).lines().enumerate() {
+            let lowered = line.to_lowercase();
+            if !BACKENDS.iter().any(|backend| lowered.contains(backend)) {
+                continue;
+            }
+            // The one permitted mention: the constant that declares the default command.
+            if line.contains("pub const DEFAULT_SERVER") {
+                continue;
+            }
+            violations.push(format!("{}:{}: {}", file.display(), number + 1, line.trim()));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "RISKS.md #2: a backend may be named where the default `ServerConfig` is declared \
+         and nowhere else — anything more is the start of special-casing, and the point of \
+         the LSP client is that it cannot tell one server from another. Found: {violations:#?}"
+    );
+}
+
+/// The shipped logic of a file: comments and `#[cfg(test)]` modules removed.
+///
+/// Same scanner, and the same two exclusions, as `crates/lsp/tests/substitutability.rs` —
+/// comments must be able to *discuss* a backend (this file's own doc comments do), and
+/// tests must be able to name two real servers to show the code cannot tell them apart.
+///
+/// ponytail: this is now the third copy of this scanner (here, `substitutability.rs`,
+/// `theming.rs`). A fourth is the point at which it should become a small shared dev
+/// dependency rather than a paste; three near-identical 30-line functions is still cheaper
+/// than a crate that exists to hold one of them.
+fn shipped_code(text: &str) -> String {
+    let without_comments: Vec<&str> = text
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(position) => &line[..position],
+            None => line,
+        })
+        .collect();
+
+    let mut kept = Vec::new();
+    let mut test_module_depth: Option<i32> = None;
+
+    for line in without_comments {
+        match test_module_depth {
+            None => {
+                if line.trim_start().starts_with("mod tests")
+                    || line.trim_start().starts_with("mod lsp_status_tests")
+                    || line.trim_start().starts_with("mod route_label_tests")
+                {
+                    test_module_depth = Some(count_braces(line));
+                    continue;
+                }
+                if line.trim() == "#[cfg(test)]" {
+                    continue;
+                }
+                kept.push(line);
+            }
+            Some(depth) => {
+                let depth = depth + count_braces(line);
+                test_module_depth = if depth <= 0 { None } else { Some(depth) };
+            }
+        }
+    }
+
+    kept.join("\n")
+}
+
+fn count_braces(line: &str) -> i32 {
+    line.chars().filter(|c| *c == '{').count() as i32
+        - line.chars().filter(|c| *c == '}').count() as i32
+}
+
 #[test]
 fn domain_crates_have_no_platform_conditionals() {
     // RISKS.md #8: platform-specific code stays in the app crate, so the domain layers

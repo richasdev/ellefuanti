@@ -1695,6 +1695,7 @@ dependencies = [
  "elle-core",
  "elle-index",
  "elle-laravel",
+ "elle-lsp",
  "elle-syntax",
  "elle-terminal",
  "elle-text",

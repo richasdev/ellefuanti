@@ -362,3 +362,107 @@ async fn switching_the_theme_at_runtime_repaints_every_surface(cx: &mut TestAppC
         "one toggle must advance the cycle by exactly one"
     );
 }
+
+// --- diagnostics (#59 step 3) -----------------------------------------------------------
+
+/// The case almost every user is in, and the one §24 is really about.
+///
+/// No language server is installed — nothing was started, nothing is running — and the
+/// workspace must render exactly as it did before diagnostics existed. Not "renders an
+/// empty problems area": renders with the status bar saying nothing about the LSP at all.
+///
+/// A render test rather than a unit test because the failure it guards against is visual:
+/// a stray icon, a "0 problems", a `Starting…` that never clears. The unit test in
+/// `workspace_view` pins the label; this pins that a real layout pass agrees.
+#[gpui::test]
+async fn the_workspace_renders_normally_with_no_language_server(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    workspace.update(cx, |workspace, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("User.php")),
+            "<?php\n\nclass User\n{\n    public $name;\n}\n",
+            true,
+        )
+        .expect("php grammar loads");
+        workspace.open_document_for_test(document, cx);
+    });
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(
+            workspace.lsp_label_for_test(),
+            "",
+            "an editor with no language server must say nothing about it"
+        );
+    });
+
+    draw(cx);
+}
+
+/// Diagnostics reach a real layout pass, in every theme.
+///
+/// What this proves that a `line_runs` unit test cannot: the underline styles survive
+/// `StyledText`, `uniform_list` and a full prepaint/paint without gpui rejecting a run.
+/// Overlapping and multi-line ranges are in the fixture because those are the ones that
+/// produce the malformed run lists gpui debug-asserts on.
+#[gpui::test]
+async fn an_editor_with_diagnostics_renders(cx: &mut TestAppContext) {
+    use elle_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+    fn at(line: u32, start: u32, end: u32, severity: DiagnosticSeverity) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position { line, character: start },
+                end: Position { line, character: end },
+            },
+            severity: Some(severity),
+            message: "something is wrong".into(),
+            ..Default::default()
+        }
+    }
+
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    let path = std::path::PathBuf::from("User.php");
+    workspace.update(cx, |workspace, cx| {
+        let document = Document::new(
+            Some(path.clone()),
+            // Line 4 carries multibyte characters, so a UTF-16 range over it is the case
+            // that would land mid-codepoint if the conversion were wrong.
+            "<?php\n\nclass User\n{\n    public $ação = 'não';\n}\n",
+            true,
+        )
+        .expect("php grammar loads");
+        workspace.open_document_for_test(document, cx);
+    });
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.publish_diagnostics_for_test(
+            &path,
+            &[
+                at(2, 6, 10, DiagnosticSeverity::ERROR),
+                // Overlapping the one above, which is what forces the run splitting.
+                at(2, 0, 8, DiagnosticSeverity::WARNING),
+                // Over the multibyte identifier.
+                at(4, 11, 16, DiagnosticSeverity::INFORMATION),
+                // Spanning more than one line.
+                at(3, 0, 2, DiagnosticSeverity::HINT),
+            ],
+            cx,
+        );
+    });
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(
+            workspace.lsp_label_for_test(),
+            "1 ✕  1 ⚠",
+            "the status bar counts errors and warnings, not hints"
+        );
+    });
+
+    draw(cx);
+}
