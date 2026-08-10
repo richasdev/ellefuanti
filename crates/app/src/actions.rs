@@ -12,6 +12,7 @@ actions!(
     [
         Quit,
         OpenFolder,
+        NewFile,
         Save,
         CloseTab,
         ToggleCommandPalette,
@@ -63,6 +64,7 @@ pub fn init(cx: &mut App) -> CommandRegistry {
     cx.bind_keys([
         // Workspace-wide
         KeyBinding::new("cmd-o", OpenFolder, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-n", NewFile, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-s", Save, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-w", CloseTab, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-p", ToggleCommandPalette, Some(context::WORKSPACE)),
@@ -118,6 +120,7 @@ pub fn init(cx: &mut App) -> CommandRegistry {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dispatch {
     OpenFolder,
+    NewFile,
     Save,
     CloseTab,
     QuickOpen,
@@ -132,6 +135,7 @@ pub enum Dispatch {
 pub fn dispatch_for(id: CommandId) -> Dispatch {
     match id.0 {
         "workspace.open_folder" => Dispatch::OpenFolder,
+        "editor.new_file" => Dispatch::NewFile,
         "workspace.quit" => Dispatch::Quit,
         "editor.save" => Dispatch::Save,
         "editor.close" => Dispatch::CloseTab,

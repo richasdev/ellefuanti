@@ -135,6 +135,7 @@ fn subsequence_span(haystack: &str, needle: &str) -> Option<usize> {
 pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("workspace.open_folder", "Open Folder…"),
     Command::new("workspace.quit", "Quit"),
+    Command::new("editor.new_file", "New File"),
     Command::new("editor.save", "Save File"),
     Command::new("editor.close", "Close Tab"),
     Command::new("palette.toggle", "Command Palette"),

@@ -47,3 +47,6 @@ tracing-subscriber.workspace = true
 # It was previously believed unusable here because the feature pulls in `wayland` and `x11`.
 # It does pull them in — and it compiles and runs on macOS anyway, verified before adding it.
 gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
+# Real files on a real disk, for the save round-trip tests. Asserting on `text_for_save`
+# alone would not catch a `read_file`/`write_file` pair that reshapes the bytes.
+tempfile = "3"

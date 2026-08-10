@@ -1670,6 +1670,7 @@ dependencies = [
  "elle-text",
  "elle-workspace",
  "gpui",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
