@@ -47,6 +47,30 @@
 //! [`FALLBACK_CHAIN`]. Re-run it the same way if these checks are ever changed — a green
 //! `cargo test` says nothing about any line in this table.
 //!
+//! # The advance ratio, and why 0.6 was not good enough (#92)
+//!
+//! #85 recorded *whether* families are monospaced but not *how wide* they are, and the
+//! terminal used an assumed `0.6`. Measured through `text_system().advance()` on `m`, the
+//! ratio is identical at 13, 16 and 20px — it is a property of the face, not the size:
+//!
+//! ```text
+//!  Menlo        0.602051    9.6328px at 16px
+//!  Monaco       0.600098    9.6016px at 16px
+//!  Courier New  0.600098    9.6016px at 16px
+//!  Andale Mono  0.600098    9.6016px at 16px
+//!  SF Mono          —       not installed (no Xcode)
+//! ```
+//!
+//! **Every one is above 0.6.** The assumption therefore always over-estimates how many
+//! characters fit, never under — and `sync_size` floors a division by it to decide how many
+//! columns to tell the PTY it has. At 13px Menlo that hands out a column too many at 53% of
+//! window widths, and since the *shell* does the wrapping, `ls` and `git log --graph` format
+//! to a width that is not there. That is #92, reported as "it breaks lines out of nowhere".
+//!
+//! So the ratio is measured once in [`resolve`] and cached on [`Fonts`]. The objection in
+//! [`Fonts::gutter_width`] to measuring — a text-system round trip per frame — was about
+//! measuring *per render*, and caching removes it for both callers.
+//!
 //! The same run confirms the derived metrics at a size nobody had tried. At
 //! `"editor.fontSize": 20`: gutter 80px (was a flat 52px, which loses a five-digit line
 //! number), editor row 30px, terminal cell 12 x 24.6px (was a flat 16px row under 20px text
@@ -101,16 +125,27 @@ const PROBE_CHARS: [char; 3] = ['i', 'W', 'm'];
 /// above float noise.
 const ADVANCE_TOLERANCE: f32 = 0.02;
 
-/// Character-cell width as a fraction of the font size.
+/// Character-cell width as a fraction of the font size, for when nothing has been measured.
 ///
-/// Menlo advances 0.6 em, measured: 9.63px at 16px. Not queried per frame — the terminal
-/// lays out one `StyledText` per row rather than per cell, so this only decides how many
-/// columns fit, and being a fraction of a pixel out costs nothing where a text-system round
-/// trip per frame would not.
+/// A starting point, not the answer: [`Fonts::advance_ratio`] holds the measured one and is
+/// what every caller actually gets. This is the value for a `Fonts::default()` — render
+/// tests, and the moment in `main` before the text system has been asked anything.
+///
+/// **0.6 is an assumption and it is wrong for every monospace family on macOS**, which is
+/// #92. Measured through `text_system().advance()`: Menlo 0.602051, Monaco / Courier New /
+/// Andale Mono 0.600098. All of them are *above* 0.6, so assuming 0.6 always over-estimates
+/// how many characters fit — see [`Fonts::advance_ratio`] for what that costs.
 ///
 /// Lives here rather than in `terminal_view` because the *editor* gutter derives from the
 /// same ratio, and two copies of "how wide is a character" is how they drift apart.
 const CELL_WIDTH_RATIO: f32 = 0.6;
+
+/// The character the advance is measured from.
+///
+/// `m` is the em reference and is one of the three [`PROBE_CHARS`] a family must agree on to
+/// be accepted at all, so on any family that got this far it is *the* advance rather than
+/// one of several.
+const ADVANCE_PROBE_CHAR: char = 'm';
 
 /// Terminal row height as a multiple of the font size.
 ///
@@ -143,6 +178,13 @@ pub struct Fonts {
     pub ui_size: Pixels,
     /// Multiple of [`size`](Self::size), not pixels. See [`Fonts::line_height`].
     pub line_height_ratio: f32,
+    /// The resolved family's real glyph advance, as a fraction of the font size — measured
+    /// once in [`resolve`], never per frame. `None` until something has measured it, which
+    /// is [`Fonts::default`] and nothing else on the real startup path.
+    ///
+    /// Read through [`Fonts::advance_ratio`], which supplies [`CELL_WIDTH_RATIO`] when this
+    /// is `None`, so no caller has to know the difference.
+    pub measured_advance_ratio: Option<f32>,
 }
 
 impl Global for Fonts {}
@@ -160,6 +202,9 @@ impl Default for Fonts {
             size: px(13.0),
             ui_size: px(12.0),
             line_height_ratio: 1.5,
+            // Nothing has been measured: `Default` has no `App` and so no text system, the
+            // same reason the family here is a name rather than a chain walk.
+            measured_advance_ratio: None,
         }
     }
 }
@@ -198,8 +243,23 @@ impl Fonts {
     /// Both derive from the editor font size, so ⌘+ scales the terminal with everything else.
     /// Before #49 these were `FONT_SIZE * 0.6` and a flat `TERMINAL_LINE_HEIGHT: px(16.0)`,
     /// and the flat one is why a zoomed terminal used to overlap its own rows.
+    /// How wide one character is, as a fraction of the font size — measured if anything has
+    /// measured it, [`CELL_WIDTH_RATIO`] if not.
+    ///
+    /// Free to call: the measurement happened once in [`resolve`], and this reads a field.
+    /// That is the whole point of caching it on the struct — see [`Fonts::cell_size`] for
+    /// why the terminal cannot use the assumed number.
+    pub fn advance_ratio(&self) -> f32 {
+        self.measured_advance_ratio.unwrap_or(CELL_WIDTH_RATIO)
+    }
+
     pub fn cell_size(&self) -> (Pixels, Pixels) {
-        (self.size * CELL_WIDTH_RATIO, self.size * TERMINAL_LINE_HEIGHT_RATIO)
+        // The *measured* advance, not [`CELL_WIDTH_RATIO`] — this is the #92 fix. `sync_size`
+        // divides the panel width by this and floors to get the column count it hands the
+        // PTY, so a cell even slightly narrower than the real glyph buys the shell a column
+        // that cannot be drawn. Menlo advances 0.602051 em against the assumed 0.6, and at
+        // 13px that one part in 350 hands out one column too many at 53% of window widths.
+        (self.size * self.advance_ratio(), self.size * TERMINAL_LINE_HEIGHT_RATIO)
     }
 
     /// Width of the gutter, derived from the font size.
@@ -210,12 +270,19 @@ impl Fonts {
     /// `size * 0.6 * 5 + 12 + 8`. At 13px that gives 59px against the old 52 — six digits
     /// of headroom instead of five, which is the direction to be wrong in.
     ///
-    /// Not measured through the text system: this is called during render, and a
-    /// text-system round trip per frame to save a few pixels of a gutter is the wrong
-    /// trade. [`CELL_WIDTH_RATIO`] is the same 0.6 em the terminal grid uses — shared rather
-    /// than written twice, so "how wide is a character" has one answer.
+    /// Still one shared answer to "how wide is a character" — [`Fonts::advance_ratio`], the
+    /// same call [`cell_size`](Self::cell_size) makes. What changed in #92 is where that
+    /// answer comes from: it is measured once in [`resolve`] and cached, so this is a field
+    /// read and the old objection to measuring is gone rather than worked around.
+    ///
+    /// That objection — *"this is called during render, and a text-system round trip per
+    /// frame to save a few pixels of a gutter is the wrong trade"* — was right about the
+    /// gutter and wrong about the terminal, and the number was shared, so the gutter's
+    /// tolerance set the terminal's. A few pixels of gutter is cosmetic; the same few pixels
+    /// in `cell_size` decide what the shell believes its width is. Measuring once serves
+    /// both without the round trip either was avoiding.
     pub fn gutter_width(&self) -> Pixels {
-        self.size * CELL_WIDTH_RATIO * 5.0 + px(20.0)
+        self.size * self.advance_ratio() * 5.0 + px(20.0)
     }
 
     /// A `gpui::Font` for the resolved family, for the places that need a `TextRun`.
@@ -262,12 +329,48 @@ pub fn resolve(settings: &Settings, cx: &App) -> Fonts {
         }
     };
 
+    // Measured here and nowhere else: `resolve` runs at startup and on a settings change,
+    // which is exactly when the family can change. Zoom does not come through here — it
+    // rebuilds `Fonts` from the current one in `settings::adjust_font_size`, keeping this
+    // ratio, which is correct because a ratio is per-family and scale-free. Verified: Menlo
+    // measures 0.602051 at 13, 16 and 20px.
+    let measured_advance_ratio = measure_advance_ratio(&family, cx);
+
     Fonts {
         family,
         size: px(settings.font_size()),
         ui_size: px(settings.ui_font_size()),
         line_height_ratio: settings.line_height(),
+        measured_advance_ratio,
     }
+}
+
+/// The family's real advance as a fraction of the font size, or `None` if it cannot be
+/// measured.
+///
+/// The honest number behind [`CELL_WIDTH_RATIO`], and #92's fix. Measured at one size and
+/// stored as a ratio because that is what it is: advance scales linearly with size, and
+/// Menlo returns 0.602051 at 13, 16 and 20px to six figures.
+///
+/// `None` rather than a guess when the text system cannot answer — the caller falls back to
+/// the assumed constant, which is the behaviour that shipped, so a font that cannot be
+/// measured is no worse off than before.
+fn measure_advance_ratio(family: &str, cx: &App) -> Option<f32> {
+    let text_system = cx.text_system();
+    let font_id = text_system.resolve_font(&gpui::font(family.to_string()));
+
+    // 16px rather than the configured size: a fixed probe size keeps this one number per
+    // family, and the ratio is what gets stored anyway.
+    let size = px(16.0);
+    let advance = text_system.advance(font_id, size, ADVANCE_PROBE_CHAR).ok()?;
+    let ratio = f32::from(advance.width) / f32::from(size);
+
+    // A zero or negative advance is a text system that answered without measuring — the
+    // `NoopTextSystem` under `#[gpui::test]` returns 600.0 for every character, which is a
+    // ratio of 37.5 and would hand the terminal one column. Anything outside a plausible
+    // monospace range means the answer is not about this font, so decline it and let the
+    // constant stand.
+    (0.4..=0.9).contains(&ratio).then_some(ratio)
 }
 
 /// Installs the resolved fonts. Called at startup and on every zoom.
@@ -448,6 +551,118 @@ mod tests {
                  into a {panel_height}px panel — the shell would write off-screen"
             );
         }
+    }
+
+    /// #92: the columns handed to the PTY must all be drawable.
+    ///
+    /// This is the bug the user reported as *"quebra a linha do nada"*. `sync_size` divides
+    /// the panel width by `cell_size().0` and floors, and sends that count to the PTY via
+    /// `resize_all` — so the *shell* does the wrapping. Claim one column more than fits and
+    /// everything that formats to its own width (`ls`, `git log --graph`, `top`, a progress
+    /// bar) breaks a line at a width that does not exist, with nothing visible to explain it.
+    ///
+    /// The check is the arithmetic, not a font: given a real advance ratio, the count derived
+    /// from `cell_size` must fit inside the panel when drawn at that real advance. No window,
+    /// no text system — which matters, because the text system that *is* available headlessly
+    /// measures every font as 600.0 and would make this pass on anything. See the module docs.
+    ///
+    /// **Fails against the assumed `CELL_WIDTH_RATIO = 0.6`.** With Menlo's measured 0.602051
+    /// at 13px it over-claims a column at 53% of the widths swept below.
+    #[test]
+    fn the_pty_is_never_told_it_has_a_column_that_cannot_be_drawn() {
+        // Measured through `text_system().advance()` on macOS, one glyph at 16px. Every
+        // monospace family on the machine is *above* the assumed 0.6, so the assumption
+        // always over-estimates how many characters fit — it never errs the safe way.
+        for (family, real_ratio) in
+            [("Menlo", 0.602_051_f32), ("Monaco", 0.600_098), ("Courier New", 0.600_098)]
+        {
+            for size in [6.0f32, 13.0, 16.0, 20.0, 32.0] {
+                let fonts = Fonts {
+                    size: px(size),
+                    measured_advance_ratio: Some(real_ratio),
+                    ..Fonts::default()
+                };
+                let cell_width = f32::from(fonts.cell_size().0);
+
+                // A sweep rather than the three widths in the issue: the bug appears and
+                // disappears with window size, which is what made it look like it came from
+                // nowhere. Anything that only fires at some widths has to be checked at many.
+                for width in (400..=2000).step_by(1).map(|w| w as f32) {
+                    let cols = (width / cell_width).floor().max(1.0);
+
+                    // What those columns actually occupy when drawn with the real glyph.
+                    let drawn = cols * size * real_ratio;
+                    assert!(
+                        drawn <= width,
+                        "{family} at {size}px in a {width}px panel: the PTY is told {cols} \
+                         columns, which draw {drawn}px — the shell wraps at a width that is \
+                         not there"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half of the same trade: not so conservative that a column goes missing.
+    ///
+    /// Rounding down is the right direction — an unused pixel column is invisible and a
+    /// column too many is #92 — but "tell the PTY it has one column" would also satisfy
+    /// that. The cell must stay within a pixel of the real glyph, so at most one column is
+    /// ever given up.
+    #[test]
+    fn rounding_down_costs_at_most_one_column() {
+        let real_ratio = 0.602_051_f32;
+        for size in [13.0f32, 16.0, 20.0] {
+            let fonts = Fonts {
+                size: px(size),
+                measured_advance_ratio: Some(real_ratio),
+                ..Fonts::default()
+            };
+            let cell_width = f32::from(fonts.cell_size().0);
+
+            for width in (400..=2000).step_by(7).map(|w| w as f32) {
+                let cols = (width / cell_width).floor().max(1.0);
+                let fits = (width / (size * real_ratio)).floor().max(1.0);
+                assert!(
+                    cols >= fits - 1.0,
+                    "at {size}px in {width}px the PTY is told {cols} columns where {fits} fit \
+                     — giving up more than one column is a visible margin, not a rounding"
+                );
+            }
+        }
+    }
+
+    /// The measured ratio must actually reach the callers, or the fix is decoration.
+    ///
+    /// Both consumers, because they share the number by design (#85) and #92 changed where
+    /// it comes from rather than splitting it in two.
+    #[test]
+    fn a_measured_advance_reaches_both_the_cell_and_the_gutter() {
+        let assumed = Fonts { size: px(13.0), ..Fonts::default() };
+        let measured = Fonts { measured_advance_ratio: Some(0.602_051), ..assumed.clone() };
+
+        assert_eq!(assumed.advance_ratio(), CELL_WIDTH_RATIO, "unmeasured falls back");
+        assert_eq!(measured.advance_ratio(), 0.602_051);
+
+        assert!(measured.cell_size().0 > assumed.cell_size().0, "the cell must widen");
+        assert!(measured.gutter_width() > assumed.gutter_width(), "so must the gutter");
+
+        // The row height is untouched: it is set directly from the size rather than divided
+        // out of a glyph, which is why the vertical axis never had this bug.
+        assert_eq!(measured.cell_size().1, assumed.cell_size().1);
+    }
+
+    /// An unmeasurable font is no worse off than before the fix.
+    ///
+    /// The fallback path matters more than it looks: under `#[gpui::test]` the noop text
+    /// system reports 600.0px for every glyph — a ratio of 37.5 — and taking that at face
+    /// value would tell the PTY it has one column. Implausible ratios are declined, so the
+    /// assumed constant stands and behaviour matches what shipped.
+    #[test]
+    fn an_implausible_measurement_is_declined_rather_than_used() {
+        let fonts = Fonts { measured_advance_ratio: None, ..Fonts::default() };
+        assert_eq!(fonts.advance_ratio(), CELL_WIDTH_RATIO);
+        assert_eq!(fonts.cell_size().0, px(13.0) * CELL_WIDTH_RATIO, "the shipped behaviour");
     }
 
     #[test]
