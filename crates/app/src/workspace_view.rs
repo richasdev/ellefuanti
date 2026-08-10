@@ -14,7 +14,7 @@ use elle_text::Point;
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
     App, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
-    SharedString, Task, Window, div, prelude::*, px, svg, uniform_list,
+    SharedString, Task, Window, div, prelude::*, px, rgb, svg, uniform_list,
 };
 
 use crate::actions::{
@@ -3957,8 +3957,11 @@ impl WorkspaceView {
                         // A directory's glyph says open or closed — the same fact the
                         // chevron carries, deliberately doubled, because that is how VS
                         // Code draws it and the redundancy costs nothing.
-                        let icon = if is_dir {
-                            if expanded { icons::FOLDER_OPENED } else { icons::FOLDER }
+                        // A directory's glyph is a themed Codicon; a file's may be a
+                        // coloured Ayu icon, which carries its own colour instead of
+                        // taking the row's. `None` means "use the row's colour".
+                        let (icon, icon_color) = if is_dir {
+                            (if expanded { icons::FOLDER_OPENED } else { icons::FOLDER }, None)
                         } else {
                             icons::for_file(&entry.name)
                         };
@@ -4008,10 +4011,15 @@ impl WorkspaceView {
                                         )
                                     },
                                 ))
-                                // The type glyph. Colour comes from `text_color` on the row
-                                // above — gpui rasterises the SVG to an alpha mask and
-                                // fills it with `style.text.color`, so every theme variant
-                                // recolours it for free and nothing here is hardcoded.
+                                // The type glyph. A themed Codicon takes its colour from
+                                // `text_color` on the row above — gpui rasterises the SVG
+                                // to an alpha mask and fills it with `style.text.color`,
+                                // so every theme variant recolours it for free.
+                                //
+                                // An Ayu icon overrides that with its own colour, because
+                                // for a file-type icon the colour *is* the identity (#115).
+                                // That is the one place in this window where a glyph
+                                // deliberately ignores the theme — see `file_icons`.
                                 //
                                 // Set on the row rather than on the sidebar root because
                                 // this callback runs *outside* the root's style scope
@@ -4019,12 +4027,12 @@ impl WorkspaceView {
                                 // line-height PRs). A style that is not on the row is not
                                 // on the row.
                                 .child(
-                                    div()
-                                        .mr_1()
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .child(svg().path(icon).size(px(16.0))),
+                                    div().mr_1().flex_none().flex().items_center().child(
+                                        svg()
+                                            .path(icon)
+                                            .size(px(16.0))
+                                            .when_some(icon_color, |el, c| el.text_color(rgb(c))),
+                                    ),
                                 )
                                 .child(SharedString::from(entry.name.clone()))
                                 .into_any_element(),
@@ -4056,7 +4064,7 @@ impl WorkspaceView {
                 // than neither having an icon. `title` is the file name (`state.rs:199`),
                 // which is exactly what `for_file` wants; an untitled buffer's "untitled"
                 // has no extension and lands on the generic file icon, which is right.
-                let icon = icons::for_file(&title);
+                let (icon, icon_color) = icons::for_file(&title);
                 let entity = entity.clone();
                 let close_entity = entity.clone();
 
@@ -4093,13 +4101,15 @@ impl WorkspaceView {
                     // width depended on anything — presence, hover, state — would reopen
                     // that. This one is unconditional and constant, so every tab is exactly
                     // 16px wider than before and none of them ever move again.
+                    //
+                    // An Ayu icon supplies its own colour; a Codicon takes the tab's.
                     .child(
-                        div()
-                            .w(px(16.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .child(svg().path(icon).size(px(16.0))),
+                        div().w(px(16.0)).flex_none().flex().items_center().child(
+                            svg()
+                                .path(icon)
+                                .size(px(16.0))
+                                .when_some(icon_color, |el, c| el.text_color(rgb(c))),
+                        ),
                     )
                     .child(SharedString::from(title))
                     .child(

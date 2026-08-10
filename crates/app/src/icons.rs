@@ -134,7 +134,35 @@ pub const FILE: &str = "icons/file.svg";
 /// The whole name, lowercased, not just the extension. `.blade.php` is a double extension
 /// that a naive `Path::extension` reads as `php`, and `composer.lock` / `package-lock.json`
 /// are recognised by name. Order matters: the most specific suffix has to be tested first.
-pub fn for_file(name: &str) -> &'static str {
+/// The icon for a file: its path, and a colour if the icon supplies its own.
+///
+/// `None` means "a themed Codicon" — the caller fills its alpha mask with the row's
+/// `text_color` and the theme recolours it for free, which is how every glyph in this
+/// window worked before #115. `Some(rgb)` means an Ayu file-type icon, which carries its
+/// own colour because for a file-type icon the colour *is* the identity.
+///
+/// # Why both sets, rather than one
+///
+/// Ayu wins wherever it has a glyph: a purple PHP elephant and a yellow JS badge are
+/// recognisable in a way that three identical `file-code` sheets are not, and telling `.php`
+/// from `.js` at a glance is the entire point of the feature.
+///
+/// But Ayu ships **no SVG** for `html`, `blade`, `composer`, `docker`, `sql` or `xml` — they
+/// exist only as `@2x.png`, which cannot go through gpui's SVG path. Those are exactly the
+/// files a Laravel project is full of, and the Codicons below cover them: `.blade.php` and
+/// `.html` get `file-markup`, `.sql` gets `file-code`, `composer.lock` gets `file-lock`.
+///
+/// So neither set alone is right. Ayu first for identity, Codicons behind it for coverage,
+/// and `file.svg` last so an unknown file still gets a glyph rather than a hole.
+pub fn for_file(name: &str) -> (&'static str, Option<u32>) {
+    if let Some((path, color)) = crate::file_icons::ayu_icon_for_name(name) {
+        return (path, Some(color));
+    }
+    (codicon_for_file(name), None)
+}
+
+/// The Codicon half of [`for_file`]: one flat themed glyph per broad category.
+fn codicon_for_file(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
 
     // Double extensions and whole names first: `Path::extension` on `x.blade.php` is
@@ -178,17 +206,26 @@ pub struct Icons;
 
 impl AssetSource for Icons {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        Ok(ICONS
+        if let Some(icon) = ICONS.iter().find(|icon| icon.path == path) {
+            return Ok(Some(Cow::Borrowed(icon.svg.as_bytes())));
+        }
+        // The Ayu file-type icons (#115) share this source because gpui installs exactly
+        // one per `Application`. Same element and same rasteriser as the icons above; the
+        // only difference is that the caller fills their mask with the icon's own colour
+        // instead of the theme's — see `file_icons.rs`.
+        Ok(crate::file_icons::FILE_ICONS
             .iter()
             .find(|icon| icon.path == path)
-            .map(|icon| Cow::Borrowed(icon.svg.as_bytes())))
+            .map(|icon| Cow::Borrowed(icon.svg().as_bytes())))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(ICONS
             .iter()
-            .filter(|icon| icon.path.starts_with(path))
-            .map(|icon| SharedString::from(icon.path))
+            .map(|icon| icon.path)
+            .chain(crate::file_icons::FILE_ICONS.iter().map(|icon| icon.path))
+            .filter(|p| p.starts_with(path))
+            .map(SharedString::from)
             .collect())
     }
 }
@@ -331,13 +368,14 @@ mod tests {
             "unknown.qqq",
             "",
         ] {
-            paths.push(for_file(name));
+            paths.push(for_file(name).0);
         }
 
         for path in paths {
             assert!(
                 Icons.load(path).unwrap().is_some(),
-                "{path} is drawn somewhere but is not in ICONS: it renders as a blank square"
+                "{path} is drawn somewhere but the asset source cannot load it: \
+                 it renders as a blank square"
             );
         }
     }
@@ -350,11 +388,14 @@ mod tests {
     /// wrong. The order of the checks in `for_file` is the whole fix.
     #[test]
     fn blade_is_not_read_as_php() {
-        assert_eq!(for_file("welcome.blade.php"), "icons/file-markup.svg");
-        assert_eq!(for_file("User.php"), "icons/file-code.svg");
+        assert_eq!(for_file("welcome.blade.php").0, "icons/file-markup.svg");
+        // #115: PHP now reaches Ayu's elephant rather than the generic `file-code`. Blade
+        // stays on `file-markup` — Ayu has no Blade glyph, and this one is the better
+        // answer anyway for the reason this test was written.
+        assert_eq!(for_file("User.php").0, "icons/file-types/php.svg");
         assert_ne!(
-            for_file("welcome.blade.php"),
-            for_file("User.php"),
+            for_file("welcome.blade.php").0,
+            for_file("User.php").0,
             "a Blade view and a PHP class must not draw the same glyph"
         );
     }
@@ -368,6 +409,10 @@ mod tests {
         assert_eq!(for_file("README.MD"), for_file("readme.md"));
         assert_eq!(for_file("Photo.JPG"), for_file("photo.jpg"));
         assert_eq!(for_file("Welcome.Blade.PHP"), for_file("welcome.blade.php"));
+        // Both halves of the lookup have to agree on case, not just this one — an Ayu hit
+        // that was case-sensitive would send `User.PHP` to the Codicon fallback instead.
+        assert_eq!(for_file("User.PHP"), for_file("user.php"));
+        assert_eq!(for_file(".ENV"), for_file(".env"));
     }
 
     /// An unrecognised name gets the generic file icon, never an empty string.
@@ -377,8 +422,20 @@ mod tests {
     /// extension at all and are the ordinary case here, not an edge one.
     #[test]
     fn an_unknown_file_still_gets_an_icon() {
-        for name in ["Makefile", "LICENSE", "unknown.qqq", "", "no-extension"] {
-            assert_eq!(for_file(name), FILE, "{name:?} got no icon");
+        // `LICENSE` is deliberately absent: #115 gives it Ayu's licence glyph, which is
+        // more specific than the generic sheet and is the point of that set.
+        for name in ["Makefile", "unknown.qqq", "", "no-extension"] {
+            assert_eq!(for_file(name).0, FILE, "{name:?} got no icon");
+        }
+        // Whatever the name, there is always *a* glyph, and it is one that really exists
+        // in one of the two sets — the Ayu half is served by the same `AssetSource`, so a
+        // path from either is loadable.
+        for name in ["Makefile", "LICENSE", "unknown.qqq", "", "User.php", "app.js"] {
+            let (path, _) = for_file(name);
+            assert!(
+                Icons.load(path).unwrap().is_some(),
+                "{name:?} -> {path}, which the asset source cannot load"
+            );
         }
     }
 
@@ -387,13 +444,18 @@ mod tests {
     /// `package-lock.json` is JSON and would otherwise take the JSON glyph, which is not
     /// wrong so much as unhelpful — a lock file is a generated artefact you do not edit,
     /// and that is the useful thing to signal.
+    ///
+    /// #115 kept this intact by *not* mapping `.lock` or `-lock.json` on the Ayu side.
+    /// Ayu would have given `package-lock.json` its JSON glyph, which is the outcome this
+    /// test exists to prevent, so the omission there is load-bearing rather than an
+    /// oversight — hence checking it here, where the reason is written down.
     #[test]
     fn lock_files_are_recognised_by_name() {
-        assert_eq!(for_file("composer.lock"), "icons/file-lock.svg");
-        assert_eq!(for_file("package-lock.json"), "icons/file-lock.svg");
-        assert_eq!(for_file("yarn.lock"), "icons/file-lock.svg");
-        // A plain JSON file is still JSON.
-        assert_eq!(for_file("composer.json"), "icons/file-json.svg");
+        assert_eq!(for_file("composer.lock").0, "icons/file-lock.svg");
+        assert_eq!(for_file("package-lock.json").0, "icons/file-lock.svg");
+        assert_eq!(for_file("yarn.lock").0, "icons/file-lock.svg");
+        // A plain JSON file is still JSON — Ayu's, now, which is still a JSON glyph.
+        assert_eq!(for_file("composer.json").0, "icons/file-types/json.svg");
     }
 
     /// `.env` and its variants are config, and they are dotfiles with no extension.
@@ -401,12 +463,19 @@ mod tests {
     /// `Path::extension` on `.env` is `None` (a leading dot is a hidden-file marker, not a
     /// separator), and on `.env.example` it is `example`. Both would fall through to the
     /// generic icon without the explicit check.
+    ///
+    /// #115 leaves all three to this set on purpose: `language_for_path` reads `.env` with
+    /// the bash grammar, so an Ayu shell icon would have been the consistent choice, but
+    /// `.env` is configuration you edit rather than a script you run. Which grammar parses
+    /// it and which glyph describes it are different questions.
     #[test]
     fn dotenv_files_are_config() {
-        assert_eq!(for_file(".env"), "icons/file-config.svg");
-        assert_eq!(for_file(".env.example"), "icons/file-config.svg");
-        assert_eq!(for_file(".env.local"), "icons/file-config.svg");
-        // Not everything starting with a dot is an env file.
-        assert_eq!(for_file(".gitignore"), FILE);
+        assert_eq!(for_file(".env").0, "icons/file-config.svg");
+        assert_eq!(for_file(".env.example").0, "icons/file-config.svg");
+        assert_eq!(for_file(".env.local").0, "icons/file-config.svg");
+        // Not everything starting with a dot is an env file. `.gitignore` now gets Ayu's
+        // git glyph rather than the generic sheet — still not the config icon, which is
+        // what this line is actually asserting.
+        assert_eq!(for_file(".gitignore").0, "icons/file-types/git.svg");
     }
 }
