@@ -25,12 +25,25 @@ use crate::editor::{Document, EditorEvent, EditorView};
 use crate::file_cache;
 use crate::find_bar::{FindBar, FindEvent, Status};
 use crate::fonts::Fonts;
+use crate::git_panel::{DiffRenderer, GitEvent, GitPanel, PanelState, render_diff};
 use crate::icons;
 use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::terminal_view::TerminalView;
 use crate::theme::{Metrics, Theme, Themed};
+
+/// Which panel the sidebar is showing.
+///
+/// Two variants because two panels are enabled; the other five in the activity bar are
+/// still disabled and still have nothing to switch to. An enum rather than a bool so the
+/// third one is a compile error at the match rather than an inverted flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Sidebar {
+    #[default]
+    Explorer,
+    Git,
+}
 
 /// An open tab.
 struct Tab {
@@ -69,6 +82,17 @@ enum Job {
     /// slot for both because they are strictly sequential — the poll loop only exists once
     /// a start succeeded, and a new start must supersede whatever the old server was doing.
     Lsp,
+    /// Reading `git status` for the source control panel (#64).
+    ///
+    /// Its own slot because a refresh is triggered by focus and by save, and those can land
+    /// close together — ⌘S while the window is regaining focus. Superseding is exactly
+    /// right there: the second read sees everything the first would have, so the first is
+    /// waste the moment the second starts.
+    GitStatus,
+    /// Reading one file's diff. Separate from `GitStatus` because clicking a row must not
+    /// cancel the status refresh that is repopulating the list underneath it — they answer
+    /// different questions and both answers are wanted.
+    GitDiff,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -355,6 +379,32 @@ pub struct WorkspaceView {
     /// is the handle that lets a superseding navigation say `$/cancelRequest` and reclaim
     /// both — ADR-0007's "cancellation, not queueing", which needs the id to mean anything.
     in_flight_query: Option<elle_lsp::RequestId>,
+    /// The source control panel (#64), and whether it is the visible sidebar.
+    ///
+    /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
+    /// own a subprocess and a query, so a closed one should not exist. This owns a status
+    /// list and nothing else, and keeping it alive means switching back to it does not
+    /// re-read the repository — which matters because the refresh is event-driven and a
+    /// freshly built panel would have no event to wait for.
+    git: Entity<GitPanel>,
+    /// Which sidebar the activity bar has selected. Explorer until someone clicks Git.
+    sidebar: Sidebar,
+    /// Cancels an in-flight status walk, for the same reason `quick_open_cancel` exists:
+    /// dropping the Task stops the await, not the libgit2 walk behind it (ADR-0007).
+    git_cancel: Option<CancelFlag>,
+    /// The parsed diff for the selected file, held here rather than in the panel because
+    /// building it is blocking work the workspace owns.
+    git_diff: Option<DiffRenderer>,
+    /// Holds the window-activation observer that drives the focus refresh (#64).
+    ///
+    /// Registered on the first render rather than in `new`, because
+    /// `observe_window_activation` needs a `&mut Window` and `new` has none. Adding a
+    /// `Window` parameter was the alternative and was rejected: it would touch all ten
+    /// `WorkspaceView::new` call sites in `render_tests.rs`, and two sibling agents are
+    /// editing that file right now — a signature change there is a merge conflict bought
+    /// for nothing. A `Subscription` dropped is a subscription cancelled, so holding it
+    /// here is also what keeps the observer alive for exactly as long as the workspace.
+    window_activation: Option<gpui::Subscription>,
     /// Byte range the route-name palette will overwrite when confirmed (#83).
     ///
     /// Held here rather than recomputed on confirm because the buffer is the thing being
@@ -366,6 +416,12 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     pub fn new(registry: Arc<CommandRegistry>, cx: &mut Context<Self>) -> Self {
+        let git = cx.new(GitPanel::new);
+        // Row clicks come back as events rather than as a callback holding a handle on the
+        // workspace, the same shape the find bar and the palette use.
+        cx.subscribe(&git, |this, _panel, event: &GitEvent, cx| this.on_git_event(event, cx))
+            .detach();
+
         Self {
             focus_handle: cx.focus_handle(),
             registry,
@@ -382,6 +438,11 @@ impl WorkspaceView {
             lsp: Lsp::new(),
             history: JumpHistory::default(),
             in_flight_query: None,
+            git,
+            sidebar: Sidebar::default(),
+            git_cancel: None,
+            git_diff: None,
+            window_activation: None,
             completion_target: None,
         }
     }
@@ -433,6 +494,9 @@ impl WorkspaceView {
                         // A new project gets a new server, pointed at the new root. The
                         // old one is dropped by `set_root`, which kills its process.
                         this.start_lsp(cx);
+                        // First of the three refresh triggers (#64). The other two are
+                        // save and window focus; there is no timer.
+                        this.refresh_git_status(cx);
                     }
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
@@ -441,6 +505,140 @@ impl WorkspaceView {
             .ok();
         });
         self.jobs.start(Job::OpenFolder, task);
+    }
+
+    // --- source control (#64) ------------------------------------------------------
+
+    /// Registers the window-activation observer, once.
+    ///
+    /// The third refresh trigger, and the one that covers every change made *outside* this
+    /// editor — a `git commit` in the terminal, a branch switch, a `git pull`. It works
+    /// because to notice a stale panel you must first look at the window, and looking at
+    /// the window is what raises this event.
+    ///
+    /// Idempotent by the `is_none` guard, so calling it from `render` costs one branch per
+    /// frame after the first. `observe_window_activation` fires on deactivation too; the
+    /// `is_window_active` check is what keeps it to one refresh per return rather than two
+    /// per round trip.
+    fn observe_window_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.window_activation.is_some() {
+            return;
+        }
+        self.window_activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh_git_status(cx);
+            }
+        }));
+    }
+
+    /// Cancels an in-flight status walk. Same shape as `cancel_quick_open_walk`.
+    fn cancel_git_status(&mut self) {
+        if let Some(cancel) = self.git_cancel.take() {
+            cancel.cancel();
+        }
+    }
+
+    /// Re-reads `git status` for the open folder.
+    ///
+    /// **Called on folder open, on window focus, and after a successful save — never on a
+    /// timer.** See the module docs on [`crate::git_panel`] for why those three and not a
+    /// poll: a timer would burn CPU on a panel nobody is looking at, and the perf gate now
+    /// measures idle CPU, so it would show up as a regression rather than as a nicety.
+    ///
+    /// Runs even when the Git panel is not the visible sidebar. That is one `git status` on
+    /// focus for a panel you cannot see, which sounds wasteful and is the cheaper of the two
+    /// options: the alternative is a visible stall the first time you click Git on a large
+    /// repository, and the status is what the activity bar would need anyway to show a
+    /// change count. It is bounded work with no timer behind it.
+    fn refresh_git_status(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else {
+            self.git.update(cx, |panel, cx| panel.set_state(PanelState::NoFolder, cx));
+            return;
+        };
+
+        self.cancel_git_status();
+        let cancel = CancelFlag::new();
+        self.git_cancel = Some(cancel.clone());
+
+        // Say "Loading…" only when there is nothing to show yet. A refresh over an existing
+        // list keeps the list up: blanking it on every ⌘S would make the panel flicker on
+        // the event that fires most.
+        self.git.update(cx, |panel, cx| {
+            if matches!(panel.state(), PanelState::NoFolder) {
+                panel.set_state(PanelState::Loading, cx);
+            }
+        });
+
+        let panel = self.git.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let walk_cancel = cancel.clone();
+            // libgit2 blocks, so it goes to the background pool (ADR-0007). `status`
+            // returns `None` for a folder that is not a repository, which is the common
+            // case and not an error — no dialog, no log line.
+            let result = cx
+                .background_spawn(
+                    async move { elle_git::status(&root, &|| walk_cancel.is_cancelled()) },
+                )
+                .await;
+
+            // A superseded walk's answer is stale by definition; dropping it silently is
+            // the point of the flag.
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            let state = match result {
+                Some(status) => PanelState::Repo(status),
+                None => PanelState::NotARepo,
+            };
+
+            panel.update(cx, |panel, cx| panel.set_state(state, cx)).ok();
+            this.update(cx, |this, cx| {
+                // A file that stopped having changes takes its diff with it.
+                if this.git.read(cx).selected().is_none() {
+                    this.git_diff = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::GitStatus, task);
+    }
+
+    /// Reads and parses the diff for one file.
+    ///
+    /// Both halves run on the background pool: libgit2 produces the hunks and tree-sitter
+    /// highlights both sides of them, and neither belongs on the UI thread. The panel is
+    /// handed a finished `DiffRenderer` rather than parsing during render.
+    fn load_git_diff(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        let panel = self.git.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let (diff, renderer) = cx
+                .background_spawn(async move {
+                    let diff = elle_git::diff_file(&root, &path);
+                    // Parsing here rather than on the main thread is the whole reason this
+                    // pair is built together: `DiffRenderer::new` runs tree-sitter twice.
+                    let renderer = diff.as_ref().map(DiffRenderer::new);
+                    (diff, renderer)
+                })
+                .await;
+
+            panel.update(cx, |panel, cx| panel.set_diff(diff, cx)).ok();
+            this.update(cx, |this, cx| {
+                this.git_diff = renderer;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::GitDiff, task);
+    }
+
+    fn on_git_event(&mut self, event: &GitEvent, cx: &mut Context<Self>) {
+        match event {
+            GitEvent::DiffRequested { path } => self.load_git_diff(path.clone(), cx),
+        }
     }
 
     fn toggle_hidden_files(
@@ -741,6 +939,10 @@ impl WorkspaceView {
                         editor
                             .update(cx, |editor, _| editor.document.buffer.mark_saved_at(version));
                         this.status = None;
+                        // Second refresh trigger: a save is the only way this editor
+                        // changes the working tree, so it is the only internal event that
+                        // can invalidate the status (#64).
+                        this.refresh_git_status(cx);
                     }
                     // The buffer is untouched on failure, so the user loses nothing.
                     Err(err) => this.status = Some(format!("save failed: {err:#}").into()),
@@ -2251,6 +2453,10 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.frames.tick();
 
+        // Registers once and then costs one `is_none` per frame. See
+        // `observe_window_focus` for why here and not in `new`.
+        self.observe_window_focus(window, cx);
+
         // Re-apply the find query to whichever document is active (#80).
         //
         // Switching tabs with the bar open has to search the *new* file, and `active_tab`
@@ -2311,7 +2517,7 @@ impl Render for WorkspaceView {
                     .flex()
                     .flex_1()
                     .overflow_hidden()
-                    .child(self.render_activity_bar(&theme))
+                    .child(self.render_activity_bar(&theme, cx))
                     .child(self.render_sidebar(&theme, cx))
                     .child(
                         div()
@@ -2325,7 +2531,7 @@ impl Render for WorkspaceView {
                             // like the palette, so it *pushes* the text down instead of
                             // covering the first two lines of the file being searched.
                             .children(self.find.clone())
-                            .child(self.render_editor_area(&theme))
+                            .child(self.render_editor_area(&theme, cx))
                             // Below the editor and inside its column, so the sidebar keeps
                             // its full height — the layout every other IDE uses.
                             .children(self.terminal.clone()),
@@ -2341,22 +2547,28 @@ impl Render for WorkspaceView {
 }
 
 impl WorkspaceView {
-    fn render_activity_bar(&self, theme: &Theme) -> impl IntoElement {
+    fn render_activity_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         // Later panels are shown disabled rather than hidden, so the shape of the product
         // is legible from the first commit (§6) without pretending they work.
+        //
+        // **Git is now enabled** — this is the issue that turns it on (#64). The third
+        // element is the sidebar it selects; `None` means still disabled.
         //
         // Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned`
         // below is what keeps that honest — a zip would silently drop a panel if the two
         // ever fell out of step.
         let panels = [
-            ("Explorer", true),
-            ("Search", false),
-            ("Git", false),
-            ("Laravel", false),
-            ("Database", false),
-            ("Docker", false),
-            ("Tests", false),
+            ("Explorer", Some(Sidebar::Explorer)),
+            ("Search", None),
+            ("Git", Some(Sidebar::Git)),
+            ("Laravel", None),
+            ("Database", None),
+            ("Docker", None),
+            ("Tests", None),
         ];
+
+        let entity = cx.entity();
+        let active = self.sidebar;
 
         div()
             .w(Metrics::ACTIVITY_BAR_WIDTH)
@@ -2369,7 +2581,11 @@ impl WorkspaceView {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .children(panels.into_iter().zip(icons::ICONS).map(|((name, enabled), icon)| {
+            .children(panels.into_iter().zip(icons::ICONS).map(|((name, target), icon)| {
+                let enabled = target.is_some();
+                let is_active = target == Some(active);
+                let entity = entity.clone();
+
                 div()
                     .id(name)
                     .size(px(32.0))
@@ -2378,12 +2594,16 @@ impl WorkspaceView {
                     .justify_center()
                     .rounded_md()
                     .when(enabled, |el| {
-                        el.bg(theme.selected)
-                            .text_color(theme.accent)
-                            .cursor_pointer()
+                        el.cursor_pointer()
                             .hover(|el| el.bg(theme.hover))
                             .active(|el| el.bg(theme.pressed))
                     })
+                    // The selected panel is the one whose sidebar you are looking at.
+                    // Before #64 this was every enabled panel, because there was only one.
+                    .when(is_active, |el| el.bg(theme.selected).text_color(theme.accent))
+                    // An enabled but unselected panel: readable, not shouting, and clearly
+                    // not the disabled treatment below — full opacity is the difference.
+                    .when(enabled && !is_active, |el| el.text_color(theme.text))
                     // A disabled panel says so by *not* responding: no hover, no pointer.
                     // The `not-allowed` cursor is what distinguishes "not ready yet" from
                     // "your click missed", and it is not a colour — the dimmer glyph alone
@@ -2395,13 +2615,17 @@ impl WorkspaceView {
                             .opacity(0.5)
                             .cursor(CursorStyle::OperationNotAllowed)
                     })
-                    // ponytail: no click handler. Explorer is the only enabled panel and it
-                    // is already the sidebar you are looking at, so the only honest thing a
-                    // click could do is collapse it — and that is a layout feature with
-                    // persisted state, not interaction feedback. Pressing it acknowledges
-                    // the press and changes nothing, which is what it should do until there
-                    // is a second panel to switch to.
-                    //
+                    // Now there *is* a second panel to switch to, which is what the note
+                    // here used to say was missing. Only the enabled ones take a click; a
+                    // disabled panel still acknowledges the press and changes nothing.
+                    .when_some(target, |el, target| {
+                        el.on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.sidebar = target;
+                                cx.notify();
+                            });
+                        })
+                    })
                     // 16px inside a 32px hit target: the icon is the glyph, the square is
                     // the thing you can hit, and VS Code uses the same ratio.
                     //
@@ -2415,11 +2639,14 @@ impl WorkspaceView {
     }
 
     fn render_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = self
-            .tree
-            .as_ref()
-            .map(|tree| tree.root_name().to_uppercase())
-            .unwrap_or_else(|| "NO FOLDER OPEN".to_string());
+        let header = match self.sidebar {
+            Sidebar::Explorer => self
+                .tree
+                .as_ref()
+                .map(|tree| tree.root_name().to_uppercase())
+                .unwrap_or_else(|| "NO FOLDER OPEN".to_string()),
+            Sidebar::Git => "SOURCE CONTROL".to_string(),
+        };
 
         div()
             .w(Metrics::SIDEBAR_WIDTH)
@@ -2438,15 +2665,21 @@ impl WorkspaceView {
                     .text_color(theme.text_muted)
                     .child(SharedString::from(header)),
             )
-            .child(match self.tree.as_ref() {
-                Some(tree) if !tree.is_empty() => {
-                    self.render_tree_rows(tree.len(), theme, cx).into_any_element()
-                }
-                _ => div()
-                    .p_3()
-                    .text_color(theme.text_muted)
-                    .child("Press ⌘O to open a folder")
-                    .into_any_element(),
+            .child(match self.sidebar {
+                // The panel is its own entity, so switching away and back does not
+                // re-read the repository — the refresh is event-driven and a rebuilt
+                // panel would have no event to wait for.
+                Sidebar::Git => self.git.clone().into_any_element(),
+                Sidebar::Explorer => match self.tree.as_ref() {
+                    Some(tree) if !tree.is_empty() => {
+                        self.render_tree_rows(tree.len(), theme, cx).into_any_element()
+                    }
+                    _ => div()
+                        .p_3()
+                        .text_color(theme.text_muted)
+                        .child("Press ⌘O to open a folder")
+                        .into_any_element(),
+                },
             })
     }
 
@@ -2586,10 +2819,25 @@ impl WorkspaceView {
             }))
     }
 
-    fn render_editor_area(&self, theme: &Theme) -> impl IntoElement {
-        div().flex_1().overflow_hidden().child(match self.active_editor() {
-            Some(editor) => editor.clone().into_any_element(),
-            None => div()
+    fn render_editor_area(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        // The diff takes the editor area while the Git panel has a row selected, and only
+        // then. It is not a tab: a tab implies something you can edit and close, and this
+        // is a read-only view of a file that already has a tab of its own. Selecting a row
+        // shows it, switching back to Explorer or selecting nothing puts the editor back —
+        // no state to clean up and nothing that can strand a buffer.
+        let diff = match (self.sidebar, self.git_diff.as_ref()) {
+            (Sidebar::Git, Some(renderer)) => {
+                self.git.read(cx).diff().map(|file| (file.clone(), renderer))
+            }
+            _ => None,
+        };
+
+        div().flex_1().overflow_hidden().child(match (diff, self.active_editor()) {
+            (Some((file, renderer)), _) => {
+                render_diff(&file, renderer, theme, cx).into_any_element()
+            }
+            (None, Some(editor)) => editor.clone().into_any_element(),
+            (None, None) => div()
                 .size_full()
                 .flex()
                 .items_center()

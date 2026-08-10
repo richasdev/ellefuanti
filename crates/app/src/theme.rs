@@ -958,7 +958,65 @@ impl Theme {
     pub fn bracket_match(&self) -> Hsla {
         self.pressed
     }
+
+    /// Foreground for the `+`/`-` marker in the diff gutter, and for a status row's letter
+    /// (#64).
+    ///
+    /// **Derived, for the same reason as [`Theme::search_match`]** — and here the argument
+    /// is stronger, because the obvious alternative is worse than an extra field. The
+    /// obvious alternative is a hardcoded green and red, and a hardcoded green on
+    /// `#ffffff` and on `#16171d` cannot both clear 4.5:1. `error` and `string` already
+    /// solve exactly that problem per variant: every theme picked an `error` red that reads
+    /// against its own background because diagnostics needed one, and a `string` colour
+    /// that does the same because syntax needed one. Reusing them means a sixth theme gets
+    /// legible diff colours by having answered questions it had to answer anyway.
+    ///
+    /// `string` for additions rather than a dedicated green: on all five variants `string`
+    /// *is* the green-family colour, and on the two GitHub themes it is the same family
+    /// GitHub uses for additions. Where a variant's `string` is not green the diff is still
+    /// correct, because the meaning is carried by the `+` and `-` glyphs
+    /// (`LineKind::marker`) and this is the redundant channel.
+    ///
+    /// **Colour is never the only signal.** `elle_git::LineKind::marker` and
+    /// `elle_git::Status::marker` are rendered on every line and every row, so the panel is
+    /// fully readable in monochrome. That is #64's requirement and #71's rule, and it is
+    /// what makes deriving these two colours safe rather than a compromise.
+    pub fn diff_added(&self) -> Hsla {
+        self.string
+    }
+
+    /// Foreground for a removal, matching [`Theme::diff_added`].
+    pub fn diff_removed(&self) -> Hsla {
+        self.error
+    }
+
+    /// Background wash behind an added line.
+    ///
+    /// A tint of the foreground rather than another theme colour: it has to sit *under*
+    /// syntax-highlighted text without fighting it, which rules out `selected` and
+    /// `selection` — both are already spoken for by search and brackets, and a diff line
+    /// that looks like a search hit is a lie. Low alpha over the variant's own added
+    /// colour reads on any background, light or dark, because the hue comes from a colour
+    /// that variant already proved legible against it.
+    ///
+    /// 0.15 is low enough that `theme.syntax(..)` text keeps its own contrast on top —
+    /// which matters, because reusing the highlighter is the whole point of item 2.
+    pub fn diff_added_background(&self) -> Hsla {
+        Hsla { a: DIFF_WASH_ALPHA, ..self.diff_added() }
+    }
+
+    /// Background wash behind a removed line.
+    pub fn diff_removed_background(&self) -> Hsla {
+        Hsla { a: DIFF_WASH_ALPHA, ..self.diff_removed() }
+    }
 }
+
+/// Alpha for the diff line washes.
+///
+/// One constant for both, so an addition and a deletion are equally loud. Named rather than
+/// repeated because the two have to move together — a stronger red than green would make
+/// deletions look like errors.
+const DIFF_WASH_ALPHA: f32 = 0.15;
 
 #[cfg(test)]
 mod tests {

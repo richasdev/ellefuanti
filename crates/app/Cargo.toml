@@ -33,6 +33,7 @@ elle-text.workspace = true
 elle-syntax.workspace = true
 elle-workspace.workspace = true
 elle-laravel.workspace = true
+elle-git.workspace = true
 elle-index.workspace = true
 elle-lsp.workspace = true
 elle-settings.workspace = true
