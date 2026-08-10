@@ -767,6 +767,14 @@ impl Render for EditorView {
             .bg(theme.background)
             .font_family(fonts.family.clone())
             .text_size(fonts.size)
+            // Must match the `.h()` each row is given below, and gpui's default does not:
+            // it lays text out at roughly 1.618 em while the row is `fonts.line_height()`
+            // (1.5 em by default). Left unset, every line's text is ~1.5px taller than the
+            // box containing it, so the overflow accumulates down the file — by row 7 the
+            // glyphs sit half a line above their own row. That is what made the caret
+            // appear on one line while typing landed on the one above it, and what made
+            // the indent guides paint as tall grey blocks spanning two rows.
+            .line_height(fonts.line_height())
             .text_color(theme.text)
             .child(
                 // uniform_list calls back only for visible rows, so a 50k-line file costs
