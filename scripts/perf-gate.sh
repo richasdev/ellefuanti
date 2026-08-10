@@ -89,9 +89,32 @@ fi
 #
 # -x matches the executable name exactly, so a shell whose command line merely contains the
 # word "cargo" (an editor, a wrapper script) does not trip it — only a real compiler does.
-if pgrep -qx 'cargo|rustc|cc1plus|clang' 2>/dev/null; then
-	echo "a build is running (cargo/rustc/clang); memory and timing here would be contaminated" >&2
+#
+# `clippy-driver` was missing from this list until #80, and the omission produced exactly the
+# failure the guard exists to prevent: the gate reported idle CPU at 8.00% — four times the
+# limit — while `pgrep` said the machine was clear, because two `clippy-driver` processes
+# were burning 114% between them and matched none of the four names. A guard that names
+# compilers individually is only as good as its list, and rustc's toolchain ships more than
+# one front end.
+#
+# `rustdoc` for the same reason: `cargo doc` is a compile by another name.
+if pgrep -qx 'cargo|rustc|clippy-driver|rustdoc|cc1plus|clang' 2>/dev/null; then
+	echo "a build is running (cargo/rustc/clippy/clang); memory and timing here would be contaminated" >&2
 	echo "wait for it to finish, then re-run" >&2
+	exit 2
+fi
+
+# Load average, not just process names. The list above can only catch compilers someone
+# thought to name; a machine running several agents is loaded by things that are not
+# compilers at all, and a 20-second settle on a box at load 9 measures the scheduler.
+#
+# 4.0 rather than 1.0 because this is a multi-core machine and a single busy process is not
+# contamination — the reading that prompted this was taken at load 8.7, where three sibling
+# agents were building simultaneously.
+LOAD=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+if [ -n "$LOAD" ] && [ "$(awk -v l="$LOAD" 'BEGIN{print (l > 4.0) ? 1 : 0}')" = "1" ]; then
+	echo "load average is $LOAD; memory and timing here would be contaminated" >&2
+	echo "wait for the machine to go quiet, then re-run" >&2
 	exit 2
 fi
 

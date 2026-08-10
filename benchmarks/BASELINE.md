@@ -368,6 +368,25 @@ The startup line is also why the gate cannot be trusted from a headless CI runne
 display the window never opens, so the process measured is not the one a user runs and its
 RSS omits whatever the window allocates. CI runs it as a floor; the local run is authoritative.
 
+#### The guard had a hole, and it produced the exact failure it exists to prevent (#80)
+
+Found while measuring find-in-project on a machine running three other agents. The gate
+printed **idle CPU at 8.00%, four times its own 2% limit** — and did not refuse, because its
+build check is `pgrep -x` over a list of compiler names, and `clippy-driver` was not on it.
+Two `clippy-driver` processes were burning 114% between them at the moment of the reading.
+
+A guard that names compilers individually is only as good as its list, and rustc's toolchain
+ships more front ends than the original four. `clippy-driver` and `rustdoc` are named now,
+but the real lesson is that the enumeration is the wrong shape, so a **load-average check**
+backs it up: above 4.0 the gate refuses regardless of what is running. A machine at load 9 is
+contaminated whether or not the thing loading it is a compiler.
+
+This is the fourth entry in this file about a measurement that was wrong, and the second one
+where the wrongness was visible only because a number was absurd rather than merely
+surprising — 8% is not a plausible idle CPU for a process the same script measures at 0.75%
+on a quiet machine. **A gate that can report a contaminated number is not a gate**; it is a
+source of numbers to argue about.
+
 Startup phase breakdown:
 
 | Phase           | Cold       | Warm        | CI (headless) |

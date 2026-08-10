@@ -164,6 +164,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   deserves its own PR built on what this one learned. The Search entry in the activity bar
   stays disabled until then.
 
+### Fixed
+
+- **`scripts/perf-gate.sh` did not notice `clippy-driver`**, and reported a contaminated
+  number rather than refusing (#84, found while measuring #80). The guard names compilers
+  individually — `pgrep -x 'cargo|rustc|cc1plus|clang'` — and rustc's toolchain ships more
+  front ends than that list knows about. The gate printed **idle CPU at 8.00%, four times
+  its own 2% limit**, while `pgrep` said the machine was clear and two `clippy-driver`
+  processes were burning 114% between them.
+
+  That is precisely the failure the guard exists to prevent, arriving through the guard.
+  `clippy-driver` and `rustdoc` are named now, but a list is only as good as the names on
+  it, so a **load-average check** backs it up: above 4.0 the gate refuses regardless of what
+  is running. A machine at load 9 is contaminated whether or not the thing loading it is a
+  compiler, and the reading that prompted this was taken at 8.7 with three sibling agents
+  building at once.
+
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —
   plus an importer for VS Code's `colors` and `tokenColors`. Themes are read from
