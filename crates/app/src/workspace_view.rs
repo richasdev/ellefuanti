@@ -886,6 +886,22 @@ impl WorkspaceView {
         self.status.clone()
     }
 
+    /// ⌘W through the real handler — the path that has to take the popup with it.
+    #[cfg(test)]
+    pub fn close_tab_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab(&CloseTab, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn toggle_palette_for_test(
+        &mut self,
+        mode: PaletteMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_palette(mode, window, cx);
+    }
+
     /// Feeds the popup items as though a source had answered.
     ///
     /// The sources themselves are asynchronous and one of them is a language server, so a
@@ -1343,6 +1359,16 @@ impl WorkspaceView {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        // ⌘W is workspace-scoped, so it fires while the completion popup holds focus. The
+        // popup is anchored to a cursor in the tab about to disappear and its
+        // `completion_word_start` is an offset into that buffer — both meaningless
+        // afterwards, and the offset is the dangerous half: left standing, the next accept
+        // would write into whatever document had inherited the active slot.
+        //
+        // Closed first rather than inside `remove_tab`, because the dirty path below is
+        // asynchronous: the popup must go now, when the user pressed the key, not when they
+        // answer a dialog that may itself be Cancel.
+        self.dismiss_completion(window, cx);
         self.close_tab_at(self.active_tab, window, cx);
     }
 
@@ -2445,6 +2471,13 @@ impl WorkspaceView {
             self.dismiss_palette(window, cx);
             return;
         }
+
+        // The palette's chords are workspace-scoped, so ⌘P reaches here with the completion
+        // popup open and holding focus. Two overlays both believing they own the keyboard is
+        // a state with no correct behaviour — and the popup would be left anchored over a
+        // palette that had focus, still holding an offset a later accept could write to.
+        // The palette is the one the user just asked for, so the popup goes.
+        self.dismiss_completion(window, cx);
 
         // Swapping modes replaces the palette entity, so a Files walk still running has
         // lost its consumer just as surely as a dismissal would have. ⌘P then ⌘⇧P used to

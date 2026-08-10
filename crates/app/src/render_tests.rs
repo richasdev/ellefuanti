@@ -1721,3 +1721,53 @@ async fn completing_with_no_language_server_stays_silent(cx: &mut TestAppContext
 
     draw(cx);
 }
+
+#[gpui::test]
+async fn closing_the_tab_takes_the_popup_with_it(cx: &mut TestAppContext) {
+    // ⌘W is workspace-scoped, so it fires while the popup holds focus. Left standing, the
+    // popup is anchored to a cursor in a tab that no longer exists and still holds a byte
+    // offset into that buffer — and the offset is the dangerous half, because a later accept
+    // would write it into whichever document inherited the active slot.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()),
+        "the popup must be open for this test to be testing anything"
+    );
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.close_tab_for_test(window, cx));
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "closing the tab must close the popup anchored into it"
+    );
+    draw(cx);
+}
+
+#[gpui::test]
+async fn opening_the_palette_closes_the_popup(cx: &mut TestAppContext) {
+    // Same shape, different key: the palette's chords are workspace-scoped too, so ⌘P
+    // arrives with the popup focused. Two overlays both believing they own the keyboard is a
+    // state with no correct behaviour, and the palette is the one the user just asked for.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    assert!(workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_palette_for_test(PaletteMode::Commands, window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "the popup must not survive underneath a palette that now holds focus"
+    );
+    draw(cx);
+}
