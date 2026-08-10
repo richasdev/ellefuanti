@@ -20,7 +20,7 @@ use crate::actions::{
     Undo, context,
 };
 use crate::editor::state::Document;
-use crate::theme::{Metrics, Theme};
+use crate::theme::{Metrics, Theme, Themed};
 
 /// Monospace family.
 ///
@@ -307,7 +307,7 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+        let theme = cx.theme().clone();
         let row_count = self.document.buffer.len_lines();
         let cursor = self.document.cursor_point();
         let entity = cx.entity();
@@ -364,7 +364,7 @@ impl EditorView {
         // Capture the visible band for scroll-into-view, which runs outside render.
         self.visible_rows = range.clone();
 
-        let theme = Theme::dark();
+        let theme = cx.theme().clone();
         let selection = self.document.selection.range();
 
         // Highlight once for the whole visible band rather than per row: one tree walk

@@ -7,8 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Changed
+
+- The theme is a value the app holds rather than a constructor each view calls. It lives in
+  gpui's global state behind a private newtype, so `cx.theme()` is the only way to read one
+  and no view can build its own — enforced by `crates/app/tests/theming.rs`, not by
+  convention. Previously `Theme::dark()` was called inline in four `render` methods, which
+  meant a second theme would have reached only the ones someone remembered to update
+  (part of #48)
+
 ### Added
 
+- A light theme, and a `Switch Theme` (`theme.toggle`) palette command that cycles between
+  it and the dark one at runtime, repainting every surface including the terminal. The
+  light theme exists as proof the plumbing works rather than as a finished design; its ANSI
+  table is darkened rather than inheriting the dark theme's `0x0000ff` readability fix,
+  which is a dark-background fix and would be backwards here (part of #48)
 - `elle-laravel`: static route extraction from `routes/*.php` via tree-sitter — HTTP method,
   URI, name, controller/action, middleware and line, including `Route::resource`
   expansion and `Route::group` prefix/middleware/name inheritance (part of #23)
@@ -22,6 +36,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - No Artisan integration, no `route('` completion, no command-palette or other UI, and no
   persistence — the extractor returns plain in-memory values. SQLite storage waits on #21.
+- None of the classic themes (Monokai, Dracula, Solarized, Nord, Gruvbox, One Dark/Light),
+  no on-disk theme format, and no persistence of the chosen theme across restarts — #48
+  defers the file-format decision until there are real themes to inform it, and remembering
+  the choice needs the settings crate. **Nobody has looked at the light theme on a screen**;
+  the tests assert that every style has a distinct colour and that nothing is invisible
+  against its own background, which is not the same as readable (#35).
 
 ## [0.1.0] — unreleased
 

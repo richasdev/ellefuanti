@@ -142,6 +142,7 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("palette.quick_open", "Quick Open File"),
     Command::new("terminal.new", "New Terminal"),
     Command::new("terminal.toggle", "Toggle Terminal"),
+    Command::new("theme.toggle", "Switch Theme"),
 ];
 
 #[cfg(test)]

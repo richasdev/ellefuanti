@@ -12,13 +12,13 @@ use gpui::{
 
 use crate::actions::{
     CloseTab, Dispatch, NewFile, NewTerminal, OpenFolder, Save, ToggleCommandPalette,
-    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, context, dispatch_for,
+    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
 };
 use crate::editor::{Document, EditorView};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::terminal_view::TerminalView;
-use crate::theme::{Metrics, Theme};
+use crate::theme::{Metrics, Theme, Themed, set_theme};
 
 /// An open tab.
 struct Tab {
@@ -195,6 +195,22 @@ impl WorkspaceView {
         }
     }
 
+    /// Switches to the next compiled-in theme.
+    ///
+    /// `refresh_windows` rather than `cx.notify()`: notify marks *this* entity dirty, and
+    /// the editor, terminal and palette are sibling entities that would keep their old
+    /// colours until something else happened to redraw them. A theme change is the one
+    /// case where every window really is stale, which is what `refresh_windows` means.
+    ///
+    /// ponytail: no persistence. Reopening the app is back to dark, because remembering the
+    /// choice needs somewhere to write it and that is the settings crate, not this.
+    fn toggle_theme(&mut self, _: &ToggleTheme, _w: &mut Window, cx: &mut Context<Self>) {
+        let next = cx.theme_variant().next();
+        set_theme(next, cx);
+        self.status = Some(format!("Theme: {}", next.label()).into());
+        cx.refresh_windows();
+    }
+
     fn toggle_tree_entry(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(tree) = self.tree.as_mut() {
             if let Err(err) = tree.toggle(index) {
@@ -210,6 +226,26 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn active_editor_for_test(&self) -> Option<Entity<EditorView>> {
         self.active_editor().cloned()
+    }
+
+    /// Runs the action handlers a render test needs, which are otherwise private.
+    ///
+    /// Calling the real handlers rather than reimplementing them: a test that opened the
+    /// terminal by assigning `self.terminal` would pass while the actual command was
+    /// broken, which is the failure this whole issue is about.
+    #[cfg(test)]
+    pub fn toggle_terminal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_terminal(&ToggleTerminal, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn toggle_command_palette_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_command_palette(&ToggleCommandPalette, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn toggle_theme_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_theme(&ToggleTheme, window, cx);
     }
 
     /// Puts an already-built document into a tab, synchronously.
@@ -633,6 +669,7 @@ impl WorkspaceView {
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
                     Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
                     Dispatch::ToggleTerminal => self.toggle_terminal(&ToggleTerminal, window, cx),
+                    Dispatch::ToggleTheme => self.toggle_theme(&ToggleTheme, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -683,7 +720,7 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.frames.tick();
 
-        let theme = Theme::dark();
+        let theme = cx.theme().clone();
         window.set_window_title(&self.title(cx));
 
         div()
@@ -698,6 +735,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_hidden_files))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::toggle_theme))
             .relative()
             .size_full()
             .flex()

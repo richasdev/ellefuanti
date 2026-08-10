@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use crate::actions::{Backspace, Cancel, Confirm, SelectNext, SelectPrev, context};
-use crate::theme::{Metrics, Theme};
+use crate::theme::{Metrics, Themed};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
@@ -172,7 +172,7 @@ impl Focusable for Palette {
 
 impl Render for Palette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+        let theme = cx.theme().clone();
         let entity = cx.entity();
         let count = self.filtered.len();
         let selected = self.selected;

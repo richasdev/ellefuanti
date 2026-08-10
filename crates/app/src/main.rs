@@ -43,6 +43,10 @@ fn main() {
     app.run(move |cx: &mut App| {
         startup.phase("event_loop_start");
 
+        // Before any view exists, because `cx.theme()` panics without it and the first
+        // render happens inside `open_window` below.
+        theme::set_theme(theme::ThemeVariant::default(), cx);
+
         let registry = Arc::new(actions::init(cx));
 
         // Quit has no key context, so it works before anything has focus.
