@@ -11,8 +11,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, Dispatch, NewTerminal, OpenFolder, Save, ToggleCommandPalette, ToggleHiddenFiles,
-    ToggleQuickOpen, ToggleTerminal, context, dispatch_for,
+    CloseTab, Dispatch, NewFile, NewTerminal, OpenFolder, Save, ToggleCommandPalette,
+    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, context, dispatch_for,
 };
 use crate::editor::{Document, EditorView};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
@@ -258,6 +258,33 @@ impl WorkspaceView {
             .ok();
         });
         self.jobs.start(Job::OpenFile, task);
+    }
+
+    /// Opens an empty, pathless buffer in a new tab.
+    ///
+    /// This is the missing half of save-as: `save_as` and `prompt_for_new_path` were already
+    /// here, but nothing could ever reach them because every tab was born from a file on
+    /// disk and so always had a path. A tab with `path: None` is what makes `save` fall
+    /// through to the prompt, so creating one is the entire wiring — no new save path.
+    ///
+    /// Unlike `open_path` there is no dedup: ⌘N twice means the user wants two scratch
+    /// buffers, and they have no path to match on anyway.
+    ///
+    /// Takes no `Window` — nothing here needs one, and leaving it out is what lets a test
+    /// call the real handler rather than a copy of it.
+    pub fn new_file(&mut self, cx: &mut Context<Self>) {
+        match Document::untitled() {
+            Ok(document) => {
+                let editor = cx.new(|cx| EditorView::new(document, cx));
+                self.tabs.push(Tab { path: None, editor });
+                self.active_tab = self.tabs.len() - 1;
+                self.status = None;
+            }
+            // Plain text needs no grammar, so this is unreachable in practice — but it is a
+            // Result, and swallowing it would leave ⌘N doing nothing with no explanation.
+            Err(err) => self.status = Some(format!("{err:#}").into()),
+        }
+        cx.notify();
     }
 
     // --- saving ------------------------------------------------------------------
@@ -600,6 +627,7 @@ impl WorkspaceView {
                 // a keybinding cannot drift apart.
                 match dispatch_for(elle_core::CommandId(leak_id(&self.registry, &id))) {
                     Dispatch::OpenFolder => self.open_folder(&OpenFolder, window, cx),
+                    Dispatch::NewFile => self.new_file(cx),
                     Dispatch::Save => self.save(&Save, window, cx),
                     Dispatch::CloseTab => self.close_tab(&CloseTab, window, cx),
                     Dispatch::QuickOpen => self.toggle_palette(PaletteMode::Files, window, cx),
@@ -662,6 +690,7 @@ impl Render for WorkspaceView {
             .key_context(context::WORKSPACE)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(|this, _: &NewFile, _window, cx| this.new_file(cx)))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_command_palette))

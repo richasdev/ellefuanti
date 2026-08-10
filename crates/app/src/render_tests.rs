@@ -81,6 +81,35 @@ async fn the_workspace_renders_with_a_file_open(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_new_untitled_buffer_opens_dirty_free_pathless_and_renders(cx: &mut TestAppContext) {
+    // ⌘N is the only way to reach `save_as`, so the properties that route it there are the
+    // ones worth pinning: no path (or ⌘S writes straight through and never prompts) and not
+    // dirty (or closing an untouched scratch buffer nags). Rendering it also covers the
+    // empty-document-inside-the-chrome case, which the standalone editor test does not.
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    let editor = workspace.update(cx, |workspace, cx| {
+        workspace.new_file(cx);
+        workspace.active_editor_for_test().expect("⌘N must leave the new buffer active")
+    });
+
+    editor.read_with(cx, |editor, _cx| {
+        assert!(editor.document.path.is_none(), "an untitled buffer must have no path");
+        assert!(!editor.is_dirty(), "an untouched new buffer is not unsaved work");
+        assert_eq!(editor.document.title(), "untitled");
+    });
+
+    draw(cx);
+
+    // Typing into it dirties it, which is what makes the ⌘S that follows do anything.
+    editor.update(cx, |editor, _cx| editor.document.insert("<?php\n"));
+    editor.read_with(cx, |editor, _cx| assert!(editor.is_dirty()));
+
+    draw(cx);
+}
+
+#[gpui::test]
 async fn the_editor_renders_a_large_file(cx: &mut TestAppContext) {
     // A virtualised list asked to render 20k rows is where an off-by-one in the visible
     // range surfaces as a panic rather than a wrong pixel.

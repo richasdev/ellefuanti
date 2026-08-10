@@ -74,6 +74,14 @@ impl Document {
         })
     }
 
+    /// An empty buffer with no path yet. ⌘S on one routes to save-as.
+    ///
+    /// `trailing_newline` is false because the file has never been on disk: there is no
+    /// original behaviour to preserve, so the save writes exactly what the user typed.
+    pub fn untitled() -> anyhow::Result<Self> {
+        Self::new(None, "", false)
+    }
+
     /// Gives the document a path, re-detecting its language.
     ///
     /// Used by save-as: a buffer saved as `User.php` must start highlighting as PHP, which
@@ -591,5 +599,117 @@ mod tests {
     fn blade_document_detects_its_language() {
         let d = Document::new(Some(PathBuf::from("v/show.blade.php")), "@if(1)", true).unwrap();
         assert_eq!(d.language(), Language::Blade);
+    }
+
+    // --- byte-exact round trip ---------------------------------------------------
+    //
+    // Everything above tests `text_for_save` against a `Document` built by hand. That is
+    // only half the pipeline: it cannot see `read_file` dropping bytes on the way in, nor
+    // `write_file` reshaping them on the way out. These go through real files and compare
+    // **bytes**, because issue #15's promise is that open-then-save leaves git seeing no
+    // change at all.
+
+    use elle_workspace::{read_file, write_file};
+
+    /// Writes `original`, opens it the way the app does, applies `edit`, saves through the
+    /// real save path, and returns the bytes that actually landed on disk.
+    fn round_trip(original: &[u8], edit: impl FnOnce(&mut Document)) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Round.php");
+        std::fs::write(&path, original).unwrap();
+
+        let file = read_file(&path).unwrap();
+        let mut d = Document::new(Some(path.clone()), &file.text, file.trailing_newline).unwrap();
+        edit(&mut d);
+
+        write_file(&path, &d.text_for_save()).unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn an_untouched_file_saves_back_byte_for_byte() {
+        // The zero-edit case first: if this drifts, nothing below means anything.
+        for original in [
+            &b"<?php\n$x = 1;\n"[..],
+            b"<?php\n$x = 1;",
+            b"",
+            b"\n",
+            b"<?php\n// a\xc3\xa7\xc3\xa3o\n",
+        ] {
+            assert_eq!(round_trip(original, |_| {}), original, "{original:?} changed on save");
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_trailing_newline_does_not_gain_one() {
+        // The diff-noise case: an editor that "helpfully" adds a final newline turns a
+        // one-line change into a two-line change in review.
+        let out = round_trip(b"<?php\n$x = 1;", |d| {
+            d.move_to(d.buffer.len_bytes(), false);
+            d.insert(" // note");
+        });
+        assert_eq!(out, b"<?php\n$x = 1; // note");
+    }
+
+    #[test]
+    fn a_file_with_a_trailing_newline_keeps_exactly_one() {
+        // Both directions: deleting the final newline must not lose it, and it must not
+        // silently double up either.
+        let out = round_trip(b"<?php\n$x = 1;\n", |d| {
+            d.move_to(d.buffer.len_bytes(), false);
+            d.backspace();
+        });
+        assert_eq!(out, b"<?php\n$x = 1;\n");
+
+        let out = round_trip(b"<?php\n$x = 1;\n", |d| {
+            d.move_to(d.buffer.len_bytes(), false);
+            d.insert("\n");
+        });
+        assert_eq!(out, b"<?php\n$x = 1;\n\n", "a newline the user typed is content, not padding");
+    }
+
+    #[test]
+    fn crlf_line_endings_survive_an_edit() {
+        // Nothing in the pipeline normalises line endings — the rope stores the bytes it was
+        // handed — and this pins that down. A save that rewrote a Windows checkout to LF
+        // would show every line of the file as changed.
+        let out = round_trip(b"<?php\r\n$x = 1;\r\n", |d| {
+            d.move_to(d.buffer.len_bytes(), false);
+            d.insert("$y = 2;\r\n");
+        });
+        assert_eq!(out, b"<?php\r\n$x = 1;\r\n$y = 2;\r\n");
+    }
+
+    #[test]
+    fn a_crlf_file_without_a_final_newline_does_not_gain_a_bare_lf() {
+        // `trailing_newline` is a bool, so the restore appends a bare `\n`. On a CRLF file
+        // whose last line has no ending that would introduce a lone LF into an otherwise
+        // uniform file — so the restore must fire only when the buffer genuinely lost the
+        // newline, never as unconditional padding.
+        let out = round_trip(b"<?php\r\n$x = 1;", |d| {
+            d.move_to(d.buffer.len_bytes(), false);
+            d.insert(" // note");
+        });
+        assert_eq!(out, b"<?php\r\n$x = 1; // note");
+    }
+
+    #[test]
+    fn a_bom_is_dropped_on_open_and_stays_dropped_on_save() {
+        // Deliberately *not* byte-exact: `read_file` strips a UTF-8 BOM because a BOM in a
+        // PHP file emits bytes before `<?php` and breaks headers. Asserting the intended
+        // asymmetry so nobody folds it back into the round trip by accident.
+        let out = round_trip("\u{feff}<?php\n".as_bytes(), |_| {});
+        assert_eq!(out, b"<?php\n");
+    }
+
+    #[test]
+    fn an_untitled_buffer_saves_exactly_what_was_typed() {
+        // A new buffer has never been on disk, so there is no original newline behaviour to
+        // preserve and save-as must not invent one.
+        let mut d = Document::untitled().unwrap();
+        d.insert("<?php");
+        assert_eq!(d.text_for_save(), "<?php");
+        assert_eq!(d.title(), "untitled");
+        assert!(d.path.is_none(), "an untitled buffer must have no path, or ⌘S skips save-as");
     }
 }
