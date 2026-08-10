@@ -353,9 +353,12 @@ async fn switching_the_theme_at_runtime_repaints_every_surface(cx: &mut TestAppC
 
     let after = cx.update(|_window, cx| cx.theme().background);
     assert_ne!(before, after, "toggling the theme must actually change the active theme");
+    // Against `next()` rather than a named variant: the cycle grew from two themes to
+    // five in #53, and what this test is actually about is that a toggle advances the
+    // cycle and repaints — not which theme happens to be second.
     assert_eq!(
         cx.update(|_window, cx| cx.theme_variant()),
-        ThemeVariant::Light,
-        "the default is Dark, so one toggle lands on Light"
+        ThemeVariant::default().next(),
+        "one toggle must advance the cycle by exactly one"
     );
 }

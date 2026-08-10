@@ -18,6 +18,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- Syntax highlighting for **JSON, JavaScript, TypeScript and CSS**. Before this, every file
+  that was not `.php`/`.phtml`/`.blade.php` resolved to `PlainText` and rendered with no
+  colour at all — in a Laravel project that is `composer.json`, `package.json`, `app.js`,
+  `app.css` and every config file (#53)
+- Those four languages are driven by tree-sitter `highlights.scm` query files in
+  `crates/syntax/queries/`, adapted from each grammar's own upstream query (all MIT).
+  Adding a language is now a grammar dependency, an enum variant, an extension and a query
+  file — no new Rust match arms over node kinds (#53)
+- Three themes ported verbatim from published VS Code themes, bringing the `theme.toggle`
+  cycle to five: **One Dark Pro** (`zhuangtongfa.material-theme`, MIT) and **GitHub Dark**
+  and **GitHub Light** (`github.github-vscode-theme`, MIT). Colours are read out of the
+  theme files rather than reconstructed, and are pinned by test. Where upstream paints two
+  of this editor's styles the same colour — One Dark Pro gives `variable` and `property`
+  both `#e06c75` — the port reproduces it rather than correcting it, so those themes are
+  exempt from the distinctness rule that still binds this project's own (#53)
 - A light theme, and a `Switch Theme` (`theme.toggle`) palette command that cycles between
   it and the dark one at runtime, repainting every surface including the terminal. The
   light theme exists as proof the plumbing works rather than as a finished design; its ANSI
@@ -34,6 +49,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Not included
 
+- **PHP was not migrated to a query file.** The plan for #53 was for every language to go
+  through `highlights.scm`, PHP included. Tried, and the upstream `tree-sitter-php`
+  query cannot reproduce what this editor's PHP tests already assert: it captures none of
+  the `=`/`=>`/`->`/`::` operators, neither the `#[` nor the attribute name in
+  `#[Route(...)]`, and it tags a class property `$name` as both variable and property.
+  Three existing tests fail against it. Rewriting the query until it matches is a real
+  option and is left as follow-up; weakening the assertions to fit the query is not, so PHP
+  and Blade keep the hand-written walk and the two paths coexist (#53)
+- **Only priority 1 of #53.** No YAML, Markdown, HTML, SQL, TOML or Rust — deliberately
+  stopped after landing the mechanism plus four languages, since each remaining one is now
+  a dependency and a query file rather than a design question.
+- No `.jsonc`, `.json5`, `.tsx`, `.scss` or `.less`. Each would need a grammar that accepts
+  it — mapping them to the nearest one parses them into an error tree, which renders worse
+  than no colour. They stay `PlainText`, which is the deliberate fallback (#53).
+- **Nobody has seen any of the new colours on a screen** (#35). The tests assert that the
+  ported hex values match their source and that every language produces spans; neither is
+  the same as looking at it.
 - No Artisan integration, no `route('` completion, no command-palette or other UI, and no
   persistence — the extractor returns plain in-memory values. SQLite storage waits on #21.
 - None of the classic themes (Monokai, Dracula, Solarized, Nord, Gruvbox, One Dark/Light),
