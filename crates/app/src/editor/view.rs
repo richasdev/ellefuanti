@@ -15,8 +15,12 @@ use gpui::{
 };
 
 use crate::actions::{
-    Backspace, Copy, Cut, Delete, MoveDown, MoveLeft, MoveLineEnd, MoveLineStart, MoveRight,
-    MoveUp, Newline, Paste, Redo, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, Tab,
+    Backspace, Copy, Cut, Delete, DeleteLine, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
+    DeleteWordRight, DuplicateLineDown, DuplicateLineUp, Indent, MoveDocumentEnd,
+    MoveDocumentStart, MoveDown, MoveLeft, MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp,
+    MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent,
+    Paste, Redo, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft,
+    SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
     Undo, context,
 };
 use crate::editor::state::Document;
@@ -158,9 +162,24 @@ impl EditorView {
     }
 
     fn tab(&mut self, _: &Tab, _w: &mut Window, cx: &mut Context<Self>) {
+        // With a selection ⇥ shifts the whole block right; with a bare cursor it types.
         // ponytail: four spaces, which is PSR-12 and therefore right for Laravel. Reads
         // indent settings once a settings crate exists (Milestone 1 task 15+).
-        self.document.insert("    ");
+        if self.document.selection.is_empty() {
+            self.document.insert("    ");
+        } else {
+            self.document.indent_lines(false);
+        }
+        self.after_edit(cx);
+    }
+
+    fn indent(&mut self, _: &Indent, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.indent_lines(false);
+        self.after_edit(cx);
+    }
+
+    fn outdent(&mut self, _: &Outdent, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.indent_lines(true);
         self.after_edit(cx);
     }
 
@@ -195,13 +214,143 @@ impl EditorView {
     }
 
     fn move_line_start(&mut self, _: &MoveLineStart, _w: &mut Window, cx: &mut Context<Self>) {
-        self.document.move_line_start(false);
+        self.document.move_line_home(false);
         self.after_move(cx);
     }
 
     fn move_line_end(&mut self, _: &MoveLineEnd, _w: &mut Window, cx: &mut Context<Self>) {
         self.document.move_line_end(false);
         self.after_move(cx);
+    }
+
+    fn move_word_left(&mut self, _: &MoveWordLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_word(false, false);
+        self.after_move(cx);
+    }
+
+    fn move_word_right(&mut self, _: &MoveWordRight, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_word(true, false);
+        self.after_move(cx);
+    }
+
+    fn move_document_start(
+        &mut self,
+        _: &MoveDocumentStart,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.move_document_edge(false, false);
+        self.after_move(cx);
+    }
+
+    fn move_document_end(&mut self, _: &MoveDocumentEnd, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_document_edge(true, false);
+        self.after_move(cx);
+    }
+
+    fn select_line_start(&mut self, _: &SelectLineStart, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_line_home(true);
+        self.after_move(cx);
+    }
+
+    fn select_line_end(&mut self, _: &SelectLineEnd, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_line_end(true);
+        self.after_move(cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_word(false, true);
+        self.after_move(cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_word(true, true);
+        self.after_move(cx);
+    }
+
+    fn select_document_start(
+        &mut self,
+        _: &SelectDocumentStart,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.move_document_edge(false, true);
+        self.after_move(cx);
+    }
+
+    fn select_document_end(
+        &mut self,
+        _: &SelectDocumentEnd,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.move_document_edge(true, true);
+        self.after_move(cx);
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.delete_word(false);
+        self.after_edit(cx);
+    }
+
+    fn delete_word_right(&mut self, _: &DeleteWordRight, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.delete_word(true);
+        self.after_edit(cx);
+    }
+
+    fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.delete_to_line_edge(false);
+        self.after_edit(cx);
+    }
+
+    fn delete_to_line_end(&mut self, _: &DeleteToLineEnd, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.delete_to_line_edge(true);
+        self.after_edit(cx);
+    }
+
+    fn move_line_up(&mut self, _: &MoveLineUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_lines(false);
+        self.after_edit(cx);
+    }
+
+    fn move_line_down(&mut self, _: &MoveLineDown, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.move_lines(true);
+        self.after_edit(cx);
+    }
+
+    fn duplicate_line_up(&mut self, _: &DuplicateLineUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.duplicate_lines(false);
+        self.after_edit(cx);
+    }
+
+    fn duplicate_line_down(
+        &mut self,
+        _: &DuplicateLineDown,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.duplicate_lines(true);
+        self.after_edit(cx);
+    }
+
+    fn delete_line(&mut self, _: &DeleteLine, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.delete_lines();
+        self.after_edit(cx);
+    }
+
+    fn open_line_below(&mut self, _: &OpenLineBelow, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.open_line(false);
+        self.after_edit(cx);
+    }
+
+    fn open_line_above(&mut self, _: &OpenLineAbove, _w: &mut Window, cx: &mut Context<Self>) {
+        self.document.open_line(true);
+        self.after_edit(cx);
     }
 
     fn select_left(&mut self, _: &SelectLeft, _w: &mut Window, cx: &mut Context<Self>) {
@@ -328,10 +477,33 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::move_down))
             .on_action(cx.listener(Self::move_line_start))
             .on_action(cx.listener(Self::move_line_end))
+            .on_action(cx.listener(Self::move_word_left))
+            .on_action(cx.listener(Self::move_word_right))
+            .on_action(cx.listener(Self::move_document_start))
+            .on_action(cx.listener(Self::move_document_end))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::select_line_start))
+            .on_action(cx.listener(Self::select_line_end))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::select_document_start))
+            .on_action(cx.listener(Self::select_document_end))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::delete_to_line_end))
+            .on_action(cx.listener(Self::move_line_up))
+            .on_action(cx.listener(Self::move_line_down))
+            .on_action(cx.listener(Self::duplicate_line_up))
+            .on_action(cx.listener(Self::duplicate_line_down))
+            .on_action(cx.listener(Self::delete_line))
+            .on_action(cx.listener(Self::open_line_below))
+            .on_action(cx.listener(Self::open_line_above))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))

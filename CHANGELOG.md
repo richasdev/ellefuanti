@@ -7,6 +7,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- The modifier layer of the editor keymap, which was missing entirely. Word motions (⌥←/⌥→
+  and their ⇧ variants), line and document motions (⌘←/⌘→ with a smart home, ⌘↑/⌘↓),
+  deletions (⌥⌫/⌥⌦, ⌘⌫/⌘⌦), line manipulation (⌥↑/⌥↓ to move, ⇧⌥↑/⇧⌥↓ to duplicate, ⌘⇧K to
+  delete, ⌘⏎/⌘⇧⏎ to open a line) and indentation (⇥/⇧⇥ on a selection, ⌘]/⌘[). Word
+  boundaries use three character classes so `$user->name` stops at `$user`, `->` and
+  `name` rather than treating the whole expression as one word. Every one of these edits is
+  a single undo step, which is the part that is invisible until someone presses ⌘Z: the
+  deletions and line operations each apply as one `Buffer::replace` between explicit
+  `break_undo_group` calls, so a deleted word comes back whole and never drags the
+  surrounding typing with it (part of #69)
+
 ### Changed
 
 - The theme is a value the app holds rather than a constructor each view calls. It lives in

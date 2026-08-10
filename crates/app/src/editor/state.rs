@@ -9,6 +9,44 @@ use std::path::{Path, PathBuf};
 use elle_syntax::{Language, SyntaxTree, language_for_path};
 use elle_text::{Buffer, Point, Version};
 
+/// What kind of run of text a character belongs to, for word motion.
+///
+/// Three classes, not two. `$user->name` has to stop at `$user`, `->` and `name`, which
+/// means punctuation cannot be lumped in with whitespace (⌥→ would skip straight past
+/// `->` to `name`) nor with word characters (`$user->name` would be one word). A run is
+/// a maximal span of one class, and whitespace runs are crossed rather than stopped in.
+///
+/// `is_alphanumeric` is Unicode-aware, so `função` and `имя` are single words. `_` and
+/// `$` count as word characters because a PHP variable is one thing to a reader.
+///
+/// This rules out language-aware boundaries: `$` is a word character in a `.md` file
+/// too. Getting that right needs the token stream from `crates/syntax`, which is a much
+/// bigger change than a motion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CharClass {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+impl CharClass {
+    fn of(c: char) -> Self {
+        if c.is_whitespace() {
+            Self::Whitespace
+        } else if c.is_alphanumeric() || c == '_' || c == '$' {
+            Self::Word
+        } else {
+            Self::Punctuation
+        }
+    }
+}
+
+/// `text` without its line ending, if it has one. Handles `\r\n` as well as `\n`, since
+/// nothing in this pipeline normalises line endings — see `crlf_line_endings_survive_an_edit`.
+fn strip_newline(text: &str) -> &str {
+    text.strip_suffix('\n').map_or(text, |t| t.strip_suffix('\r').unwrap_or(t))
+}
+
 /// A cursor with an optional selection anchor.
 ///
 /// One cursor for Milestone 1.
@@ -274,12 +312,6 @@ impl Document {
         self.goal_column = Some(goal);
     }
 
-    pub fn move_line_start(&mut self, extend: bool) {
-        let row = self.buffer.offset_to_point(self.selection.head).row;
-        self.move_to(self.buffer.point_to_offset(Point::new(row, 0)), extend);
-        self.goal_column = None;
-    }
-
     pub fn move_line_end(&mut self, extend: bool) {
         let row = self.buffer.offset_to_point(self.selection.head).row;
         let column = self.buffer.line_len(row);
@@ -287,9 +319,361 @@ impl Document {
         self.goal_column = None;
     }
 
+    /// ⌘← / ⌘→ with "smart home": ⌘← goes to the first non-whitespace character, and
+    /// only to column zero when already sitting on it. Toggling is what every editor
+    /// with a smart home does, and it is the only way to reach column zero on an
+    /// indented line without also making the common case (jump to the code) two presses.
+    pub fn move_line_home(&mut self, extend: bool) {
+        let row = self.buffer.offset_to_point(self.selection.head).row;
+        let line_start = self.buffer.point_to_offset(Point::new(row, 0));
+        let indent_end = self.first_non_whitespace(row);
+
+        let target = if self.selection.head == indent_end { line_start } else { indent_end };
+        self.move_to(target, extend);
+        self.goal_column = None;
+    }
+
+    /// ⌘↑ / ⌘↓: the two ends of the document.
+    pub fn move_document_edge(&mut self, end: bool, extend: bool) {
+        self.move_to(if end { self.buffer.len_bytes() } else { 0 }, extend);
+        self.goal_column = None;
+    }
+
+    /// ⌥← / ⌥→, with `extend` for the ⇧ variants.
+    pub fn move_word(&mut self, forward: bool, extend: bool) {
+        let target = if forward {
+            self.next_word_boundary(self.selection.head)
+        } else {
+            self.prev_word_boundary(self.selection.head)
+        };
+        self.move_to(target, extend);
+        self.goal_column = None;
+    }
+
     pub fn select_all(&mut self) {
         self.selection = Selection { anchor: 0, head: self.buffer.len_bytes() };
         self.goal_column = None;
+    }
+
+    // --- deletion ------------------------------------------------------------------
+
+    /// ⌥⌫ / ⌥⌦: delete to the previous/next word boundary.
+    ///
+    /// One `replace` call, so it is one undo group — see [`Document::delete_range`].
+    pub fn delete_word(&mut self, forward: bool) {
+        if !self.selection.is_empty() {
+            self.delete_range(self.selection.range());
+            return;
+        }
+        let head = self.selection.head;
+        let range = if forward {
+            head..self.next_word_boundary(head)
+        } else {
+            self.prev_word_boundary(head)..head
+        };
+        self.delete_range(range);
+    }
+
+    /// ⌘⌫ / ⌘⌦: delete from the cursor to the start/end of the line.
+    ///
+    /// Line *content*, not the line ending: ⌘⌫ at column zero does nothing rather than
+    /// joining with the line above, which matches macOS and means a mistimed press
+    /// cannot silently reflow the file.
+    pub fn delete_to_line_edge(&mut self, forward: bool) {
+        if !self.selection.is_empty() {
+            self.delete_range(self.selection.range());
+            return;
+        }
+        let head = self.selection.head;
+        let row = self.buffer.offset_to_point(head).row;
+        let range = if forward {
+            head..self.buffer.point_to_offset(Point::new(row, self.buffer.line_len(row)))
+        } else {
+            self.buffer.point_to_offset(Point::new(row, 0))..head
+        };
+        self.delete_range(range);
+    }
+
+    /// Deletes a byte range as exactly one undo step.
+    ///
+    /// The grouping is the whole point. `Buffer::replace` coalesces into the previous
+    /// undo group only when `Edit::extends` holds, and a deletion never extends
+    /// anything — so one call is one group. The explicit `break_undo_group` guards the
+    /// other direction: without it a delete-then-type sequence could let the *typing*
+    /// coalesce onto the deletion's group and undo them together.
+    fn delete_range(&mut self, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        self.replace_as_one_step(range, "");
+    }
+
+    /// Applies one replacement as exactly one undo step, leaving the cursor after it.
+    ///
+    /// Callers that reshape a line rely on this: the break before stops the edit joining
+    /// a typing run already on the stack, and the break after stops later typing joining
+    /// this one. Between them `Buffer::replace` pushes exactly one group.
+    fn replace_as_one_step(&mut self, range: Range<usize>, text: &str) {
+        self.buffer.break_undo_group();
+        let edit = self.buffer.replace(range, text);
+        self.selection = Selection::at(edit.new_range().end);
+        self.goal_column = None;
+        self.buffer.break_undo_group();
+        self.sync_syntax();
+    }
+
+    // --- line manipulation -----------------------------------------------------------
+
+    /// ⌥↑ / ⌥↓: swaps the selected lines with the line above/below.
+    ///
+    /// Implemented as one `replace` over the whole span of both, rather than a delete and
+    /// an insert, so it is a single undo step and the syntax tree sees one edit.
+    pub fn move_lines(&mut self, down: bool) {
+        let (first, last) = self.selected_rows();
+        if down && last + 1 >= self.buffer.len_lines() || !down && first == 0 {
+            return;
+        }
+
+        // Rewrite the span covering the block and its neighbour in one go, swapping the
+        // two halves. Moving content only — `strip_newline` — and re-joining keeps the
+        // newline count right even when the block reaches the last line of the file,
+        // which has no trailing newline to carry with it.
+        //
+        // The separator is re-read from the span rather than assumed to be `\n`, so
+        // moving a line in a CRLF file does not leave one lone LF behind. See
+        // `crlf_line_endings_survive_an_edit` for why that matters.
+        let (upper, lower) = if down {
+            (first..=last, last + 1..=last + 1)
+        } else {
+            (first - 1..=first - 1, first..=last)
+        };
+        let span = self.line_span(upper.clone()).start..self.line_span(lower.clone()).end;
+        let upper_text = self.buffer.slice(self.line_span(upper));
+        let lower_text = self.buffer.slice(self.line_span(lower));
+
+        // The upper block always ends in an ending (something follows it); the lower one
+        // may not, if it is the last line. Reuse each as found and they stay put.
+        let separator = &upper_text[strip_newline(&upper_text).len()..];
+        let terminator = &lower_text[strip_newline(&lower_text).len()..];
+        let new_text = format!(
+            "{}{separator}{}{terminator}",
+            strip_newline(&lower_text),
+            strip_newline(&upper_text)
+        );
+
+        self.replace_as_one_step(span, &new_text);
+
+        let shift = if down { 1 } else { -1 };
+        self.select_rows(first.wrapping_add_signed(shift), last.wrapping_add_signed(shift));
+    }
+
+    /// ⇧⌥↑ / ⇧⌥↓: copies the selected lines above/below, leaving the copy selected.
+    pub fn duplicate_lines(&mut self, down: bool) {
+        let (first, last) = self.selected_rows();
+        let span = self.line_span(first..=last);
+        let text = strip_newline(&self.buffer.slice(span.clone())).to_string();
+        let ending = self.line_ending(first);
+
+        // Insert at the block's start either way; whether the cursor follows the copy is
+        // what makes it "up" or "down".
+        self.replace_as_one_step(span.start..span.start, &format!("{text}{ending}"));
+
+        let rows = last - first + 1;
+        if down {
+            self.select_rows(first + rows, last + rows);
+        } else {
+            self.select_rows(first, last);
+        }
+    }
+
+    /// ⌘⇧K: removes the selected lines entirely, line endings included.
+    pub fn delete_lines(&mut self) {
+        let (first, last) = self.selected_rows();
+        let mut span = self.line_span(first..=last);
+
+        // On the last line there is no trailing newline to take, so take the *leading*
+        // one instead. Otherwise deleting the final line leaves a stray blank behind.
+        if span.end == self.buffer.len_bytes() && first > 0 {
+            span.start =
+                self.buffer.point_to_offset(Point::new(first - 1, self.buffer.line_len(first - 1)));
+        }
+
+        self.replace_as_one_step(span, "");
+    }
+
+    /// ⌘Enter / ⌘⇧Enter: opens a blank line below/above, matching the current indent.
+    pub fn open_line(&mut self, above: bool) {
+        let row = self.buffer.offset_to_point(self.selection.head).row;
+        let indent = self.indent_of(row);
+        let ending = self.line_ending(row);
+
+        if above {
+            let at = self.buffer.point_to_offset(Point::new(row, 0));
+            self.replace_as_one_step(at..at, &format!("{indent}{ending}"));
+            self.move_to(at + indent.len(), false);
+        } else {
+            let at = self.buffer.point_to_offset(Point::new(row, self.buffer.line_len(row)));
+            self.replace_as_one_step(at..at, &format!("{ending}{indent}"));
+            self.move_to(at + ending.len() + indent.len(), false);
+        }
+    }
+
+    /// Tab / ⇧Tab on a selection, and ⌘] / ⌘[ anywhere.
+    ///
+    /// One `replace` over the whole block rather than one per line: it is a single undo
+    /// step, and per-line edits would each shift the offsets of the ones after them.
+    ///
+    /// ponytail: four spaces, hardcoded, matching `EditorView::tab`. Both read the same
+    /// setting once a settings crate exists (#60).
+    pub fn indent_lines(&mut self, outdent: bool) {
+        const INDENT: &str = "    ";
+
+        let (first, last) = self.selected_rows();
+        let span = self.line_span(first..=last);
+        let text = self.buffer.slice(span.clone());
+
+        let mut out = String::with_capacity(text.len() + (last - first + 1) * INDENT.len());
+        // split_inclusive keeps each line's ending attached, so the endings pass through
+        // untouched and a CRLF file stays CRLF.
+        for line in text.split_inclusive('\n') {
+            if outdent {
+                // Remove up to one indent's worth of leading whitespace, stopping early on
+                // a short indent so a two-space line loses two spaces rather than nothing.
+                let mut removed = 0;
+                let rest = line.trim_start_matches(|c| {
+                    let keep = removed < INDENT.len() && (c == ' ' || c == '\t');
+                    if keep {
+                        removed += 1;
+                    }
+                    keep
+                });
+                out.push_str(rest);
+            } else if strip_newline(line).is_empty() {
+                // Indenting a blank line would leave trailing whitespace behind.
+                out.push_str(line);
+            } else {
+                out.push_str(INDENT);
+                out.push_str(line);
+            }
+        }
+
+        if out == text {
+            return;
+        }
+
+        // The block stays selected, so ⇥⇥ indents twice instead of replacing the text.
+        self.replace_as_one_step(span, &out);
+        self.select_rows(first, last);
+    }
+
+    /// The rows the selection touches, inclusive.
+    fn selected_rows(&self) -> (usize, usize) {
+        let range = self.selection.range();
+        let first = self.buffer.offset_to_point(range.start).row;
+        let mut last = self.buffer.offset_to_point(range.end).row;
+        // A selection ending exactly at column zero visually stops on the line above, so
+        // ⌘⇧K on a shift-down selection does not eat an extra untouched line.
+        if last > first && self.buffer.offset_to_point(range.end).column == 0 {
+            last -= 1;
+        }
+        (first, last)
+    }
+
+    /// Byte range covering whole rows, including the final row's line ending if it has one.
+    fn line_span(&self, rows: std::ops::RangeInclusive<usize>) -> Range<usize> {
+        let start = self.buffer.point_to_offset(Point::new(*rows.start(), 0));
+        let last = *rows.end();
+        let content_end = self.buffer.point_to_offset(Point::new(last, self.buffer.line_len(last)));
+        // The next row's column zero is past the ending whatever it is, so \r\n needs no
+        // special case. The last row has no ending, so the span stops at its content.
+        let end = if last + 1 < self.buffer.len_lines() {
+            self.buffer.point_to_offset(Point::new(last + 1, 0))
+        } else {
+            content_end
+        };
+        start..end
+    }
+
+    /// The line ending `row` uses, for building a new line that matches it.
+    ///
+    /// Falls back to the row above when `row` is the last line and has none, so opening a
+    /// line at the end of a CRLF file does not introduce a lone LF. `\n` only when the
+    /// buffer has no ending to copy at all.
+    fn line_ending(&self, row: usize) -> &'static str {
+        // `line_len` excludes the ending, so the byte just past the content is `\r` on a
+        // CRLF line and `\n` on an LF one.
+        let is_crlf = |row: usize| {
+            if row + 1 >= self.buffer.len_lines() {
+                return false;
+            }
+            let end = self.buffer.point_to_offset(Point::new(row, self.buffer.line_len(row)));
+            self.buffer.slice(end..end + 1) == "\r"
+        };
+        if is_crlf(row) || (row > 0 && is_crlf(row - 1)) { "\r\n" } else { "\n" }
+    }
+
+    /// The leading whitespace of a row, as text to reuse for a new line.
+    fn indent_of(&self, row: usize) -> String {
+        let start = self.buffer.point_to_offset(Point::new(row, 0));
+        self.buffer.slice(start..self.first_non_whitespace(row))
+    }
+
+    fn select_rows(&mut self, first: usize, last: usize) {
+        let start = self.buffer.point_to_offset(Point::new(first, 0));
+        let end = self.buffer.point_to_offset(Point::new(last, self.buffer.line_len(last)));
+        self.selection = Selection { anchor: start, head: end };
+        self.goal_column = None;
+    }
+
+    // --- word boundaries -------------------------------------------------------------
+
+    /// Where ⌥→ lands: past any whitespace, then past the run that follows.
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let rope = self.buffer.rope();
+        let len = rope.len_chars();
+        let mut i = rope.byte_to_char(offset);
+
+        while i < len && CharClass::of(rope.char(i)) == CharClass::Whitespace {
+            i += 1;
+        }
+        if i < len {
+            let class = CharClass::of(rope.char(i));
+            while i < len && CharClass::of(rope.char(i)) == class {
+                i += 1;
+            }
+        }
+        rope.char_to_byte(i)
+    }
+
+    /// Where ⌥← lands: back over any whitespace, then back over the run before it.
+    fn prev_word_boundary(&self, offset: usize) -> usize {
+        let rope = self.buffer.rope();
+        let mut i = rope.byte_to_char(offset);
+
+        while i > 0 && CharClass::of(rope.char(i - 1)) == CharClass::Whitespace {
+            i -= 1;
+        }
+        if i > 0 {
+            let class = CharClass::of(rope.char(i - 1));
+            while i > 0 && CharClass::of(rope.char(i - 1)) == class {
+                i -= 1;
+            }
+        }
+        rope.char_to_byte(i)
+    }
+
+    /// Offset of the first non-whitespace character on `row`, or the line end if the
+    /// line is blank or all whitespace.
+    fn first_non_whitespace(&self, row: usize) -> usize {
+        let line_start = self.buffer.point_to_offset(Point::new(row, 0));
+        let len = self.buffer.line_len(row);
+        let rope = self.buffer.rope();
+        let mut i = rope.byte_to_char(line_start);
+        let end = rope.byte_to_char(line_start + len);
+        while i < end && rope.char(i).is_whitespace() {
+            i += 1;
+        }
+        rope.char_to_byte(i)
     }
 
     /// Offset of the character before `offset`, respecting UTF-8.
@@ -428,8 +812,552 @@ mod tests {
         d.move_to(4, false);
         d.move_line_end(false);
         assert_eq!(d.cursor_point(), Point::new(0, 7));
-        d.move_line_start(false);
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(0, 2), "smart home stops at the code first");
+        d.move_line_home(false);
         assert_eq!(d.cursor_point(), Point::new(0, 0));
+    }
+
+    #[test]
+    fn smart_home_toggles_between_indent_and_column_zero() {
+        let mut d = doc("    return $x;\nplain");
+        d.move_line_end(false);
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(0, 4));
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(0, 0), "already at the indent, so go to zero");
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(0, 4), "and back, so zero is never a dead end");
+
+        // An unindented line has nothing to toggle: both stops are column zero.
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 3)), false);
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(1, 0));
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(1, 0));
+    }
+
+    #[test]
+    fn smart_home_on_a_whitespace_only_line_stops_at_the_end() {
+        // No non-whitespace to find, so the "indent end" is the line end. Pressing again
+        // must still reach column zero rather than pinning the cursor at the end.
+        let mut d = doc("   \nx");
+        d.move_to(0, false);
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(0, 3));
+        d.move_line_home(false);
+        assert_eq!(d.cursor_point(), Point::new(0, 0));
+    }
+
+    // --- word motion ---------------------------------------------------------------
+
+    #[test]
+    fn word_motion_splits_a_php_member_access_into_three_stops() {
+        // The rule from the issue: `$user->name` is `$user`, `->`, `name`. Punctuation is
+        // its own class, so the arrow is a stop rather than something to skip over.
+        let mut d = doc("$user->name;");
+        d.move_to(0, false);
+        for expected in ["$user", "$user->", "$user->name", "$user->name;"] {
+            d.move_word(true, false);
+            assert_eq!(&d.buffer.text()[..d.selection.head], expected);
+        }
+        // And back out again, symmetrically.
+        for expected in ["$user->name", "$user->", "$user", ""] {
+            d.move_word(false, false);
+            assert_eq!(&d.buffer.text()[..d.selection.head], expected);
+        }
+    }
+
+    #[test]
+    fn word_motion_crosses_whitespace_without_stopping_in_it() {
+        let mut d = doc("one   two");
+        d.move_to(0, false);
+        d.move_word(true, false);
+        assert_eq!(d.selection.head, 3, "stops at the end of the word, not before the gap");
+        d.move_word(true, false);
+        assert_eq!(d.selection.head, 9, "one press crosses the gap and the next word");
+        d.move_word(false, false);
+        assert_eq!(d.selection.head, 6);
+    }
+
+    #[test]
+    fn word_motion_stops_at_the_document_edges() {
+        let mut d = doc("word");
+        d.move_to(0, false);
+        d.move_word(false, false);
+        assert_eq!(d.selection.head, 0);
+        d.move_to(4, false);
+        d.move_word(true, false);
+        assert_eq!(d.selection.head, 4);
+    }
+
+    #[test]
+    fn word_motion_lands_on_char_boundaries_in_multibyte_text() {
+        // `função` is 8 bytes over 6 chars, `назва` is 10 bytes over 5. A boundary that
+        // came out mid-codepoint would panic the slicing below in a debug build — which is
+        // exactly the failure mode this guards.
+        let mut d = doc("$função->назva çé");
+        d.move_to(0, false);
+        let mut stops = vec![];
+        loop {
+            let before = d.selection.head;
+            d.move_word(true, false);
+            if d.selection.head == before {
+                break;
+            }
+            stops.push(d.buffer.text()[..d.selection.head].to_string());
+        }
+        assert_eq!(stops, ["$função", "$função->", "$função->назva", "$função->назva çé"]);
+    }
+
+    #[test]
+    fn shift_option_arrow_selects_a_word() {
+        let mut d = doc("alpha beta");
+        d.move_to(0, false);
+        d.move_word(true, true);
+        assert_eq!(d.selected_text().unwrap(), "alpha");
+        d.move_word(true, true);
+        assert_eq!(d.selected_text().unwrap(), "alpha beta");
+        assert_eq!(d.selection.anchor, 0, "the anchor stays put while the head runs");
+    }
+
+    #[test]
+    fn word_motion_clears_the_goal_column() {
+        // Horizontal motion must not leave a stale goal behind, or the next ↓ jumps to a
+        // column the user never visited.
+        let mut d = doc("aaaaaaaa\nbb\ncccccccc");
+        d.move_to(d.buffer.point_to_offset(Point::new(0, 5)), false);
+        d.move_vertical(true, false);
+        d.move_word(false, false);
+        d.move_vertical(true, false);
+        assert_eq!(d.cursor_point(), Point::new(2, 0), "column comes from the word motion");
+    }
+
+    // --- document edges --------------------------------------------------------------
+
+    #[test]
+    fn document_edges_and_their_selecting_variants() {
+        let mut d = doc("one\ntwo\nthree");
+        d.move_to(5, false);
+        d.move_document_edge(true, false);
+        assert_eq!(d.selection.head, d.buffer.len_bytes());
+        d.move_document_edge(false, false);
+        assert_eq!(d.selection.head, 0);
+
+        d.move_to(4, false);
+        d.move_document_edge(true, true);
+        assert_eq!(d.selected_text().unwrap(), "two\nthree");
+        d.move_to(4, false);
+        d.move_document_edge(false, true);
+        assert_eq!(d.selected_text().unwrap(), "one\n");
+    }
+
+    // --- deletion --------------------------------------------------------------------
+
+    #[test]
+    fn delete_word_back_and_forward() {
+        let mut d = doc("$user->name;");
+        d.move_to(11, false);
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "$user->;");
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "$user;");
+
+        let mut d = doc("alpha beta");
+        d.move_to(0, false);
+        d.delete_word(true);
+        assert_eq!(d.buffer.text(), " beta");
+        d.delete_word(true);
+        assert_eq!(d.buffer.text(), "", "one press takes the gap and the word after it");
+    }
+
+    #[test]
+    fn delete_word_with_a_selection_deletes_the_selection() {
+        // ⌥⌫ on a selection must not also eat the word before it.
+        let mut d = doc("one two three");
+        d.selection = Selection { anchor: 4, head: 7 };
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "one  three");
+        assert_eq!(d.selection.head, 4);
+    }
+
+    #[test]
+    fn delete_word_back_on_multibyte_text_deletes_whole_chars() {
+        let mut d = doc("uma ação");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "uma ");
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "");
+    }
+
+    #[test]
+    fn delete_to_line_start_and_end_stop_at_the_line_ending() {
+        let mut d = doc("    return $x;\nnext");
+        d.move_to(d.buffer.point_to_offset(Point::new(0, 11)), false);
+        d.delete_to_line_edge(true);
+        assert_eq!(d.buffer.text(), "    return \nnext", "the newline survives");
+        d.delete_to_line_edge(false);
+        assert_eq!(d.buffer.text(), "\nnext");
+        assert_eq!(d.cursor_point(), Point::new(0, 0));
+
+        // At column zero there is nothing left to take, and it must not join the lines.
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 0)), false);
+        d.delete_to_line_edge(false);
+        assert_eq!(d.buffer.text(), "\nnext");
+    }
+
+    // --- undo granularity ------------------------------------------------------------
+    //
+    // The trap from the issue: deleting a word must undo as ONE step, not five characters.
+    // `Buffer::replace` makes a fresh undo group unless `Edit::extends` holds, and a
+    // deletion never extends — so each of these is one call and therefore one group.
+    // Asserting it here because it is invisible until a user presses ⌘Z and is surprised.
+
+    #[test]
+    fn deleting_a_word_undoes_in_one_step() {
+        let mut d = doc("alpha beta gamma");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "alpha beta ");
+        d.undo();
+        assert_eq!(d.buffer.text(), "alpha beta gamma", "one undo, not five");
+        d.undo();
+        assert_eq!(d.buffer.text(), "alpha beta gamma", "and nothing else was on the stack");
+    }
+
+    #[test]
+    fn deleting_to_the_line_start_undoes_in_one_step() {
+        let mut d = doc("    return $x;");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.delete_to_line_edge(false);
+        assert_eq!(d.buffer.text(), "");
+        d.undo();
+        assert_eq!(d.buffer.text(), "    return $x;");
+    }
+
+    #[test]
+    fn typing_then_deleting_a_word_are_two_separate_undo_steps() {
+        // The direction the explicit break guards. Without it the typing run and the
+        // deletion could land in one group and ⌘Z would undo both at once.
+        let mut d = doc("");
+        d.insert("hello");
+        d.insert(" world");
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "hello ");
+        d.undo();
+        assert_eq!(d.buffer.text(), "hello world", "the deletion undid on its own");
+        d.undo();
+        assert_eq!(d.buffer.text(), "", "and the typing run is a separate step");
+    }
+
+    #[test]
+    fn deleting_a_word_then_typing_are_two_separate_undo_steps() {
+        let mut d = doc("alpha beta");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.delete_word(false);
+        d.insert("gamma");
+        assert_eq!(d.buffer.text(), "alpha gamma");
+        d.undo();
+        assert_eq!(d.buffer.text(), "alpha ", "the typing undid without taking the deletion");
+        d.undo();
+        assert_eq!(d.buffer.text(), "alpha beta");
+    }
+
+    #[test]
+    fn two_word_deletions_are_two_undo_steps() {
+        let mut d = doc("one two three");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.delete_word(false);
+        d.delete_word(false);
+        assert_eq!(d.buffer.text(), "one ");
+        d.undo();
+        assert_eq!(d.buffer.text(), "one two ");
+        d.undo();
+        assert_eq!(d.buffer.text(), "one two three");
+    }
+
+    // --- line manipulation -----------------------------------------------------------
+
+    #[test]
+    fn move_line_up_and_down_swaps_with_the_neighbour() {
+        let mut d = doc("one\ntwo\nthree\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 1)), false);
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "one\nthree\ntwo\n");
+        d.move_lines(false);
+        assert_eq!(d.buffer.text(), "one\ntwo\nthree\n");
+        d.move_lines(false);
+        assert_eq!(d.buffer.text(), "two\none\nthree\n");
+    }
+
+    #[test]
+    fn move_line_stops_at_the_document_edges() {
+        let mut d = doc("one\ntwo");
+        d.move_to(0, false);
+        d.move_lines(false);
+        assert_eq!(d.buffer.text(), "one\ntwo", "nothing above the first line");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "one\ntwo", "nothing below the last");
+    }
+
+    #[test]
+    fn moving_the_last_line_does_not_glue_two_lines_together() {
+        // The last line has no trailing newline. A swap that carried the ending along
+        // with the text instead of with the position would produce "twoone".
+        let mut d = doc("one\ntwo");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.move_lines(false);
+        assert_eq!(d.buffer.text(), "two\none");
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "one\ntwo");
+    }
+
+    #[test]
+    fn move_line_carries_a_multi_line_selection_and_keeps_it_selected() {
+        let mut d = doc("a\nb\nc\nd\n");
+        d.selection = Selection {
+            anchor: d.buffer.point_to_offset(Point::new(0, 0)),
+            head: d.buffer.point_to_offset(Point::new(1, 1)),
+        };
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "c\na\nb\nd\n");
+        assert_eq!(d.selected_text().unwrap(), "a\nb", "the same lines stay selected");
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "c\nd\na\nb\n");
+    }
+
+    #[test]
+    fn move_line_undoes_in_one_step() {
+        let mut d = doc("one\ntwo\nthree\n");
+        d.move_to(0, false);
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "two\none\nthree\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "one\ntwo\nthree\n", "one undo, not a delete plus an insert");
+    }
+
+    #[test]
+    fn duplicate_line_copies_above_or_below() {
+        let mut d = doc("one\ntwo\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(0, 1)), false);
+        d.duplicate_lines(true);
+        assert_eq!(d.buffer.text(), "one\none\ntwo\n");
+        assert_eq!(d.cursor_point().row, 1, "the cursor follows the copy downwards");
+
+        let mut d = doc("one\ntwo\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 0)), false);
+        d.duplicate_lines(false);
+        assert_eq!(d.buffer.text(), "one\ntwo\ntwo\n");
+        assert_eq!(d.cursor_point().row, 1, "duplicating upwards leaves the cursor on top");
+    }
+
+    #[test]
+    fn duplicating_the_last_line_gains_exactly_one_newline() {
+        let mut d = doc("one\ntwo");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.duplicate_lines(true);
+        assert_eq!(d.buffer.text(), "one\ntwo\ntwo");
+    }
+
+    #[test]
+    fn duplicate_line_undoes_in_one_step() {
+        let mut d = doc("a\nb\n");
+        d.move_to(0, false);
+        d.duplicate_lines(true);
+        assert_eq!(d.buffer.text(), "a\na\nb\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn delete_line_takes_the_line_ending_with_it() {
+        let mut d = doc("one\ntwo\nthree\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 2)), false);
+        d.delete_lines();
+        assert_eq!(d.buffer.text(), "one\nthree\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "one\ntwo\nthree\n", "one undo step");
+    }
+
+    #[test]
+    fn deleting_the_last_line_leaves_no_stray_blank() {
+        // There is no trailing newline to remove, so the *leading* one has to go instead.
+        let mut d = doc("one\ntwo");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.delete_lines();
+        assert_eq!(d.buffer.text(), "one");
+
+        // And deleting the only line empties the buffer rather than underflowing.
+        let mut d = doc("only");
+        d.move_to(2, false);
+        d.delete_lines();
+        assert_eq!(d.buffer.text(), "");
+    }
+
+    #[test]
+    fn delete_line_on_a_selection_that_ends_at_column_zero_spares_the_untouched_line() {
+        // Shift-down from line 0 selects "a\n", whose end sits on row 1 column 0. The user
+        // never saw row 1 highlighted, so ⌘⇧K must not take it.
+        let mut d = doc("a\nb\nc\n");
+        d.selection = Selection { anchor: 0, head: d.buffer.point_to_offset(Point::new(1, 0)) };
+        d.delete_lines();
+        assert_eq!(d.buffer.text(), "b\nc\n");
+    }
+
+    #[test]
+    fn open_line_below_and_above_match_the_indentation() {
+        let mut d = doc("    $x = 1;\nplain\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(0, 6)), false);
+        d.open_line(false);
+        assert_eq!(d.buffer.text(), "    $x = 1;\n    \nplain\n");
+        assert_eq!(d.cursor_point(), Point::new(1, 4), "cursor sits after the indent");
+
+        let mut d = doc("    $x = 1;\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(0, 6)), false);
+        d.open_line(true);
+        assert_eq!(d.buffer.text(), "    \n    $x = 1;\n");
+        assert_eq!(d.cursor_point(), Point::new(0, 4));
+    }
+
+    #[test]
+    fn open_line_undoes_in_one_step() {
+        let mut d = doc("  a\n");
+        d.move_to(3, false);
+        d.open_line(false);
+        assert_eq!(d.buffer.text(), "  a\n  \n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "  a\n");
+    }
+
+    #[test]
+    fn line_manipulation_is_multibyte_safe() {
+        // Byte arithmetic on these lines would land mid-codepoint; the assertions below
+        // would panic before they could fail.
+        let mut d = doc("  função\nação\nçé\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 0)), false);
+        d.move_lines(false);
+        assert_eq!(d.buffer.text(), "ação\n  função\nçé\n");
+        d.duplicate_lines(true);
+        assert_eq!(d.buffer.text(), "ação\nação\n  função\nçé\n");
+        d.delete_lines();
+        assert_eq!(d.buffer.text(), "ação\n  função\nçé\n");
+
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 4)), false);
+        d.open_line(false);
+        assert_eq!(d.buffer.text(), "ação\n  função\n  \nçé\n");
+        assert_eq!(d.cursor_point(), Point::new(2, 2));
+    }
+
+    // --- indentation -----------------------------------------------------------------
+
+    #[test]
+    fn indent_and_outdent_shift_every_selected_line() {
+        let mut d = doc("a\nb\nc\n");
+        d.selection = Selection { anchor: 0, head: d.buffer.point_to_offset(Point::new(1, 1)) };
+        d.indent_lines(false);
+        assert_eq!(d.buffer.text(), "    a\n    b\nc\n");
+        assert_eq!(d.selected_text().unwrap(), "    a\n    b", "the block stays selected");
+        d.indent_lines(false);
+        assert_eq!(d.buffer.text(), "        a\n        b\nc\n", "so a second ⇥ indents again");
+        d.indent_lines(true);
+        d.indent_lines(true);
+        assert_eq!(d.buffer.text(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn outdent_removes_a_short_indent_rather_than_nothing() {
+        // Two spaces is less than one indent's worth; taking what is there beats a no-op.
+        let mut d = doc("  a\n\tb\nc\n");
+        d.selection = Selection { anchor: 0, head: d.buffer.len_bytes() };
+        d.indent_lines(true);
+        assert_eq!(d.buffer.text(), "a\nb\nc\n");
+        // Nothing left to remove, so the whole call is a no-op and pushes no undo step.
+        d.indent_lines(true);
+        assert_eq!(d.buffer.text(), "a\nb\nc\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "  a\n\tb\nc\n", "one undo, and nothing empty on the stack");
+    }
+
+    #[test]
+    fn indent_leaves_blank_lines_alone() {
+        // Indenting a blank line would leave trailing whitespace for a linter to flag.
+        let mut d = doc("a\n\nb\n");
+        d.selection = Selection { anchor: 0, head: d.buffer.len_bytes() };
+        d.indent_lines(false);
+        assert_eq!(d.buffer.text(), "    a\n\n    b\n");
+    }
+
+    #[test]
+    fn indent_undoes_in_one_step_and_is_multibyte_safe() {
+        let mut d = doc("função\nação\n");
+        d.selection = Selection { anchor: 0, head: d.buffer.len_bytes() };
+        d.indent_lines(false);
+        assert_eq!(d.buffer.text(), "    função\n    ação\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "função\nação\n", "two lines, one undo");
+    }
+
+    #[test]
+    fn indent_with_a_bare_cursor_still_shifts_the_line() {
+        // ⌘] has no selection to work from, so it acts on the line the cursor is in.
+        let mut d = doc("a\nb\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 1)), false);
+        d.indent_lines(false);
+        assert_eq!(d.buffer.text(), "a\n    b\n");
+    }
+
+    #[test]
+    fn line_manipulation_keeps_crlf_endings_crlf() {
+        // Nothing in this pipeline normalises endings (see `crlf_line_endings_survive_an
+        // _edit`), so a line motion must not be the thing that introduces a lone LF into
+        // a Windows checkout and shows every line as changed in review.
+        let mut d = doc("one\r\ntwo\r\nthree\r\n");
+        d.move_to(0, false);
+        d.move_lines(true);
+        assert_eq!(d.buffer.text(), "two\r\none\r\nthree\r\n");
+        d.duplicate_lines(true);
+        assert_eq!(d.buffer.text(), "two\r\none\r\none\r\nthree\r\n");
+        d.open_line(false);
+        assert_eq!(d.buffer.text(), "two\r\none\r\none\r\n\r\nthree\r\n");
+
+        // Including at the end of the file, where the last line has no ending of its own
+        // to copy and the row above has to supply it.
+        let mut d = doc("one\r\ntwo");
+        d.move_to(d.buffer.len_bytes(), false);
+        d.open_line(false);
+        assert_eq!(d.buffer.text(), "one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn line_manipulation_keeps_the_syntax_tree_in_sync() {
+        let mut d = doc("<?php\n$a = 1;\n$b = 2;\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 0)), false);
+        d.move_lines(true);
+        assert!(!d.buffer.has_pending(), "move_lines must drain");
+        d.duplicate_lines(true);
+        assert!(!d.buffer.has_pending(), "duplicate_lines must drain");
+        d.delete_lines();
+        assert!(!d.buffer.has_pending(), "delete_lines must drain");
+        d.open_line(false);
+        assert!(!d.buffer.has_pending(), "open_line must drain");
+        d.insert("$c = 3;");
+        assert!(!d.syntax.has_error(), "the tree must still agree with the text");
+    }
+
+    #[test]
+    fn word_deletion_keeps_the_syntax_tree_in_sync() {
+        // Same invariant `a_path_swap_never_happens_with_edits_outstanding` pins for the
+        // older mutators: every new mutating path must drain the edit log too.
+        let mut d = doc("<?php\n$name = 1;\n");
+        d.move_to(d.buffer.point_to_offset(Point::new(1, 5)), false);
+        d.delete_word(false);
+        assert!(!d.buffer.has_pending(), "delete_word must drain");
+        d.delete_to_line_edge(true);
+        assert!(!d.buffer.has_pending(), "delete_to_line_edge must drain");
+        d.insert("$x = 1;");
+        assert!(!d.syntax.has_error(), "the tree must still agree with the text");
     }
 
     #[test]
