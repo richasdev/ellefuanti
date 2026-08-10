@@ -48,7 +48,10 @@ jobs:
           NAME="ellefuanti-${VERSION}-macos-$(uname -m)"
 
           mkdir -p "dist/${NAME}"
-          cp target/release/ellefuanti "dist/${NAME}/"
+          # Ship the .app, not the bare binary: it is what carries the icon, and it is what
+          # a user can actually drag to /Applications.
+          python3 scripts/gen-iconset.py
+          scripts/bundle-macos.sh target/release/ellefuanti "dist/${NAME}"
           cp README.md LICENSE "dist/${NAME}/"
 
           # Gatekeeper will block an unsigned binary downloaded from the internet. Saying so

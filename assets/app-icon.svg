@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ellefuanti app icon: the pixel-art elePHPant, square and transparent.
+
+     Derived from a 1342x894 source whose real resolution is only 18x10 art pixels;
+     this file states that grid directly, one rect per pixel.
+
+     No background rect. macOS masks app icons itself, so an opaque fill shows up as a
+     white square in the Dock fighting the system corner rounding.
+
+     Art is 72/90 = 80% of the canvas: the Big Sur+ safe area. All coordinates are
+     integers, so every whole-number render scale stays pixel-crisp.
+
+     The .icns is NOT generated from this file; see assets/README.md. Fractionally
+     resampling 18 art pixels down to a 16pt icon destroys the eyes and legs, so the
+     small sizes are drawn from the same matrix at integer scale instead. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 90 90" width="1024" height="1024" shape-rendering="crispEdges">
+  <rect x="17" y="25" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="33" y="25" width="12" height="4" fill="#9f9fa3"/>
+  <rect x="53" y="25" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="13" y="29" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="17" y="29" width="8" height="4" fill="#707276"/>
+  <rect x="25" y="29" width="28" height="4" fill="#9f9fa3"/>
+  <rect x="53" y="29" width="8" height="4" fill="#707276"/>
+  <rect x="61" y="29" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="13" y="33" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="17" y="33" width="8" height="4" fill="#707276"/>
+  <rect x="25" y="33" width="28" height="4" fill="#9f9fa3"/>
+  <rect x="53" y="33" width="8" height="4" fill="#707276"/>
+  <rect x="61" y="33" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="13" y="37" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="17" y="37" width="8" height="4" fill="#707276"/>
+  <rect x="25" y="37" width="28" height="4" fill="#9f9fa3"/>
+  <rect x="53" y="37" width="8" height="4" fill="#707276"/>
+  <rect x="61" y="37" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="17" y="41" width="8" height="4" fill="#707276"/>
+  <rect x="25" y="41" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="29" y="41" width="4" height="4" fill="#010101"/>
+  <rect x="33" y="41" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="41" y="41" width="4" height="4" fill="#010101"/>
+  <rect x="45" y="41" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="53" y="41" width="8" height="4" fill="#707276"/>
+  <rect x="61" y="41" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="21" y="45" width="32" height="4" fill="#9f9fa3"/>
+  <rect x="53" y="45" width="4" height="4" fill="#707276"/>
+  <rect x="57" y="45" width="16" height="4" fill="#9f9fa3"/>
+  <rect x="9" y="49" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="21" y="49" width="48" height="4" fill="#9f9fa3"/>
+  <rect x="73" y="49" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="77" y="49" width="4" height="4" fill="#707276"/>
+  <rect x="9" y="53" width="20" height="4" fill="#9f9fa3"/>
+  <rect x="33" y="53" width="36" height="4" fill="#9f9fa3"/>
+  <rect x="13" y="57" width="12" height="4" fill="#9f9fa3"/>
+  <rect x="33" y="57" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="45" y="57" width="8" height="4" fill="#9f9fa3"/>
+  <rect x="57" y="57" width="12" height="4" fill="#9f9fa3"/>
+  <rect x="33" y="61" width="8" height="4" fill="#707276"/>
+  <rect x="45" y="61" width="8" height="4" fill="#707276"/>
+  <rect x="57" y="61" width="4" height="4" fill="#707276"/>
+  <rect x="61" y="61" width="4" height="4" fill="#9f9fa3"/>
+  <rect x="65" y="61" width="4" height="4" fill="#707276"/>
+</svg>

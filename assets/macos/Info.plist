@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>ellefuanti</string>
+	<key>CFBundleDisplayName</key>
+	<string>ellefuanti</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.github.uemuradev.ellefuanti</string>
+	<key>CFBundleExecutable</key>
+	<string>ellefuanti</string>
+	<key>CFBundleIconFile</key>
+	<string>ellefuanti</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<!-- Kept in step with the workspace version by hand. There is one number in one file;
+	     a build script to copy it would be more machinery than the problem deserves. -->
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<!-- gpui draws its own Metal surface and needs a real windowed app, not an agent. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- The editor opens whatever directory it is pointed at, so it must be able to read
+	     files the user selects outside its own container. -->
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>
