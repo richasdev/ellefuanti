@@ -424,7 +424,7 @@ impl WorkspaceView {
             return;
         }
         self.tabs.remove(index);
-        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
         cx.notify();
     }
 
@@ -615,6 +615,20 @@ impl WorkspaceView {
             None => {}
         }
     }
+}
+
+/// Which tab is active after the one at `closed` is removed, leaving `remaining` tabs.
+///
+/// Closing a tab *before* the active one shifts every later tab down by one, so keeping
+/// `active` where it is would silently switch the user to a different file. Clamping alone
+/// was enough while ⌘W was the only way to close — it always closed the active tab, the one
+/// case where clamping is right — but the per-tab ✕ closes an arbitrary index, so the shift
+/// is now reachable by a single click on any tab left of the current one.
+fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
+    // Follow the same file when it slides down; closing the active tab itself falls through
+    // to the clamp, which lands on the neighbour that took its place (or the new last tab).
+    let active = if closed < active { active - 1 } else { active };
+    active.min(remaining.saturating_sub(1))
 }
 
 /// Recovers the `&'static str` id for a title the palette returned.
@@ -1075,6 +1089,37 @@ mod tests {
         let mut h = Harness::new();
         h.slots.cancel(Job::QuickOpenIndex);
         assert!(h.cancelled().is_empty());
+    }
+
+    #[test]
+    fn closing_a_tab_left_of_the_active_one_keeps_the_same_file_active() {
+        // Three tabs with the third active, closing the first: the clamp happens to agree
+        // here (both give 1), because the active tab was last and clamping to the new end
+        // lands on the right file by luck. Kept as a regression guard, not as evidence.
+        assert_eq!(active_after_close(2, 0, 2), 1);
+        // This is the case that actually proves the bug — the only one where the clamp
+        // cannot hide it. Five tabs, fourth active, close the second: the three later tabs
+        // shift down, so the active file is now at 2. Clamping alone returns 3, which is a
+        // different file. The user closed one file and silently got shown another.
+        assert_eq!(active_after_close(3, 1, 4), 2);
+    }
+
+    #[test]
+    fn closing_a_tab_right_of_the_active_one_leaves_it_alone() {
+        // Nothing before the active tab moved, so neither should the selection.
+        assert_eq!(active_after_close(0, 1, 2), 0);
+        assert_eq!(active_after_close(1, 3, 3), 1);
+    }
+
+    #[test]
+    fn closing_the_active_tab_selects_the_one_that_took_its_place() {
+        // ⌘W's case, and the only one the old clamp got right: the neighbour that slid into
+        // the slot becomes active.
+        assert_eq!(active_after_close(1, 1, 3), 1);
+        // Closing the last tab has no successor, so it falls back to the new last one.
+        assert_eq!(active_after_close(2, 2, 2), 1);
+        // Closing the only tab leaves nothing; index 0 is what an empty tab bar renders as.
+        assert_eq!(active_after_close(0, 0, 0), 0);
     }
 
     #[test]
