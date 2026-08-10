@@ -387,8 +387,27 @@ impl Client {
         )
     }
 
+    /// Issues a hover request without waiting.
+    ///
+    /// Hover fires on cursor movement, so it has the same superseding problem
+    /// completion does: the answer to where the pointer *was* is not worth showing.
+    pub fn request_hover(&self, uri: &Uri, offset: usize) -> Result<RequestId> {
+        self.send_request(
+            lsp_types::request::HoverRequest::METHOD,
+            self.text_document_position(uri, offset)?,
+        )
+    }
+
     pub fn definition(&self, uri: &Uri, offset: usize) -> Result<Option<GotoDefinitionResponse>> {
         self.request(
+            lsp_types::request::GotoDefinition::METHOD,
+            self.text_document_position(uri, offset)?,
+        )
+    }
+
+    /// Issues a go-to-definition request without waiting.
+    pub fn request_definition(&self, uri: &Uri, offset: usize) -> Result<RequestId> {
+        self.send_request(
             lsp_types::request::GotoDefinition::METHOD,
             self.text_document_position(uri, offset)?,
         )
@@ -400,15 +419,40 @@ impl Client {
         offset: usize,
         include_declaration: bool,
     ) -> Result<Option<Vec<Location>>> {
-        let mut params = self.text_document_position(uri, offset)?;
-        params["context"] = json!({ "includeDeclaration": include_declaration });
-        self.request(lsp_types::request::References::METHOD, params)
+        self.request(
+            lsp_types::request::References::METHOD,
+            self.reference_params(uri, offset, include_declaration)?,
+        )
+    }
+
+    /// Issues a find-references request without waiting.
+    ///
+    /// The one most worth cancelling: a whole-project search is the slowest thing a
+    /// server does, and abandoning it is how the user closes the panel without waiting.
+    pub fn request_references(
+        &self,
+        uri: &Uri,
+        offset: usize,
+        include_declaration: bool,
+    ) -> Result<RequestId> {
+        self.send_request(
+            lsp_types::request::References::METHOD,
+            self.reference_params(uri, offset, include_declaration)?,
+        )
     }
 
     pub fn document_symbols(&self, uri: &Uri) -> Result<Option<DocumentSymbolResponse>> {
         self.request(
             lsp_types::request::DocumentSymbolRequest::METHOD,
-            json!({ "textDocument": { "uri": uri } }),
+            self.document_symbol_params(uri)?,
+        )
+    }
+
+    /// Issues a document-symbol request without waiting.
+    pub fn request_document_symbols(&self, uri: &Uri) -> Result<RequestId> {
+        self.send_request(
+            lsp_types::request::DocumentSymbolRequest::METHOD,
+            self.document_symbol_params(uri)?,
         )
     }
 
@@ -417,6 +461,35 @@ impl Client {
             lsp_types::request::SignatureHelpRequest::METHOD,
             self.text_document_position(uri, offset)?,
         )
+    }
+
+    /// Issues a signature-help request without waiting.
+    pub fn request_signature_help(&self, uri: &Uri, offset: usize) -> Result<RequestId> {
+        self.send_request(
+            lsp_types::request::SignatureHelpRequest::METHOD,
+            self.text_document_position(uri, offset)?,
+        )
+    }
+
+    fn reference_params(
+        &self,
+        uri: &Uri,
+        offset: usize,
+        include_declaration: bool,
+    ) -> Result<Value> {
+        let mut params = self.text_document_position(uri, offset)?;
+        params["context"] = json!({ "includeDeclaration": include_declaration });
+        Ok(params)
+    }
+
+    /// Rejects a document the server was never told about, exactly as
+    /// [`Client::text_document_position`] does — a symbol request carries no position,
+    /// but asking about an unopened file is the same caller mistake either way.
+    fn document_symbol_params(&self, uri: &Uri) -> Result<Value> {
+        if self.document(uri).is_none() {
+            bail!("{} is not open on the {} language server", uri.as_str(), self.name);
+        }
+        Ok(json!({ "textDocument": { "uri": uri } }))
     }
 
     fn text_document_position(&self, uri: &Uri, offset: usize) -> Result<Value> {

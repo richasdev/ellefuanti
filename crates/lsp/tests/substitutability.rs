@@ -184,6 +184,51 @@ fn no_php_specific_behaviour_is_baked_in() {
 }
 
 #[test]
+fn request_methods_come_from_lsp_types_not_hand_written_strings() {
+    // Each typed request method is a new place a `"textDocument/…"` literal could be
+    // typed by hand, and a hand-written method name is how a server-specific extension
+    // (`intelephense/index`, `phpactor/…`) gets sent without anything noticing — the
+    // request is spelled out in full rather than named by the protocol crate, so no
+    // backend name has to appear for the client to stop being generic.
+    //
+    // Using `lsp_types::request::*::METHOD` keeps the set of reachable methods to the
+    // ones the specification defines. `$/cancelRequest` and the `client/*` replies are
+    // the exceptions: they are protocol plumbing `lsp-types` gives no constant for.
+    const ALLOWED: [&str; 5] = [
+        "$/cancelRequest",
+        "client/registerCapability",
+        "client/unregisterCapability",
+        "workspace/configuration",
+        "window/workDoneProgress/create",
+    ];
+
+    let mut violations = Vec::new();
+
+    for file in rust_files(&src_dir()) {
+        let text = fs::read_to_string(&file).unwrap();
+        for line in shipped_code(&text).lines() {
+            // A method name is a string literal containing a `/` and no whitespace,
+            // which is what every LSP method and every vendor extension looks like on
+            // the wire. The whitespace exclusion is what keeps prose — log messages
+            // that happen to mention `$/cancelRequest` — from reading as a method.
+            for literal in line.split('"').skip(1).step_by(2) {
+                let looks_like_a_method =
+                    literal.contains('/') && !literal.contains(char::is_whitespace);
+                if looks_like_a_method && !ALLOWED.contains(&literal) {
+                    violations.push(format!("{}: {literal:?}", file.display()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "LSP method names must come from `lsp_types::request::*::METHOD`, not string literals, \
+         so this client can only send requests the specification defines. Found: {violations:?}"
+    );
+}
+
+#[test]
 fn the_crate_does_not_depend_on_gpui_or_tokio() {
     // ADR-0004 (only crates/app may use gpui) and ADR-0007 (no tokio). The workspace
     // test in crates/app covers gpui across all crates; this one also catches tokio,
