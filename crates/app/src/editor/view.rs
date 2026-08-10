@@ -24,16 +24,9 @@ use crate::actions::{
     Undo, context,
 };
 use crate::editor::state::Document;
+use crate::fonts::Fonts;
 use crate::lsp_session::Severity;
 use crate::theme::{Metrics, Theme, Themed};
-
-/// Monospace family.
-///
-/// `Menlo` ships with macOS itself. `SF Mono` does *not* — it comes with Xcode/Terminal —
-/// and a missing family does not error: gpui's `resolve_font` silently falls back to a
-/// proportional font, which would break every column calculation below in a way that
-/// looks like a layout bug rather than a missing font.
-pub const FONT_FAMILY: &str = "Menlo";
 
 /// How much text may be measured to map a click to a column.
 ///
@@ -436,8 +429,9 @@ impl EditorView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let fonts = Fonts::get(cx);
         let line = self.document.buffer.line(row);
-        let x = text_local_x(event.position.x, self.text_origin_x);
+        let x = text_local_x(event.position.x, self.text_origin_x, &fonts);
 
         let column = if line.is_empty() || x <= px(0.0) {
             0
@@ -445,7 +439,7 @@ impl EditorView {
             let measured = &line[..line.len().min(MAX_MEASURE_BYTES)];
             let runs = [TextRun {
                 len: measured.len(),
-                font: gpui::font(FONT_FAMILY),
+                font: fonts.font(),
                 color: gpui::white(),
                 background_color: None,
                 underline: None,
@@ -455,7 +449,7 @@ impl EditorView {
             // end of the line — clamping is what a click past end-of-line should do.
             window
                 .text_system()
-                .layout_line(measured, Metrics::FONT_SIZE, &runs, None)
+                .layout_line(measured, fonts.size, &runs, None)
                 .closest_index_for_x(x)
         };
 
@@ -475,6 +469,7 @@ impl Focusable for EditorView {
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let fonts = Fonts::get(cx);
         let row_count = self.document.buffer.len_lines();
         let cursor = self.document.cursor_point();
         let entity = cx.entity();
@@ -528,8 +523,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::paste))
             .size_full()
             .bg(theme.background)
-            .font_family(FONT_FAMILY)
-            .text_size(Metrics::FONT_SIZE)
+            .font_family(fonts.family.clone())
+            .text_size(fonts.size)
             .text_color(theme.text)
             .child(
                 // uniform_list calls back only for visible rows, so a 50k-line file costs
@@ -555,6 +550,7 @@ impl EditorView {
         self.visible_rows = range.clone();
 
         let theme = cx.theme().clone();
+        let fonts = Fonts::get(cx);
         let selection = self.document.selection.range();
 
         // Highlight once for the whole visible band rather than per row: one tree walk
@@ -609,14 +605,14 @@ impl EditorView {
                         });
                     })
                     .flex()
-                    .h(Metrics::LINE_HEIGHT)
+                    .h(fonts.line_height())
                     .w_full()
                     .when(row_selected, |el| el.bg(theme.selection))
                     .when(is_cursor_row && !row_selected, |el| el.bg(theme.hover))
                     .child(
                         // Gutter. Right-aligned so digits line up as numbers grow.
                         div()
-                            .w(Metrics::GUTTER_WIDTH)
+                            .w(fonts.gutter_width())
                             .flex()
                             .flex_none()
                             .justify_end()
@@ -825,27 +821,32 @@ fn merge_underline(
 /// Turns a window-relative click x into an x relative to the start of the text.
 ///
 /// Split out as a free function because the subtraction is the whole bug: the original
-/// version subtracted only [`Metrics::GUTTER_WIDTH`] from a **window**-relative
-/// coordinate, ignoring the activity bar and the sidebar the row sits inside. Every click
-/// therefore resolved a column far to the right of the character under the pointer, and
-/// no click could reach column 0 at all, because the smallest x a row could ever receive
-/// was already well past the gutter.
+/// version subtracted only the gutter width from a **window**-relative coordinate,
+/// ignoring the activity bar and the sidebar the row sits inside. Every click therefore
+/// resolved a column far to the right of the character under the pointer, and no click
+/// could reach column 0 at all, because the smallest x a row could ever receive was
+/// already well past the gutter.
 ///
 /// `origin` is the measured text origin. Until the first prepaint there is none, and
 /// [`fallback_text_origin_x`] stands in — it is the full chrome offset, not the gutter
 /// alone. The result is clamped at zero so a click in the gutter, or anywhere left of the
 /// text, lands on column 0 instead of going negative.
-fn text_local_x(window_x: Pixels, origin: Option<Pixels>) -> Pixels {
-    let origin = origin.unwrap_or_else(fallback_text_origin_x);
+fn text_local_x(window_x: Pixels, origin: Option<Pixels>, fonts: &Fonts) -> Pixels {
+    let origin = origin.unwrap_or_else(|| fallback_text_origin_x(fonts));
     (window_x - origin).max(px(0.0))
 }
 
 /// Where the text column sits before the first prepaint has measured it.
 ///
 /// Activity bar + sidebar + gutter. A guess, but the *right* guess for the default layout,
-/// where the old code's `GUTTER_WIDTH` was out by 284 px.
-fn fallback_text_origin_x() -> Pixels {
-    Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + Metrics::GUTTER_WIDTH
+/// where the old code's gutter-only version was out by 284 px.
+///
+/// Takes the fonts because the gutter is derived from the font size now (#49). A constant
+/// here would be a *second* place the gutter width is decided, and the two would disagree
+/// the moment someone zoomed — reintroducing the same class of bug in the fallback path,
+/// which is the path nothing has measured yet.
+fn fallback_text_origin_x(fonts: &Fonts) -> Pixels {
+    Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + fonts.gutter_width()
 }
 
 /// Largest char boundary <= `index`.
@@ -874,21 +875,22 @@ mod tests {
 
     #[test]
     fn a_click_on_the_first_character_maps_to_the_start_of_the_text() {
-        // The bug this pins: the old code subtracted only GUTTER_WIDTH from a
+        // The bug this pins: the old code subtracted only the gutter width from a
         // *window*-relative x. Every row is nested inside the 44 px activity bar and the
         // 240 px sidebar, so a click on column 0 arrived at window x 336 and resolved to
-        // 336 - 52 = 284 px into the line — roughly 35 columns of Menlo 13 to the right of
-        // where the user actually clicked.
+        // 284 px into the line — roughly 35 columns of Menlo 13 to the right of where the
+        // user actually clicked.
+        let fonts = Fonts::default();
         let first_char_x =
-            Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + Metrics::GUTTER_WIDTH;
+            Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + fonts.gutter_width();
 
         assert_eq!(
-            text_local_x(first_char_x, None),
+            text_local_x(first_char_x, None, &fonts),
             px(0.0),
             "a click on the first character must resolve to the start of the line"
         );
         assert_eq!(
-            first_char_x - Metrics::GUTTER_WIDTH,
+            first_char_x - fonts.gutter_width(),
             px(284.0),
             "and the old arithmetic put it 284 px into the line instead"
         );
@@ -897,12 +899,13 @@ mod tests {
     #[test]
     fn the_measured_origin_wins_over_the_fallback() {
         // Prepaint reports where the text really is; a collapsed sidebar or an extra panel
-        // changes it, and the fallback constant must not override the measurement.
+        // changes it, and the fallback must not override the measurement.
+        let fonts = Fonts::default();
         let measured = px(96.0);
-        assert_eq!(text_local_x(px(150.0), Some(measured)), px(54.0));
+        assert_eq!(text_local_x(px(150.0), Some(measured), &fonts), px(54.0));
         assert_ne!(
-            text_local_x(px(150.0), Some(measured)),
-            text_local_x(px(150.0), None),
+            text_local_x(px(150.0), Some(measured), &fonts),
+            text_local_x(px(150.0), None, &fonts),
             "the measurement must actually be used"
         );
     }
@@ -913,8 +916,10 @@ mod tests {
         // newtype, so an unclamped subtraction yields a negative x rather than
         // underflowing — which `closest_index_for_x` would then resolve against, and which
         // no caller downstream is expecting.
-        for window_x in [px(0.0), px(10.0), px(300.0), fallback_text_origin_x() - px(1.0)] {
-            let x = text_local_x(window_x, None);
+        let fonts = Fonts::default();
+        let edge = fallback_text_origin_x(&fonts) - px(1.0);
+        for window_x in [px(0.0), px(10.0), px(300.0), edge] {
+            let x = text_local_x(window_x, None, &fonts);
             assert_eq!(x, px(0.0), "x={window_x:?} is left of the text and must clamp to 0");
             assert!(x >= px(0.0));
         }
@@ -922,13 +927,28 @@ mod tests {
 
     #[test]
     fn the_fallback_origin_is_the_whole_chrome_offset_not_just_the_gutter() {
-        // The regression guard: if someone "simplifies" this back to GUTTER_WIDTH, or adds
-        // a panel to the left of the editor without updating the fallback, this fails.
+        // The regression guard: if someone "simplifies" this back to the gutter alone, or
+        // adds a panel to the left of the editor without updating the fallback, this fails.
+        let fonts = Fonts::default();
         assert_eq!(
-            fallback_text_origin_x(),
-            Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + Metrics::GUTTER_WIDTH
+            fallback_text_origin_x(&fonts),
+            Metrics::ACTIVITY_BAR_WIDTH + Metrics::SIDEBAR_WIDTH + fonts.gutter_width()
         );
-        assert!(fallback_text_origin_x() > Metrics::GUTTER_WIDTH);
+        assert!(fallback_text_origin_x(&fonts) > fonts.gutter_width());
+    }
+
+    /// The gutter is derived now, so the fallback origin has to move with the font size —
+    /// otherwise a zoomed editor's pre-prepaint clicks land in the wrong column, in the one
+    /// path where nothing has measured the real origin yet.
+    #[test]
+    fn the_fallback_origin_follows_the_font_size() {
+        let small = Fonts { size: px(13.0), ..Fonts::default() };
+        let large = Fonts { size: px(20.0), ..Fonts::default() };
+
+        assert!(
+            fallback_text_origin_x(&large) > fallback_text_origin_x(&small),
+            "a wider gutter has to push the text origin right"
+        );
     }
 
     #[test]

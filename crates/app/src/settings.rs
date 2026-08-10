@@ -5,16 +5,21 @@
 //! crate has to hold — the twenty lines that turn a string into a `ThemeVariant` and a
 //! parse error into a log line.
 //!
-//! Only the theme is wired up. That is the whole point of #60: a settings *layer* with one
-//! real consumer proving it works, rather than a schema of keys nobody reads yet. Fonts
-//! (#49), scrollback (#70) and window geometry each add a pair of functions here when
-//! their issue lands.
+//! The theme and the fonts (#49) are wired up. Scrollback (#70) and window geometry add
+//! their pair of functions here when their issue lands.
+//!
+//! Fonts are the more interesting of the two, because reading them is not enough. A family
+//! from a settings file is a string a human typed, and gpui will render *something* for any
+//! string — a proportional fallback, silently, with every column wrong. So the read is
+//! followed by a resolution step that measures real glyph advances before accepting the
+//! answer; [`crate::fonts`] holds it and explains why no headless test can cover it.
 
 use std::path::PathBuf;
 
 use elle_settings::{Load, Settings};
-use gpui::{App, AppContext as _, Global};
+use gpui::{App, AppContext as _, Global, Pixels, px};
 
+use crate::fonts::{self, Fonts};
 use crate::theme::{ThemeVariant, set_theme};
 
 /// The settings document, live, plus where it came from.
@@ -54,6 +59,10 @@ pub fn load_and_apply(cx: &mut App) {
     let Some(path) = elle_settings::settings_path() else {
         tracing::warn!("HOME is unset; running on default settings and persisting nothing");
         set_theme(ThemeVariant::default(), cx);
+        // Still resolved rather than left at `Fonts::default()`: with no settings file the
+        // chain still has to be walked, because the default names Menlo and a machine
+        // without it needs the fallback just as much as a configured one does.
+        fonts::set_fonts(fonts::resolve(&Settings::default(), cx), cx);
         return;
     };
 
@@ -74,6 +83,7 @@ pub fn load_and_apply(cx: &mut App) {
     // `apply_named` rather than `theme_from`, so a name that is not a compiled-in variant
     // gets a chance to be a disk theme before it is treated as unrecognised.
     crate::themes::apply_named(settings.theme(), cx);
+    fonts::set_fonts(fonts::resolve(&settings, cx), cx);
 
     // A file we could not read does **not** become writable. `settings` here is defaults,
     // and installing it would mean the next theme toggle overwrote a file full of the
@@ -153,6 +163,53 @@ pub fn path_for_editing(cx: &mut App) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Applies a font-size change and records it, the same shape as [`persist_theme`].
+///
+/// `delta` is added to the current editor size; `None` resets to the default. The family is
+/// **not** re-resolved: it passed both checks at startup and a size change cannot make a
+/// monospaced font proportional, so zooming costs no text-system round trips.
+///
+/// The caller repaints. `WorkspaceView::zoom` calls `cx.refresh_windows()` for the same
+/// reason a theme switch does — the editor, terminal and palette are sibling entities that
+/// would otherwise keep their old sizes.
+///
+/// Returns the size actually applied, so the caller can say so in the status bar; at the
+/// clamp it is the same size twice, which is the honest answer.
+pub fn adjust_font_size(delta: Option<f32>, cx: &mut App) -> Pixels {
+    let current = Fonts::get(cx);
+
+    // The clamp lives in `elle-settings` and is the same one the file read uses, so a held
+    // ⌘- cannot walk the size below what a hand-edited file could contain. Going through a
+    // scratch `Settings` rather than duplicating the bounds here is what keeps that true —
+    // and a fresh `Settings::default()` already holds the default size, so `None` (reset)
+    // is the case where nothing is set at all.
+    let mut scratch = Settings::default();
+    if let Some(delta) = delta {
+        scratch.set_font_size(f32::from(current.size) + delta);
+    }
+    let size = px(scratch.font_size());
+
+    fonts::set_fonts(Fonts { size, ..current }, cx);
+
+    // Persistence is best-effort and separate: a zoom that cannot be saved is still a zoom.
+    if let Some(live) = cx.try_global::<LiveSettings>()
+        && live.settings.font_size() != f32::from(size)
+    {
+        let live = cx.global_mut::<LiveSettings>();
+        live.settings.set_font_size(f32::from(size));
+        let (settings, path) = (live.settings.clone(), live.path.clone());
+
+        cx.background_spawn(async move {
+            if let Err(err) = settings.save(&path) {
+                tracing::error!("could not save the font size: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    size
+}
+
 /// The compiled-in variant the settings named, or the default.
 ///
 /// An unrecognised name logs and falls back rather than failing, and — importantly — does
@@ -185,6 +242,20 @@ mod tests {
     #[test]
     fn the_default_theme_name_agrees_across_the_crate_boundary() {
         assert_eq!(Settings::default().theme(), ThemeVariant::default().name());
+    }
+
+    /// The same drift check for the fonts. `elle-settings` duplicates the sizes because it
+    /// cannot see `Fonts`, so nothing but this pins the two together — and a `Fonts::get`
+    /// that silently disagreed with a file read would be a first run that changes size the
+    /// moment anything writes settings.json.
+    #[test]
+    fn the_default_font_metrics_agree_across_the_crate_boundary() {
+        let settings = Settings::default();
+        let fonts = Fonts::default();
+
+        assert_eq!(px(settings.font_size()), fonts.size);
+        assert_eq!(px(settings.ui_font_size()), fonts.ui_size);
+        assert_eq!(settings.line_height(), fonts.line_height_ratio);
     }
 
     #[test]
@@ -348,5 +419,91 @@ mod tests {
             written,
             "no LiveSettings global means no persistence"
         );
+    }
+
+    // --- zoom (#49) ---------------------------------------------------------------------
+
+    /// ⌘+, ⌘-, ⌘0, through the real handler and out to a real file.
+    ///
+    /// Deliberately *not* a test of the resolved family — that needs real glyph metrics and
+    /// the test platform has none (see `crate::fonts`). What is checkable headlessly is the
+    /// wiring: that a zoom reaches the `Fonts` global, that it reaches the file, and that
+    /// ⌘0 goes back to the default rather than to wherever the deltas happened to land.
+    #[gpui::test]
+    async fn zooming_changes_the_size_and_saves_it(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        cx.update(|cx| {
+            let settings = Settings::load(&path).settings;
+            set_theme(theme_from(&settings), cx);
+            fonts::set_fonts(Fonts::default(), cx);
+            cx.set_global(LiveSettings { settings, path: path.clone() });
+        });
+
+        let default = f32::from(Fonts::default().size);
+
+        cx.update(|cx| {
+            assert_eq!(adjust_font_size(Some(1.0), cx), px(default + 1.0));
+            assert_eq!(adjust_font_size(Some(1.0), cx), px(default + 2.0));
+            assert_eq!(adjust_font_size(Some(-1.0), cx), px(default + 1.0));
+        });
+        cx.background_executor.run_until_parked();
+
+        assert_eq!(
+            Settings::load(&path).settings.font_size(),
+            default + 1.0,
+            "a zoom must survive the process that made it"
+        );
+
+        // ⌘0. Back to the default, not to the last value before a zoom — the reset has no
+        // history to consult and must not grow one.
+        cx.update(|cx| assert_eq!(adjust_font_size(None, cx), px(default)));
+        cx.background_executor.run_until_parked();
+        assert_eq!(Settings::load(&path).settings.font_size(), default);
+    }
+
+    /// A held ⌘- must stop at the clamp rather than walking to an invisible editor, and the
+    /// clamp must be `elle-settings`' one — not a second copy in the zoom handler that
+    /// could drift from what a hand-edited file is allowed to contain.
+    #[gpui::test]
+    async fn holding_zoom_out_stops_at_the_clamp(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            set_theme(ThemeVariant::default(), cx);
+            fonts::set_fonts(Fonts::default(), cx);
+
+            // Far more presses than it takes to reach the floor from the default.
+            let mut size = Fonts::get(cx).size;
+            for _ in 0..200 {
+                size = adjust_font_size(Some(-1.0), cx);
+            }
+
+            assert!(size > px(0.0), "the editor must still have visible text, got {size:?}");
+            // Whatever the floor is, a file may hold it: the getter agrees with the setter.
+            let mut floor = Settings::default();
+            floor.set_font_size(f32::from(size));
+            assert_eq!(px(floor.font_size()), size, "the zoom clamp is the settings clamp");
+        });
+    }
+
+    /// The same no-persistence guarantee the theme has, for the same reason: without it
+    /// every render test that zoomed would rewrite the developer's real settings.json.
+    #[gpui::test]
+    async fn zooming_with_no_live_settings_writes_nothing(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        cx.update(|cx| {
+            set_theme(ThemeVariant::default(), cx);
+            fonts::set_fonts(Fonts::default(), cx);
+            adjust_font_size(Some(3.0), cx);
+        });
+        cx.background_executor.run_until_parked();
+
+        assert!(!path.exists(), "no LiveSettings global means no file");
+        // The change still applied in memory — not persisting is not the same as not working.
+        cx.update(|cx| {
+            assert_eq!(Fonts::get(cx).size, px(f32::from(Fonts::default().size) + 3.0));
+        });
     }
 }

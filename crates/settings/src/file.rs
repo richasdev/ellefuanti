@@ -21,6 +21,41 @@ const THEME_KEY: &str = "theme";
 /// pins the two together, so a change to either without the other fails.
 const DEFAULT_THEME: &str = "dark";
 
+/// Font keys, VS Code's names so a settings file reads the way people expect.
+///
+/// `editor.fontFamily` is deliberately absent from the defaults below: "no family
+/// configured" is a distinct state from "the user asked for Menlo", because the app walks a
+/// fallback chain when nobody has chosen (#49). A default here would name one family and
+/// make that chain unreachable.
+const FONT_FAMILY_KEY: &str = "editor.fontFamily";
+const FONT_SIZE_KEY: &str = "editor.fontSize";
+const UI_FONT_SIZE_KEY: &str = "ui.fontSize";
+const LINE_HEIGHT_KEY: &str = "editor.lineHeight";
+
+/// The sizes and ratio a first run gets — the constants this replaced in `theme.rs`.
+///
+/// `LINE_HEIGHT` is a *multiplier*, not pixels: 20px against 13px text is a ratio someone
+/// chose once and it stops meaning anything at 20px text. 20/13 is 1.538, rounded to the
+/// 1.5 that every other editor defaults to — a third of a pixel at the old size, and
+/// correct at every other size.
+const DEFAULT_FONT_SIZE: f32 = 13.0;
+const DEFAULT_UI_FONT_SIZE: f32 = 12.0;
+const DEFAULT_LINE_HEIGHT: f32 = 1.5;
+
+/// What a font size is allowed to be.
+///
+/// Clamped rather than rejected, because the failure is not symmetric: `"editor.fontSize":
+/// 0` is a window of invisible text with no way to open settings and fix it, and a negative
+/// size reaches gpui's layout as a negative `Pixels`. The bounds are generous enough that
+/// nobody with a real preference meets them.
+const MIN_FONT_SIZE: f32 = 6.0;
+const MAX_FONT_SIZE: f32 = 96.0;
+
+/// What a line-height multiplier is allowed to be. Below 1.0 rows overlap; above 3.0 is
+/// not a preference anyone holds, and both ends are cheaper to clamp than to explain.
+const MIN_LINE_HEIGHT: f32 = 1.0;
+const MAX_LINE_HEIGHT: f32 = 3.0;
+
 /// What went wrong reading a settings file, in terms the user can act on.
 ///
 /// Never a reason not to launch. Every variant here resolves to "run on defaults", and the
@@ -187,6 +222,73 @@ impl Settings {
     /// recognised or not, is untouched.
     pub fn set_theme(&mut self, name: &str) {
         self.document.insert(THEME_KEY.to_string(), Value::String(name.to_string()));
+    }
+
+    /// The font family the user asked for, or `None` if they did not ask.
+    ///
+    /// `None` is not "Menlo". Whether the named family even exists, and whether it is
+    /// monospaced, is the app's question — this crate cannot open a font (ADR-0004), and
+    /// answering "is Comic Sans monospaced" from here would mean guessing. So an absent key
+    /// means "walk the fallback chain" and a present one means "try this first", and the
+    /// app decides what either resolves to.
+    pub fn font_family(&self) -> Option<&str> {
+        match self.document.get(FONT_FAMILY_KEY)? {
+            Value::String(family) => Some(family),
+            other => {
+                tracing::warn!(
+                    key = FONT_FAMILY_KEY,
+                    found = type_name(other),
+                    "settings: expected a string, using the default"
+                );
+                None
+            }
+        }
+    }
+
+    /// Editor text size in pixels, clamped to something legible.
+    pub fn font_size(&self) -> f32 {
+        self.number(FONT_SIZE_KEY, DEFAULT_FONT_SIZE).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    }
+
+    /// Size of the chrome — tabs, sidebar, status bar. Independent of the editor's,
+    /// because someone reading code at 18px does not want an 18px status bar.
+    pub fn ui_font_size(&self) -> f32 {
+        self.number(UI_FONT_SIZE_KEY, DEFAULT_UI_FONT_SIZE).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    }
+
+    /// Line height as a multiple of the editor font size, clamped so rows cannot overlap.
+    pub fn line_height(&self) -> f32 {
+        self.number(LINE_HEIGHT_KEY, DEFAULT_LINE_HEIGHT).clamp(MIN_LINE_HEIGHT, MAX_LINE_HEIGHT)
+    }
+
+    /// Writes the editor font size. Used by the zoom actions, which are the only thing that
+    /// changes a size without the user opening the file.
+    pub fn set_font_size(&mut self, size: f32) {
+        let size = f64::from(size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        self.document.insert(FONT_SIZE_KEY.to_string(), Value::from(size));
+    }
+
+    /// A numeric key, or its default if absent or the wrong type.
+    ///
+    /// No `is_finite` guard, and that is checked rather than assumed: `serde_json` has no
+    /// `NaN` or `Infinity` literals and rejects an out-of-range `1e400` as *malformed JSON*
+    /// at parse time, so a `Value::Number` that reached this document is finite. The
+    /// caller's `clamp` handles the rest, and a `clamp` on a finite `f32` cannot produce
+    /// one that is not. A guard here was written first and removed once the parse error
+    /// proved it unreachable — see the test.
+    fn number(&self, key: &str, default: f32) -> f32 {
+        match self.document.get(key) {
+            Some(Value::Number(number)) => number.as_f64().unwrap_or(f64::from(default)) as f32,
+            Some(other) => {
+                tracing::warn!(
+                    key,
+                    found = type_name(other),
+                    "settings: expected a number, using the default"
+                );
+                default
+            }
+            None => default,
+        }
     }
 
     /// Serialises to the exact bytes [`Settings::save`] writes.
@@ -369,5 +471,131 @@ mod tests {
     #[test]
     fn the_written_file_ends_in_a_newline() {
         assert!(Settings::default().to_json().ends_with("}\n"));
+    }
+
+    // --- fonts (#49) --------------------------------------------------------------------
+
+    #[test]
+    fn no_font_keys_at_all_gives_the_old_compiled_in_values() {
+        // These were `Metrics::FONT_SIZE` and friends until #49. A first run must look
+        // exactly like the build before the setting existed.
+        let settings = Settings::default();
+        assert_eq!(settings.font_family(), None, "absent means 'walk the fallback chain'");
+        assert_eq!(settings.font_size(), 13.0);
+        assert_eq!(settings.ui_font_size(), 12.0);
+        assert_eq!(settings.line_height(), 1.5);
+    }
+
+    #[test]
+    fn the_font_keys_read_back_what_was_written() {
+        let text = r#"{
+            "editor.fontFamily": "Berkeley Mono",
+            "editor.fontSize": 16,
+            "ui.fontSize": 14,
+            "editor.lineHeight": 1.8
+        }"#;
+        let settings = Settings::parse(&path(), text).unwrap();
+
+        assert_eq!(settings.font_family(), Some("Berkeley Mono"));
+        assert_eq!(settings.font_size(), 16.0);
+        assert_eq!(settings.ui_font_size(), 14.0);
+        assert_eq!(settings.line_height(), 1.8);
+    }
+
+    /// A family this build cannot use keeps its spelling, exactly as a theme name does.
+    ///
+    /// Whether "Comic Sans" is monospaced is not decidable here (ADR-0004) — the app
+    /// refuses it against real font metrics. What this pins is that refusing it must not
+    /// mean *rewriting* it, or the user loses the typo they need to see.
+    #[test]
+    fn a_font_family_this_crate_cannot_judge_is_kept_verbatim() {
+        let mut settings =
+            Settings::parse(&path(), r#"{"editor.fontFamily": "Comic Sans"}"#).unwrap();
+        assert_eq!(settings.font_family(), Some("Comic Sans"));
+
+        settings.set_theme("light");
+        assert!(settings.to_json().contains("Comic Sans"), "{}", settings.to_json());
+    }
+
+    /// Sizes are clamped rather than rejected, and the reason is asymmetric: a 0px editor
+    /// is a window of invisible text with no way to open settings and fix it.
+    #[test]
+    fn a_size_that_would_make_the_editor_unusable_is_clamped() {
+        for (json, expected) in [
+            (r#"{"editor.fontSize": 0}"#, MIN_FONT_SIZE),
+            (r#"{"editor.fontSize": -13}"#, MIN_FONT_SIZE),
+            (r#"{"editor.fontSize": 100000}"#, MAX_FONT_SIZE),
+        ] {
+            let settings = Settings::parse(&path(), json).unwrap();
+            assert_eq!(settings.font_size(), expected, "{json}");
+            assert!(settings.font_size().is_finite());
+        }
+    }
+
+    /// Why [`Settings::number`] has no `is_finite` guard.
+    ///
+    /// It had one, defending against `1e400` parsing to `f64::INFINITY` and surviving
+    /// `clamp` as infinity. It cannot: serde_json rejects an out-of-range float as
+    /// malformed JSON before a `Value::Number` ever exists, so the whole file falls back to
+    /// defaults — the branch was unreachable. This pins the parser behaviour the removal
+    /// depends on, so a serde_json that starts accepting `1e400` as infinity fails here
+    /// rather than in someone's layout.
+    #[test]
+    fn an_out_of_range_float_is_a_parse_error_not_an_infinity() {
+        let error = Settings::parse(&path(), r#"{"editor.fontSize": 1e400}"#)
+            .expect_err("serde_json must reject this rather than yield infinity");
+        assert!(matches!(error, SettingsError::Malformed { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_line_height_below_one_would_overlap_rows_and_is_clamped() {
+        let settings = Settings::parse(&path(), r#"{"editor.lineHeight": 0.2}"#).unwrap();
+        assert_eq!(settings.line_height(), MIN_LINE_HEIGHT);
+    }
+
+    /// The old absolute pixel value, typed into the new multiplier key.
+    ///
+    /// Someone migrating by hand will write `20`. That is not 20 px of line — it is a 20x
+    /// multiplier, i.e. a 260 px row — so the clamp is what stands between them and one
+    /// visible line of code. Not silently reinterpreted as pixels: guessing which of two
+    /// units a number meant is how a setting becomes unpredictable.
+    #[test]
+    fn the_old_absolute_line_height_clamps_instead_of_producing_a_260px_row() {
+        let settings = Settings::parse(&path(), r#"{"editor.lineHeight": 20}"#).unwrap();
+        assert_eq!(settings.line_height(), MAX_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn a_font_key_of_the_wrong_type_falls_back_without_touching_its_neighbours() {
+        let text = r#"{"editor.fontFamily": 12, "editor.fontSize": "big", "theme": "light"}"#;
+        let settings = Settings::parse(&path(), text).unwrap();
+
+        assert_eq!(settings.font_family(), None);
+        assert_eq!(settings.font_size(), DEFAULT_FONT_SIZE);
+        assert_eq!(settings.theme(), "light", "one bad key costs one key");
+    }
+
+    #[test]
+    fn setting_the_font_size_leaves_every_other_key_alone() {
+        let mut settings =
+            Settings::parse(&path(), r#"{"theme": "light", "editor.fontFamily": "Menlo"}"#)
+                .unwrap();
+        settings.set_font_size(18.0);
+
+        assert_eq!(settings.font_size(), 18.0);
+        assert_eq!(settings.theme(), "light");
+        assert_eq!(settings.font_family(), Some("Menlo"));
+    }
+
+    /// The zoom actions call this in a loop; the clamp has to hold at the setter too, or a
+    /// held ⌘- walks the size to zero and writes it to the file.
+    #[test]
+    fn the_setter_clamps_as_well_as_the_getter() {
+        let mut settings = Settings::default();
+        settings.set_font_size(-5.0);
+        assert_eq!(settings.font_size(), MIN_FONT_SIZE);
+
+        settings.set_font_size(1_000.0);
+        assert_eq!(settings.font_size(), MAX_FONT_SIZE);
     }
 }

@@ -21,9 +21,16 @@
 //! - **One bad key costs one key.** A value of the wrong type falls back to that key's
 //!   default and logs; it does not discard the other twenty keys around it.
 //!
-//! Only [`Settings::theme`] exists so far. It is deliberately one real consumer rather
-//! than a speculative schema: fonts (#49), scrollback (#70) and window geometry each add
-//! their accessor pair when the issue that needs them lands.
+//! [`Settings::theme`] and the font keys (#49) exist. Each arrived with the issue that
+//! needed it rather than as a speculative schema; scrollback (#70) and window geometry add
+//! their accessor pair the same way.
+//!
+//! The font keys are where the "one bad key costs one key" rule earns its keep. A size is
+//! *clamped*, not rejected, because `"editor.fontSize": 0` is a window of invisible text
+//! with no way to open settings and fix it. `editor.fontFamily` is the one key with no
+//! default: this crate cannot open a font, so whether a family exists and is monospaced is
+//! the app's question (ADR-0004), and an absent key means "walk the fallback chain" rather
+//! than naming one family here and making that chain unreachable.
 
 mod file;
 mod paths;

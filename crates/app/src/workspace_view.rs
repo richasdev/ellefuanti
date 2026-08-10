@@ -12,12 +12,13 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, Dispatch, GoToRoute, NewFile, NewTerminal, OpenFolder, OpenSettings, Save,
-    ToggleCommandPalette, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context,
-    dispatch_for,
+    CloseTab, DecreaseFontSize, Dispatch, GoToRoute, IncreaseFontSize, NewFile, NewTerminal,
+    OpenFolder, OpenSettings, ResetFontSize, Save, ToggleCommandPalette, ToggleHiddenFiles,
+    ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
 };
 use crate::editor::{Document, EditorView};
 use crate::file_cache;
+use crate::fonts::Fonts;
 use crate::icons;
 use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
@@ -264,6 +265,22 @@ impl WorkspaceView {
     fn toggle_theme(&mut self, _: &ToggleTheme, _w: &mut Window, cx: &mut Context<Self>) {
         let label = crate::themes::cycle(cx);
         self.status = Some(format!("Theme: {label}").into());
+        cx.refresh_windows();
+    }
+
+    /// ⌘+ / ⌘- / ⌘0 (#49).
+    ///
+    /// Turned out to be cheap, which is why it is here: nothing caches a size. Every view
+    /// reads `Fonts::get(cx)` inside its own `render`, so a new size plus the
+    /// `refresh_windows` a theme switch already needed *is* the re-layout — gpui rebuilds
+    /// the element tree and taffy measures it again. No re-layout plumbing was added.
+    ///
+    /// One step is 1px rather than a ratio. At the sizes anyone reads code at, 13→14 is the
+    /// adjustment people actually want, and a 1.1x step gives 14.3 and a half-pixel
+    /// baseline for nothing.
+    fn zoom(&mut self, delta: Option<f32>, cx: &mut Context<Self>) {
+        let size = crate::settings::adjust_font_size(delta, cx);
+        self.status = Some(format!("Font size: {}px", f32::from(size)).into());
         cx.refresh_windows();
     }
 
@@ -1234,12 +1251,15 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
+            .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
+            .on_action(cx.listener(|this, _: &ResetFontSize, _w, cx| this.zoom(None, cx)))
             .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.background)
-            .text_size(Metrics::UI_FONT_SIZE)
+            .text_size(Fonts::get(cx).ui_size)
             .text_color(theme.text)
             .child(
                 div()

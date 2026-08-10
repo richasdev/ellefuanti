@@ -23,7 +23,7 @@ use gpui::{
 };
 
 use crate::actions::{Copy, NewTerminal, Paste, SelectAll, context};
-use crate::editor::FONT_FAMILY;
+use crate::fonts::Fonts;
 use crate::theme::{Metrics, Theme, Themed};
 
 /// How often the panel checks for new PTY output.
@@ -35,13 +35,11 @@ use crate::theme::{Metrics, Theme, Themed};
 /// smaller change and the cost is only paid while the panel is open.
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Character-cell width, as a fraction of the font size.
-///
-/// Menlo's advance width is 0.6 em. Hardcoded rather than measured because the grid is
-/// laid out per row (one `StyledText` per line, not per cell), so this only decides how
-/// many columns fit the panel width — being a fraction of a pixel out costs nothing,
-/// where measuring per frame would cost a text-system round trip.
-const CELL_WIDTH_RATIO: f32 = 0.6;
+// The cell width and row height that used to be `CELL_WIDTH_RATIO` here and
+// `Metrics::TERMINAL_LINE_HEIGHT` in `theme.rs` now come from `Fonts::cell_size` (#49).
+// Both derive from the editor font size, so ⌘+ scales the terminal too — the flat 16px row
+// was why a zoomed terminal overlapped its own rows. One function returning both is what
+// keeps the three consumers below (layout, PTY resize, selection hit-testing) agreeing.
 
 pub struct TerminalView {
     focus_handle: FocusHandle,
@@ -295,17 +293,21 @@ impl TerminalView {
     /// `None` before the grid has been laid out. Falling back to the window origin would
     /// silently map the click several rows off — better to ignore a click that arrives
     /// before the first frame than to anchor a selection to the wrong text.
+    /// The cell size has to be the one the grid was *drawn* with, or a click lands on the
+    /// wrong row — which is why it comes from [`Fonts::cell_size`] here, in `sync_size` and
+    /// in `render_grid` rather than from three copies of the same arithmetic.
     fn point_at(
         &self,
         position: Point<Pixels>,
         geometry: GridGeometry,
+        cell: (Pixels, Pixels),
     ) -> Option<elle_terminal::SelectionPoint> {
         let origin = self.grid_origin?;
         Some(elle_terminal::cell_at(
             f32::from(position.x - origin.x),
             f32::from(position.y - origin.y),
-            f32::from(Metrics::FONT_SIZE * CELL_WIDTH_RATIO),
-            f32::from(Metrics::TERMINAL_LINE_HEIGHT),
+            f32::from(cell.0),
+            f32::from(cell.1),
             geometry,
         ))
     }
@@ -320,8 +322,9 @@ impl TerminalView {
         // reach the shell rather than whatever had focus before.
         window.focus(&self.focus_handle);
 
+        let cell = Fonts::get(cx).cell_size();
         let Some(geometry) = self.geometry() else { return };
-        let Some(point) = self.point_at(event.position, geometry) else { return };
+        let Some(point) = self.point_at(event.position, geometry, cell) else { return };
 
         // gpui reports a running click count, so the mode falls straight out of it.
         let mode = match event.click_count {
@@ -344,8 +347,9 @@ impl TerminalView {
         if !self.dragging {
             return;
         }
+        let cell = Fonts::get(cx).cell_size();
         let Some(geometry) = self.geometry() else { return };
-        let Some(point) = self.point_at(event.position, geometry) else { return };
+        let Some(point) = self.point_at(event.position, geometry, cell) else { return };
 
         if let Some(selection) = self.selection.as_mut()
             && selection.head != point
@@ -436,11 +440,13 @@ impl TerminalView {
     /// Called from render, where the pixel size is known, but only acts on a *change* — a
     /// resize syscall plus a grid reflow on every frame would be wasteful and would fight
     /// the shell's own redraw.
-    fn sync_size(&mut self, width: gpui::Pixels, height: gpui::Pixels) {
-        let cell_width = Metrics::FONT_SIZE * CELL_WIDTH_RATIO;
-        let cols = (f32::from(width) / f32::from(cell_width)).floor().max(1.0) as u16;
-        let rows =
-            (f32::from(height) / f32::from(Metrics::TERMINAL_LINE_HEIGHT)).floor().max(1.0) as u16;
+    /// `cell` must be the size the grid is actually drawn at. Telling the PTY it has more
+    /// rows than are rendered means the shell writes to lines nobody sees and its output
+    /// garbles — a worse failure than misalignment, and the reason this takes the cell size
+    /// from the same [`Fonts::cell_size`] the renderer uses rather than recomputing it.
+    fn sync_size(&mut self, width: gpui::Pixels, height: gpui::Pixels, cell: (Pixels, Pixels)) {
+        let cols = (f32::from(width) / f32::from(cell.0)).floor().max(1.0) as u16;
+        let rows = (f32::from(height) / f32::from(cell.1)).floor().max(1.0) as u16;
 
         if (rows, cols) != self.grid_size {
             self.grid_size = (rows, cols);
@@ -595,6 +601,8 @@ impl TerminalView {
         let entity = cx.entity();
         let geometry = GridGeometry::of(&snapshot);
         let selection = self.selection;
+        let fonts = Fonts::get(cx);
+        let cell = fonts.cell_size();
 
         div()
             .id("terminal-body")
@@ -602,8 +610,8 @@ impl TerminalView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .font_family(FONT_FAMILY)
-            .text_size(Metrics::FONT_SIZE)
+            .font_family(fonts.family.clone())
+            .text_size(fonts.size)
             // Down/move/up rather than a drag handler: a drag that leaves the panel must
             // keep extending the selection to the edge, and gpui only delivers moves
             // outside an element's bounds while a button is held.
@@ -621,7 +629,7 @@ impl TerminalView {
                 gpui::canvas(
                     move |bounds, _window, cx| {
                         entity.update(cx, |this, _cx| {
-                            this.sync_size(bounds.size.width, bounds.size.height);
+                            this.sync_size(bounds.size.width, bounds.size.height, cell);
                         });
                     },
                     |_, _, _, _| {},
@@ -629,8 +637,15 @@ impl TerminalView {
                 .absolute()
                 .size_full(),
             )
-            .children(self.render_status_banner(status, theme))
-            .child(self.render_grid_measured(&snapshot, geometry, selection.as_ref(), theme, cx))
+            .children(self.render_status_banner(status, theme, fonts.ui_size))
+            .child(self.render_grid_measured(
+                &snapshot,
+                geometry,
+                selection.as_ref(),
+                theme,
+                &fonts,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -645,6 +660,7 @@ impl TerminalView {
         geometry: GridGeometry,
         selection: Option<&Selection>,
         theme: &Theme,
+        fonts: &Fonts,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let entity = cx.entity();
@@ -665,7 +681,16 @@ impl TerminalView {
                 .absolute()
                 .size_full(),
             )
-            .child(render_grid(snapshot, geometry, selection, theme))
+            // `cell_size().1`, not a row height computed here: the same call `sync_size`
+            // makes, so what is drawn and what the PTY is told cannot diverge.
+            .child(render_grid(
+                snapshot,
+                geometry,
+                selection,
+                theme,
+                fonts.cell_size().1,
+                &fonts.family,
+            ))
     }
 
     /// A one-line banner for a session that has exited or failed.
@@ -673,6 +698,7 @@ impl TerminalView {
         &self,
         status: Option<SessionStatus>,
         theme: &Theme,
+        ui_size: Pixels,
     ) -> Option<impl IntoElement> {
         let message = match status {
             Some(SessionStatus::Exited { code }) => match code {
@@ -683,21 +709,23 @@ impl TerminalView {
             },
             Some(SessionStatus::Failed(err)) => format!("Terminal failed: {err}"),
             // A write error on a live session shows here too, without hiding the output.
-            _ => return self.error.clone().map(|error| banner(error, theme)),
+            _ => return self.error.clone().map(|error| banner(error, theme, ui_size)),
         };
 
-        Some(banner(SharedString::from(message), theme))
+        Some(banner(SharedString::from(message), theme, ui_size))
     }
 }
 
-fn banner(message: SharedString, theme: &Theme) -> gpui::Div {
+fn banner(message: SharedString, theme: &Theme, ui_size: Pixels) -> gpui::Div {
     div()
         .flex_none()
         .px_2()
         .py_1()
         .bg(theme.panel)
         .text_color(theme.accent)
-        .text_size(Metrics::UI_FONT_SIZE)
+        // Explicitly the UI size, overriding the grid's editor size on the parent. A banner
+        // is chrome, not terminal output, and it should not grow with ⌘+.
+        .text_size(ui_size)
         .child(message)
 }
 
@@ -708,11 +736,17 @@ fn banner(message: SharedString, theme: &Theme) -> gpui::Div {
 /// and gpui shapes each row once. The cost is that a per-cell *background* needs its own
 /// pass — which is also how the selection highlight is drawn: as a background colour on
 /// the runs, not as a second layer of rectangles over the text.
+/// `row_height` is `Fonts::cell_size().1` — the *same* value `sync_size` divided the panel
+/// height by. Drawing rows at one height while telling the PTY it has a screen measured in
+/// another means the shell writes rows nobody sees; passing the number in rather than
+/// recomputing it is what makes that impossible to get wrong.
 fn render_grid(
     snapshot: &GridSnapshot,
     geometry: GridGeometry,
     selection: Option<&Selection>,
     theme: &Theme,
+    row_height: Pixels,
+    family: &SharedString,
 ) -> impl IntoElement {
     div().flex_1().flex().flex_col().overflow_hidden().children(
         snapshot.lines.iter().enumerate().map(|(index, line)| {
@@ -728,11 +762,12 @@ fn render_grid(
                 })
                 .unwrap_or(0..0);
 
-            div().h(Metrics::TERMINAL_LINE_HEIGHT).flex_none().child(styled_row(
+            div().h(row_height).flex_none().child(styled_row(
                 line,
                 cursor_column,
                 selected,
                 theme,
+                family,
             ))
         }),
     )
@@ -749,17 +784,24 @@ fn styled_row(
     cursor_column: Option<usize>,
     selected: std::ops::Range<usize>,
     theme: &Theme,
+    family: &SharedString,
 ) -> StyledText {
-    let (text, runs) = row_runs(cells, cursor_column, selected, theme);
+    let (text, runs) = row_runs(cells, cursor_column, selected, theme, family);
     StyledText::new(SharedString::from(text)).with_runs(runs)
 }
 
 /// The text and colour runs for one row.
+///
+/// `family` is the resolved family from [`Fonts`], not a constant (#49) — and it has been
+/// verified monospace at selection time, which the terminal depends on more than the editor
+/// does: this grid is addressed by column, so a proportional face does not merely look wrong,
+/// it puts the cursor on the wrong character.
 fn row_runs(
     cells: &[Cell],
     cursor_column: Option<usize>,
     selected: std::ops::Range<usize>,
     theme: &Theme,
+    family: &SharedString,
 ) -> (String, Vec<TextRun>) {
     // A cursor past the last column (end of line) has no cell to invert, so the row is
     // padded with one blank. Doing it up front keeps the run loop single-path.
@@ -797,7 +839,7 @@ fn row_runs(
         let run = TextRun {
             len: c.len_utf8(),
             font: gpui::Font {
-                family: FONT_FAMILY.into(),
+                family: family.clone(),
                 features: Default::default(),
                 fallbacks: None,
                 weight: if cell.bold { gpui::FontWeight::BOLD } else { gpui::FontWeight::NORMAL },
@@ -822,7 +864,7 @@ fn row_runs(
         text.push(' ');
         runs.push(TextRun {
             len: 1,
-            font: gpui::font(FONT_FAMILY),
+            font: gpui::font(family.clone()),
             color: theme.background,
             background_color: Some(theme.cursor),
             underline: None,
@@ -869,7 +911,7 @@ mod tests {
     fn a_row_merges_adjacent_cells_with_identical_styling() {
         let theme = Theme::dark();
         let cells: Vec<Cell> = "hello".chars().map(cell).collect();
-        let (text, runs) = row_runs(&cells, None, 0..0, &theme);
+        let (text, runs) = row_runs(&cells, None, 0..0, &theme, &Fonts::default().family);
 
         // Five identically-styled cells must shape as one run, not five.
         assert_eq!(runs.len(), 1, "uniform text should collapse to one run");
@@ -882,7 +924,7 @@ mod tests {
         let mut cells: Vec<Cell> = "ab".chars().map(cell).collect();
         cells[1].fg = CellColor::Ansi(1);
 
-        let (text, runs) = row_runs(&cells, None, 0..0, &theme);
+        let (text, runs) = row_runs(&cells, None, 0..0, &theme, &Fonts::default().family);
         assert_eq!(runs.len(), 2);
         assert_runs_cover_text(&text, &runs);
     }
@@ -897,7 +939,7 @@ mod tests {
         ];
 
         // The spacer must contribute no character, or every later column moves right.
-        let (text, runs) = row_runs(&cells, None, 0..0, &theme);
+        let (text, runs) = row_runs(&cells, None, 0..0, &theme, &Fonts::default().family);
         assert_eq!(text, "漢x");
         // The multibyte case is where a run length in *chars* rather than bytes would
         // panic inside gpui.
@@ -910,7 +952,7 @@ mod tests {
         let cells: Vec<Cell> = "ab".chars().map(cell).collect();
 
         // End-of-line cursor: there is no cell to invert, so a blank is appended.
-        let (text, runs) = row_runs(&cells, Some(2), 0..0, &theme);
+        let (text, runs) = row_runs(&cells, Some(2), 0..0, &theme, &Fonts::default().family);
         assert_eq!(text, "ab ");
         assert_runs_cover_text(&text, &runs);
     }
@@ -919,7 +961,7 @@ mod tests {
     fn the_cursor_cell_is_inverted() {
         let theme = Theme::dark();
         let cells: Vec<Cell> = "ab".chars().map(cell).collect();
-        let (_, runs) = row_runs(&cells, Some(0), 0..0, &theme);
+        let (_, runs) = row_runs(&cells, Some(0), 0..0, &theme, &Fonts::default().family);
 
         // The cursor is drawn by inverting its own cell, so the first run carries the
         // cursor colour as a background.
@@ -932,7 +974,7 @@ mod tests {
         let theme = Theme::dark();
         // Portuguese and CJK together: the exact case where char/byte confusion panics.
         let cells: Vec<Cell> = "ação日本".chars().map(cell).collect();
-        let (text, runs) = row_runs(&cells, None, 0..0, &theme);
+        let (text, runs) = row_runs(&cells, None, 0..0, &theme, &Fonts::default().family);
         assert_runs_cover_text(&text, &runs);
     }
 
@@ -949,7 +991,7 @@ mod tests {
     fn nul_cells_render_as_spaces() {
         let theme = Theme::dark();
         // A NUL would otherwise reach the text system as an unprintable glyph.
-        let (text, runs) = row_runs(&[cell('\0')], None, 0..0, &theme);
+        let (text, runs) = row_runs(&[cell('\0')], None, 0..0, &theme, &Fonts::default().family);
         assert_eq!(text, " ");
         assert_runs_cover_text(&text, &runs);
     }
@@ -958,7 +1000,7 @@ mod tests {
     fn selected_cells_take_the_themes_selection_colour() {
         let theme = Theme::dark();
         let cells: Vec<Cell> = "abcd".chars().map(cell).collect();
-        let (text, runs) = row_runs(&cells, None, 1..3, &theme);
+        let (text, runs) = row_runs(&cells, None, 1..3, &theme, &Fonts::default().family);
 
         assert_runs_cover_text(&text, &runs);
         // Unselected, selected, unselected: three runs, and the middle one is the theme's
@@ -995,7 +1037,7 @@ mod tests {
         let cells: Vec<Cell> = "ab".chars().map(cell).collect();
         // Dragging across the cursor must not hide it — losing the caret mid-drag is
         // worse than a cell that reads as unselected.
-        let (_, runs) = row_runs(&cells, Some(0), 0..2, &theme);
+        let (_, runs) = row_runs(&cells, Some(0), 0..2, &theme, &Fonts::default().family);
         assert_eq!(runs[0].background_color, Some(theme.cursor));
     }
 
@@ -1005,7 +1047,7 @@ mod tests {
         // Selecting from the middle of a multibyte run is where a run length counted in
         // chars rather than bytes panics inside gpui.
         let cells: Vec<Cell> = "ação".chars().map(cell).collect();
-        let (text, runs) = row_runs(&cells, None, 1..3, &theme);
+        let (text, runs) = row_runs(&cells, None, 1..3, &theme, &Fonts::default().family);
         assert_runs_cover_text(&text, &runs);
         assert_eq!(text, "ação");
     }
