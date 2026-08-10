@@ -22,7 +22,7 @@ use gpui::{
 
 use crate::actions::{NewTerminal, context};
 use crate::editor::FONT_FAMILY;
-use crate::theme::{Metrics, Theme};
+use crate::theme::{Metrics, Theme, Themed};
 
 /// How often the panel checks for new PTY output.
 ///
@@ -280,7 +280,7 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+        let theme = cx.theme().clone();
 
         div()
             .key_context(context::TERMINAL)

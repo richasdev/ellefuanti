@@ -37,13 +37,34 @@ use gpui::{TestAppContext, VisualTestContext, px, size};
 
 use crate::editor::{Document, EditorView};
 use crate::palette::{Palette, PaletteMode};
-use crate::theme::Metrics;
+use crate::theme::{Metrics, ThemeVariant, Themed, set_theme};
 use crate::workspace_view::WorkspaceView;
 
-/// A window big enough that the sidebar, tab bar and status bar all have room; a cramped
+/// Installs a theme, because `cx.theme()` panics without one.
+///
+/// Every test here calls this before building a view, for the same reason `main` does it
+/// before opening the window: the theme is the one piece of state a view cannot construct
+/// for itself, which is the entire point of #48's step 1.
+fn install_theme(cx: &mut TestAppContext) {
+    cx.update(|cx| set_theme(ThemeVariant::default(), cx));
+}
+
+/// Lays out and paints the window — once per compiled-in theme.
+///
+/// Painting under every variant is deliberate and is the closest thing to the acceptance
+/// test #48 describes. A view that still built its own `Theme` would render identically in
+/// both passes and this would not catch it, so the grep test in `tests/theming.rs` is what
+/// enforces *that*. What this catches is the other half: a theme missing a colour, or a
+/// variant whose values break layout, showing up as a panic in every render test rather
+/// than in whichever one someone thought to write.
+///
+/// The window is 1180x760 so the sidebar, tab bar and status bar all have room; a cramped
 /// window can hide a layout panic behind a zero-sized element that never lays out children.
 fn draw(cx: &mut VisualTestContext) {
-    cx.draw(gpui::point(px(0.), px(0.)), size(px(1180.), px(760.)), |_window, _cx| gpui::div());
+    for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
+        cx.update(|_window, cx| set_theme(variant, cx));
+        cx.draw(gpui::point(px(0.), px(0.)), size(px(1180.), px(760.)), |_window, _cx| gpui::div());
+    }
 }
 
 fn registry() -> Arc<CommandRegistry> {
@@ -54,6 +75,7 @@ fn registry() -> Arc<CommandRegistry> {
 
 #[gpui::test]
 async fn the_workspace_renders_with_no_folder_open(cx: &mut TestAppContext) {
+    install_theme(cx);
     // The startup state: no project, no tabs. It still has to paint the chrome — activity
     // bar, empty sidebar, status bar — and the empty-state hint.
     let registry = registry();
@@ -63,6 +85,7 @@ async fn the_workspace_renders_with_no_folder_open(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn the_workspace_renders_with_a_file_open(cx: &mut TestAppContext) {
+    install_theme(cx);
     let registry = registry();
     let (view, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
 
@@ -82,6 +105,7 @@ async fn the_workspace_renders_with_a_file_open(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn a_new_untitled_buffer_opens_dirty_free_pathless_and_renders(cx: &mut TestAppContext) {
+    install_theme(cx);
     // ⌘N is the only way to reach `save_as`, so the properties that route it there are the
     // ones worth pinning: no path (or ⌘S writes straight through and never prompts) and not
     // dirty (or closing an untouched scratch buffer nags). Rendering it also covers the
@@ -111,6 +135,7 @@ async fn a_new_untitled_buffer_opens_dirty_free_pathless_and_renders(cx: &mut Te
 
 #[gpui::test]
 async fn the_editor_renders_a_large_file(cx: &mut TestAppContext) {
+    install_theme(cx);
     // A virtualised list asked to render 20k rows is where an off-by-one in the visible
     // range surfaces as a panic rather than a wrong pixel.
     let mut text = String::from("<?php\n");
@@ -129,6 +154,7 @@ async fn the_editor_renders_a_large_file(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn the_editor_renders_multibyte_text_with_a_cursor_on_it(cx: &mut TestAppContext) {
+    install_theme(cx);
     // Byte-vs-char confusion in the highlight or cursor spans shows up here as a panic from
     // `StyledText`, which debug-asserts on non-boundary indices.
     let (view, cx) = cx.add_window_view(|_window, cx| {
@@ -152,6 +178,7 @@ async fn the_editor_renders_multibyte_text_with_a_cursor_on_it(cx: &mut TestAppC
 
 #[gpui::test]
 async fn the_editor_renders_an_empty_document(cx: &mut TestAppContext) {
+    install_theme(cx);
     // Zero rows, cursor at 0, no highlight spans: the degenerate case that a renderer
     // written against a non-empty fixture tends to divide by.
     let (_view, cx) = cx.add_window_view(|_window, cx| {
@@ -164,6 +191,7 @@ async fn the_editor_renders_an_empty_document(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn the_editor_measures_its_text_origin_during_layout(cx: &mut TestAppContext) {
+    install_theme(cx);
     // The click-to-column fix depends on `text_origin_x` being filled in by the layout
     // engine at prepaint — guessing it from the chrome constants is what produced the
     // 284 px error, where a window-relative x was treated as row-relative.
@@ -196,6 +224,7 @@ async fn the_editor_measures_its_text_origin_during_layout(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut TestAppContext) {
+    install_theme(cx);
     // End-to-end on the bug PR #39 fixed. It must run **inside the workspace**, not against a
     // standalone editor: the defect was that a window-relative x had only the gutter
     // subtracted, ignoring the 44 px activity bar and 240 px sidebar the row sits inside.
@@ -245,6 +274,7 @@ async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut 
 
 #[gpui::test]
 async fn typing_reaches_the_document(cx: &mut TestAppContext) {
+    install_theme(cx);
     // The full input path: keystroke → gpui dispatch → key_char → Document::insert. Every
     // piece of that is covered in isolation; nothing until now proved they are connected.
     let (view, cx) = cx.add_window_view(|_window, cx| {
@@ -265,6 +295,7 @@ async fn typing_reaches_the_document(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn the_palette_renders_in_both_modes(cx: &mut TestAppContext) {
+    install_theme(cx);
     let items: Vec<(String, String)> =
         BUILTIN_COMMANDS.iter().map(|c| (c.title.to_string(), c.id.0.to_string())).collect();
 
@@ -277,4 +308,54 @@ async fn the_palette_renders_in_both_modes(cx: &mut TestAppContext) {
     let (_files, cx) =
         cx.add_window_view(|_window, cx| Palette::new(PaletteMode::Files, Vec::new(), cx));
     draw(cx);
+}
+
+#[gpui::test]
+async fn switching_the_theme_at_runtime_repaints_every_surface(cx: &mut TestAppContext) {
+    // #48's second "done when": switching updates every surface, including the terminal.
+    //
+    // The point of the plumbing is that this needs no per-view bookkeeping — so the test
+    // opens a workspace with an editor, a terminal panel and a palette all live, switches
+    // once, and paints. Under the old code the editor, terminal and palette would each
+    // have kept building `Theme::dark()`; here there is one theme and it moved.
+    //
+    // What this proves is that the switch reaches every view without panicking, and that
+    // the colours they read afterwards are the new theme's. It does **not** prove the
+    // result looks right — that is #35, and it needs a person.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    workspace.update(cx, |workspace, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("User.php")),
+            "<?php\n\nclass User extends Model\n{\n    protected $table = 'users';\n}\n",
+            true,
+        )
+        .expect("php grammar loads");
+        workspace.open_document_for_test(document, cx);
+    });
+
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_terminal_for_test(window, cx);
+            workspace.toggle_command_palette_for_test(window, cx);
+        })
+    });
+    cx.draw(gpui::point(px(0.), px(0.)), size(px(1180.), px(760.)), |_window, _cx| gpui::div());
+
+    let before = cx.update(|_window, cx| cx.theme().background);
+
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_theme_for_test(window, cx))
+    });
+    cx.draw(gpui::point(px(0.), px(0.)), size(px(1180.), px(760.)), |_window, _cx| gpui::div());
+
+    let after = cx.update(|_window, cx| cx.theme().background);
+    assert_ne!(before, after, "toggling the theme must actually change the active theme");
+    assert_eq!(
+        cx.update(|_window, cx| cx.theme_variant()),
+        ThemeVariant::Light,
+        "the default is Dark, so one toggle lands on Light"
+    );
 }

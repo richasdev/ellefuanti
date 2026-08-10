@@ -44,6 +44,7 @@ actions!(
         ToggleHiddenFiles,
         NewTerminal,
         ToggleTerminal,
+        ToggleTheme,
     ]
 );
 
@@ -74,6 +75,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // also *closes* the panel while the terminal itself has focus.
         KeyBinding::new("ctrl-`", ToggleTerminal, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-`", NewTerminal, Some(context::WORKSPACE)),
+        // `ToggleTheme` is deliberately unbound: it reaches the user through the palette.
+        // Every obvious chord (cmd-k, cmd-t) is a prefix or a tab command elsewhere, and
+        // picking one now means choosing a keymap before there is a file to override it in.
+        //
         // Overlay
         KeyBinding::new("escape", Cancel, Some(context::PALETTE)),
         KeyBinding::new("enter", Confirm, Some(context::PALETTE)),
@@ -127,6 +132,7 @@ pub enum Dispatch {
     Quit,
     NewTerminal,
     ToggleTerminal,
+    ToggleTheme,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -142,6 +148,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "palette.quick_open" => Dispatch::QuickOpen,
         "terminal.new" => Dispatch::NewTerminal,
         "terminal.toggle" => Dispatch::ToggleTerminal,
+        "theme.toggle" => Dispatch::ToggleTheme,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }
