@@ -110,3 +110,26 @@ jobs:
           echo "--- raw ---"
           head -40 startup.log
           echo "Note: indicative only — headless runner, no display. See issue #38."
+
+      - name: Performance gate
+        # #84: idle RSS and binary size, the two deterministic numbers. Idle RSS drifted
+        # 69 → 105 MB over twenty PRs (#79) because every PR measured its own cost and none
+        # measured the aggregate.
+        #
+        # The script is the same one run locally — deliberately, because GitHub Actions is
+        # currently blocked on billing and a gate that only exists in CI would be a gate
+        # nobody has ever run. `scripts/perf-gate.sh` is the primary path; this step is the
+        # backstop for when billing is fixed.
+        #
+        # NOT continue-on-error: this one is meant to fail the build. The numbers it blocks
+        # on are deterministic; the wall-clock one it only reports.
+        #
+        # One caveat that has to be said rather than discovered: a headless runner has no
+        # display, so if the window fails to open the process measured here is not the same
+        # program a user runs — its RSS omits whatever the window and first paint allocate.
+        # That makes the CI reading a floor, not the local number, and it is why the local
+        # run stays the authoritative one. The step still earns its place: the binary-size
+        # half is display-independent and exact, and an RSS *floor* crossing the limit is
+        # unambiguous evidence of a regression even when staying under it proves nothing.
+        timeout-minutes: 5
+        run: scripts/perf-gate.sh
