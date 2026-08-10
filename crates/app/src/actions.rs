@@ -68,6 +68,10 @@ actions!(
         ToggleHiddenFiles,
         NewTerminal,
         ToggleTerminal,
+        // Terminal close and split (#97). Both terminal-scoped, so neither has any effect
+        // unless the panel itself has focus.
+        CloseTerminal,
+        SplitTerminal,
         ToggleTheme,
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
@@ -280,6 +284,20 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-c", Copy, Some(context::TERMINAL)),
         KeyBinding::new("cmd-v", Paste, Some(context::TERMINAL)),
         KeyBinding::new("cmd-a", SelectAll, Some(context::TERMINAL)),
+        // ⌘W closes the *terminal* while the terminal has focus (#97). The panel's div sits
+        // inside the workspace's, so this shadows the `CloseTab` above rather than replacing
+        // it — with focus anywhere else ⌘W still closes the editor tab.
+        //
+        // Bound deliberately, and the "it will surprise someone mid-edit" objection is the
+        // reason it is safe rather than a reason against: ⌘W only arrives here when the
+        // terminal already holds keyboard focus, which takes a click in the panel or ⌃`.
+        // Someone editing text has editor focus and is unaffected. The hazard actually worth
+        // avoiding is the mirror image — ⌘W silently closing a *file* while the user is
+        // looking at a terminal — which is what leaving this unbound would have kept.
+        // Destructiveness is handled by the confirm prompt, not by withholding the key.
+        KeyBinding::new("cmd-w", CloseTerminal, Some(context::TERMINAL)),
+        // ⌘D is the split in iTerm and VS Code's terminal alike.
+        KeyBinding::new("cmd-d", SplitTerminal, Some(context::TERMINAL)),
     ]);
 
     let mut registry = CommandRegistry::new();

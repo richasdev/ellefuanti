@@ -22,7 +22,7 @@ use gpui::{
     TextRun, Window, div, prelude::*, px,
 };
 
-use crate::actions::{Copy, NewTerminal, Paste, SelectAll, context};
+use crate::actions::{CloseTerminal, Copy, NewTerminal, Paste, SelectAll, SplitTerminal, context};
 use crate::fonts::Fonts;
 use crate::theme::{Metrics, Theme, Themed};
 
@@ -64,6 +64,21 @@ pub struct TerminalView {
     /// the laid-out element rather than derived from the constants the workspace happens
     /// to use today. `None` until the first layout, which is before any click can arrive.
     grid_origin: Option<Point<Pixels>>,
+    /// The session in the pane that does *not* have focus, when the panel is split.
+    ///
+    /// One extra id rather than a pane tree: this splits in two, side by side, which is
+    /// what was asked for. A general layout would be a `Vec` of panes plus a focused index
+    /// plus an orientation, and none of that has a caller yet.
+    ///
+    /// Holding the *inactive* pane is what keeps typing unchanged: keys go to
+    /// `manager.active()` exactly as they did before splits existed, and clicking the other
+    /// pane activates it, which swaps the two ids without moving either grid. Pane order on
+    /// screen comes from the session order in the manager, so the halves do not jump when
+    /// focus moves.
+    split: Option<elle_terminal::SessionId>,
+    /// The close prompt's task. Held so dropping the view cancels it (ADR-0007), and so a
+    /// second ⌘W replaces the first dialog rather than stacking two over one terminal.
+    close_prompt: Option<Task<()>>,
 }
 
 impl TerminalView {
@@ -78,6 +93,8 @@ impl TerminalView {
             selection: None,
             dragging: false,
             grid_origin: None,
+            split: None,
+            close_prompt: None,
         }
     }
 
@@ -89,6 +106,26 @@ impl TerminalView {
     /// How many sessions are open, for the status bar.
     pub fn session_count(&self) -> usize {
         self.manager.len()
+    }
+
+    /// Drives ⌘D through the same handler the keybinding fires, for tests.
+    ///
+    /// The action rather than setting `split` directly: a test that assigned the field
+    /// would pass while the real command was broken — the same reason
+    /// `toggle_terminal_for_test` exists on the workspace.
+    #[cfg(test)]
+    pub fn split_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(&SplitTerminal, window, cx);
+    }
+
+    /// Opens a session running a named program, so a test does not depend on the login
+    /// shell. `cat` blocks on stdin: alive, silent, and it never draws a prompt.
+    #[cfg(test)]
+    pub fn open_shell_for_test(&mut self, shell: &str, cx: &mut Context<Self>) {
+        if self.manager.open_with_shell(Some(shell)).is_ok() {
+            self.ensure_polling(cx);
+        }
+        cx.notify();
     }
 
     /// Opens a session, starting the poll loop if this is the first one.
@@ -119,22 +156,124 @@ impl TerminalView {
 
     pub fn close_active(&mut self, cx: &mut Context<Self>) {
         self.manager.close_active();
+        self.after_close(cx);
+    }
+
+    /// Closes a session by id, whatever index it currently sits at.
+    ///
+    /// By id rather than index because the only callers that need this are asynchronous —
+    /// the confirm prompt below — and a tab opened or closed while the dialog was up would
+    /// make an index point at a different shell. Closing the wrong terminal is exactly the
+    /// data loss the prompt exists to prevent.
+    fn close_id(&mut self, id: elle_terminal::SessionId, cx: &mut Context<Self>) {
+        self.manager.close(id);
+        self.after_close(cx);
+    }
+
+    /// Shared tail of every close: stop the timer once nothing is left to poll.
+    fn after_close(&mut self, cx: &mut Context<Self>) {
         if self.manager.is_empty() {
             // Nothing to poll for; dropping the task stops the timer.
             self.poll = None;
         }
+        // A split showing a session that just went away falls back to the active one.
+        self.sync_split();
         cx.notify();
     }
 
+    /// ⌘W, and the ✕ on the tab strip. Asks first when the shell is still running.
+    ///
+    /// The dirty-tab prompt (#40) is the model, for the same reason: killing a shell
+    /// halfway through `php artisan migrate` costs work that cannot be recovered, and this
+    /// is the one place in the panel where a mis-click is expensive. A shell that has
+    /// already exited has nothing to lose, so its tab closes without a question — a prompt
+    /// there would train the user to dismiss the one that matters.
+    ///
+    /// This deliberately does not try to name the running command. The PTY carries output,
+    /// not a process table, so knowing that `migrate` in particular is running would mean
+    /// walking the child's descendants — a lot of platform-specific machinery to make the
+    /// message one word better.
+    fn close_with_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.manager.active() else { return };
+
+        if !session.status().is_running() {
+            self.close_active(cx);
+            return;
+        }
+
+        let id = session.id();
+        let title = session.title().to_string();
+
+        // Button order matches #40: index 0 is macOS's default, so Cancel sits there and a
+        // stray Return cannot be the keystroke that kills a running process.
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("{title} is still running."),
+            Some("Closing this terminal will end it and anything it is running."),
+            &["Cancel", "Close Terminal"],
+            cx,
+        );
+
+        self.close_prompt = Some(cx.spawn(async move |this, cx| {
+            // A dropped receiver means the dialog went away without an answer; treat that
+            // as Cancel, because the safe default is to keep the shell alive.
+            let Ok(choice) = answer.await else { return };
+            if choice != 1 {
+                return;
+            }
+            this.update(cx, |this, cx| this.close_id(id, cx)).ok();
+        }));
+    }
+
+    fn close_terminal(&mut self, _: &CloseTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_with_confirm(window, cx);
+    }
+
     fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        // Selecting a tab while split replaces the pane that had focus, leaving the other
+        // where it is — the same rule as clicking the other half, so a tab click never
+        // silently changes what the *unfocused* pane is showing.
         self.manager.activate(index);
+        self.sync_split();
+        cx.notify();
+    }
+
+    /// Focuses the pane showing `id`. The click target on the unfocused half of a split.
+    fn activate_id(
+        &mut self,
+        id: elle_terminal::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The panel keeps one focus handle for both panes: which pane is "focused" is the
+        // manager's active session, not a second gpui focus target. Focusing the panel is
+        // still needed for the click to make keys reach the shell at all.
+        window.focus(&self.focus_handle);
+
+        // The pane losing focus keeps its grid, so it becomes the split.
+        let previous = self.manager.active().map(|session| session.id());
+        self.manager.activate_id(id);
+        if let Some(previous) = previous
+            && previous != id
+            && self.split.is_some()
+        {
+            self.split = Some(previous);
+        }
+        // A selection belongs to the pane it was dragged in; carrying it across would
+        // highlight unrelated text at the same coordinates in the other grid.
+        self.selection = None;
+        self.sync_split();
         cx.notify();
     }
 
     /// Repaints while any session may be producing output.
     ///
-    /// One timer for the whole panel rather than one per session: only the active session
-    /// is visible, so a background session's output does not need a frame.
+    /// One timer for the whole panel rather than one per session — and still one after a
+    /// split (#97). Splitting makes a second session *visible*, not a second thing to
+    /// schedule: what changes is that the generation check below sums both panes instead of
+    /// reading the active one. Two timers would double the idle wakeups the perf gate
+    /// measures (#93) to buy nothing, since one frame repaints the whole panel anyway.
+    /// A session that is neither pane is still not polled: its output needs no frame.
     fn ensure_polling(&mut self, cx: &mut Context<Self>) {
         if self.poll.is_some() {
             return;
@@ -150,8 +289,7 @@ impl TerminalView {
                     if this.manager.is_empty() {
                         return false;
                     }
-                    let generation =
-                        this.manager.active().map(|session| session.generation()).unwrap_or(0);
+                    let generation = this.visible_generation();
                     // Repaint only on new output. An idle terminal costs one atomic read
                     // per frame instead of a full grid copy and re-layout.
                     if generation != this.last_generation {
@@ -167,6 +305,83 @@ impl TerminalView {
                 }
             }
         }));
+    }
+
+    // --- split ----------------------------------------------------------------------
+
+    /// The id shown in the right pane, if that session still exists.
+    ///
+    /// Read through this rather than off the field: the session may have been closed since
+    /// the split was made, and a stale id would render an empty pane forever.
+    fn split_id(&self) -> Option<elle_terminal::SessionId> {
+        let split = self.split?;
+        let active = self.manager.active()?.id();
+        // A split pointing at the active session is not a split — it would show the same
+        // shell twice, which is *mirroring*, and mirroring is deliberately not built here
+        // (#97): two views on one PTY needs one grid feeding two scrollbacks and two
+        // selections, which is a different problem from laying out two grids.
+        (split != active && self.manager.sessions().iter().any(|s| s.id() == split))
+            .then_some(split)
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.split_id().is_some()
+    }
+
+    /// Drops a split whose session has gone away, so a closed pane does not linger.
+    fn sync_split(&mut self) {
+        if self.split_id().is_none() {
+            self.split = None;
+        }
+    }
+
+    /// The combined generation of everything on screen.
+    ///
+    /// A sum rather than the active session's counter alone: with a split, output in either
+    /// pane has to trigger the repaint, and a sum changes whenever either side does. It can
+    /// only collide if two sessions moved by offsetting amounts in the same 16ms tick, which
+    /// would cost one late frame and be corrected by the next byte either shell writes.
+    fn visible_generation(&self) -> u64 {
+        let active = self.manager.active().map(|session| session.generation()).unwrap_or(0);
+        let split = self
+            .split_id()
+            .and_then(|id| self.manager.sessions().iter().find(|s| s.id() == id))
+            .map(|session| session.generation())
+            .unwrap_or(0);
+        active.wrapping_add(split)
+    }
+
+    /// ⌘D. Opens a second session beside this one, or closes the split if there is one.
+    ///
+    /// A toggle rather than a separate unsplit command, because there are only two states
+    /// and the second binding would have nothing else to do.
+    fn split_terminal(&mut self, _: &SplitTerminal, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_split() {
+            self.split = None;
+            // The panes just doubled in width, so the PTYs are a resize behind. Clearing
+            // the recorded size forces the next layout to re-tell both — see `sync_size`,
+            // which only acts on a change.
+            self.grid_size = (0, 0);
+            cx.notify();
+            return;
+        }
+
+        // The session that is active *now* stays on the left, and the new one becomes
+        // active on the right — matching every other terminal, where the split you just
+        // made is the one you type into.
+        let left = self.manager.active().map(|session| session.id());
+        self.open_session(cx);
+
+        match (left, self.manager.active().map(|session| session.id())) {
+            // The left pane is the one that was already there; `open_session` made the new
+            // session active, so it renders on the right.
+            (Some(left), Some(new)) if left != new => self.split = Some(left),
+            // Nothing was open, or the spawn failed and `open_session` already reported it.
+            // Either way one pane is the honest result.
+            _ => self.split = None,
+        }
+        self.grid_size = (0, 0);
+        cx.notify();
     }
 
     /// Forwards a keypress to the active session.
@@ -444,12 +659,19 @@ impl TerminalView {
     /// rows than are rendered means the shell writes to lines nobody sees and its output
     /// garbles — a worse failure than misalignment, and the reason this takes the cell size
     /// from the same [`Fonts::cell_size`] the renderer uses rather than recomputing it.
+    ///
+    /// `width` is the width of *one pane*, not of the panel: split in two, each shell has
+    /// half the columns, and telling both they have the full width is #92 again — the shell
+    /// wraps at a column that is not where the pane ends. The caller divides, because it is
+    /// the caller that knows how the panel was laid out.
     fn sync_size(&mut self, width: gpui::Pixels, height: gpui::Pixels, cell: (Pixels, Pixels)) {
         let cols = (f32::from(width) / f32::from(cell.0)).floor().max(1.0) as u16;
         let rows = (f32::from(height) / f32::from(cell.1)).floor().max(1.0) as u16;
 
         if (rows, cols) != self.grid_size {
             self.grid_size = (rows, cols);
+            // Both panes are the same size, so one call still covers them — and a session
+            // that is off screen is sized for the pane it will appear in.
             self.manager.resize_all(rows, cols);
         }
     }
@@ -473,6 +695,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::close_terminal))
+            .on_action(cx.listener(Self::split_terminal))
             .on_scroll_wheel(cx.listener(|this, event, window, cx| {
                 this.on_scroll(event, window, cx);
             }))
@@ -535,22 +759,38 @@ impl TerminalView {
                         )))
                 }),
             ))
-            .child(self.render_strip_button("+", "terminal-new", theme, cx, |this, cx| {
+            .child(self.render_strip_button("+", "terminal-new", theme, cx, |this, _window, cx| {
                 this.open_session(cx)
             }))
-            .child(self.render_strip_button("✕", "terminal-close", theme, cx, |this, cx| {
-                this.close_active(cx)
-            }))
+            // "⫿" reads as two panes side by side. ⌘D does the same thing.
+            .child(self.render_strip_button(
+                "⫿",
+                "terminal-split",
+                theme,
+                cx,
+                |this, window, cx| this.split_terminal(&SplitTerminal, window, cx),
+            ))
+            // The ✕ now asks before killing a running shell, exactly as ⌘W does — the
+            // mouse path was the one that could destroy work without a question.
+            .child(self.render_strip_button(
+                "✕",
+                "terminal-close",
+                theme,
+                cx,
+                |this, window, cx| this.close_with_confirm(window, cx),
+            ))
     }
 
     /// One of the small square buttons on the right of the tab strip.
+    ///
+    /// The action takes a `Window` because closing needs one to raise the confirm prompt.
     fn render_strip_button(
         &self,
         glyph: &'static str,
         id: &'static str,
         theme: &Theme,
         cx: &mut Context<Self>,
-        action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         let entity = cx.entity();
 
@@ -565,8 +805,8 @@ impl TerminalView {
             .cursor_pointer()
             .text_color(theme.text_muted)
             .hover(|el| el.bg(theme.hover).text_color(theme.text))
-            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                entity.update(cx, |this, cx| action(this, cx));
+            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                entity.update(cx, |this, cx| action(this, window, cx));
             })
             .child(glyph)
     }
@@ -591,45 +831,49 @@ impl TerminalView {
                 .into_any_element();
         }
 
-        let status = self.manager.active().map(|session| session.status());
-        let snapshot = self.manager.active().map(|session| session.snapshot());
-
-        let Some(snapshot) = snapshot else {
+        let Some(active_id) = self.manager.active().map(|session| session.id()) else {
             return div().flex_1().into_any_element();
         };
 
-        let entity = cx.entity();
-        let geometry = GridGeometry::of(&snapshot);
-        let selection = self.selection;
         let fonts = Fonts::get(cx);
         let cell = fonts.cell_size();
+        let panes = self.pane_ids(active_id);
+        let pane_count = panes.len();
+        let entity = cx.entity();
+
+        // A loop rather than `map().collect()`: rendering a pane reborrows `cx` mutably,
+        // which a closure cannot do across iterations.
+        let mut rendered = Vec::with_capacity(pane_count);
+        for &id in &panes {
+            rendered.push(self.render_pane(id, id == active_id, theme, &fonts, cx));
+        }
 
         div()
             .id("terminal-body")
             .flex_1()
             .flex()
-            .flex_col()
+            // Row, not column: the panes sit side by side. Vertical splits would be the
+            // same layout with `flex_col` and a height divisor in `sync_size`, and are left
+            // out because nothing asked for them (#97).
+            .flex_row()
             .overflow_hidden()
             .font_family(fonts.family.clone())
             .text_size(fonts.size)
-            // Down/move/up rather than a drag handler: a drag that leaves the panel must
-            // keep extending the selection to the edge, and gpui only delivers moves
-            // outside an element's bounds while a button is held.
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            // The button can come up outside the panel, which is the common case for a
-            // drag that ran off the bottom; without this the view stays stuck in a drag.
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(
                 // A canvas purely to learn the panel's pixel size, which is what decides
                 // the PTY's rows and columns. gpui gives layout bounds to an element, not
                 // to a render function, so measuring needs one. The grid's *origin* is
                 // measured separately, by the grid itself — see `render_grid_measured`.
+                //
+                // Measured once for the whole body and divided, rather than once per pane:
+                // both panes are `flex_1` of the same row, so they are the same width by
+                // construction, and one canvas cannot disagree with itself about the row
+                // count the way two racing ones could.
                 gpui::canvas(
                     move |bounds, _window, cx| {
                         entity.update(cx, |this, _cx| {
-                            this.sync_size(bounds.size.width, bounds.size.height, cell);
+                            let width = bounds.size.width / pane_count as f32;
+                            this.sync_size(width, bounds.size.height, cell);
                         });
                     },
                     |_, _, _, _| {},
@@ -637,16 +881,126 @@ impl TerminalView {
                 .absolute()
                 .size_full(),
             )
-            .children(self.render_status_banner(status, theme, fonts.ui_size))
+            .children(rendered)
+            .into_any_element()
+    }
+
+    /// The sessions on screen, left to right.
+    ///
+    /// Ordered by their position in the manager rather than by which is active, so
+    /// activating the right pane does not make the two grids swap places under the cursor.
+    fn pane_ids(&self, active_id: elle_terminal::SessionId) -> Vec<elle_terminal::SessionId> {
+        let Some(split) = self.split_id() else { return vec![active_id] };
+
+        let mut ids: Vec<_> = self
+            .manager
+            .sessions()
+            .iter()
+            .map(|session| session.id())
+            .filter(|id| *id == active_id || *id == split)
+            .collect();
+        ids.sort_by_key(|id| self.manager.sessions().iter().position(|s| s.id() == *id));
+        ids
+    }
+
+    /// One pane: its status banner and its grid.
+    ///
+    /// Only the focused pane carries the selection and the mouse handlers. A selection per
+    /// pane would need a selection *and* a grid origin per pane, and the payoff — dragging
+    /// in the unfocused half without focusing it first — is not one terminals offer anyway:
+    /// clicking a pane focuses it, and then the drag works as it always has.
+    fn render_pane(
+        &self,
+        id: elle_terminal::SessionId,
+        is_active: bool,
+        theme: &Theme,
+        fonts: &Fonts,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let split = self.is_split();
+        let session = self.manager.sessions().iter().find(|session| session.id() == id);
+        let Some(session) = session else { return div().flex_1().into_any_element() };
+
+        let snapshot = session.snapshot();
+        let geometry = GridGeometry::of(&snapshot);
+        let status = session.status();
+        let entity = cx.entity();
+
+        div()
+            .id(("terminal-pane", id.0 as usize))
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            // The divider between the halves, and the indicator for which one has focus.
+            // A left border on the second pane rather than a separate element: one line,
+            // and it cannot end up laid out in the wrong place.
+            .when(split, |el| {
+                el.border_l_1().border_color(if is_active { theme.accent } else { theme.border })
+            })
+            .when(split && is_active, |el| el.bg(theme.panel))
+            // Down/move/up rather than a drag handler: a drag that leaves the panel must
+            // keep extending the selection to the edge, and gpui only delivers moves
+            // outside an element's bounds while a button is held.
+            .when(is_active, |el| {
+                el.on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    // The button can come up outside the panel, which is the common case
+                    // for a drag that ran off the bottom; without this the view stays
+                    // stuck in a drag.
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            })
+            // Clicking the other half focuses it, which is how a split is driven from the
+            // mouse. It does not also start a selection: the first click chooses the pane.
+            .when(!is_active, |el| {
+                el.cursor_pointer().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    entity.update(cx, |this, cx| this.activate_id(id, window, cx));
+                })
+            })
+            .children(self.render_pane_label(id, is_active, theme, fonts.ui_size))
+            .children(self.render_status_banner(Some(status), theme, fonts.ui_size))
             .child(self.render_grid_measured(
                 &snapshot,
                 geometry,
-                selection.as_ref(),
+                // The unfocused pane draws no highlight: the selection belongs to the
+                // focused one, and painting it on both would show a selection in a grid
+                // whose text is at different coordinates.
+                is_active.then_some(self.selection).flatten().as_ref(),
                 theme,
-                &fonts,
+                fonts,
                 cx,
             ))
             .into_any_element()
+    }
+
+    /// The per-pane title, shown only while split.
+    ///
+    /// The active pane is marked by a "▍" and its title in the theme's text colour against
+    /// the muted one — never by colour alone, so the split still reads on a monochrome
+    /// display and in all five themes.
+    fn render_pane_label(
+        &self,
+        id: elle_terminal::SessionId,
+        is_active: bool,
+        theme: &Theme,
+        ui_size: Pixels,
+    ) -> Option<impl IntoElement> {
+        if !self.is_split() {
+            return None;
+        }
+        let session = self.manager.sessions().iter().find(|session| session.id() == id)?;
+        let title = format!("{}{}", if is_active { "▍" } else { " " }, session.title());
+
+        Some(
+            div()
+                .flex_none()
+                .px_1()
+                .bg(theme.panel)
+                .text_size(ui_size)
+                .text_color(if is_active { theme.text } else { theme.text_muted })
+                .child(SharedString::from(title)),
+        )
     }
 
     /// The grid, with a canvas behind it that records where it actually starts.
