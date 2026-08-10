@@ -3,6 +3,7 @@
 mod actions;
 mod editor;
 mod file_cache;
+mod fonts;
 mod icons;
 mod lsp_session;
 mod menu;
@@ -57,6 +58,12 @@ fn main() {
         // render happens inside `open_window` below. Reads settings.json and applies what
         // it finds — a missing or unreadable file is a default theme and a log line, never
         // a failure to launch (#60).
+        //
+        // This also resolves the font (#49), which is why it has to happen before the
+        // window rather than alongside it: the family is chosen by measuring real glyph
+        // advances through `cx.text_system()`, and the first frame renders with whatever
+        // this decides. The startup warning that used to live further down is now part of
+        // that resolution — see `fonts::usable`.
         settings::load_and_apply(cx);
         startup.phase("settings");
 
@@ -102,18 +109,6 @@ fn main() {
         });
         if let Err(err) = focused {
             tracing::error!("could not focus the workspace: {err:#}");
-        }
-
-        // A missing font family does NOT error in gpui: text layout falls back to a
-        // proportional font and every column calculation in the editor silently goes
-        // wrong, which presents as a layout bug rather than a missing font. Check once,
-        // loudly, at startup.
-        if !cx.text_system().all_font_names().iter().any(|name| name == editor::FONT_FAMILY) {
-            tracing::error!(
-                font = editor::FONT_FAMILY,
-                "monospace font not found; text will fall back to a proportional font and \
-                 column positions will be wrong"
-            );
         }
 
         cx.activate(true);

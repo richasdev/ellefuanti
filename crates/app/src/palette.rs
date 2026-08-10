@@ -6,6 +6,7 @@ use gpui::{
 };
 
 use crate::actions::{Backspace, Cancel, Confirm, SelectNext, SelectPrev, context};
+use crate::fonts::Fonts;
 use crate::theme::{Metrics, Themed};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,7 +205,7 @@ impl Render for Palette {
             .border_color(theme.border)
             .rounded_lg()
             .shadow_lg()
-            .text_size(Metrics::UI_FONT_SIZE)
+            .text_size(Fonts::get(cx).ui_size)
             .text_color(theme.text)
             .child(
                 div()

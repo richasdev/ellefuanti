@@ -85,16 +85,23 @@ pub struct Theme {
     pub ansi: [Hsla; 16],
 }
 
-/// Editor metrics. Line height is derived from font size so zoom stays consistent.
+/// Chrome metrics: the sizes that are not a function of the font.
+///
+/// Font size, UI font size, editor line height, gutter width and the terminal's row height
+/// used to live here as consts too. They are settings now, or derived from one, and moved to
+/// [`crate::fonts::Fonts`] — a const cannot be read from a settings file, and the two derived
+/// ones had to move because a fixed pixel value is simply *wrong* at another font size: 52px
+/// of gutter loses a five-digit line number at 20px, and a 16px terminal row overlaps its own
+/// text.
+///
+/// What is left is genuinely fixed: an activity bar is 44px because that is how wide an
+/// icon button is, not because of the text inside it. These become settings when someone
+/// asks, not before.
 pub struct Metrics;
 
 impl Metrics {
-    pub const FONT_SIZE: Pixels = px(13.0);
-    pub const UI_FONT_SIZE: Pixels = px(12.0);
-    pub const LINE_HEIGHT: Pixels = px(20.0);
     pub const ACTIVITY_BAR_WIDTH: Pixels = px(44.0);
     pub const SIDEBAR_WIDTH: Pixels = px(240.0);
-    pub const GUTTER_WIDTH: Pixels = px(52.0);
     pub const TAB_HEIGHT: Pixels = px(32.0);
     pub const STATUS_HEIGHT: Pixels = px(24.0);
     pub const ROW_HEIGHT: Pixels = px(22.0);
@@ -102,10 +109,12 @@ impl Metrics {
     /// Height of the terminal panel, including its tab strip.
     /// ponytail: fixed, not draggable. A splitter needs a drag-handle element and a
     /// persisted layout; both arrive with the settings crate.
+    ///
+    /// Deliberately still a constant while the grid inside it scales: this is how much room
+    /// the panel takes from the editor, which is a layout preference, not a consequence of
+    /// the font. A taller font means fewer rows in the same panel, which is what the PTY is
+    /// told — see `Fonts::cell_size`.
     pub const TERMINAL_HEIGHT: Pixels = px(260.0);
-    /// Line height inside the terminal grid. Tighter than the editor's, which is what
-    /// makes a terminal look like a terminal rather than a document.
-    pub const TERMINAL_LINE_HEIGHT: Pixels = px(16.0);
 }
 
 /// Which compiled-in theme is active.

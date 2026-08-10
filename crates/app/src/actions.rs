@@ -72,6 +72,9 @@ actions!(
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
         OpenSettings,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
     ]
 );
 
@@ -107,6 +110,16 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // `ToggleTheme` is deliberately unbound: it reaches the user through the palette.
         // Every obvious chord (cmd-k, cmd-t) is a prefix or a tab command elsewhere, and
         // picking one now means choosing a keymap before there is a file to override it in.
+        //
+        // Zoom (#49). Bound and *not* in the palette, the opposite of `ToggleTheme`: these
+        // are held down and repeated, which is a chord's job and not a command list's.
+        // Three bindings for two keys because macOS reports the unshifted `=` for ⌘+ on a
+        // US layout while a numpad or a shifted press reports `+`; binding only one means
+        // the key works on some keyboards and not others.
+        KeyBinding::new("cmd-=", IncreaseFontSize, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-+", IncreaseFontSize, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd--", DecreaseFontSize, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-0", ResetFontSize, Some(context::WORKSPACE)),
         //
         // Overlay
         KeyBinding::new("escape", Cancel, Some(context::PALETTE)),

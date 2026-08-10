@@ -24,11 +24,15 @@
 //!
 //! **Fonts and text metrics cannot be tested here at all.** gpui's test platform installs
 //! `NoopTextSystem`, whose `font_id` returns `FontId(1)` for *every* descriptor and whose
-//! `advance` is a fixed formula. A test asserting "the editor font is monospaced" therefore
-//! passes with `Helvetica` — I wrote that test, watched it pass under a proportional family,
-//! and deleted it. Column alignment and whether `Menlo` actually resolves are verifiable only
-//! on a real display, which is why the startup check in `main` logs a warning and why they
-//! stay on issue #35's human list.
+//! `advance` is a fixed formula — `600.0 * ch.len_utf16()`, so every BMP character has the
+//! same advance and the noop text system measures as a *perfect monospace*. A test asserting
+//! "the editor font is monospaced" therefore passes with `Helvetica` — I wrote that test,
+//! watched it pass under a proportional family, and deleted it.
+//!
+//! #49 made the family configurable and did not change that. The monospace check it added
+//! queries real glyph advances through `cx.text_system()` and is correspondingly untestable
+//! from here; `crate::fonts` says so at the point where someone would be tempted. Column
+//! alignment and whether the chosen family actually resolves stay on issue #35's human list.
 
 use std::sync::Arc;
 
@@ -36,6 +40,7 @@ use elle_core::{BUILTIN_COMMANDS, CommandRegistry};
 use gpui::{TestAppContext, VisualTestContext, px, size};
 
 use crate::editor::{Document, EditorView};
+use crate::fonts::Fonts;
 use crate::palette::{Palette, PaletteMode};
 use crate::theme::{Metrics, ThemeVariant, Themed, set_theme};
 use crate::workspace_view::WorkspaceView;
@@ -216,10 +221,8 @@ async fn the_editor_measures_its_text_origin_during_layout(cx: &mut TestAppConte
     // The editor is rendered standalone here, so the text begins after the gutter and
     // nothing else. If this ever reads ~0, `on_children_prepainted` stopped firing and the
     // click handler is back to guessing.
-    assert!(
-        origin >= Metrics::GUTTER_WIDTH,
-        "text should start at or after the gutter, measured {origin:?}"
-    );
+    let gutter = cx.update(|_window, cx| Fonts::get(cx).gutter_width());
+    assert!(origin >= gutter, "text should start at or after the gutter, measured {origin:?}");
 }
 
 #[gpui::test]
@@ -254,13 +257,14 @@ async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut 
     let origin = editor
         .read_with(cx, |editor, _cx| editor.text_origin_x_for_test())
         .expect("prepaint records the text origin");
+    let fonts = cx.update(|_window, cx| Fonts::get(cx));
     assert!(
-        origin > Metrics::GUTTER_WIDTH + px(100.0),
+        origin > fonts.gutter_width() + px(100.0),
         "inside the chrome the text origin must be well right of the gutter; got {origin:?}"
     );
 
     // Click a few pixels into the text of a row, which must resolve to an early column.
-    let y = Metrics::TAB_HEIGHT + Metrics::LINE_HEIGHT * 2.5;
+    let y = Metrics::TAB_HEIGHT + fonts.line_height() * 2.5;
     cx.simulate_click(gpui::point(origin + px(4.0), y), gpui::Modifiers::default());
 
     let after = editor.read_with(cx, |editor, _cx| editor.document.cursor_point());

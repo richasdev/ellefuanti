@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+<<<<<<< HEAD
 - Themes load from disk, and VS Code themes can be imported. `elle-theme` is a new plain-Rust
   crate holding a native format — flat, one key per colour, versioned from the first commit —
   plus an importer for VS Code's `colors` and `tokenColors`. Themes are read from
@@ -29,6 +30,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   position in a document, which an importer resolving a name in the abstract does not have.
   Where a theme says nothing, the fallback names another key in the same theme, so an
   unstyled concept lands in the theme's own palette and never at black (#58)
+=======
+- Configurable fonts, on the settings layer #60 added: `editor.fontFamily`,
+  `editor.fontSize`, `ui.fontSize` and `editor.lineHeight`. Line height is a **multiplier**
+  rather than pixels — the old `20px` against `13px` text was a ratio someone chose once
+  that stops meaning anything at 20px text. ⌘+ / ⌘- / ⌘0 adjust the editor size live and
+  persist it.
+
+  Two metrics that were fixed pixel values are now **derived** from the font size, because a
+  constant is not merely unfashionable there, it is _wrong_ at any other size: the gutter's
+  `52px` loses a five-digit line number at 20px, and the terminal's `16px` row overlaps its
+  own text as soon as anything zooms. The terminal's cell width and row height come from one
+  function returning both, because three places need them and all three have to agree — the
+  grid layout, the PTY resize, and the mouse hit-test that anchors a selection. A drawn row
+  height that disagrees with the resize row height means the shell believes it has a
+  different number of rows than are on screen and its output garbles, which is a worse
+  failure than a visual offset and is not one a render test would catch.
+
+  The part that is not cosmetic: **a configured family is verified monospace at selection
+  time, against real glyph metrics.** gpui does not error on a missing family — it
+  substitutes a proportional face and returns a valid `FontId`, and every column
+  calculation in the editor and terminal silently goes wrong. So each candidate is checked
+  for availability and then measured (`i`, `W`, `m` advances through `cx.text_system()`),
+  and a family that fails either check is skipped with an error saying _which_ — "not
+  installed" and "not monospaced" are different problems with different fixes. Falling back
+  walks a chain (Menlo → SF Mono → Monaco) rather than one hardcoded name.
+
+  Those checks are deliberately **not** unit-tested, and that is the point. gpui's test
+  platform gives every character an identical advance, so a headless "is it monospaced"
+  assertion passes with Helvetica — the same mistake as the test deleted in `0eff21c`. They
+  were verified by running them against the real macOS text system instead: Menlo and Monaco
+  accepted at 9.63/9.60px uniform advance, Helvetica and Comic Sans MS rejected at
+  3.55–16.63px. That run also removed a generic `monospace` entry from the fallback chain,
+  which had been added on the assumption gpui resolves the CSS generic — measured, it comes
+  back _proportional_, i.e. an entry that would have failed the check it existed to satisfy
+  (#49)
+>>>>>>> 8d254de (feat(fonts): configurable family, size and line height - verified monospace)
 
 - A settings layer: `~/Library/Application Support/ellefuanti/settings.json`, read at
   startup and written atomically. JSON rather than TOML so #58's `.vscode/settings.json`
