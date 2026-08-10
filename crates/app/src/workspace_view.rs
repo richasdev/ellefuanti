@@ -7,7 +7,7 @@ use elle_core::CommandRegistry;
 use elle_workspace::{CancelFlag, FileTree, index_files, read_file, write_file};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions, SharedString,
-    Task, Window, div, prelude::*, px, uniform_list,
+    Task, Window, div, prelude::*, px, svg, uniform_list,
 };
 
 use crate::actions::{
@@ -15,6 +15,7 @@ use crate::actions::{
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTheme, context, dispatch_for,
 };
 use crate::editor::{Document, EditorView};
+use crate::icons;
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::terminal_view::TerminalView;
@@ -776,6 +777,10 @@ impl WorkspaceView {
     fn render_activity_bar(&self, theme: &Theme) -> impl IntoElement {
         // Later panels are shown disabled rather than hidden, so the shape of the product
         // is legible from the first commit (§6) without pretending they work.
+        //
+        // Paired with `icons::ICONS` positionally, and `panels_and_icons_stay_aligned`
+        // below is what keeps that honest — a zip would silently drop a panel if the two
+        // ever fell out of step.
         let panels = [
             ("Explorer", true),
             ("Search", false),
@@ -797,7 +802,7 @@ impl WorkspaceView {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .children(panels.into_iter().map(|(name, enabled)| {
+            .children(panels.into_iter().zip(icons::ICONS).map(|((name, enabled), icon)| {
                 div()
                     .id(name)
                     .size(px(32.0))
@@ -807,9 +812,15 @@ impl WorkspaceView {
                     .rounded_md()
                     .when(enabled, |el| el.bg(theme.selected).text_color(theme.accent))
                     .when(!enabled, |el| el.text_color(theme.text_muted))
-                    // First letter as a placeholder glyph: real icons are an assets task,
-                    // and a letter is honest about being a placeholder.
-                    .child(SharedString::from(name[..1].to_string()))
+                    // 16px inside a 32px hit target: the icon is the glyph, the square is
+                    // the thing you can hit, and VS Code uses the same ratio.
+                    //
+                    // The colour is set on this parent, not on the svg. gpui rasterises
+                    // the SVG to an alpha mask and fills it with `style.text.color`, so
+                    // the icon inherits `text_color` above and every theme variant
+                    // recolours it for free. An icon with a hardcoded fill would be
+                    // invisible in at least one of the five.
+                    .child(svg().path(icon.path).size(px(16.0)))
             }))
     }
 
@@ -1040,6 +1051,33 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// `render_activity_bar` zips its panel list against `icons::ICONS`, and `zip` stops at
+    /// the shorter side — so adding a panel without adding an icon would silently drop the
+    /// last panel off the bar rather than fail. Assert the lengths match.
+    ///
+    /// The names are asserted too, because equal lengths in the wrong order is the other
+    /// way to get this wrong, and it is the more confusing one: every icon renders, each
+    /// against the wrong panel.
+    #[test]
+    fn panels_and_icons_stay_aligned() {
+        let expected = ["explorer", "search", "git", "laravel", "database", "docker", "tests"];
+
+        assert_eq!(
+            icons::ICONS.len(),
+            expected.len(),
+            "the activity bar renders {} panels; add the matching icon to icons::ICONS",
+            expected.len()
+        );
+
+        for (icon, name) in icons::ICONS.iter().zip(expected) {
+            assert_eq!(
+                icon.path,
+                format!("icons/{name}.svg"),
+                "icons::ICONS is out of order: every panel would get the wrong glyph"
+            );
+        }
+    }
 
     /// Stands in for a `Task`, recording its own cancellation.
     ///
