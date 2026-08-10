@@ -72,6 +72,10 @@ actions!(
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
+        // Laravel completion (#83). Offers the project's route names inside a `route('…')`,
+        // and does nothing anywhere else — so the key stays free for the general completion
+        // this editor does not have yet.
+        CompleteLaravel,
         // Navigation (#81). `GoToDefinition` and `FindReferences` are also reachable by
         // ⌘click and the Go menu; the palette-backed two are keyboard-only.
         GoToSymbol,
@@ -137,6 +141,11 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("f12", GoToDefinition, Some(context::WORKSPACE)),
         KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
+        // ⌃space is the universal "complete here". Workspace-scoped like the rest, and it
+        // falls through silently when the cursor is not in a `route('…')` — there is no
+        // general completion to fall back to yet, so a press elsewhere does nothing rather
+        // than opening an empty list.
+        KeyBinding::new("ctrl-space", CompleteLaravel, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl--", NavigateBack, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift--", NavigateForward, Some(context::WORKSPACE)),
         // ctrl-` is the conventional terminal toggle. It is bound workspace-wide so it
@@ -268,6 +277,7 @@ pub enum Dispatch {
     CloseTab,
     QuickOpen,
     Routes,
+    CompleteRouteName,
     GoToSymbol,
     GoToDefinition,
     FindReferences,
@@ -295,6 +305,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "editor.close" => Dispatch::CloseTab,
         "palette.quick_open" => Dispatch::QuickOpen,
         "laravel.routes" => Dispatch::Routes,
+        "laravel.route_name" => Dispatch::CompleteRouteName,
         "navigate.symbol" => Dispatch::GoToSymbol,
         "navigate.definition" => Dispatch::GoToDefinition,
         "navigate.references" => Dispatch::FindReferences,
