@@ -29,6 +29,12 @@ pub struct ModelFacts {
     /// Query scopes by their *call* name: `scopeActive` is stored as `active`, because
     /// the name the user types is the one completion answers with.
     pub scopes: Vec<String>,
+    /// Accessor attributes by the property they expose: `getFullNameAttribute` and the
+    /// new-style `fullName(): Attribute` both report `full_name`.
+    pub accessors: Vec<String>,
+    /// `$guarded` entries — column names by implication (a guard on a column that does
+    /// not exist guards nothing), the weakest claim of the column sources.
+    pub guarded: Vec<String>,
 }
 
 /// The relationship builders worth recognising — the set Eloquent documents.
@@ -71,6 +77,7 @@ pub fn extract_model(source: &str) -> Option<ModelFacts> {
     facts.table = quoted_after(source, "$table");
     facts.fillable = quoted_list_after(source, "$fillable");
     facts.casts = pair_list_after(source, "$casts");
+    facts.guarded = quoted_list_after(source, "$guarded");
 
     // Relationship methods: `function posts() { return $this->hasMany(Post::class); }`.
     // Scanned by builder name because that is the invariant part; the method name is
@@ -103,6 +110,40 @@ pub fn extract_model(source: &str) -> Option<ModelFacts> {
             if !method.is_empty() && !target.is_empty() {
                 facts.relations.push((method, kind.to_string(), target));
             }
+        }
+    }
+
+    // Accessors, old style: `function getFullNameAttribute(` → `full_name`. The middle
+    // must be non-empty — `getAttribute` itself is Eloquent's machinery, not an accessor.
+    let mut from = 0;
+    while let Some(at) = source[from..].find("function get") {
+        let at = from + at + "function get".len();
+        from = at;
+        let rest: String =
+            source[at..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if let Some(middle) = rest.strip_suffix("Attribute")
+            && !middle.is_empty()
+        {
+            facts.accessors.push(snake(middle));
+        }
+    }
+
+    // Accessors, new style: `function fullName(): Attribute`. The return type is the
+    // marker; the argument list of an accessor is empty in every generated shape, so
+    // scanning to the first `)` is the honest approximation.
+    let mut from = 0;
+    while let Some(at) = source[from..].find("function ") {
+        let at = from + at + "function ".len();
+        from = at;
+        let name: String =
+            source[at..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let Some(close) = source[at..].find(')') else { continue };
+        let after = source[at + close + 1..].trim_start();
+        if let Some(return_type) = after.strip_prefix(':')
+            && return_type.trim_start().starts_with("Attribute")
+            && !name.is_empty()
+        {
+            facts.accessors.push(snake(&name));
         }
     }
 
@@ -184,6 +225,20 @@ pub fn extract_migration_columns(source: &str) -> Vec<(String, String, String)> 
         }
     }
 
+    out
+}
+
+/// `FullName` / `fullName` → `full_name` — the camel-to-snake half of Laravel's
+/// attribute naming. The plural half lives in the index (`snake_plural`), which is the
+/// one seam allowed to guess; this is a mechanical spelling, not a guess.
+fn snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+    }
     out
 }
 
@@ -277,6 +332,26 @@ class User extends Authenticatable
                 ("company".into(), "belongsTo".into(), "App\\Models\\Company".into()),
             ]
         );
+    }
+
+    #[test]
+    fn accessors_are_reported_as_the_attribute_they_expose() {
+        // Both accessor styles expose `$user->full_name`; the property name is the item.
+        let old_style = "<?php\nclass User extends Model {\n  public function getFullNameAttribute() { return ''; }\n  public function getAttribute($key) { return parent::getAttribute($key); }\n}\n";
+        let facts = extract_model(old_style).expect("a model");
+        assert_eq!(facts.accessors, ["full_name"]);
+        // `getAttribute` itself is Eloquent's own machinery, not an accessor.
+
+        let new_style = "<?php\nclass User extends Model {\n  protected function fullName(): Attribute { return Attribute::make(get: fn () => ''); }\n  protected function plainHelper(): string { return ''; }\n}\n";
+        let facts = extract_model(new_style).expect("a model");
+        assert_eq!(facts.accessors, ["full_name"]);
+    }
+
+    #[test]
+    fn guarded_columns_are_facts_too() {
+        let src = "<?php\nclass User extends Model {\n  protected $guarded = ['id', 'is_admin'];\n}\n";
+        let facts = extract_model(src).expect("a model");
+        assert_eq!(facts.guarded, ["id", "is_admin"]);
     }
 
     #[test]
