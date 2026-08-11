@@ -2326,6 +2326,7 @@ mod tests {
         assert_eq!(d.buffer.text(), "açã");
     }
 
+    #[test]
     fn deleting_a_word_undoes_in_one_step() {
         let mut d = doc("alpha beta gamma");
         d.move_to(d.buffer.len_bytes(), false);
@@ -3189,10 +3190,6 @@ $ação = 1;
     // unparseable file has no tree and correctly matches nothing, which is asserted below
     // rather than worked around.
 
-    /// The pair `matching_bracket` finds, as the two characters it points at.
-    fn matched(d: &Document) -> Option<(String, String)> {
-        d.matching_bracket().map(|(a, b)| (d.buffer.slice(a..a + 1), d.buffer.slice(b..b + 1)))
-    }
 
     #[test]
     fn the_bracket_under_the_cursor_finds_its_partner() {

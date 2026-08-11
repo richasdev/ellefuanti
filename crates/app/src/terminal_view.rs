@@ -1195,6 +1195,8 @@ fn banner(message: SharedString, theme: &Theme, ui_size: Pixels) -> gpui::Div {
 /// height by. Drawing rows at one height while telling the PTY it has a screen measured in
 /// another means the shell writes rows nobody sees; passing the number in rather than
 /// recomputing it is what makes that impossible to get wrong.
+#[allow(clippy::too_many_arguments)] // the doc above is the reason: every argument is a
+// number two other consumers must agree on, and bundling them would hide the agreement.
 fn render_grid(
     snapshot: &GridSnapshot,
     geometry: GridGeometry,

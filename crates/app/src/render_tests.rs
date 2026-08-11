@@ -3368,6 +3368,37 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     draw(cx);
 }
 
+/// The rename prompt confirms the typed name, and an empty name is not a rename (#19).
+#[gpui::test]
+async fn the_rename_prompt_confirms_its_query_not_a_row(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let confirmed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+
+    let (palette, subscription) = cx.update(|cx| {
+        use gpui::AppContext as _;
+        let palette =
+            cx.new(|cx| crate::palette::Palette::new(crate::palette::PaletteMode::Rename, Vec::new(), cx));
+        let sink = confirmed.clone();
+        let subscription = cx.subscribe(&palette, move |_palette, event, _cx| {
+            if let crate::palette::PaletteEvent::Confirmed(name) = event {
+                sink.borrow_mut().push(name.clone());
+            }
+        });
+        (palette, subscription)
+    });
+
+    palette.update(cx, |palette, cx| {
+        // Empty first: confirming nothing must emit nothing — Escape is how you decline.
+        palette.confirm_for_test(cx);
+        palette.preset_query("old_name", cx);
+        palette.type_for_test("_2", cx);
+        palette.confirm_for_test(cx);
+    });
+
+    assert_eq!(*confirmed.borrow(), ["old_name_2"], "the typed name is the answer");
+    drop(subscription);
+}
+
 /// A rename's WorkspaceEdit touches open buffers and closed files — all or none (#19).
 ///
 /// The open buffer takes its edits as one undo step and goes dirty (the user saves);
@@ -3452,6 +3483,57 @@ async fn a_workspace_edit_spans_open_buffers_and_closed_files_or_touches_nothing
         std::fs::read_to_string(&closed_path).unwrap(),
         "<?php\n$old = 2;\n",
         "and nothing was touched"
+    );
+
+    draw(cx);
+}
+
+/// Confirming a quick-fix row applies that action's edit — by index, all files or none (#19).
+///
+/// The request half needs a live server; what this pins is the half that can corrupt a
+/// file: the chosen row maps to the right pending edit, and the application goes through
+/// the same all-or-nothing applier the rename test proves.
+#[gpui::test]
+async fn confirming_a_quick_fix_applies_the_chosen_edit(cx: &mut TestAppContext) {
+    use elle_lsp::lsp_types as lt;
+    install_theme(cx);
+    let dir = project();
+    let target = dir.path().join("fixable.php");
+    std::fs::write(&target, "<?php\nnew User();\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    let import_edit = lt::WorkspaceEdit {
+        changes: Some(
+            [(
+                elle_lsp::path_to_uri(&target).unwrap(),
+                vec![lt::TextEdit {
+                    range: lt::Range {
+                        start: lt::Position { line: 1, character: 0 },
+                        end: lt::Position { line: 1, character: 0 },
+                    },
+                    new_text: "use App\\Models\\User;\n".into(),
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        document_changes: None,
+        change_annotations: None,
+    };
+    // A decoy at index 0, so "the right edit" is falsifiable rather than "the only edit".
+    let decoy = lt::WorkspaceEdit::default();
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.set_pending_code_actions_for_test(vec![decoy, import_edit], cx);
+        workspace.toggle_palette_for_test(crate::palette::PaletteMode::CodeActions, window, cx);
+        workspace.confirm_palette_for_test("1", window, cx);
+    });
+
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "<?php\nuse App\\Models\\User;\nnew User();\n",
+        "the chosen fix landed, not the decoy"
     );
 
     draw(cx);

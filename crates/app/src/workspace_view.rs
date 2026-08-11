@@ -20,7 +20,7 @@ use gpui::{
 use crate::actions::{
     CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
     FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
-    IncreaseFontSize, RenameSymbol,
+    IncreaseFontSize, QuickFix, RenameSymbol,
     NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
     RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
@@ -527,6 +527,8 @@ pub struct WorkspaceView {
     /// under the overlay; taken (not read) at confirm so a dismissed prompt leaves
     /// nothing armed.
     pending_rename: Option<(elle_lsp::lsp_types::Uri, usize)>,
+    /// The edits behind the open quick-fix palette, index-paired with its rows.
+    pending_code_actions: Vec<elle_lsp::lsp_types::WorkspaceEdit>,
     /// The source control panel (#64), and whether it is the visible sidebar.
     ///
     /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
@@ -627,6 +629,7 @@ impl WorkspaceView {
             history: JumpHistory::default(),
             in_flight_query: None,
             pending_rename: None,
+            pending_code_actions: Vec::new(),
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -1140,6 +1143,17 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn save_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save(&Save, window, cx);
+    }
+
+    /// Arms the quick-fix palette's pending edits, for tests — the request half needs
+    /// a live server; the apply half is what can corrupt a file and is what gets pinned.
+    #[cfg(test)]
+    pub fn set_pending_code_actions_for_test(
+        &mut self,
+        edits: Vec<elle_lsp::lsp_types::WorkspaceEdit>,
+        _cx: &mut Context<Self>,
+    ) {
+        self.pending_code_actions = edits;
     }
 
     /// The rename applier, for tests — a real `WorkspaceEdit` needs a live server.
@@ -3582,7 +3596,8 @@ impl WorkspaceView {
             | PaletteMode::References
             | PaletteMode::Artisan
             | PaletteMode::WorkspaceSymbols
-            | PaletteMode::Rename => Vec::new(),
+            | PaletteMode::Rename
+            | PaletteMode::CodeActions => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3617,7 +3632,10 @@ impl WorkspaceView {
             PaletteMode::WorkspaceSymbols => {
                 self.load_workspace_symbol_items(palette, String::new(), cx)
             }
-            PaletteMode::Commands | PaletteMode::Languages | PaletteMode::Rename => {}
+            PaletteMode::Commands
+            | PaletteMode::Languages
+            | PaletteMode::Rename
+            | PaletteMode::CodeActions => {}
         }
 
         cx.notify();
@@ -3959,6 +3977,74 @@ impl WorkspaceView {
             .ok();
         });
         self.jobs.start(Job::LspQuery, task);
+    }
+
+    /// Asks for quick fixes at the cursor and lists them in the palette (#19, ⌘.).
+    ///
+    /// The request runs *before* the palette opens — a palette that appears and then
+    /// fills is right for navigation lists, wrong for a menu of two fixes. Silent with
+    /// no server; "No quick fixes here" when the server answers empty, because the user
+    /// asked and silence would read as a dead keybinding (the ⌥⌘I rule). Command-only
+    /// entries (no edit) are skipped: applying one means workspace/executeCommand,
+    /// which is a different contract — recorded here rather than half-built.
+    fn quick_fix(&mut self, _: &QuickFix, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((uri, offset)) = self.navigation_origin(cx) else { return };
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(path) = tab.path.clone() else { return };
+        let text = tab.editor.read(cx).document.buffer.text();
+        let selection = tab.editor.read(cx).document.selection.range();
+        let range = if selection.is_empty() { offset..offset } else { selection };
+
+        // The server decides what to offer from the diagnostics we send back.
+        let diagnostics = self
+            .lsp
+            .diagnostics_for(&uri)
+            .map(|file| file.raw_in_range(range.clone()))
+            .unwrap_or_default();
+
+        self.notify_lsp_of_change(&path, &text);
+        let Some(client) = self.lsp.client_mut() else { return };
+        let id = match client.request_code_actions(&uri, range, &diagnostics) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for code actions: {err:#}");
+                return;
+            }
+        };
+
+        let query = id.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let reply =
+                Self::poll_query::<elle_lsp::lsp_types::CodeActionResponse>(&this, &query, cx)
+                    .await
+                    .unwrap_or_default();
+            this.update_in(cx, |this, window, cx| {
+                this.in_flight_query = None;
+                let mut titles = Vec::new();
+                let mut edits = Vec::new();
+                for entry in reply.unwrap_or_default() {
+                    if let elle_lsp::lsp_types::CodeActionOrCommand::CodeAction(action) = entry
+                        && let Some(edit) = action.edit
+                    {
+                        titles.push((action.title, edits.len().to_string()));
+                        edits.push(edit);
+                    }
+                }
+                if edits.is_empty() {
+                    this.status = Some("No quick fixes here".into());
+                    cx.notify();
+                    return;
+                }
+                this.pending_code_actions = edits;
+                this.toggle_palette(PaletteMode::CodeActions, window, cx);
+                if let Some(palette) = this.palette.clone() {
+                    palette.update(cx, |palette, cx| palette.set_items(titles, cx));
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.start_query(id, task);
     }
 
     /// Opens the rename prompt for the symbol under the cursor (#19, F2).
@@ -5321,6 +5407,21 @@ impl WorkspaceView {
                     window.focus(&terminal.read(cx).focus_handle(cx));
                 }
             }
+            // #19. The id is the chosen action's index into the pending edits.
+            Some(PaletteMode::CodeActions) => {
+                let pending = std::mem::take(&mut self.pending_code_actions);
+                if let Some(edit) = id.parse::<usize>().ok().and_then(|i| pending.into_iter().nth(i)) {
+                    match self.apply_workspace_edit(edit, cx) {
+                        Ok(files) => {
+                            self.status = Some(format!("Fix applied in {files} file(s)").into())
+                        }
+                        Err(err) => {
+                            self.status = Some(format!("Fix not applied: {err}").into())
+                        }
+                    }
+                    cx.notify();
+                }
+            }
             // #19. The "id" is the typed new name; the position it applies to was
             // captured when the prompt opened.
             Some(PaletteMode::Rename) => {
@@ -5392,6 +5493,7 @@ impl WorkspaceView {
                         self.toggle_palette(PaletteMode::WorkspaceSymbols, window, cx)
                     }
                     Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
+                    Dispatch::QuickFix => self.quick_fix(&QuickFix, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -5779,6 +5881,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::format_document))
             .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::quick_fix))
             .on_action(cx.listener(Self::find_references))
             .on_action(cx.listener(Self::navigate_back))
             .on_action(cx.listener(Self::navigate_forward))
