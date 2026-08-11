@@ -553,6 +553,28 @@ impl Document {
     /// hardcodes `$` in [`CharClass::of`] instead and that limitation is already documented
     /// there; wiring per-language scopes is the same much-bigger change.
     pub fn select_word_at(&mut self, offset: usize) {
+        let Some((_, start, end)) = self.class_run_at(offset) else {
+            // Empty buffer: there is no run to select.
+            self.selection = Selection::at(0);
+            self.goal_column = None;
+            return;
+        };
+
+        let rope = self.buffer.rope();
+        self.selection =
+            Selection { anchor: rope.char_to_byte(start), head: rope.char_to_byte(end) };
+        self.goal_column = None;
+        // A click is a jump: the same reason `move_to` breaks the run.
+        self.buffer.break_undo_group();
+    }
+
+    /// The run of one character class around `offset`: `(class, start, end)` in **chars**.
+    ///
+    /// The shared core of double-click selection and the ⌘-hover link hint — extracted so
+    /// the two cannot disagree about what "the word here" means. All of `select_word_at`'s
+    /// documented subtleties (the `max` of both sides, the newline stop, the 128 cap) live
+    /// here now; see that method's comment for why each is the way it is.
+    fn class_run_at(&self, offset: usize) -> Option<(CharClass, usize, usize)> {
         let rope = self.buffer.rope();
         let len = rope.len_chars();
         let mid = rope.byte_to_char(offset.min(self.buffer.len_bytes()));
@@ -562,12 +584,7 @@ impl Document {
         // `Option`'s own `Ord` puts `None` below every `Some`, which is what Zed's
         // `cmp::max` over two `Option<CharKind>` relies on: one side being past the end of
         // the buffer must not win.
-        let Some(kind) = prev.max(next) else {
-            // Empty buffer: there is no run to select.
-            self.selection = Selection::at(0);
-            self.goal_column = None;
-            return;
-        };
+        let kind = prev.max(next)?;
 
         const MAX_SCAN: usize = 128;
 
@@ -589,11 +606,22 @@ impl Document {
             end += 1;
         }
 
-        self.selection =
-            Selection { anchor: rope.char_to_byte(start), head: rope.char_to_byte(end) };
-        self.goal_column = None;
-        // A click is a jump: the same reason `move_to` breaks the run.
-        self.buffer.break_undo_group();
+        Some((kind, start, end))
+    }
+
+    /// The byte span of the *word* under `offset`, or `None` when what is there is not one.
+    ///
+    /// The ⌘-hover link hint: only a word earns an underline and a pointing hand, because
+    /// only a word is something go-to-definition can answer about. Whitespace and
+    /// punctuation return `None` — ⌘ held over `->` must not promise a jump the server
+    /// will refuse, which is the same honesty rule as everywhere else, applied to a hint.
+    pub fn word_span_at(&self, offset: usize) -> Option<std::ops::Range<usize>> {
+        let (kind, start, end) = self.class_run_at(offset)?;
+        if kind != CharClass::Word || start == end {
+            return None;
+        }
+        let rope = self.buffer.rope();
+        Some(rope.char_to_byte(start)..rope.char_to_byte(end))
     }
 
     /// Triple-click: selects the whole line `row` sits on, including its line ending.
@@ -2351,6 +2379,25 @@ mod tests {
     fn title_falls_back_to_untitled() {
         assert_eq!(Document::new(None, "", false).unwrap().title(), "untitled");
         assert_eq!(doc("").title(), "t.php");
+    }
+
+    #[test]
+    fn the_link_hint_answers_only_for_words() {
+        // The ⌘-hover underline promises a jump; only a word can keep that promise.
+        let d = doc("<?php \n$this->name;\n");
+
+        // On `name` (bytes 14..18): the word, whole.
+        assert_eq!(d.word_span_at(15), Some(14..18));
+        // On `$this`: `$` is a word character here (see CharClass::of), so the span
+        // includes it — the same answer double-click gives.
+        assert_eq!(d.word_span_at(8), Some(7..12));
+        // Inside the `->` (both neighbours punctuation): nothing to promise.
+        assert_eq!(d.word_span_at(13), None);
+        // At the boundary between `$this` and `->`, the word side wins — the same `max`
+        // rule double-click uses, so hint and selection cannot disagree there.
+        assert_eq!(d.word_span_at(12), Some(7..12));
+        // On whitespace: nothing.
+        assert_eq!(d.word_span_at(6), None);
     }
 
     #[test]
