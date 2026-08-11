@@ -290,7 +290,7 @@ impl JumpHistory {
 /// F12 means: jump, do not ask. A symbol with several definitions — an interface and its
 /// implementations — is what ⇧F12 is for, and offering a picker on every F12 would slow the
 /// common case down to serve the rare one.
-fn first_location(response: &GotoDefinitionResponse) -> Option<(PathBuf, Point)> {
+fn first_location(response: &GotoDefinitionResponse) -> Option<(PathBuf, u32, u32)> {
     let (uri, range) = match response {
         GotoDefinitionResponse::Scalar(location) => (&location.uri, location.range),
         GotoDefinitionResponse::Array(locations) => {
@@ -306,14 +306,14 @@ fn first_location(response: &GotoDefinitionResponse) -> Option<(PathBuf, Point)>
     };
 
     let path = elle_lsp::uri_to_path(uri).ok()?;
-    // Column 0, not `range.start.character`. The character is a UTF-16 offset and a `Point`
-    // column is a byte offset; they agree only for ASCII, and converting needs the buffer,
-    // which does not exist until the file has loaded. Landing at the start of the line is
-    // both correct and a normal IDE behaviour, where landing at a mis-converted column would
-    // put the cursor mid-identifier on exactly the accented Portuguese source this project
-    // is for. `crates/lsp`'s `LineIndex` does the conversion properly when there is a buffer
-    // to do it against — see `Lsp::set_diagnostics`.
-    Some((path, Point::new(range.start.line as usize, 0)))
+    // The raw LSP coordinates, deliberately unconverted: the character is a UTF-16 offset
+    // and a `Point` column is a byte offset, and converting needs the target file's text —
+    // which this function does not have and, for a file not yet open, nobody has until the
+    // load lands. `Target::Lsp` carries them to the moment a `Document` exists, where
+    // `point_from_lsp` does it properly. This used to land at column 0 with the honest
+    // note that the buffer was out of reach; the owner read that as "quase" — right line,
+    // wrong place — which next to every other IDE is a defect, not a behaviour.
+    Some((path, range.start.line, range.start.character))
 }
 
 /// Whether a file can hold Laravel references, and if so whether to read it as Blade.
@@ -1333,6 +1333,25 @@ impl WorkspaceView {
         self.dismiss_overlay(window, cx);
     }
 
+    /// A definition landing, through the same door the LSP answer takes.
+    #[cfg(test)]
+    pub fn open_path_at_lsp_for_test(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_at_lsp(path, line, character, window, cx);
+    }
+
+    /// The active cursor as a full point, for asserting a landing column.
+    #[cfg(test)]
+    pub fn cursor_point_for_test(&self, cx: &App) -> Option<Point> {
+        Some(self.active_editor()?.read(cx).document.cursor_point())
+    }
+
     /// A terminal link arriving, through the same resolver the subscription calls.
     #[cfg(test)]
     pub fn open_terminal_link_for_test(
@@ -1517,6 +1536,31 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_path_target(path, target.map(Target::Point), window, cx);
+    }
+
+    /// Opens a file at a position still in the server's units.
+    ///
+    /// The definition/declaration door. Takes the LSP position raw rather than a `Point`
+    /// because the conversion needs the target file's text — see [`Target`].
+    fn open_path_at_lsp(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_target(path, Some(Target::Lsp { line, character }), window, cx);
+    }
+
+    fn open_path_target(
+        &mut self,
+        path: PathBuf,
+        target: Option<Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
             self.clear_hover_cards(cx);
@@ -1525,7 +1569,8 @@ impl WorkspaceView {
             // make the command look broken.
             if let Some(target) = target {
                 self.tabs[index].editor.update(cx, |editor, cx| {
-                    editor.reveal(target);
+                    let point = target.resolve(&editor.document);
+                    editor.reveal(point);
                     cx.notify();
                 });
             }
@@ -1553,7 +1598,10 @@ impl WorkspaceView {
                                 // is already at the target rather than painting the top of
                                 // the file and jumping a frame later.
                                 if let Some(target) = target {
-                                    editor.update(cx, |editor, _| editor.reveal(target));
+                                    editor.update(cx, |editor, _| {
+                                        let point = target.resolve(&editor.document);
+                                        editor.reveal(point);
+                                    });
                                 }
                                 window.focus(&editor.read(cx).focus_handle(cx));
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
@@ -3474,11 +3522,11 @@ impl WorkspaceView {
                     // no-op that is indistinguishable from a dropped keystroke.
                     Ok(None) => this.status = Some("No definition found".into()),
                     Ok(Some(response)) => match first_location(&response) {
-                        Some((path, point)) => {
+                        Some((path, line, character)) => {
                             if let Some(origin) = origin {
                                 this.history.push(origin);
                             }
-                            this.open_path_at(path, Some(point), window, cx);
+                            this.open_path_at_lsp(path, line, character, window, cx);
                         }
                         None => this.status = Some("No definition found".into()),
                     },
@@ -4650,6 +4698,31 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
         .collect();
 
     (items, incomplete)
+}
+
+/// Where an open should land, in whichever unit the producer actually has.
+///
+/// Two variants because two kinds of producer exist and neither should convert at the
+/// wrong moment. A [`Point`] producer (terminal links, palette rows) already has byte
+/// columns. An LSP producer has UTF-16 characters, and converting those needs the line's
+/// text — which for a file not yet open does not exist until the load lands. Carrying the
+/// LSP position through and converting where a `Document` is in hand is what lets a
+/// definition land *on the identifier* instead of at column zero, which is where these
+/// jumps landed while the conversion had nowhere to happen.
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    Point(Point),
+    Lsp { line: u32, character: u32 },
+}
+
+impl Target {
+    /// The byte-column point, resolved against the document being revealed.
+    fn resolve(self, document: &Document) -> Point {
+        match self {
+            Target::Point(point) => point,
+            Target::Lsp { line, character } => document.point_from_lsp(line as usize, character),
+        }
+    }
 }
 
 /// Which step of the context-menu interaction is in flight (#126).
@@ -5903,20 +5976,16 @@ mod tests {
         // The protocol has three and servers use all of them. Handling only the one the
         // server of the day sends is a feature that silently does nothing after a swap.
         let scalar = GotoDefinitionResponse::Scalar(location("/srv/app/User.php", 12));
-        assert_eq!(
-            first_location(&scalar),
-            Some((PathBuf::from("/srv/app/User.php"), Point::new(12, 0)))
-        );
+        // The character comes through raw — UTF-16, converted only where a document
+        // exists (`Target::resolve`), which is what lets the jump land on the identifier.
+        assert_eq!(first_location(&scalar), Some((PathBuf::from("/srv/app/User.php"), 12, 4)));
 
         // An array takes the first: F12 means jump, not "ask me which".
         let array = GotoDefinitionResponse::Array(vec![
             location("/srv/app/User.php", 12),
             location("/srv/app/Other.php", 99),
         ]);
-        assert_eq!(
-            first_location(&array),
-            Some((PathBuf::from("/srv/app/User.php"), Point::new(12, 0)))
-        );
+        assert_eq!(first_location(&array), Some((PathBuf::from("/srv/app/User.php"), 12, 4)));
     }
 
     #[test]
@@ -5940,7 +6009,7 @@ mod tests {
 
         assert_eq!(
             first_location(&link),
-            Some((PathBuf::from("/srv/app/User.php"), Point::new(12, 0))),
+            Some((PathBuf::from("/srv/app/User.php"), 12, 4)),
             "must use the selection range, not the enclosing one"
         );
     }

@@ -2808,3 +2808,55 @@ async fn a_terminal_path_click_opens_the_file_at_its_line(cx: &mut TestAppContex
 
     draw(cx);
 }
+
+/// A definition jump lands on the identifier, through both doors, in UTF-16-correct columns.
+///
+/// The jump used to land at column 0 with a comment explaining that converting the
+/// server's UTF-16 character needed a buffer nobody had yet — true where it was written,
+/// and exactly why the conversion moved to where the buffer exists (`Target::resolve`).
+/// The fixture is accented on purpose: `$ação`'s `ç`/`ã` are one UTF-16 unit but two
+/// UTF-8 bytes, so an unconverted column lands mid-identifier on the code this editor
+/// is for, and an ASCII fixture would pass with the conversion deleted.
+#[gpui::test]
+async fn a_definition_jump_lands_on_the_identifier(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    // UTF-16 character 11 on line 1 is past `$ação = $b` — byte column 13.
+    let accented = "<?php\n$ação = $bem;\nmais\n";
+    let on_disk = dir.path().join("app/Acentos.php");
+    std::fs::write(&on_disk, accented).unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    // Door one: the file is already open — the `$this->name` same-file case.
+    let open_path = std::path::PathBuf::from("/srv/app/Aberto.php");
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(open_path.clone()), accented, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.open_path_at_lsp_for_test(open_path.clone(), 1, 11, window, cx);
+    });
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.cursor_point_for_test(cx),
+            Some(elle_text::Point::new(1, 13)),
+            "UTF-16 character 11 is byte column 13 on this line — column 0 or 11 is the bug"
+        );
+    });
+
+    // Door two: the file loads first, and the conversion waits for it.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_path_at_lsp_for_test(on_disk.clone(), 1, 11, window, cx);
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.tab_count_for_test(), 2, "the second door opened a new tab");
+        assert_eq!(
+            workspace.cursor_point_for_test(cx),
+            Some(elle_text::Point::new(1, 13)),
+            "the loaded door must convert too, after the text exists"
+        );
+    });
+
+    draw(cx);
+}
