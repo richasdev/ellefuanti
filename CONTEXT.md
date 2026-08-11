@@ -14,6 +14,38 @@ Written at `64c7871` (#111), 965 tests passing, v0.1.0 untagged. Amended at `4e6
 #125, #126 and #127 — are **fixed and closed**, along with #123. What that cost, and the two
 bugs found on the way, is immediately below.
 
+**Amended at `9b3828f`, ~1145 tests.** Since the previous amendment: #57, #59 (hover card),
+#69 (audited complete), #70, #100 and most of #82 shipped; the completion popup works end to
+end on a real server and has been *seen* working. The lessons worth the price of this round,
+each expanded in its own commit message:
+
+- **`ellefuanti .` exists now** (`main` read no argv at all — several diagnostic rounds were
+  spent on logs from windows that had never opened anything). `open` the `.app` for the
+  Finder environment; the wrapper-script trick in the git history shows how to capture a
+  launched `.app`'s stderr when logs are needed.
+- **A spawn that succeeds is not a server that runs.** Node LSP servers are `#!/usr/bin/env
+  node` scripts; resolving the binary without giving the child a `PATH` spawns a process
+  that dies before its first byte. The completion saga stacked five such almost-fixes:
+  server never started → binary not found → shebang starved → document never synced → list
+  zero pixels tall. Each fix exposed the next; nothing short of a live session finds these.
+- **The wire is the ground truth.** `ELLE_LSP_COMMAND` pointed at a tee script captured the
+  exact JSON both ways and ended three rounds of plausible-but-wrong theories. Cheaper than
+  any amount of reading.
+- **`debug_selector` + `VisualTestContext::debug_bounds`** (gpui test builds) give headless
+  tests measured element bounds — the suite's first real geometry assertions. Know the
+  limit: bounds measure **boxes, not ink**. A fixed-height row whose text wraps out of it
+  measures clean while painting garbage; that test was deleted as vacuous, and the comment
+  at the truncation site records why.
+- **Full-row selection tint hid ⌘D entirely** on themes where `hover == selected`
+  (one_dark_pro). Selections now paint precise byte ranges. When a reported "feature is
+  dead" arrives, check whether it worked invisibly before checking whether it worked.
+- **The multi-cursor undo trap was walked into with its warning already in this file.**
+  A loop of replaces is N undo steps no matter the `break_undo_group`s; `splice_at` now does
+  the one-spanning-replace shape. The warning did not prevent it; the test did.
+- **macOS swallows the activating click on a background window, modifiers included** — the
+  recurring "⌘-click does nothing" has been that, twice. F12-after-a-click works because
+  the click already activated.
+
 ---
 
 ## What the last three fixes taught — start here
@@ -575,7 +607,7 @@ The `.app` is also the only way to see the icon (#55) — a bare binary gets the
 
 ## If you are about to claim something works
 
-Run `cargo test --no-fail-fast` (1103 expected). Then, for anything that touches the screen,
+Run `cargo test --no-fail-fast` (~1145 expected; one PTY test is load-flaky under the full suite and solo-green). Then, for anything that touches the screen,
 say plainly that it has not been seen. The five-PR sequence above is what happens otherwise.
 
 The two-minute human check, from #35: `cargo run` → ⌘O a Laravel project → click into a PHP
