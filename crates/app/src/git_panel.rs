@@ -50,6 +50,9 @@ use crate::theme::{Metrics, Theme, Themed};
 /// One variant, and it stays one until there is a second thing a read-only panel can ask
 /// for. An `OpenRequested` for "open the file in a tab" was written and removed: nothing
 /// raises it, and an event nobody emits is a branch nobody tests.
+// The shared postfix is the point: every variant is a *request* the workspace runs,
+// because the panel has no executor policy — clippy would trade that honesty for brevity.
+#[allow(clippy::enum_variant_names)]
 pub enum GitEvent {
     /// A status row was clicked: show this file's diff. The workspace owns the background
     /// task, because the panel must not spawn — it has no root and no executor policy.
