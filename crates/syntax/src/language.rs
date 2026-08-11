@@ -115,6 +115,15 @@ impl Language {
     }
 
     /// Whether Blade directives (`@if`, `{{ $x }}`) should be highlighted.
+    /// Whether raw-markup regions inside this language's tree get the HTML lexer.
+    ///
+    /// PHP and Blade both: the grammar hands inline HTML back as opaque `text` nodes for
+    /// either, and a plain PHP view file with markup deserves colour exactly as a Blade
+    /// one does.
+    pub fn paints_inline_markup(&self) -> bool {
+        matches!(self, Language::Php | Language::Blade)
+    }
+
     pub fn has_blade_directives(&self) -> bool {
         matches!(self, Language::Blade)
     }
