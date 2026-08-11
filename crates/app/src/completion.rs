@@ -46,6 +46,11 @@ pub enum CompletionSource {
     /// `$fillable`'s — the provenance is in the item's detail, because which claim backs
     /// a column is exactly what #20 says the user must be able to see.
     LaravelColumn,
+    /// A relationship method from the Laravel index (#22): `posts` because the model
+    /// declares `hasMany(Post::class)`. A different claim than a column — it names a
+    /// method the class really defines, but the kind/target in the detail are read from
+    /// the method body by scan, not proven by execution.
+    LaravelRelation,
     /// A route name read out of the project's route files by static analysis (#83).
     ///
     /// A *weaker* claim than it looks, and deliberately labelled so: `route_names` only
@@ -63,6 +68,7 @@ impl CompletionSource {
             CompletionSource::Lsp => "LSP",
             CompletionSource::LaravelRoute => "route",
             CompletionSource::LaravelColumn => "column",
+            CompletionSource::LaravelRelation => "relation",
         }
     }
 
@@ -79,6 +85,7 @@ impl CompletionSource {
             // Same voice as routes: project facts, worth noticing, with a known blind
             // spot (the index sees what artisan wrote, not what a package injected).
             CompletionSource::LaravelColumn => theme.accent,
+            CompletionSource::LaravelRelation => theme.accent,
         }
     }
 }

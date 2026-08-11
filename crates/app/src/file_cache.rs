@@ -278,6 +278,15 @@ pub fn store(root: &Path, files: &[IndexedFile], cancel: &CancelFlag) {
     }
 }
 
+/// `HOME` is process-global, so any test that *sets* it — or resolves an
+/// `index_path` on a background task while another test might be setting it — must
+/// hold this lock for the duration. It lives outside `mod tests` because the render
+/// tests (#22's popup tests) read paths derived from `HOME` across awaits and race
+/// the `with_home` tests below without it: popup items arrived empty only under the
+/// full parallel suite, which is exactly the class of bug #43 was.
+#[cfg(test)]
+pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,14 +303,8 @@ mod tests {
         (home, project)
     }
 
-    /// `HOME` is process-global, so these tests cannot run concurrently with each other.
-    /// One mutex, taken by every test that sets it, rather than a `--test-threads=1` note
-    /// nobody reads. Issue #43 is about tests that fail only under parallel load; this is
-    /// the class of bug that causes it.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_home<T>(home: &Path, body: impl FnOnce() -> T) -> T {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("HOME");
         // SAFETY: guarded by HOME_LOCK, and restored before the guard drops.
         unsafe { std::env::set_var("HOME", home) };
