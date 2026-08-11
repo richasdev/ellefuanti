@@ -28,6 +28,9 @@ this file is the session ledger.
   seam, wholesale cancellable build fired on folder open. Unblocks #22 → #20.
   Mutation caught an unfalsifiable fixture (declared name == convention) — the
   vacuous test wearing data.
+- **#140 (#22 first slice)**: a model's own columns in the completion popup,
+  provenance in the detail (`string · migration` vs `boolean · cast`) — #20's
+  provenance rule paying out at the first consumer. Spelling trap count: **5**.
 
 ## Issues closed this loop (with evidence in each)
 
@@ -45,9 +48,9 @@ for boxes, owner-eyes for ink) and stays open for the owner's ack.
 - **#83/#23** — route palette + navigation + route-name completion shipped earlier;
   Artisan-through-palette not started.
 - **#21** — first slice merged (#139). Remaining: incremental reanalysis via the
-  dependency graph, routes/Livewire/Blade tables, external-change watch. **#22
-  (Eloquent completion from this index) is now unblocked and is the next
-  highest-value implementable.** #20 behind it.
+  dependency graph, routes/Livewire/Blade tables, external-change watch. #22's first slice
+  merged; remaining: relationships, `Model::` context, where('...') strings. #20 (the
+  merge/rank engine) is now the next design-sized piece, with two live sources to merge.
 - **#65** — DB viewer; the ADR-0007 conflict has an obvious resolution nobody has
   written down: **rusqlite is already in the tree (elle-index) and is synchronous** —
   SQLx was the wrong question. Needs a decision note + design.
