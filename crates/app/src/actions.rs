@@ -89,6 +89,7 @@ actions!(
         // Navigation (#81). `GoToDefinition` and `FindReferences` are also reachable by
         // ⌘click and the Go menu; the palette-backed two are keyboard-only.
         GoToSymbol,
+        SetLanguage,
         GoToDefinition,
         FindReferences,
         NavigateBack,
@@ -407,6 +408,7 @@ pub fn init(cx: &mut App) -> CommandRegistry {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dispatch {
     OpenFolder,
+    SetLanguage,
     NewFile,
     Save,
     CloseTab,
@@ -447,6 +449,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "laravel.routes" => Dispatch::Routes,
         "laravel.route_name" => Dispatch::CompleteRouteName,
         "navigate.symbol" => Dispatch::GoToSymbol,
+        "editor.language" => Dispatch::SetLanguage,
         "navigate.definition" => Dispatch::GoToDefinition,
         "navigate.references" => Dispatch::FindReferences,
         "navigate.back" => Dispatch::NavigateBack,

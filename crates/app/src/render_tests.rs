@@ -2425,3 +2425,83 @@ async fn a_name_with_a_slash_is_reported_not_silently_mangled(cx: &mut TestAppCo
 
     draw(cx);
 }
+
+// --- setting the language for a buffer (#127) ---------------------------------------
+
+/// ⌘N then choosing PHP colours the buffer, without saving it first.
+///
+/// The whole of #127 as the user meets it: `Document::untitled()` has no path, so nothing
+/// detects a language and there is no syntax colour, and before this the only way to get
+/// one was to save the file. This goes through the real palette path — the same one the
+/// status-bar cell and the command both open — rather than calling `set_language` directly,
+/// because what was missing was the *route to it*, not the capability.
+#[gpui::test]
+async fn an_untitled_buffer_can_be_given_a_language_from_the_palette(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.new_file(window, cx);
+    });
+
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.active_language_for_test(cx),
+            Some(elle_syntax::Language::PlainText),
+            "a new buffer starts as plain text — that is the bug"
+        );
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_palette_for_test(PaletteMode::Languages, window, cx);
+        // The id is the language's own `name()`, which is what the rows carry.
+        workspace.confirm_palette_for_test("PHP", window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.active_language_for_test(cx),
+            Some(elle_syntax::Language::Php),
+            "choosing PHP must reach the document"
+        );
+        assert_eq!(
+            workspace.tab_count_for_test(),
+            1,
+            "the buffer must still be the same one, not a saved file"
+        );
+    });
+
+    draw(cx);
+}
+
+/// The language palette offers every language, and marks the one in effect.
+#[gpui::test]
+async fn the_language_palette_lists_every_language(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("User.php")), "<?php\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.toggle_palette_for_test(PaletteMode::Languages, window, cx);
+    });
+
+    workspace.read_with(cx, |workspace, cx| {
+        let labels = workspace.palette_labels_for_test(cx);
+        assert_eq!(
+            labels.len(),
+            elle_syntax::ALL_LANGUAGES.len(),
+            "every language must be offered: {labels:?}"
+        );
+        // The current one is marked rather than hidden, so the list says what the buffer is
+        // as well as what it could become.
+        assert!(
+            labels.iter().any(|label| label.starts_with("PHP") && label.contains('✓')),
+            "the language in effect must be marked: {labels:?}"
+        );
+    });
+
+    draw(cx);
+}

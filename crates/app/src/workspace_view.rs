@@ -1192,6 +1192,29 @@ impl WorkspaceView {
         self.overlay.is_some()
     }
 
+    /// Confirms a palette row by id, through the handler Enter and a click both use.
+    #[cfg(test)]
+    pub fn confirm_palette_for_test(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_palette(id.to_string(), window, cx);
+    }
+
+    /// The active tab's language, which is what the status bar's last cell shows.
+    #[cfg(test)]
+    pub fn active_language_for_test(&self, cx: &App) -> Option<elle_syntax::Language> {
+        Some(self.active_editor()?.read(cx).document.language())
+    }
+
+    /// The rows the open palette is showing.
+    #[cfg(test)]
+    pub fn palette_labels_for_test(&self, cx: &App) -> Vec<String> {
+        self.palette.as_ref().map(|palette| palette.read(cx).labels_for_test()).unwrap_or_default()
+    }
+
     /// Dismisses the open overlay, as Escape and a click outside both do.
     #[cfg(test)]
     pub fn dismiss_overlay_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2951,6 +2974,25 @@ impl WorkspaceView {
                 .iter()
                 .map(|command| (command.title.to_string(), command.id.0.to_string()))
                 .collect(),
+            // Known up front, and short: eleven fixed choices with no IO behind them.
+            // The current language is marked rather than filtered out, so the list always
+            // says what the buffer is now as well as what it could be (#127).
+            PaletteMode::Languages => {
+                let current =
+                    self.active_editor().map(|editor| editor.read(cx).document.language());
+                elle_syntax::ALL_LANGUAGES
+                    .iter()
+                    .map(|language| {
+                        let name = language.name();
+                        let label = if Some(*language) == current {
+                            format!("{name}  ✓")
+                        } else {
+                            name.to_string()
+                        };
+                        (label, name.to_string())
+                    })
+                    .collect()
+            }
             // Everything else arrives asynchronously — the palette opens empty and fills in.
             PaletteMode::Files
             | PaletteMode::Routes
@@ -2980,7 +3022,7 @@ impl WorkspaceView {
             // the offset they are about is the cursor position at the moment the user
             // pressed the key, which `toggle_palette` does not know.
             PaletteMode::References => {}
-            PaletteMode::Commands => {}
+            PaletteMode::Commands | PaletteMode::Languages => {}
         }
 
         cx.notify();
@@ -3741,6 +3783,45 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Sets the syntax language for the active tab (#127).
+    ///
+    /// # Why this does not also rename the file
+    ///
+    /// Choosing "PHP" for an untitled buffer says how to colour it, not where it should
+    /// live. Inventing `untitled.php` on the strength of it would put a file on disk the
+    /// user never asked for and pre-empt the save-as dialog they are going to get anyway.
+    /// The language is a view of the buffer; the path is a decision about the filesystem.
+    ///
+    /// The choice does not survive a save, and that is deliberate rather than missing: once
+    /// the buffer has a path, `set_path` re-detects from the extension, which is the answer
+    /// the user just gave by choosing a name. A language override that outlived the save
+    /// would mean a file called `.php` that refuses to highlight as PHP because of a menu
+    /// choice made ten minutes earlier.
+    ///
+    /// ponytail: the override is per-document and unrecorded, so reopening a `.txt` full of
+    /// SQL means choosing again. Persisting it needs somewhere to write per-file state
+    /// (#60's settings layer, or the index), which is a store this does not have yet.
+    fn set_active_language(&mut self, language: elle_syntax::Language, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else { return };
+
+        let failed = editor.update(cx, |editor, cx| {
+            let failed = editor.document.set_language(language).err();
+            // A repaint has to be asked for explicitly: the buffer's text has not changed,
+            // so nothing else marks the view dirty. Highlights are read straight off the
+            // tree during render — there is no cache to invalidate — so redrawing is the
+            // whole of applying the new grammar.
+            cx.notify();
+            failed
+        });
+
+        // A grammar that will not load leaves the document as plain text, which is visible
+        // on screen — so saying nothing would look like the choice was ignored.
+        if let Some(err) = failed {
+            self.status = Some(format!("{err:#}").into());
+        }
+        cx.notify();
+    }
+
     // --- language server ------------------------------------------------------------
 
     /// Starts a language server for the open folder, if one is configured.
@@ -4108,6 +4189,17 @@ impl WorkspaceView {
                 }
                 self.open_path_at(path, target, window, cx);
             }
+            // #127. The id is the language's own `name()`, so the mapping back is a lookup
+            // over the same table the list was built from — no parallel list of strings to
+            // drift out of step with `Language`.
+            Some(PaletteMode::Languages) => {
+                let Some(language) =
+                    elle_syntax::ALL_LANGUAGES.iter().find(|language| language.name() == id)
+                else {
+                    return;
+                };
+                self.set_active_language(*language, cx);
+            }
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -4122,6 +4214,11 @@ impl WorkspaceView {
                         self.complete_laravel(&CompleteLaravel, window, cx)
                     }
                     Dispatch::GoToSymbol => self.go_to_symbol(&GoToSymbol, window, cx),
+                    // Reopens the palette in a different mode. Safe from here: the palette
+                    // that dispatched this was already dismissed at the top of the function.
+                    Dispatch::SetLanguage => {
+                        self.toggle_palette(PaletteMode::Languages, window, cx)
+                    }
                     Dispatch::GoToDefinition => self.go_to_definition(&GoToDefinition, window, cx),
                     Dispatch::FindReferences => self.find_references(&FindReferences, window, cx),
                     Dispatch::NavigateBack => self.navigate_back(&NavigateBack, window, cx),
@@ -5095,7 +5192,30 @@ impl WorkspaceView {
             .child(SharedString::from(tests))
             .child(SharedString::from(terminals))
             .child(SharedString::from(position))
-            .child(SharedString::from(language))
+            // #127. The language cell is a button, which is where every comparable editor
+            // puts this control and the only affordance an untitled buffer has: it has no
+            // path, so nothing detects a language for it and it can never be anything but
+            // plain text otherwise.
+            //
+            // Only when a tab is open. An empty cell that is nonetheless clickable is the
+            // kind of dead target #71 is about.
+            .when(!language.is_empty(), |el| {
+                let entity = cx.entity();
+                el.child(
+                    div()
+                        .id("status-language")
+                        .px_1()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme.hover))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.toggle_palette(PaletteMode::Languages, window, cx);
+                            });
+                        })
+                        .child(SharedString::from(language)),
+                )
+            })
     }
 }
 
