@@ -3919,8 +3919,9 @@ impl WorkspaceView {
 
         let origin = self.current_location(cx);
         let task = cx.spawn_in(window, async move |this, cx| {
-            let found =
-                cx.background_spawn(async move { elle_laravel::resolve(&root, &reference) }).await;
+            let found = cx
+                .background_spawn(async move { elle_laravel::resolve(&root, &path, &reference) })
+                .await;
 
             this.update_in(cx, |this, window, cx| {
                 // Nothing found means nothing said. A view comes from a configurable
