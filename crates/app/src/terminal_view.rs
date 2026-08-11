@@ -514,6 +514,13 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Types `text` into the active session as though the user had — the artisan
+    /// palette's door (#23). The caller decides what to send; this sends it verbatim,
+    /// newline included only if the caller put one there.
+    pub fn feed_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.send_text(text, cx);
+    }
+
     fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if let Some(session) = self.manager.active_mut() {
             session.scroll_to_bottom();

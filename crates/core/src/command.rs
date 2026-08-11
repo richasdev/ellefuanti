@@ -158,6 +158,10 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // #83. Named for what it does rather than "Complete", because it completes exactly one
     // thing and a row promising general completion would be the lie §24 warns about.
     Command::new("laravel.route_name", "Insert Route Name…"),
+    // #23. "Artisan Command…", not "Run Artisan…": confirming *types* the command into
+    // the terminal for the user to finish and execute — a row promising to run it would
+    // be the lie §24 warns about.
+    Command::new("laravel.artisan", "Artisan Command…"),
     // Navigation (#81). These have keybindings too — a command id is what makes them
     // findable by someone who does not know the chord, and what lets the Go menu name them.
     Command::new("navigate.symbol", "Go to Symbol in File…"),

@@ -3301,3 +3301,30 @@ async fn a_static_prefix_offers_the_models_scopes(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Confirming an artisan palette row opens the terminal and types — never runs (#23).
+///
+/// What is machine-checkable is that the panel opens with a session for the command to
+/// land in. That the typed line reaches the PTY without a newline is carried by
+/// `artisan::command_line`'s unit test plus the send path the terminal already pins;
+/// that the *shell* shows it is a rendering claim this suite cannot make (#112).
+#[gpui::test]
+async fn confirming_an_artisan_row_opens_the_terminal_to_type_into(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_palette_for_test(PaletteMode::Artisan, window, cx);
+        workspace.confirm_palette_for_test("migrate", window, cx);
+    });
+
+    workspace.read_with(cx, |workspace, cx| {
+        let terminal = workspace.terminal_for_test().expect("the terminal panel opened");
+        assert!(
+            terminal.read(cx).session_count() > 0,
+            "a session exists for the command to land in"
+        );
+    });
+
+    draw(cx);
+}

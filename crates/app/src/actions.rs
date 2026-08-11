@@ -439,6 +439,7 @@ pub enum Dispatch {
     RunTestsInFile,
     RerunFailedTests,
     FindInProject,
+    Artisan,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -473,6 +474,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "tests.run_file" => Dispatch::RunTestsInFile,
         "tests.rerun_failed" => Dispatch::RerunFailedTests,
         "editor.find_in_project" => Dispatch::FindInProject,
+        "laravel.artisan" => Dispatch::Artisan,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

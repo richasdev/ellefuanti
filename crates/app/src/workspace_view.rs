@@ -77,6 +77,10 @@ enum Job {
     Save,
     QuickOpenIndex,
     RouteIndex,
+    /// Asking the project's artisan for its command list (#23). Its own slot: the palette
+    /// that consumes it may be swapped to another mode while artisan is still answering,
+    /// and the swap must cancel the ask rather than race it.
+    ArtisanList,
     ClosePrompt,
     /// A create, rename or delete started from the tree's context menu (#126).
     ///
@@ -1113,6 +1117,12 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.close_tab_at(index, window, cx);
+    }
+
+    /// The terminal panel entity, for tests that assert where a command would land.
+    #[cfg(test)]
+    pub fn terminal_for_test(&self) -> Option<Entity<TerminalView>> {
+        self.terminal.clone()
     }
 
     #[cfg(test)]
@@ -3490,7 +3500,8 @@ impl WorkspaceView {
             PaletteMode::Files
             | PaletteMode::Routes
             | PaletteMode::Symbols
-            | PaletteMode::References => Vec::new(),
+            | PaletteMode::References
+            | PaletteMode::Artisan => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3515,6 +3526,7 @@ impl WorkspaceView {
             // the offset they are about is the cursor position at the moment the user
             // pressed the key, which `toggle_palette` does not know.
             PaletteMode::References => {}
+            PaletteMode::Artisan => self.load_artisan_items(palette, cx),
             PaletteMode::Commands | PaletteMode::Languages => {}
         }
 
@@ -3616,6 +3628,36 @@ impl WorkspaceView {
             this.update(cx, |_, cx| cx.notify()).ok();
         });
         self.jobs.start(Job::RouteIndex, task);
+    }
+
+    /// Fills the artisan palette from `php artisan list --raw` run against this project.
+    ///
+    /// The project's own artisan is the only honest source: a package-registered command
+    /// appears, a command this Laravel version lacks does not. When artisan does not
+    /// answer — not a Laravel project, no php, artisan errored — the palette stays empty,
+    /// which its "No matches" already says (`artisan::list` documents why silence).
+    fn load_artisan_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        let task = cx.spawn(async move |this, cx| {
+            let commands =
+                cx.background_spawn(async move { crate::artisan::list(&root) }).await;
+            let items = commands
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, description)| {
+                    let label = if description.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{name} — {description}")
+                    };
+                    (label, name)
+                })
+                .collect();
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::ArtisanList, task);
     }
 
     // --- navigation (#81) -------------------------------------------------------------
@@ -4873,6 +4915,21 @@ impl WorkspaceView {
                 }
                 self.open_path_at(path, target, window, cx);
             }
+            // #23. Confirming *types* `php artisan <name> ` into the terminal — no
+            // newline, so nothing executes that the user did not visibly finish and
+            // press Enter on. The panel opens if it was closed; the command has to land
+            // somewhere the user is looking.
+            Some(PaletteMode::Artisan) => {
+                if self.terminal.is_none() {
+                    self.toggle_terminal(&ToggleTerminal, window, cx);
+                }
+                if let Some(terminal) = self.terminal.clone() {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.feed_text(&crate::artisan::command_line(&id), cx);
+                    });
+                    window.focus(&terminal.read(cx).focus_handle(cx));
+                }
+            }
             // #127. The id is the language's own `name()`, so the mapping back is a lookup
             // over the same table the list was built from — no parallel list of strings to
             // drift out of step with `Language`.
@@ -4928,6 +4985,8 @@ impl WorkspaceView {
                         self.rerun_failed_tests(&RerunFailedTests, window, cx)
                     }
                     Dispatch::FindInProject => self.find_in_project(&FindInProject, window, cx),
+                    // Reopens the palette in artisan mode, like SetLanguage above.
+                    Dispatch::Artisan => self.toggle_palette(PaletteMode::Artisan, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
