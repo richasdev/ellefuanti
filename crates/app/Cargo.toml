@@ -37,6 +37,7 @@ elle-laravel.workspace = true
 elle-git.workspace = true
 elle-index.workspace = true
 elle-db.workspace = true
+elle-docker.workspace = true
 elle-lsp.workspace = true
 elle-settings.workspace = true
 elle-terminal.workspace = true

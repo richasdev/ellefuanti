@@ -180,6 +180,11 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // danger note — a force flag that does not exist cannot be run.
     // #25. A viewer, not a tail: reads on open and on refocus, never on a timer.
     Command::new("laravel.logs", "Toggle Log Panel"),
+    // #25. These TYPE the compose command into the terminal (#146's rule) — the panel
+    // shows state, the terminal runs things, and nothing runs out of sight.
+    Command::new("docker.up", "Docker: Compose Up"),
+    Command::new("docker.stop", "Docker: Compose Stop"),
+    Command::new("docker.logs", "Docker: Compose Logs"),
     Command::new("git.fetch", "Git: Fetch"),
     Command::new("git.push", "Git: Push"),
     Command::new("git.switch_branch", "Git: Switch Branch…"),

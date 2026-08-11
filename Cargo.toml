@@ -10,6 +10,7 @@ members = [
     "crates/lsp",
     "crates/index",
     "crates/db",
+    "crates/docker",
     "crates/laravel",
     "crates/git",
     "crates/test-runner",
@@ -34,6 +35,7 @@ elle-terminal = { path = "crates/terminal" }
 elle-lsp = { path = "crates/lsp" }
 elle-index = { path = "crates/index" }
 elle-db = { path = "crates/db" }
+elle-docker = { path = "crates/docker" }
 elle-laravel = { path = "crates/laravel" }
 elle-git = { path = "crates/git" }
 elle-test-runner = { path = "crates/test-runner" }
