@@ -568,15 +568,22 @@ fn completion_row(
                 cx.emit(CompletionEvent::Accepted(accepted));
             });
         })
+        // A row is one line, enforced, not assumed. `overflow_hidden` alone clips the box
+        // horizontally but lets the *text wrap* first — and wrapped text grows downward,
+        // painting over the rows below. Intelephense's detail for `$_SERVER` is an array
+        // shape hundreds of characters long, so with real data every global's detail
+        // bled across its neighbours and the list read as garbage. `truncate` is
+        // no-wrap plus ellipsis: a long detail ends in `…` inside its own row.
+        //
+        // Untested, and the attempt is worth recording: a `debug_bounds` test asserting the
+        // row stays ROW_HEIGHT tall passed *with the bug restored*, because the row's box
+        // never grew — `.h()` fixes it — the wrapped glyphs simply painted outside it.
+        // Bounds measure boxes, not ink, so this is #112's territory: only eyes catch it.
+        //
         // The label takes the space that is left, so the badge keeps its own.
-        .child(div().flex_1().overflow_hidden().child(item.label.clone()))
+        .child(div().flex_1().truncate().child(item.label.clone()))
         .children(item.detail.clone().map(|detail| {
-            div()
-                .flex_none()
-                .text_color(theme.text_muted)
-                .max_w(px(160.0))
-                .overflow_hidden()
-                .child(detail)
+            div().flex_none().text_color(theme.text_muted).max_w(px(160.0)).truncate().child(detail)
         }))
         .child(div().flex_none().text_color(badge_color).child(item.source.badge()))
         .into_any_element()
