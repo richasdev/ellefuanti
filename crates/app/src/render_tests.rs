@@ -3368,6 +3368,95 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     draw(cx);
 }
 
+/// A rename's WorkspaceEdit touches open buffers and closed files — all or none (#19).
+///
+/// The open buffer takes its edits as one undo step and goes dirty (the user saves);
+/// the closed file is rewritten on disk. And the all-or-nothing rule is falsifiable:
+/// an edit containing a file operation is refused whole, with both targets untouched.
+#[gpui::test]
+async fn a_workspace_edit_spans_open_buffers_and_closed_files_or_touches_nothing(
+    cx: &mut TestAppContext,
+) {
+    use elle_lsp::lsp_types as lt;
+    install_theme(cx);
+    let dir = project();
+    let open_path = dir.path().join("a.php");
+    let closed_path = dir.path().join("b.php");
+    std::fs::write(&open_path, "<?php\n$old = 1;\n").unwrap();
+    std::fs::write(&closed_path, "<?php\n$old = 2;\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        let text = std::fs::read_to_string(&open_path).unwrap();
+        let document = Document::new(Some(open_path.clone()), &text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+
+    let edit_for = |path: &std::path::Path| {
+        (
+            elle_lsp::path_to_uri(path).unwrap(),
+            vec![lt::TextEdit {
+                range: lt::Range {
+                    start: lt::Position { line: 1, character: 1 },
+                    end: lt::Position { line: 1, character: 4 },
+                },
+                new_text: "renamed".into(),
+            }],
+        )
+    };
+    let edit = lt::WorkspaceEdit {
+        changes: Some([edit_for(&open_path), edit_for(&closed_path)].into_iter().collect()),
+        document_changes: None,
+        change_annotations: None,
+    };
+
+    let files = workspace
+        .update(cx, |workspace, cx| workspace.apply_workspace_edit_for_test(edit, cx))
+        .expect("the edit applies");
+    assert_eq!(files, 2);
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    editor.update(cx, |editor, _cx| {
+        assert_eq!(editor.document.buffer.text(), "<?php\n$renamed = 1;\n");
+        editor.document.undo();
+        assert_eq!(
+            editor.document.buffer.text(),
+            "<?php\n$old = 1;\n",
+            "one undo restores the buffer"
+        );
+    });
+    assert_eq!(
+        std::fs::read_to_string(&closed_path).unwrap(),
+        "<?php\n$renamed = 2;\n",
+        "the closed file is rewritten on disk"
+    );
+
+    // The refusal half: a file operation poisons the whole edit.
+    std::fs::write(&closed_path, "<?php\n$old = 2;\n").unwrap();
+    let poisoned = lt::WorkspaceEdit {
+        changes: None,
+        document_changes: Some(lt::DocumentChanges::Operations(vec![
+            lt::DocumentChangeOperation::Op(lt::ResourceOp::Delete(lt::DeleteFile {
+                uri: elle_lsp::path_to_uri(&closed_path).unwrap(),
+                options: None,
+            })),
+        ])),
+        change_annotations: None,
+    };
+    let refused =
+        workspace.update(cx, |workspace, cx| workspace.apply_workspace_edit_for_test(poisoned, cx));
+    assert!(refused.is_err(), "file operations are refused whole");
+    assert_eq!(
+        std::fs::read_to_string(&closed_path).unwrap(),
+        "<?php\n$old = 2;\n",
+        "and nothing was touched"
+    );
+
+    draw(cx);
+}
+
 /// With no server, mid-word invoke offers the buffer's own words (#20).
 ///
 /// The degradation path: Intelephense not installed, the user types `$user` and invokes

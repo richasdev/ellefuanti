@@ -1231,3 +1231,31 @@ fn workspace_symbols_reach_the_server_with_the_query() {
     let params = server.params_for("workspace/symbol");
     assert_eq!(params[0]["query"], json!("usrctrl"), "the typed query is the request");
 }
+
+#[test]
+fn rename_reaches_the_server_with_the_new_name_and_position() {
+    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+        "textDocument/rename" => Reply::Result(json!({
+            "changes": {
+                "file:///tmp/a.php": [{
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}},
+                    "newText": "renamed"
+                }]
+            }
+        })),
+        _ => Reply::Silence,
+    });
+
+    // Positioned like every position request, so the unopened-document guard applies.
+    assert!(client.request_rename(&uri(), 6, "renamed").is_err());
+
+    client.did_open(uri(), "php", "<?php\n$x = 1;\n").unwrap();
+    let id = client.request_rename(&uri(), 6, "renamed").unwrap();
+    let edit: Option<lsp_types::WorkspaceEdit> =
+        client.await_response(&id, Duration::from_secs(5)).unwrap();
+    assert!(edit.expect("an edit").changes.is_some());
+
+    let params = server.params_for("textDocument/rename");
+    assert_eq!(params[0]["newName"], json!("renamed"));
+    assert_eq!(params[0]["position"]["line"], json!(1), "the offset became a position");
+}
