@@ -178,6 +178,8 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // #64 item 5, the safe half: fetch/push touch no working-tree file, and switch
     // refuses a dirty tree outright. Force push and stash stay unbuilt behind the
     // danger note — a force flag that does not exist cannot be run.
+    // #25. A viewer, not a tail: reads on open and on refocus, never on a timer.
+    Command::new("laravel.logs", "Toggle Log Panel"),
     Command::new("git.fetch", "Git: Fetch"),
     Command::new("git.push", "Git: Push"),
     Command::new("git.switch_branch", "Git: Switch Branch…"),
