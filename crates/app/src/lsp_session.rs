@@ -537,10 +537,31 @@ fn search_dirs() -> Vec<PathBuf> {
 ///
 /// The path found is passed on as the command, so the spawn does not repeat the lookup
 /// against the empty `PATH` that caused #123 in the first place.
+///
+/// # Why the child is also given a `PATH`, which is not the same fix
+///
+/// Finding the binary is **not sufficient**, and assuming it was is what made the first
+/// attempt at #123 incomplete. Every node-based language server installs as a script whose
+/// first line is `#!/usr/bin/env node`, so executing it makes the kernel run `env`, and
+/// `env` looks up `node` in the child's `PATH`. With launchd's empty environment that fails
+/// with `env: node: No such file or directory` and exit status 127 — the binary was found,
+/// spawned, and died before writing a byte of LSP.
+///
+/// Measured on this machine, running the resolved Herd/nvm intelephense directly:
+///
+/// ```text
+/// with PATH:    exit status 1     (the script ran; the flag was wrong)
+/// without PATH: exit status 127   env: node: No such file or directory
+/// ```
+///
+/// So the child gets `PATH` set to the same directories the binary was searched in. The
+/// interpreter a server needs lives next to the server itself — `node` is in the very
+/// `bin/` directory nvm put `intelephense` in — so the list that found one finds the other.
 pub fn config_for(root: &Path) -> Option<ServerConfig> {
     let (command, args) = configured_command()?;
 
-    let Some(binary) = resolve_binary(&command, &search_dirs()) else {
+    let dirs = search_dirs();
+    let Some(binary) = resolve_binary(&command, &dirs) else {
         tracing::debug!("no language server: `{command}` is not installed on PATH");
         return None;
     };
@@ -550,8 +571,31 @@ pub fn config_for(root: &Path) -> Option<ServerConfig> {
         // wrote and what they would search for. The path is only what gets executed.
         ServerConfig::new(command, binary.to_string_lossy().into_owned(), root)
             .with_args(args)
+            // The interpreter the shebang needs. See this function's docs: without it a
+            // Finder launch spawns the server successfully and it dies at `env: node: No
+            // such file or directory` before writing a byte.
+            .with_env("PATH", join_paths(&dirs))
             .with_language_ids([LANGUAGE_ID]),
     )
+}
+
+/// Joins search directories into a `PATH` value for the child process.
+///
+/// `std::env::join_paths` rather than `join(":")`: the separator is a platform detail, and
+/// a directory containing one would silently split into two unusable entries. A path that
+/// cannot be expressed is dropped rather than corrupting the whole variable — losing one
+/// candidate directory is recoverable, a malformed `PATH` is not.
+fn join_paths(dirs: &[PathBuf]) -> String {
+    std::env::join_paths(dirs)
+        .or_else(|_| {
+            let usable: Vec<_> = dirs
+                .iter()
+                .filter(|dir| !dir.as_os_str().to_string_lossy().contains(':'))
+                .collect();
+            std::env::join_paths(usable)
+        })
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Whether this path is one the configured server should be told about.
@@ -732,6 +776,45 @@ mod tests {
             None,
             "a named path that is absent must fail, not fall back to a namesake"
         );
+    }
+
+    #[test]
+    fn the_child_is_given_a_path_because_finding_the_binary_is_not_enough() {
+        // The half of #123 the first fix missed, and the reason this test exists at all.
+        //
+        // Every node-based server installs as a script starting `#!/usr/bin/env node`, so
+        // running it makes the kernel run `env`, which looks `node` up in the **child's**
+        // PATH. Resolving the server's own path does nothing for that. Measured against the
+        // real Herd/nvm intelephense on this machine:
+        //
+        //     with PATH:    exit status 1     (ran; wrong flag)
+        //     without PATH: exit status 127   env: node: No such file or directory
+        //
+        // So the config must carry a PATH, or a Finder launch spawns a server that dies
+        // before writing a byte of LSP — which looks exactly like the server not existing.
+        let root = tempfile::tempdir().unwrap();
+        let Some(config) = config_for(root.path()) else {
+            // No server installed on this machine; nothing to assert about its environment.
+            return;
+        };
+
+        let path = config.env.get("PATH").expect("the child must be given a PATH (#123)");
+        assert!(!path.is_empty(), "an empty PATH is the bug, not the fix");
+        assert!(
+            std::env::split_paths(path).count() > 1,
+            "the child's PATH must carry the search directories, not a single entry"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_expressed_does_not_destroy_the_whole_path() {
+        // `join_paths` refuses a directory containing the separator. Dropping that one
+        // candidate is recoverable; returning an empty string would take every other
+        // directory with it and reintroduce #123 for everyone.
+        let dirs = vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/opt/we:rd")];
+
+        let joined = join_paths(&dirs);
+        assert!(joined.contains("/usr/local/bin"), "the usable directories must survive");
     }
 
     #[test]
