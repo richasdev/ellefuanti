@@ -516,6 +516,35 @@ impl Client {
         )
     }
 
+    /// Issues a code-action request for a byte range without waiting (#19).
+    ///
+    /// The diagnostics ride along in the context because servers decide what to offer
+    /// *from* them — an empty context is a quieter server, so the caller passes whatever
+    /// it holds for the range. The reply mixes actions (with edits) and bare commands;
+    /// what to do with a command-only entry is the caller's decision.
+    pub fn request_code_actions(
+        &self,
+        uri: &Uri,
+        range: std::ops::Range<usize>,
+        diagnostics: &[lsp_types::Diagnostic],
+    ) -> Result<RequestId> {
+        let Some(document) = self.document(uri) else {
+            bail!("{} is not open on the {} language server", uri.as_str(), self.name);
+        };
+        let encoding = self.capabilities.encoding;
+        self.send_request(
+            lsp_types::request::CodeActionRequest::METHOD,
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": document.position(range.start, encoding),
+                    "end": document.position(range.end, encoding),
+                },
+                "context": { "diagnostics": diagnostics },
+            }),
+        )
+    }
+
     /// Issues a rename request without waiting (#19).
     ///
     /// The reply is a `WorkspaceEdit` that may touch files this editor has never opened;

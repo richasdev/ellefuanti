@@ -1209,7 +1209,7 @@ fn formatting_reaches_the_server_with_options_and_rejects_unopened_documents() {
 
 #[test]
 fn workspace_symbols_reach_the_server_with_the_query() {
-    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+    let (client, server) = open_client(full_capabilities(), |method, _| match method {
         "workspace/symbol" => Reply::Result(json!([{
             "name": "UserController",
             "kind": 5,
@@ -1258,4 +1258,36 @@ fn rename_reaches_the_server_with_the_new_name_and_position() {
     let params = server.params_for("textDocument/rename");
     assert_eq!(params[0]["newName"], json!("renamed"));
     assert_eq!(params[0]["position"]["line"], json!(1), "the offset became a position");
+}
+
+#[test]
+fn code_actions_reach_the_server_with_range_and_context_diagnostics() {
+    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+        "textDocument/codeAction" => Reply::Result(json!([{
+            "title": "Import App\\Models\\User",
+            "kind": "quickfix",
+            "edit": { "changes": {} }
+        }])),
+        _ => Reply::Silence,
+    });
+
+    client.did_open(uri(), "php", "<?php\n$x = new User();\n").unwrap();
+    let diagnostic = lsp_types::Diagnostic {
+        range: lsp_types::Range {
+            start: lsp_types::Position { line: 1, character: 9 },
+            end: lsp_types::Position { line: 1, character: 13 },
+        },
+        message: "Undefined type".into(),
+        ..Default::default()
+    };
+    let id = client.request_code_actions(&uri(), 15..19, &[diagnostic]).unwrap();
+    let reply: Option<lsp_types::CodeActionResponse> =
+        client.await_response(&id, Duration::from_secs(5)).unwrap();
+    assert_eq!(reply.expect("actions arrive").len(), 1);
+
+    let params = server.params_for("textDocument/codeAction");
+    // The byte range became UTF-16 positions, and the diagnostics rode along — servers
+    // decide what to offer *from* them, so an empty context is a quieter server.
+    assert_eq!(params[0]["range"]["start"]["line"], json!(1));
+    assert_eq!(params[0]["context"]["diagnostics"][0]["message"], json!("Undefined type"));
 }

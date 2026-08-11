@@ -817,6 +817,7 @@ mod tests {
         assert!(styled(src, &spans, HighlightStyle::Property).contains(&"findOrFail"));
     }
 
+    #[test]
     fn highlights_operators() {
         let src = "<?php $a = ['k' => 1]; $b = $a ?? 2; $c = $a->d; $e = Foo::F; $f = 1 + 2;";
         let spans = spans_of(Language::Php, src);

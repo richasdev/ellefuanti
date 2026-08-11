@@ -96,6 +96,11 @@ pub const LSP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Clone, Debug, Default)]
 pub struct FileDiagnostics {
     pub items: Vec<ResolvedDiagnostic>,
+    /// The diagnostics exactly as the server sent them, index-paired with `items`.
+    /// Kept because code actions (#19) send them *back* — a server decides what to
+    /// offer from the diagnostics in the request context, and a reconstructed one
+    /// would not be the claim the server made.
+    pub raw: Vec<Diagnostic>,
 }
 
 impl FileDiagnostics {
@@ -127,6 +132,18 @@ impl FileDiagnostics {
     /// between reasons nobody has needed yet.
     pub fn on_line(&self, line: std::ops::Range<usize>) -> Option<&ResolvedDiagnostic> {
         self.items.iter().find(|d| d.range.start < line.end && line.start <= d.range.end)
+    }
+
+    /// The server's own diagnostics overlapping a byte range — what a code-action
+    /// request sends back as its context (#19). Inclusive at both ends for the same
+    /// reason `at` is: the cursor just past a problem is still asking about it.
+    pub fn raw_in_range(&self, range: std::ops::Range<usize>) -> Vec<Diagnostic> {
+        self.items
+            .iter()
+            .zip(&self.raw)
+            .filter(|(resolved, _)| resolved.range.start <= range.end && range.start <= resolved.range.end)
+            .map(|(_, raw)| raw.clone())
+            .collect()
     }
 
     /// Counts by severity, for the status bar: `(errors, warnings)`.
@@ -327,7 +344,7 @@ impl Lsp {
             })
             .collect();
 
-        self.diagnostics.insert(uri, FileDiagnostics { items });
+        self.diagnostics.insert(uri, FileDiagnostics { items, raw: diagnostics.to_vec() });
     }
 }
 
@@ -1326,6 +1343,29 @@ mod tests {
             },
         ];
         assert_eq!(apply_lsp_edits_to_text(text, overlapping), None);
+    }
+
+    #[test]
+    fn raw_diagnostics_come_back_for_the_range_they_overlap() {
+        // The pairing contract: the raw diagnostic returned is the SERVER'S original for
+        // the resolved range the cursor touches — not a reconstruction.
+        let mut lsp = Lsp::new();
+        let text = "<?php\n$a = 1;\n$b = 2;\n";
+        lsp.set_diagnostics(
+            uri(),
+            &[
+                diagnostic(1, 0, 2, DiagnosticSeverity::ERROR),
+                diagnostic(2, 0, 2, DiagnosticSeverity::WARNING),
+            ],
+            text,
+        );
+        let file = lsp.diagnostics_for(&uri()).unwrap();
+
+        // The byte range of line 1 only.
+        let line1 = text.find("$a").unwrap()..text.find("$a").unwrap() + 2;
+        let raw = file.raw_in_range(line1);
+        assert_eq!(raw.len(), 1, "only the overlapping diagnostic rides along");
+        assert_eq!(raw[0].range.start.line, 1, "and it is the server's own, line intact");
     }
 
     #[test]

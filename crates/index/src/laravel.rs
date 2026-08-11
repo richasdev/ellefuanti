@@ -273,7 +273,7 @@ mod tests {
         let index = open();
         let conn = index.connection();
         build(conn, dir.path(), &CancelFlag::default()).unwrap();
-        build(&conn, dir.path(), &CancelFlag::default()).unwrap();
+        build(conn, dir.path(), &CancelFlag::default()).unwrap();
 
         let columns = columns_for_model(conn, "User").unwrap();
         assert_eq!(columns.len(), 7, "two builds, one set of rows — the index is a cache");
