@@ -83,6 +83,8 @@ enum Job {
     /// One slot: these are all started by a click on a modal overlay, so two cannot be in
     /// flight at once, and a second one superseding the first is the right behaviour anyway.
     FileOperation,
+    /// A git stage/unstage or commit (#64). One slot: they are click-driven and serial.
+    GitWrite,
     /// A find-in-project sweep, and the debounce timer in front of it (#80).
     ///
     /// **One slot for both on purpose.** The timer and the search it starts are the same
@@ -907,7 +909,52 @@ impl WorkspaceView {
     fn on_git_event(&mut self, event: &GitEvent, cx: &mut Context<Self>) {
         match event {
             GitEvent::DiffRequested { path } => self.load_git_diff(path.clone(), cx),
+            GitEvent::StageRequested { path, stage } => {
+                self.run_git_write(GitWrite::Stage { path: path.clone(), stage: *stage }, cx)
+            }
+            GitEvent::CommitRequested { message } => {
+                self.run_git_write(GitWrite::Commit { message: message.clone() }, cx)
+            }
         }
+    }
+
+    /// Runs one git write on the background executor and refreshes status after (#64).
+    ///
+    /// One funnel for both writes so the after-story cannot diverge: whatever happened,
+    /// the panel re-reads reality rather than patching its own copy — the same
+    /// state-follows-disk rule the tree's refresh established. A failure lands in the
+    /// status bar verbatim, because for commit the interesting failures are the *user's
+    /// own hooks* talking (`elle_git::commit` returns their stderr for exactly this).
+    fn run_git_write(&mut self, write: GitWrite, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        let task = cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_spawn(async move {
+                    match write {
+                        GitWrite::Stage { path, stage } => {
+                            elle_git::stage(&root, &path, stage).map(|()| String::new())
+                        }
+                        GitWrite::Commit { message } => elle_git::commit(&root, &message),
+                    }
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                match done {
+                    Ok(_) => {
+                        // The commit box empties only on success; a hook's refusal must
+                        // not eat the message the user typed.
+                        this.git.update(cx, |panel, cx| panel.clear_commit_message(cx));
+                    }
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                this.refresh_git_status(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::GitWrite, task);
     }
 
     fn toggle_hidden_files(
@@ -4770,6 +4817,12 @@ impl Target {
             Target::Lsp { line, character } => document.point_from_lsp(line as usize, character),
         }
     }
+}
+
+/// One git write, queued for the background executor (#64 items 3–4).
+enum GitWrite {
+    Stage { path: PathBuf, stage: bool },
+    Commit { message: String },
 }
 
 /// Which step of the context-menu interaction is in flight (#126).

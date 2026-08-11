@@ -122,6 +122,170 @@ impl Repo {
 /// The one-shot form of [`Repo::discover`] plus [`Repo::workdir`], for the common case of
 /// "is this folder a repo, and if so where does it start". Blocking; call it off the UI
 /// thread with everything else.
+/// Stages one file (adds it to the index), or unstages it (restores the index entry to
+/// HEAD's version).
+///
+/// # git2, and why it is safe here where commit is not
+///
+/// Staging touches only the *index* — the worktree file and every commit are untouched,
+/// so both directions are freely reversible and neither needs a confirmation. This is
+/// the half of the write path #64 rates safe to build first. `git2` is fine for it:
+/// hooks do not run on `add`, so the known libgit2 gap does not apply.
+///
+/// Unstaging a file that is new in the index (no HEAD version) removes the entry, which
+/// is what `git restore --staged` does for the same case.
+pub fn stage(root: &Path, path: &Path, stage: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let repo = git2::Repository::discover(root).context("not a git repository")?;
+    let workdir = repo.workdir().context("bare repository")?;
+    // Canonical forms before the strip — the /var vs /private/var trap, met for the
+    // fourth time in this codebase and now expected on sight: libgit2 canonicalises the
+    // workdir, the caller's path is whatever spelling it arrived with, and a failed
+    // strip here surfaced as git2's "repo path should be relative".
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let relative = canonical.strip_prefix(&workdir).unwrap_or(path);
+
+    if stage {
+        let mut index = repo.index()?;
+        index.add_path(relative)?;
+        index.write()?;
+        return Ok(());
+    }
+
+    // Unstage: reset the index entry to HEAD. `reset_default` is exactly
+    // `git restore --staged <path>` — worktree untouched.
+    let head = repo.head().ok().and_then(|h| h.peel(git2::ObjectType::Commit).ok());
+    repo.reset_default(head.as_ref(), [relative])?;
+    Ok(())
+}
+
+/// Commits the staged changes with `message`, through the **git CLI**, not libgit2.
+///
+/// The choice #64 asks to be made per operation and recorded: libgit2 does not run
+/// hooks, and a commit that skips the user's pre-commit hook writes commits their own
+/// tooling would have rejected — the crate docs have carried that warning since the
+/// read-only panel shipped. The CLI runs the hooks, respects `commit.gpgsign`, the
+/// user's editor-less `-m` path, and `include`d config, all the places libgit2 quietly
+/// diverges. The cost is a subprocess per commit, which is commit-rate.
+///
+/// Blocking; run it on the background executor. Returns the CLI's stderr on failure,
+/// because a hook's rejection message is *for the user* and swallowing it would turn
+/// "your linter said no" into "the commit silently did not happen".
+pub fn commit(root: &Path, message: &str) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["commit", "-m", message])
+        .output()
+        .context("could not run git — is it installed?")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        anyhow::bail!("{}", if stderr.trim().is_empty() { stdout } else { stderr });
+    }
+    Ok(stdout)
+}
+
 pub fn discover_workdir(path: &Path) -> Option<PathBuf> {
     Repo::discover(path)?.workdir().map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A real repository, because staging against a mock proves the mock.
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("a.php"), "<?php\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    fn porcelain(dir: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn stage_and_unstage_round_trip_without_touching_the_worktree() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.php"), "<?php // changed\n").unwrap();
+
+        assert!(porcelain(dir.path()).starts_with(" M"), "modified, unstaged");
+        stage(dir.path(), &dir.path().join("a.php"), true).unwrap();
+        assert!(porcelain(dir.path()).starts_with("M "), "staged");
+        stage(dir.path(), &dir.path().join("a.php"), false).unwrap();
+        assert!(porcelain(dir.path()).starts_with(" M"), "back to unstaged");
+        // The one guarantee that makes this safe to ship without a confirm: the file's
+        // content never moved.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.php")).unwrap(),
+            "<?php // changed\n"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_new_file_removes_the_index_entry() {
+        let dir = repo();
+        std::fs::write(dir.path().join("novo.php"), "<?php\n").unwrap();
+        stage(dir.path(), &dir.path().join("novo.php"), true).unwrap();
+        assert!(porcelain(dir.path()).starts_with("A "), "added");
+        stage(dir.path(), &dir.path().join("novo.php"), false).unwrap();
+        assert!(porcelain(dir.path()).starts_with("??"), "untracked again, file intact");
+        assert!(dir.path().join("novo.php").exists());
+    }
+
+    #[test]
+    fn commit_goes_through_the_cli_and_hooks_can_refuse() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.php"), "<?php // v2\n").unwrap();
+        stage(dir.path(), &dir.path().join("a.php"), true).unwrap();
+        commit(dir.path(), "second").unwrap();
+        assert!(porcelain(dir.path()).is_empty(), "clean after commit");
+
+        // The reason it is the CLI: a pre-commit hook must be able to say no, and its
+        // message must come back to the user. libgit2 would have skipped it silently.
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(
+            hooks.join("pre-commit"),
+            "#!/bin/sh\necho recusado pelo hook >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hooks.join("pre-commit"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        std::fs::write(dir.path().join("a.php"), "<?php // v3\n").unwrap();
+        stage(dir.path(), &dir.path().join("a.php"), true).unwrap();
+        let err = commit(dir.path(), "blocked").unwrap_err().to_string();
+        assert!(err.contains("recusado pelo hook"), "the hook's message reaches the user: {err}");
+    }
 }

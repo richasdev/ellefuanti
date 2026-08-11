@@ -1272,7 +1272,9 @@ mod tests {
         let spans = spans_of(Language::Markdown, src);
 
         assert!(styled(src, &spans, HighlightStyle::Keyword).iter().any(|s| s.contains("# Title")));
-        assert!(styled(src, &spans, HighlightStyle::String).iter().any(|s| s.contains("code here")));
+        assert!(
+            styled(src, &spans, HighlightStyle::String).iter().any(|s| s.contains("code here"))
+        );
         assert!(styled(src, &spans, HighlightStyle::Comment).iter().any(|s| s.contains("quote")));
         // Prose is not code, and colouring it would make the whole file loud — the same
         // rule the HTML query pins for text content.

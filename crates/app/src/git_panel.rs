@@ -54,6 +54,11 @@ pub enum GitEvent {
     /// A status row was clicked: show this file's diff. The workspace owns the background
     /// task, because the panel must not spawn — it has no root and no executor policy.
     DiffRequested { path: PathBuf },
+    /// The row's ± was clicked: stage (true) or unstage this file. The workspace runs it
+    /// for the same no-executor reason, and refreshes status after.
+    StageRequested { path: PathBuf, stage: bool },
+    /// The commit button, with the message typed into the panel's box.
+    CommitRequested { message: String },
 }
 
 /// What the panel is showing right now.
@@ -114,6 +119,10 @@ impl PanelState {
 
 pub struct GitPanel {
     state: PanelState,
+    /// The commit box's text. Plain keystroke capture, the palette's pattern — a full
+    /// text-input widget for a one-line message would be the framework this repo keeps
+    /// declining to build.
+    commit_message: String,
     /// The diff for the selected row, once it has come back.
     diff: Option<DiffFile>,
     /// Which row is selected, as a repo-relative path rather than an index — the list is
@@ -125,13 +134,132 @@ impl EventEmitter<GitEvent> for GitPanel {}
 
 impl GitPanel {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { state: PanelState::default(), diff: None, selected: None }
+        Self {
+            state: PanelState::default(),
+            diff: None,
+            selected: None,
+            commit_message: String::new(),
+        }
     }
 
     pub fn state(&self) -> &PanelState {
         &self.state
     }
 
+    pub fn clear_commit_message(&mut self, cx: &mut Context<Self>) {
+        self.commit_message.clear();
+        cx.notify();
+    }
+
+    /// Keystrokes for the commit box, captured the palette's way: printable characters
+    /// append, backspace pops, Enter commits when there is a message and something
+    /// staged. No text-input widget — one line does not buy a framework.
+    fn on_key_down(&mut self, event: &gpui::KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform
+            || keystroke.modifiers.control
+            || keystroke.modifiers.function
+        {
+            return;
+        }
+        match keystroke.key.as_str() {
+            "backspace" => {
+                self.commit_message.pop();
+                cx.notify();
+            }
+            "enter" => {
+                let staged_anything = self.state.files().iter().any(|file| file.staged);
+                if !self.commit_message.trim().is_empty() && staged_anything {
+                    cx.emit(GitEvent::CommitRequested { message: self.commit_message.clone() });
+                }
+            }
+            _ => {
+                let Some(text) = keystroke.key_char.as_deref() else { return };
+                if text.is_empty() || text.chars().all(|c| c.is_control()) {
+                    return;
+                }
+                self.commit_message.push_str(text);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The commit box (#64 item 4): message line, button, both live only when a
+    /// repository is showing.
+    fn render_commit_box(&self, theme: &Theme, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        if self.state.files().is_empty() && self.state.empty_message().is_some() {
+            return None;
+        }
+        let staged_anything = self.state.files().iter().any(|file| file.staged);
+        let has_message = !self.commit_message.trim().is_empty();
+        let shown = if self.commit_message.is_empty() {
+            SharedString::from("Commit message…")
+        } else {
+            SharedString::from(self.commit_message.clone())
+        };
+        let entity = cx.entity();
+
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .when(self.commit_message.is_empty(), |el| el.text_color(theme.text_muted))
+                        .child(shown),
+                )
+                .child(
+                    div()
+                        .id("git-commit-button")
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_color(if staged_anything && has_message {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        // Enabled = clickable; disabled still explains itself in words
+                        // below rather than by shade alone.
+                        .when(staged_anything && has_message, |el| {
+                            el.cursor_pointer()
+                                .hover(|el| el.bg(theme.hover))
+                                .active(|el| el.bg(theme.pressed))
+                        })
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                let staged = this.state.files().iter().any(|f| f.staged);
+                                if staged && !this.commit_message.trim().is_empty() {
+                                    cx.emit(GitEvent::CommitRequested {
+                                        message: this.commit_message.clone(),
+                                    });
+                                }
+                            });
+                        })
+                        .child("Commit"),
+                )
+                .children((!staged_anything).then(|| {
+                    div()
+                        .text_color(theme.text_muted)
+                        .child("Stage something (+) to commit")
+                        .into_any_element()
+                }))
+                .into_any_element(),
+        )
+    }
     pub fn diff(&self) -> Option<&DiffFile> {
         self.diff.as_ref()
     }
@@ -200,8 +328,10 @@ impl Render for GitPanel {
             .flex()
             .flex_col()
             .size_full()
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_header(&theme))
             .child(self.render_rows(&theme, cx))
+            .children(self.render_commit_box(&theme, cx))
     }
 }
 
@@ -250,6 +380,7 @@ impl GitPanel {
                     .filter_map(|index| {
                         let file = this.state.files().get(index)?;
                         let entity = entity.clone();
+                        let stage_entity = entity.clone();
                         let file = file.clone();
                         let is_selected = this.selected.as_deref() == Some(file.relative.as_str());
                         let marker_color = status_color(file.status, &theme);
@@ -298,6 +429,37 @@ impl GitPanel {
                                             .text_color(muted)
                                             .child(SharedString::from("staged")),
                                     )
+                                })
+                                // Stage/unstage (#64 item 3). ± because the action is the
+                                // toggle of the word beside it; both directions touch only
+                                // the index, which is what makes this button safe without
+                                // a confirmation — see `elle_git::stage`.
+                                .child({
+                                    let entity = stage_entity;
+                                    let path = file.path.clone();
+                                    let to_stage = !file.staged;
+                                    div()
+                                        .id(("git-stage", index))
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded(px(3.0))
+                                        .cursor_pointer()
+                                        .text_color(muted)
+                                        .hover(|el| el.bg(hover).text_color(text))
+                                        .active(|el| el.bg(pressed))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, _window, cx| {
+                                                cx.stop_propagation();
+                                                entity.update(cx, |_this, cx| {
+                                                    cx.emit(GitEvent::StageRequested {
+                                                        path: path.clone(),
+                                                        stage: to_stage,
+                                                    });
+                                                });
+                                            },
+                                        )
+                                        .child(if to_stage { "+" } else { "−" })
                                 })
                                 .into_any_element(),
                         )

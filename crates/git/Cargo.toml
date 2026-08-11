@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 # `git2` is already linked into every build of this editor: `gpui` depends on `gpui_util`,
 # which depends on `git2 0.20`. `cargo tree -p ellefuanti -i git2` shows the path. So the
 # libgit2 C library, its `libz-sys` and the whole `cc` build of it are costs this binary
