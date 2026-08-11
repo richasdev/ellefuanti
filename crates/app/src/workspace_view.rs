@@ -2925,6 +2925,33 @@ impl WorkspaceView {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
         let Some(editor) = self.active_editor() else { return };
         let text = editor.read(cx).document.buffer.text();
+        let offset = editor.read(cx).document.selection.head;
+
+        // A `where('…')` context wins over the file-wide source: it is the more precise
+        // claim (the literal names a column of *that* class), and running both would put
+        // every column in the list twice. Only when no context holds does "the file is a
+        // model" offer the whole surface.
+        if let Some(context) = elle_laravel::column_context_at(&text, offset) {
+            let class = match context.target {
+                elle_laravel::ColumnTarget::Class(name) => name,
+                // `$this->where(` — the class is whatever model this file declares; a
+                // `$this` in a non-model class gets nothing, same honesty as the scanner.
+                elle_laravel::ColumnTarget::This => {
+                    let Some(facts) = elle_laravel::extract_model(&text) else { return };
+                    facts.class
+                }
+            };
+            // Widen range and query together — both or neither, the rule the route
+            // source established (see `request_route_completions` for the two bugs the
+            // halves each cause). Declined when the caret sits mid-literal.
+            if context.range.start <= offset && context.range.end <= offset {
+                self.completion_word_start = Some((editor.clone(), context.range.start));
+                let typed = text[context.range.start..offset].to_string();
+                popup.update(cx, |popup, cx| popup.set_query(typed, cx));
+            }
+            self.request_columns_of(class, root, popup, cx);
+            return;
+        }
 
         let Some(facts) = elle_laravel::extract_model(&text) else { return };
         let class = facts.class;
@@ -2940,18 +2967,7 @@ impl WorkspaceView {
 
         let task = cx.spawn(async move |_this, cx| {
             let Some((columns, relations)) = task.await else { return };
-            let mut items: Vec<CompletionItem> = columns
-                .into_iter()
-                .map(|column| {
-                    let detail = if column.column_type.is_empty() {
-                        column.source.clone()
-                    } else {
-                        format!("{} · {}", column.column_type, column.source)
-                    };
-                    CompletionItem::new(column.name, CompletionSource::LaravelColumn)
-                        .with_detail(Some(detail))
-                })
-                .collect();
+            let mut items: Vec<CompletionItem> = columns.into_iter().map(column_item).collect();
             // Relationships after columns: both are index facts, but a column is data on
             // every row while a relationship is one method — and the detail says what the
             // method body claims (`hasMany · Post`), which is a scan's word, not a proof.
@@ -2959,6 +2975,32 @@ impl WorkspaceView {
                 CompletionItem::new(name, CompletionSource::LaravelRelation)
                     .with_detail(Some(format!("{kind} · {target}")))
             }));
+            if items.is_empty() {
+                return;
+            }
+            popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
+        });
+        self.jobs.start(Job::CompletionColumns, task);
+    }
+
+    /// Fetches one class's columns from the index and feeds them to the popup — the tail
+    /// both column sources share. Columns only, no relationships: `where('…')` accepts a
+    /// column name, and offering `posts` there would be a wrong answer wearing a badge.
+    fn request_columns_of(
+        &mut self,
+        class: String,
+        root: std::path::PathBuf,
+        popup: Entity<CompletionPopup>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_spawn(async move {
+            let path = crate::file_cache::index_path(&root)?;
+            let (index, _) = elle_index::Index::open(&path).ok()?;
+            elle_index::laravel::columns_for_model(index.connection(), &class).ok()
+        });
+        let task = cx.spawn(async move |_this, cx| {
+            let Some(columns) = task.await else { return };
+            let items: Vec<CompletionItem> = columns.into_iter().map(column_item).collect();
             if items.is_empty() {
                 return;
             }
@@ -4862,6 +4904,17 @@ impl WorkspaceView {
 /// a 10,061-file project **every** bare-word completion set it, capped at exactly 100 items.
 /// A bare `Array` response has no such flag and is complete by definition, which is why the
 /// two arms differ rather than defaulting.
+/// One indexed column as a popup item, provenance in the detail (`string · migration`).
+/// A cast with no migration behind it says just `cast` — an empty type is not a type.
+fn column_item(column: elle_index::laravel::ModelColumn) -> CompletionItem {
+    let detail = if column.column_type.is_empty() {
+        column.source
+    } else {
+        format!("{} · {}", column.column_type, column.source)
+    };
+    CompletionItem::new(column.name, CompletionSource::LaravelColumn).with_detail(Some(detail))
+}
+
 fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool) {
     let (items, incomplete) = match response {
         CompletionResponse::Array(items) => (items, false),
