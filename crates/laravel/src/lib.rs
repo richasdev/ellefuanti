@@ -20,6 +20,7 @@
 
 mod columns;
 mod livewire;
+mod logs;
 mod models;
 mod references;
 mod resolved;
@@ -27,6 +28,7 @@ mod routes;
 mod targets;
 
 pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at, scope_context_at};
+pub use logs::{LogEntry, parse_laravel_log};
 pub use livewire::{
     LivewireFacts, WireTarget, extract_livewire, livewire_class_path, wire_context_at,
 };

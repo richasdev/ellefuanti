@@ -82,6 +82,8 @@ enum Job {
     /// Reading the project database's schema for the sidebar (#65). Its own slot:
     /// clicking Database twice must supersede, not race.
     DbSchema,
+    /// Reading the Laravel log for the panel (#25). Same superseding reasoning.
+    LogRead,
     /// Asking the project's artisan for its command list (#23). Its own slot: the palette
     /// that consumes it may be swapped to another mode while artisan is still answering,
     /// and the swap must cancel the ask rather than race it.
@@ -494,6 +496,9 @@ pub struct WorkspaceView {
     /// takes minutes and closing the panel to read some code is not a request to abandon
     /// it. Cancelling is a separate, explicit thing — [`Job::TestRun`] plus the flag below.
     tests: Option<Entity<TestView>>,
+    /// The Laravel log panel (#25). Same lifecycle as the terminal: an entity while
+    /// open, dropped when closed, re-read on refocus while up.
+    logs: Option<Entity<crate::log_view::LogView>>,
     /// Cancels an in-flight test run. Separate from the task slot for the usual reason
     /// (ADR-0007): dropping the `Task` stops the await, not the PHP process behind it.
     test_cancel: Option<TestCancelFlag>,
@@ -628,6 +633,7 @@ impl WorkspaceView {
             search_cancel: None,
             terminal: None,
             tests: None,
+            logs: None,
             test_cancel: None,
             status: None,
             jobs: Jobs::default(),
@@ -849,6 +855,8 @@ impl WorkspaceView {
         if self.sidebar == Sidebar::Database {
             self.load_db_schema(cx);
         }
+        // And the log: the error you came back to read may have just been written.
+        self.refresh_log_panel(cx);
     }
 
     /// The focus trigger through the real handler, for tests — headless windows never
@@ -1168,6 +1176,17 @@ impl WorkspaceView {
         _cx: &mut Context<Self>,
     ) {
         self.pending_code_actions = edits;
+    }
+
+    /// The log toggle, through the real handler.
+    #[cfg(test)]
+    pub fn toggle_log_panel_for_test(&mut self, cx: &mut Context<Self>) {
+        self.toggle_log_panel(cx);
+    }
+
+    #[cfg(test)]
+    pub fn log_panel_for_test(&self) -> Option<Entity<crate::log_view::LogView>> {
+        self.logs.clone()
     }
 
     /// The activity-bar Database click, through the real load path.
@@ -5589,6 +5608,7 @@ impl WorkspaceView {
                     }
                     Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
                     Dispatch::QuickFix => self.quick_fix(&QuickFix, window, cx),
+                    Dispatch::ToggleLogPanel => self.toggle_log_panel(cx),
                     Dispatch::GitFetch => self.run_git_operation(
                         |root| elle_git::fetch(&root).map(|_| "Fetched".to_string()),
                         cx,
@@ -6071,7 +6091,9 @@ impl Render for WorkspaceView {
                             // Under the terminal, in the same column and by the same
                             // reasoning. Both can be open at once: a run and the shell you
                             // started it from are things people look at together.
-                            .children(self.tests.clone()),
+                            .children(self.tests.clone())
+                            // And the log under those, same column, same reasoning.
+                            .children(self.logs.clone()),
                     ),
             )
             .child(self.render_status_bar(&theme, cx))
@@ -6298,6 +6320,75 @@ impl WorkspaceView {
                         }))
                 },
             ))
+    }
+
+    /// Opens or closes the Laravel log panel (#25); opening reads the newest log file.
+    fn toggle_log_panel(&mut self, cx: &mut Context<Self>) {
+        match self.logs.take() {
+            Some(_) => cx.notify(),
+            None => {
+                let panel = cx.new(crate::log_view::LogView::new);
+                let workspace = cx.entity();
+                panel.update(cx, |panel, _| {
+                    panel.on_jump(move |path, line, window, cx| {
+                        let path = path.to_path_buf();
+                        // A trace names files from the machine the log was written on;
+                        // one that does not exist here gets silence, not a guess
+                        // (the test panel's rule, RISKS #4).
+                        if !path.is_file() {
+                            return;
+                        }
+                        let point = Point::new(line.saturating_sub(1) as usize, 0);
+                        workspace.update(cx, |this, cx| {
+                            this.open_path_at(path, Some(point), window, cx);
+                        });
+                    });
+                });
+                self.logs = Some(panel);
+                self.refresh_log_panel(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Re-reads the newest `storage/logs/*.log` into the open panel.
+    ///
+    /// Newest by file name, which for Laravel's daily channel (`laravel-YYYY-MM-DD.log`)
+    /// is also newest by date — and for the single-file channel there is only one.
+    fn refresh_log_panel(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.logs.clone() else { return };
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let parsed = cx
+                .background_spawn(async move {
+                    let dir = root.join("storage/logs");
+                    let mut logs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .map(|entry| entry.path())
+                                .filter(|path| {
+                                    path.extension().is_some_and(|ext| ext == "log")
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    logs.sort();
+                    let newest = logs.pop()?;
+                    let text = std::fs::read_to_string(&newest).ok()?;
+                    let name = newest.file_name()?.to_string_lossy().into_owned();
+                    Some((elle_laravel::parse_laravel_log(&text), name))
+                })
+                .await;
+            panel
+                .update(cx, |panel, cx| match parsed {
+                    Some((entries, name)) => panel.set_entries(entries, Some(name), cx),
+                    None => panel.set_entries(Vec::new(), None, cx),
+                })
+                .ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::LogRead, task);
     }
 
     /// Fills the branch palette from the repository.

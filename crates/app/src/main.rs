@@ -11,6 +11,7 @@ mod find_bar;
 mod fonts;
 mod git_panel;
 mod icons;
+mod log_view;
 mod lsp_session;
 mod menu;
 mod palette;

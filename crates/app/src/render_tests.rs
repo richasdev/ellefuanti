@@ -3954,3 +3954,52 @@ async fn returning_to_the_window_rebuilds_the_laravel_index(cx: &mut TestAppCont
 
     draw(cx);
 }
+
+/// The log panel parses the newest log and a row's click lands on the throw site (#25).
+#[gpui::test]
+async fn the_log_panel_lists_entries_and_jumps_to_the_frame(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("storage/logs")).unwrap();
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
+    let throw_site = dir.path().join("app/Broken.php");
+    std::fs::write(&throw_site, "<?php\n\n\nthrow new \\Exception('x');\n").unwrap();
+
+    // Two files; the newest by name must win. The trace points at a real file so the
+    // jump has somewhere honest to land.
+    std::fs::write(dir.path().join("storage/logs/laravel-2026-08-11.log"), "[2026-08-11 09:00:00] local.INFO: old day\n").unwrap();
+    std::fs::write(
+        dir.path().join("storage/logs/laravel-2026-08-12.log"),
+        format!(
+            "[2026-08-12 03:00:00] local.INFO: booted\n[2026-08-12 03:04:05] local.ERROR: boom {{\"exception\":\"x\"\n[stacktrace]\n#0 {}(4): throw()\n\"}}\n",
+            throw_site.display()
+        ),
+    )
+    .unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.toggle_log_panel_for_test(cx);
+    });
+    cx.run_until_parked();
+
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.log_panel_for_test())
+        .expect("panel open");
+    panel.read_with(cx, |panel, _cx| {
+        let entries = panel.entries_for_test();
+        assert_eq!(entries.len(), 2, "the newest FILE only, not the old day's");
+        assert_eq!(entries[0].message, "boom", "newest entry first");
+        assert_eq!(entries[1].message, "booted");
+    });
+
+    panel.update_in(cx, |panel, window, cx| panel.jump_for_test(0, window, cx));
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace.active_editor_for_test().expect("the throw site opened");
+        assert_eq!(editor.read(cx).document.cursor_point().row, 3, "line 4, 0-based row 3");
+    });
+
+    draw(cx);
+}
