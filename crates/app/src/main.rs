@@ -120,7 +120,12 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("ellefuanti".into()),
-                    appears_transparent: false,
+                    // Transparent, so the bar is the theme's colour instead of the
+                    // system's — a white strip over a dark theme was the owner's
+                    // screenshot. The native title text goes with it; the tab bar
+                    // already names the file, and it pads left to clear the traffic
+                    // lights (see `render_tab_bar`).
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 ..Default::default()

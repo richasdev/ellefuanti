@@ -36,6 +36,9 @@ pub struct Theme {
     pub text: Hsla,
     pub text_muted: Hsla,
     pub accent: Hsla,
+    /// Files git reports as changed — tree rows and any future badge. Its own field per
+    /// the convention: a tint chosen against one background is invisible on another.
+    pub modified: Hsla,
     pub hover: Hsla,
     pub selected: Hsla,
 
@@ -376,6 +379,7 @@ impl Theme {
             text: rgb(0xd7dae0).into(),
             text_muted: rgb(0x767c8a).into(),
             accent: rgb(0xff5c8a).into(),
+            modified: rgb(0xd8a657).into(),
             hover: rgb(0x24272f).into(),
             selected: rgb(0x2d313c).into(),
             // One step past `selected`, continuing the same ramp away from the background.
@@ -455,6 +459,7 @@ impl Theme {
             text: rgb(0x24262e).into(),
             text_muted: rgb(0x6b7180).into(),
             accent: rgb(0xd6336c).into(),
+            modified: rgb(0xb58900).into(),
             hover: rgb(0xe6e8ef).into(),
             selected: rgb(0xdcdfe9).into(),
             // On a light theme the ramp runs *darker* to move away from the background,
@@ -555,6 +560,7 @@ impl Theme {
             text: rgb(0xabb2bf).into(),
             text_muted: rgb(0x7f848e).into(),
             accent: rgb(0x61afef).into(),
+            modified: rgb(0xe5c07b).into(),
             hover: rgb(0x2c313a).into(),
             selected: rgb(0x2c313a).into(),
             // Upstream gives `hover` and `selected` the same value, so a press has to be a
@@ -660,6 +666,7 @@ impl Theme {
             text: rgb(0xe6edf3).into(),
             text_muted: rgb(0x8b949e).into(),
             accent: rgb(0x2f81f7).into(),
+            modified: rgb(0xd29922).into(),
             hover: rgb(0x161b22).into(),
             selected: rgb(0x21262d).into(),
             // GitHub's own `--button-default-bgColor-active`, which is the right neighbour
@@ -742,6 +749,7 @@ impl Theme {
             text: rgb(0x1f2328).into(),
             text_muted: rgb(0x6e7781).into(),
             accent: rgb(0x0969da).into(),
+            modified: rgb(0x9a6700).into(),
             hover: rgb(0xeaeef2).into(),
             selected: rgb(0xd0d7de).into(),
             // The light counterpart, again from GitHub's active-button token.
@@ -827,6 +835,9 @@ impl Theme {
             text: gpui::rgb(text).into(),
             text_muted: color("text_muted", text),
             accent: color("accent", text),
+            // Disk themes may name it; the accent is the fallback that stays visible on
+            // any background the theme chose.
+            modified: color("modified", file.color("accent").unwrap_or(text)),
             hover: color("hover", background),
             selected: color("selected", background),
             pressed: color("pressed", background),

@@ -5427,6 +5427,14 @@ impl WorkspaceView {
         let muted = theme.text_muted;
         let hover = theme.hover;
         let pressed = theme.pressed;
+        let modified_color = theme.modified;
+        // Paths git reports as changed, for the row tint and dot (#71's cousin, owner
+        // request). Built once per frame from the panel's already-polled state — the tree
+        // must not run `git status` itself, and the panel's three refresh triggers are
+        // the freshness story. Absolute paths, same spelling as tree entries (both come
+        // from the canonicalised root).
+        let modified: std::collections::HashSet<PathBuf> =
+            self.git.read(cx).state().files().iter().map(|file| file.path.clone()).collect();
 
         uniform_list("file-tree", count, move |range, _window, cx| {
             entity.update(cx, |this, _cx| {
@@ -5450,6 +5458,7 @@ impl WorkspaceView {
                         } else {
                             icons::for_file(&entry.name)
                         };
+                        let is_modified = modified.contains(&path);
 
                         Some(
                             div()
@@ -5463,7 +5472,13 @@ impl WorkspaceView {
                                 .hover(|el| el.bg(hover))
                                 .active(|el| el.bg(pressed))
                                 .cursor_pointer()
-                                .text_color(if is_dir { text } else { muted })
+                                .text_color(if modified.contains(&path) {
+                                    modified_color
+                                } else if is_dir {
+                                    text
+                                } else {
+                                    muted
+                                })
                                 .on_mouse_down(MouseButton::Left, {
                                     let entity = entity.clone();
                                     move |_ev, window, cx| {
@@ -5551,6 +5566,18 @@ impl WorkspaceView {
                                     ),
                                 )
                                 .child(SharedString::from(entry.name.clone()))
+                                // The non-colour half of the modified signal, per the
+                                // convention that nothing is said by colour alone: the
+                                // tint says it at a glance, the dot says it to everyone.
+                                .when(is_modified, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .pl_1()
+                                            .text_color(modified_color)
+                                            .child("●"),
+                                    )
+                                })
                                 .into_any_element(),
                         )
                     })
@@ -5577,6 +5604,11 @@ impl WorkspaceView {
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
+            // Clearance for the macOS traffic lights: the titlebar is transparent (the
+            // owner's screenshot was a white system strip over a dark theme), so this row
+            // is the top of the window and the buttons overlay its left edge. 78px is
+            // the standard close/min/zoom footprint with breathing room.
+            .pl(px(78.0))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let dirty = tab.editor.read(cx).is_dirty();
                 let title = tab.editor.read(cx).document.title();
