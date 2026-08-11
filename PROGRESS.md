@@ -5,6 +5,17 @@ Tudo abaixo está **merged em main e verificado**; a suite fecha em **1200 teste
 suites** (o PTY flaky pré-existente mantém-se verde solo), clippy limpo, binário
 17.81MB / 19MB.
 
+## Fim do loop (2026-08-12): o mapa do que resta
+
+O loop /loop fechou **#24, #25, #26, M5 inteira** nesta cauda, além de tudo acima.
+Estado final das milestones: **M3 ✓, M5 ✓; M2 = só #18 (teclado real, dono); M4 ✓
+(fechada com auditoria); M6 = #30 Xdebug (scoping postado: a decisão real é
+DBGp-nativo vs DAP+bridge); M7 = #28 plugins (recomendação subprocess+IPC à espera
+de 👍) e #29 AI (3 decisões do dono listadas na issue); M8 = #31 browser (colide com
+o gate de binário — spike de medição primeiro); 0.1.0 = checklist de 7 olhares no
+#35 destrava as oito.** Nada do que resta é completável autonomamente numa iteração:
+é do dono, ou é decisão dele, ou é projeto multi-sessão com o scoping já postado.
+
 ## O arco desta ronda
 
 Pedido: loop pelas issues das milestones — atacar, fechar com evidência, seguir.
