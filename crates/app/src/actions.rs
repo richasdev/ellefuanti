@@ -90,6 +90,7 @@ actions!(
         // ⌘click and the Go menu; the palette-backed two are keyboard-only.
         GoToSymbol,
         SetLanguage,
+        SelectNextOccurrence,
         GoToDefinition,
         FindReferences,
         NavigateBack,
@@ -173,6 +174,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some(context::WORKSPACE)),
         // ⌘, is the macOS convention for preferences, and the menu item shows it.
         KeyBinding::new("cmd-,", OpenSettings, Some(context::WORKSPACE)),
+        // #82 stage 1: ⌘D grows a cursor per occurrence; Escape (the editor's existing
+        // Cancel) collapses back to one.
+        KeyBinding::new("cmd-d", SelectNextOccurrence, Some(context::EDITOR)),
+        KeyBinding::new("escape", Cancel, Some(context::EDITOR)),
         // Navigation (#81). Workspace-scoped, not editor-scoped: they act on the active
         // tab but the palette they open belongs to the workspace, and ⌘⇧O must still work
         // when focus sits in the tree rather than in the text.
@@ -537,7 +542,10 @@ mod tests {
         // has focus. `SelectNext`/`SelectPrev` in the editor context would move a list that
         // is not on screen instead of the cursor.
         for line in source.lines().map(str::trim).filter(|line| !line.starts_with("//")) {
-            if line.contains("SelectNext") || line.contains("SelectPrev") {
+            // The exact tokens, with the delimiter: a substring match flagged
+            // `SelectNextOccurrence` (#82's ⌘D) the day it was added, which is a
+            // different action that genuinely belongs in the editor context.
+            if line.contains("SelectNext,") || line.contains("SelectPrev,") {
                 assert!(
                     line.contains("context::COMPLETION") || line.contains("context::PALETTE"),
                     "list navigation must never be bound where the document has focus: {line}"

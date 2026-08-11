@@ -379,6 +379,17 @@ impl EditorView {
         // auto-closing all replace the plain insert. `insert_with_pairs` reports whether it
         // handled the keystroke rather than deciding here, because what counts as a pair is
         // domain knowledge and `Document` is where that lives.
+        //
+        // With multiple cursors (#82) the pair logic steps aside: auto-closing at five
+        // sites needs per-cursor pair state that stage 1 does not carry, and a `(` that
+        // closes at one cursor and not the others is worse than plain insertion at all.
+        if self.document.has_multiple_cursors() {
+            self.document.insert_at_all_cursors(text);
+            self.restart_blink(cx);
+            cx.emit(EditorEvent::Typed(text.to_string()));
+            cx.notify();
+            return;
+        }
         let plain = !self.document.insert_with_pairs(text);
         if plain {
             self.document.insert(text);
@@ -409,8 +420,38 @@ impl EditorView {
     // keymap. Not worth it at this size.
 
     fn backspace(&mut self, _: &Backspace, _w: &mut Window, cx: &mut Context<Self>) {
-        self.document.backspace();
+        self.document.backspace_at_all_cursors();
         self.after_edit(cx);
+    }
+
+    /// Escape with multiple cursors collapses to one; otherwise the key belongs to
+    /// whoever else wants it (`propagate`), so find-dismissal and friends keep working.
+    fn cancel_multi_cursor(
+        &mut self,
+        _: &crate::actions::Cancel,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document.has_multiple_cursors() {
+            self.document.clear_extra_selections();
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// ⌘D (#82): first press selects the word, each further press adds an occurrence.
+    fn select_next_occurrence(
+        &mut self,
+        _: &crate::actions::SelectNextOccurrence,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.select_next_occurrence();
+        // The newest match is the primary, and it may be off-screen — a ⌘D that adds an
+        // invisible cursor reads as a dead key.
+        self.scroll_cursor_into_view();
+        cx.notify();
     }
 
     fn delete(&mut self, _: &Delete, _w: &mut Window, cx: &mut Context<Self>) {
@@ -1025,6 +1066,8 @@ impl Render for EditorView {
             .when(self.link_hint.is_some(), |el| el.cursor_pointer())
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::cancel_multi_cursor))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::tab))
@@ -1159,7 +1202,9 @@ impl EditorView {
 
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
-        let selection = self.document.selection.range();
+        // Every cursor, primary included, for the rows to paint (#82). Head offsets plus
+        // ranges, resolved once per frame rather than per row.
+        let all_selections = self.document.all_selections();
 
         // Once per frame, not once per row: the lookup is a tree descent, and the answer is
         // the same for every visible row. Both offsets are document-wide; `line_runs` clips
@@ -1213,9 +1258,22 @@ impl EditorView {
                     .collect();
 
                 let is_cursor_row = row == cursor.row;
-                let row_selected = !selection.is_empty()
-                    && selection.start < line_end.max(line_start + 1)
-                    && selection.end > line_start;
+                let row_selected = all_selections.iter().any(|sel| {
+                    let range = sel.range();
+                    !range.is_empty()
+                        && range.start < line_end.max(line_start + 1)
+                        && range.end > line_start
+                });
+                // Extra carets whose head sits on this row, as columns into the line.
+                // The primary is excluded here — it keeps its existing path below, with
+                // the blink and focus rules that path already carries.
+                let extra_carets: Vec<usize> = self
+                    .document
+                    .extra_selection_heads()
+                    .into_iter()
+                    .filter(|head| *head >= line_start && *head <= line_end)
+                    .map(|head| head - line_start)
+                    .collect();
                 let entity = entity.clone();
 
                 let measuring_entity = entity.clone();
@@ -1325,6 +1383,9 @@ impl EditorView {
                             // As a sibling it was placed by the flex pass and stacked
                             // *below* the text; inside the element it shares the shaped
                             // line the glyphs came from.
+                            let rendered = extra_carets.iter().fold(rendered, |line, column| {
+                                line.with_caret(*column, theme.cursor)
+                            });
                             if is_cursor_row && caret_visible {
                                 rendered.with_caret(cursor.column, theme.cursor)
                             } else {
