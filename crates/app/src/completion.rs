@@ -514,7 +514,21 @@ impl Render for CompletionPopup {
                             .collect()
                     })
                 })
-                .flex_1()
+                // An explicit height, never `flex_1`. The wrapper above has `max_h` and no
+                // `h`, so its height comes from its content — and `flex_1` is flex-basis 0,
+                // which *contributes no content height*. The two resolve to a popup exactly
+                // zero pixels tall: state, keyboard and accept all keep working, because
+                // none of them live in layout, and the list paints nothing at all. That
+                // shipped, and was reported as "funciona, mas não mostra nada" — Enter
+                // inserted the member while the screen showed nothing (#112's class again:
+                // 9 render tests drew this popup and none could see it had no height).
+                //
+                // The selector below is what finally lets a headless test see it: gpui's
+                // test build records this element's laid-out bounds under the key, and
+                // `completion_list_occupies_real_height` asserts them. First real geometry
+                // assertion in the suite — see #112 for why there were none before.
+                .h(popup_height(count))
+                .debug_selector(|| "completion-list".into())
                 .into_any_element()
             })
     }

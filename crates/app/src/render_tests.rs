@@ -2553,3 +2553,45 @@ async fn opening_a_folder_starts_a_language_server(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// The list of completions occupies real pixels — the first geometry assertion in the suite.
+///
+/// # What this would have caught
+///
+/// The popup shipped with `flex_1` on its `uniform_list`, inside a wrapper whose height was
+/// content-driven (`max_h`, no `h`). Flex-basis 0 contributes no content height, so the two
+/// resolved to a popup exactly zero pixels tall — while every *state* test kept passing,
+/// because selection, filtering and accept do not live in layout. The owner's report was
+/// "funciona, mas não mostra nada": Enter inserted the member, the screen showed nothing.
+///
+/// `debug_selector` + `VisualTestContext::debug_bounds` is gpui 0.2.2's answer to exactly
+/// this (#112): the test build records the element's laid-out bounds under a string key,
+/// and a headless test can finally assert that a thing the user must see has a size. It
+/// still cannot see colour or position-on-screen — this is a narrow window, not the golden
+/// images #112 discusses — but zero-height is the failure mode that actually shipped.
+#[gpui::test]
+async fn the_completion_list_occupies_real_height(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(
+            vec![lsp_item("getName"), lsp_item("getEmail"), lsp_item("greet")],
+            cx,
+        );
+    });
+
+    draw(cx);
+
+    let bounds =
+        cx.debug_bounds("completion-list").expect("the list must be in the rendered frame at all");
+    assert_eq!(
+        bounds.size.height,
+        crate::completion::popup_height(3),
+        "three rows must lay out at three rows' height — zero is the bug that shipped"
+    );
+    assert!(bounds.size.width > px(0.), "and it must have width: {bounds:?}");
+}
