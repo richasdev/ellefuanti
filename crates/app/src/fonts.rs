@@ -399,6 +399,16 @@ pub fn set_fonts(fonts: Fonts, cx: &mut App) {
     cx.set_global(fonts);
 }
 
+/// Whether the settings panel may offer `family` (#100): installed and monospaced.
+///
+/// The picker's gate is the same `usable` the startup chain runs — reusing it is the
+/// issue's explicit instruction, because #85 exists precisely to stop a second, weaker
+/// copy of this check letting a proportional face through. `asked_for` is true: a family
+/// the user is actively selecting deserves the loud log when it fails.
+pub fn family_is_usable(family: &str, cx: &App) -> bool {
+    usable(family, true, cx)
+}
+
 /// Both checks, with the logging that makes a rejection actionable.
 ///
 /// `asked_for` distinguishes the user's choice from a fallback entry. A family the user

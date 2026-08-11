@@ -268,6 +268,27 @@ impl Settings {
         self.document.insert(FONT_SIZE_KEY.to_string(), Value::from(size));
     }
 
+    /// Writes the editor font family. The settings panel's picker is the caller; the app
+    /// has already applied the monospace check by the time a name reaches here (#85's rule:
+    /// this crate cannot open a font, so it must not pretend to judge one).
+    pub fn set_font_family(&mut self, family: &str) {
+        self.document.insert(FONT_FAMILY_KEY.to_string(), Value::String(family.to_string()));
+    }
+
+    /// Writes the chrome font size, clamped like the read is.
+    pub fn set_ui_font_size(&mut self, size: f32) {
+        let size = f64::from(size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        self.document.insert(UI_FONT_SIZE_KEY.to_string(), Value::from(size));
+    }
+
+    /// Writes the line-height multiplier, clamped so a write cannot make rows overlap —
+    /// the same bound the read applies, for `set_font_size`'s reason: the two paths must
+    /// not disagree about what a legal value is.
+    pub fn set_line_height(&mut self, height: f32) {
+        let height = f64::from(height.clamp(MIN_LINE_HEIGHT, MAX_LINE_HEIGHT));
+        self.document.insert(LINE_HEIGHT_KEY.to_string(), Value::from(height));
+    }
+
     /// A numeric key, or its default if absent or the wrong type.
     ///
     /// No `is_finite` guard, and that is checked rather than assumed: `serde_json` has no
@@ -391,6 +412,25 @@ mod tests {
     fn an_empty_object_is_the_same_as_no_file() {
         let settings = Settings::parse(&path(), "{}").unwrap();
         assert_eq!(settings.theme(), DEFAULT_THEME);
+    }
+
+    #[test]
+    fn the_panel_setters_round_trip_and_clamp() {
+        // The four fields the settings panel writes (#100). Clamps must match the reads —
+        // a panel that can write 2.0 while the read clamps to 3.0 would show a value the
+        // next launch silently changes.
+        let mut settings = Settings::parse(&path(), r#"{"custom.key": "survives"}"#).unwrap();
+
+        settings.set_font_family("Fira Code");
+        settings.set_ui_font_size(500.0);
+        settings.set_line_height(0.1);
+
+        assert_eq!(settings.font_family(), Some("Fira Code"));
+        assert_eq!(settings.ui_font_size(), MAX_FONT_SIZE, "writes clamp like reads");
+        assert_eq!(settings.line_height(), MIN_LINE_HEIGHT);
+        // The reason the document is a Map: a panel write must not cost the user a key
+        // this build does not understand (#60's rule, extended to the new setters).
+        assert_eq!(settings.document.get("custom.key"), Some(&Value::String("survives".into())));
     }
 
     #[test]

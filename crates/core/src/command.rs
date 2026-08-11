@@ -161,6 +161,8 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // Navigation (#81). These have keybindings too — a command id is what makes them
     // findable by someone who does not know the chord, and what lets the Go menu name them.
     Command::new("navigate.symbol", "Go to Symbol in File…"),
+    // #100: ⌘, is the panel; the file keeps a named door for the people who prefer it.
+    Command::new("settings.file", "Open settings.json"),
     // #127. Findable by name for the same reason: the status-bar cell is the affordance,
     // and this is how someone who has not noticed it gets there.
     Command::new("editor.language", "Change Language Mode…"),

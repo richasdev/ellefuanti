@@ -409,6 +409,7 @@ pub fn init(cx: &mut App) -> CommandRegistry {
 pub enum Dispatch {
     OpenFolder,
     SetLanguage,
+    OpenSettingsFile,
     NewFile,
     Save,
     CloseTab,
@@ -450,6 +451,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "laravel.route_name" => Dispatch::CompleteRouteName,
         "navigate.symbol" => Dispatch::GoToSymbol,
         "editor.language" => Dispatch::SetLanguage,
+        "settings.file" => Dispatch::OpenSettingsFile,
         "navigate.definition" => Dispatch::GoToDefinition,
         "navigate.references" => Dispatch::FindReferences,
         "navigate.back" => Dispatch::NavigateBack,

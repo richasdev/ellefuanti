@@ -2860,3 +2860,65 @@ async fn a_definition_jump_lands_on_the_identifier(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// ⌘, opens the settings panel, its steppers apply live, and Escape closes it (#100).
+///
+/// The live-apply is the issue's constraint that matters: "changes apply live. theme.toggle
+/// and ⌘+/⌘− already do; the panel should feel the same." The stepper goes through
+/// `update_settings`, which re-resolves `Fonts` — so the assertion is on the *applied*
+/// global, not on a value the panel merely displays. With no `LiveSettings` installed (the
+/// malformed-file launch, and every headless test) the change still applies to the session
+/// and nothing is written, which is #60's rule holding for the panel.
+#[gpui::test]
+async fn the_settings_panel_applies_changes_live(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_settings_panel_for_test(window, cx);
+    });
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.settings_panel_for_test())
+        .expect("⌘, opens the panel");
+
+    let before = cx.update(|_window, cx| f32::from(Fonts::get(cx).size));
+    panel.update(cx, |panel, cx| panel.step_for_test("editor", 2.0, cx));
+    let after = cx.update(|_window, cx| f32::from(Fonts::get(cx).size));
+    assert_eq!(after, before + 2.0, "the stepper must reach the applied fonts, not a label");
+
+    // Second ⌘, closes, like the palette.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_settings_panel_for_test(window, cx);
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.settings_panel_for_test().is_none(), "a second press dismisses");
+    });
+
+    draw(cx);
+}
+
+/// The theme picker cycles through every selectable theme and applies each.
+#[gpui::test]
+async fn the_theme_picker_cycles_and_applies(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_settings_panel_for_test(window, cx);
+    });
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.settings_panel_for_test())
+        .expect("panel open");
+
+    // A full lap must return to where it started — the wrap is what makes ‹ from the
+    // first theme reach the last, and a sticky picker reads as broken.
+    let start = cx.update(|_window, cx| cx.theme().background);
+    let lap = crate::theme::ThemeVariant::ALL.len();
+    for _ in 0..lap {
+        panel.update(cx, |panel, cx| panel.cycle_theme_for_test(true, cx));
+    }
+    let back = cx.update(|_window, cx| cx.theme().background);
+    assert_eq!(start, back, "a full forward lap lands home");
+
+    draw(cx);
+}

@@ -40,6 +40,7 @@ use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::search_panel::{SearchPanel, SearchPanelEvent, SearchState};
+use crate::settings_panel::{SettingsPanel, SettingsPanelEvent};
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
 use crate::test_view::{RunState, TestView};
 use crate::theme::{Metrics, Theme, Themed};
@@ -418,6 +419,8 @@ pub struct WorkspaceView {
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
+    /// The settings panel (#100). `Some` while ⌘, has it open.
+    settings_panel: Option<Entity<SettingsPanel>>,
     /// The file tree's context menu, name prompt or delete confirmation (#126).
     ///
     /// One slot for all three because they are steps of one interaction: the menu opens the
@@ -594,6 +597,7 @@ impl WorkspaceView {
             palette: None,
             overlay: None,
             pending: None,
+            settings_panel: None,
             lsp_synced: std::collections::HashMap::new(),
             find: None,
             search_panel: None,
@@ -1350,6 +1354,17 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn cursor_point_for_test(&self, cx: &App) -> Option<Point> {
         Some(self.active_editor()?.read(cx).document.cursor_point())
+    }
+
+    /// ⌘, through the real handler.
+    #[cfg(test)]
+    pub fn toggle_settings_panel_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(&OpenSettings, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn settings_panel_for_test(&self) -> Option<Entity<SettingsPanel>> {
+        self.settings_panel.clone()
     }
 
     /// A terminal link arriving, through the same resolver the subscription calls.
@@ -3154,6 +3169,37 @@ impl WorkspaceView {
     /// No settings *UI*: the file is the interface for now, and a form over four keys is
     /// the kind of thing that has to be rebuilt the moment a fifth key is not a string.
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        // ⌘, is the panel now (#100); a second press dismisses, like the palette. The JSON
+        // stays one click away inside it, and keeps its own palette command — the panel
+        // must not become a wall between the user and their file.
+        if self.settings_panel.take().is_some() {
+            window.focus(&self.focus_handle);
+            cx.notify();
+            return;
+        }
+        self.dismiss_completion(window, cx);
+
+        let panel = cx.new(SettingsPanel::new);
+        cx.subscribe_in(&panel, window, |this, _panel, event, window, cx| match event {
+            SettingsPanelEvent::Dismissed => {
+                this.settings_panel = None;
+                window.focus(&this.focus_handle);
+                cx.notify();
+            }
+            SettingsPanelEvent::OpenJson => {
+                this.settings_panel = None;
+                this.open_settings_file(window, cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        window.focus(&panel.read(cx).focus_handle(cx));
+        self.settings_panel = Some(panel);
+        cx.notify();
+    }
+
+    /// Opens settings.json in a tab — the hand-editing path the panel's button reaches.
+    fn open_settings_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match crate::settings::path_for_editing(cx) {
             Some(path) => self.open_path(path, window, cx),
             // Only when HOME is unset or the file is unparseable — both already logged, and
@@ -4627,6 +4673,7 @@ impl WorkspaceView {
                     Dispatch::SetLanguage => {
                         self.toggle_palette(PaletteMode::Languages, window, cx)
                     }
+                    Dispatch::OpenSettingsFile => self.open_settings_file(window, cx),
                     Dispatch::GoToDefinition => self.go_to_definition(&GoToDefinition, window, cx),
                     Dispatch::FindReferences => self.find_references(&FindReferences, window, cx),
                     Dispatch::NavigateBack => self.navigate_back(&NavigateBack, window, cx),
@@ -5092,6 +5139,19 @@ impl Render for WorkspaceView {
                             .child(hover.message),
                     ),
                 )
+            }))
+            // The settings panel (#100): centred like the palette, modal like the tree's
+            // overlays. Dismiss-on-click-outside is the panel's own `on_mouse_down_out`.
+            .children(self.settings_panel.clone().map(|panel| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(panel)
             }))
             // The tree's menu, name prompt and delete confirmation (#126), above everything
             // else because each is modal: while one is open it is the only thing the user

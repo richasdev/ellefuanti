@@ -3,7 +3,7 @@
 #
 # A .app is a directory with three files in the right places, so that is all this does.
 # cargo-bundle would add a build dependency and a second source of truth for the plist to
-# do the same job, and it does not know about the --no-default-features release path.
+# do the same job.
 #
 # Deliberately does NOT build anything: `cargo run` stays the everyday loop, and this only
 # runs when someone actually wants a bundle.
@@ -18,7 +18,10 @@ APP=$OUTDIR/ellefuanti.app
 
 if [ ! -x "$BIN" ]; then
 	echo "no binary at $BIN" >&2
-	echo "build one first, e.g. cargo build --release -p ellefuanti --no-default-features" >&2
+	# The default features on purpose: the --no-default-features shader-precompiling
+	# variant needs the full Xcode toolchain (`xcrun metal`, absent from the Command Line
+	# Tools) and measurably buys nothing — see ADR-0002's resolution and #57.
+	echo "build one first: cargo build --release -p ellefuanti" >&2
 	exit 1
 fi
 
