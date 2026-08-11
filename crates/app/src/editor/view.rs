@@ -11,8 +11,8 @@ use elle_text::Point;
 use gpui::{
     App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
     HighlightStyle as GpuiHighlight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    ScrollStrategy, SharedString, StyledText, TextRun, UniformListScrollHandle, Window, div,
-    prelude::*, px, uniform_list,
+    ScrollStrategy, SharedString, TextRun, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 
 use crate::actions::{
@@ -36,6 +36,18 @@ use crate::theme::{Metrics, Theme, Themed};
 /// shape a megabyte of text on the UI thread.
 const MAX_MEASURE_BYTES: usize = 4096;
 
+/// A diagnostic the mouse is resting on, ready to be drawn as a card.
+#[derive(Clone, PartialEq)]
+pub struct HoverDiagnostic {
+    pub message: SharedString,
+    /// Window coordinates for the card's top-left — under the mouse, one line down, so the
+    /// card never covers the text it is about.
+    pub position: gpui::Point<Pixels>,
+    /// Which row produced it, so the row's hover-out can clear its own card without racing
+    /// the neighbouring row's hover-in.
+    pub row: usize,
+}
+
 pub struct EditorView {
     pub document: Document,
     focus_handle: FocusHandle,
@@ -50,7 +62,14 @@ pub struct EditorView {
     /// make "the server died" a thing every open tab has to cope with. A `Vec` it was
     /// handed cannot go stale in a way that matters — it is simply the last thing the
     /// server said, and an empty one is the correct rendering when there is no server.
-    diagnostics: Vec<(Range<usize>, Severity)>,
+    diagnostics: Vec<(Range<usize>, Severity, SharedString)>,
+    /// The diagnostic under the mouse, if any: its message and where to draw the card.
+    ///
+    /// Editor-owned because the editor is the only thing that can turn a mouse position
+    /// into a byte offset; workspace-rendered because the card must sit at *window*
+    /// coordinates, above every panel — the same split the completion popup uses, where
+    /// the editor measures and the workspace places.
+    pub hover_diagnostic: Option<HoverDiagnostic>,
     /// Window x where the text column actually begins, measured at prepaint.
     ///
     /// `MouseDownEvent::position` is window-relative, so mapping a click to a column needs
@@ -126,6 +145,7 @@ impl EditorView {
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
             diagnostics: Vec::new(),
+            hover_diagnostic: None,
             text_origin_x: None,
             cursor_row_origin_y: None,
             caret_visible: true,
@@ -183,8 +203,12 @@ impl EditorView {
     ///
     /// Called by the workspace when the server publishes, and with an empty slice when the
     /// server goes away — see `Lsp::shut_down` for why clearing matters more than it looks.
-    pub fn set_diagnostics(&mut self, diagnostics: Vec<(Range<usize>, Severity)>) {
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<(Range<usize>, Severity, SharedString)>) {
         self.diagnostics = diagnostics;
+        // The card describes a diagnostic that may have just moved or vanished; a fresh
+        // mouse move rebuilds it against the new list. Keeping it would show a message
+        // about bytes that no longer carry it.
+        self.hover_diagnostic = None;
     }
 
     /// Puts the cursor at `target` and scrolls it on screen.
@@ -704,16 +728,21 @@ impl EditorView {
     }
 
     /// Maps a click inside a row to a text offset and moves the cursor there.
-    fn on_row_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
+    /// The byte offset under a window x on `row` — the shared hit-test for click and hover.
+    ///
+    /// Extracted from `on_row_mouse_down` when hover needed the identical conversion; two
+    /// copies of "window x to buffer offset" is how a click and a hover end up disagreeing
+    /// about which character the mouse is on.
+    fn offset_at(
+        &self,
+        window_x: Pixels,
         row: usize,
         window: &Window,
-        cx: &mut Context<Self>,
-    ) {
+        cx: &Context<Self>,
+    ) -> usize {
         let fonts = Fonts::get(cx);
         let line = self.document.buffer.line(row);
-        let x = text_local_x(event.position.x, self.text_origin_x, &fonts);
+        let x = text_local_x(window_x, self.text_origin_x, &fonts);
 
         let column = if line.is_empty() || x <= px(0.0) {
             0
@@ -735,7 +764,88 @@ impl EditorView {
                 .closest_index_for_x(x)
         };
 
-        let offset = self.document.buffer.point_to_offset(Point::new(row, column));
+        self.document.buffer.point_to_offset(Point::new(row, column))
+    }
+
+    /// Updates the hover card for a mouse position over `row`.
+    ///
+    /// Notifies only when the answer changes: this runs on every mouse-move event, and
+    /// re-rendering the window per pixel of travel would put the whole frame on the hover
+    /// path for nothing.
+    fn on_row_mouse_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        row: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = self.offset_at(event.position.x, row, window, cx);
+        let fonts = Fonts::get(cx);
+        let position = gpui::point(event.position.x, event.position.y + fonts.line_height());
+        self.hover_for_offset(offset, row, position, cx);
+    }
+
+    /// The hover decision itself, split from the mouse event for the reason
+    /// `should_open_on_trigger` was: the pixel-to-offset conversion cannot be exercised
+    /// headlessly (the fake text system's advances are fiction — see `fonts.rs`), and a
+    /// test that could only reach this through pixels would be a test of that fiction.
+    /// The conversion is what the click tests already pin; this is the part with branches.
+    fn hover_for_offset(
+        &mut self,
+        offset: usize,
+        row: usize,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        // Inclusive of the end, matching `FileDiagnostics::at`: the cursor just past the
+        // last character of a problem is still "on" it.
+        let hit = self
+            .diagnostics
+            .iter()
+            .filter(|(range, _, _)| range.start <= offset && offset <= range.end)
+            .min_by_key(|(range, _, _)| range.end - range.start)
+            .map(|(_, _, message)| HoverDiagnostic { message: message.clone(), position, row });
+
+        // Position changes with every pixel; the card must not chase the mouse. Two states
+        // are the same when they describe the same diagnostic on the same row.
+        let same = match (&self.hover_diagnostic, &hit) {
+            (Some(a), Some(b)) => a.message == b.message && a.row == b.row,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.hover_diagnostic = hit;
+            cx.notify();
+        }
+    }
+
+    /// Clears the card when the mouse leaves `row`, unless a neighbour already owns it.
+    fn on_row_hover_out(&mut self, row: usize, cx: &mut Context<Self>) {
+        if self.hover_diagnostic.as_ref().is_some_and(|hover| hover.row == row) {
+            self.hover_diagnostic = None;
+            cx.notify();
+        }
+    }
+
+    /// The hover decision, at the offset level the mouse handler delegates to.
+    #[cfg(test)]
+    pub fn hover_at_for_test(&mut self, offset: usize, row: usize, cx: &mut Context<Self>) {
+        self.hover_for_offset(offset, row, gpui::point(px(0.0), px(0.0)), cx);
+    }
+
+    #[cfg(test)]
+    pub fn hover_out_for_test(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.on_row_hover_out(row, cx);
+    }
+
+    fn on_row_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        row: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = self.offset_at(event.position.x, row, window, cx);
 
         // Click count, the way Zed branches on it in `begin_selection`
         // (`crates/editor/src/selection.rs:1277`): 1 places the cursor, 2 takes the
@@ -863,6 +973,15 @@ impl Render for EditorView {
         div()
             .key_context(context::EDITOR)
             .track_focus(&self.focus_handle(cx))
+            // The hover card is anchored at window coordinates captured when the mouse
+            // stopped; scrolling moves the text out from under it, leaving a card pinned
+            // over whatever scrolled in. Clearing on wheel is honest: the mouse is now
+            // over different bytes, and the next pause re-asks.
+            .on_scroll_wheel(cx.listener(|editor, _event: &gpui::ScrollWheelEvent, _window, cx| {
+                if editor.hover_diagnostic.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -1038,11 +1157,12 @@ impl EditorView {
                 // Sliced per row rather than passed whole: `line_runs` would otherwise
                 // scan every diagnostic in the file for each of the ~40 visible rows.
                 // A file with hundreds of problems is exactly when that starts to matter.
-                let row_diagnostics: Vec<_> = self
+                let row_diagnostics: Vec<(Range<usize>, Severity)> = self
                     .diagnostics
                     .iter()
-                    .filter(|(range, _)| range.start < line_end && range.end > line_start)
-                    .cloned()
+                    .filter(|(range, _, _)| range.start < line_end && range.end > line_start)
+                    // The message is hover's; painting needs only where and how loud.
+                    .map(|(range, severity, _)| (range.clone(), *severity))
                     .collect();
 
                 let row_matches: Vec<_> = band_matches
@@ -1084,11 +1204,35 @@ impl EditorView {
                         }
                     })
                     .id(("row", row))
-                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                        let event = event.clone();
-                        entity.update(cx, |editor, cx| {
-                            editor.on_row_mouse_down(&event, row, window, cx);
-                        });
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = entity.clone();
+                        move |event, window, cx| {
+                            let event = event.clone();
+                            entity.update(cx, |editor, cx| {
+                                editor.on_row_mouse_down(&event, row, window, cx);
+                            });
+                        }
+                    })
+                    // The hover card (#59). Move decides what the mouse is on; hover-out
+                    // clears a card the row owns, so leaving the editor does not strand one
+                    // on screen. Row-in beats row-out between neighbours because the card
+                    // is keyed by row — see `on_row_hover_out`.
+                    .on_mouse_move({
+                        let entity = entity.clone();
+                        move |event, window, cx| {
+                            let event = event.clone();
+                            entity.update(cx, |editor, cx| {
+                                editor.on_row_mouse_move(&event, row, window, cx);
+                            });
+                        }
+                    })
+                    .on_hover({
+                        let entity = entity.clone();
+                        move |entered, _window, cx| {
+                            if !entered {
+                                entity.update(cx, |editor, cx| editor.on_row_hover_out(row, cx));
+                            }
+                        }
                     })
                     .flex()
                     .h(fonts.line_height())
@@ -1524,7 +1668,7 @@ fn indent_guide_columns(text: &str) -> Vec<Range<usize>> {
 /// the space left after `return $x; ` — the one that shows up as a diff hunk nobody meant.
 fn trailing_whitespace_range(line: &str) -> Option<Range<usize>> {
     let trimmed = line.trim_end_matches([' ', '\t']);
-    (!trimmed.is_empty() && trimmed.len() < line.len()).then(|| trimmed.len()..line.len())
+    (!trimmed.is_empty() && trimmed.len() < line.len()).then_some(trimmed.len()..line.len())
 }
 
 /// Adds an underline over `span`, splitting any colour runs it partly covers.

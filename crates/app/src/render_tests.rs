@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use elle_core::{BUILTIN_COMMANDS, CommandRegistry};
-use gpui::{Focusable, TestAppContext, VisualTestContext, px, size};
+use gpui::{TestAppContext, VisualTestContext, px, size};
 
 use crate::completion::{CompletionItem, CompletionSource};
 use crate::editor::{Document, EditorView};
@@ -2215,6 +2215,539 @@ async fn typing_over_an_auto_closed_bracket_closes_the_popup(cx: &mut TestAppCon
     // And it must not have doubled the bracket.
     let after = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
     assert!(!after.contains("foo())"), "typing over a closer must not insert one: {after:?}");
+
+    draw(cx);
+}
+
+// --- the file tree's context menu (#126) -------------------------------------------
+
+/// A Laravel-shaped folder for the tree tests.
+fn project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
+    std::fs::write(dir.path().join("app/User.php"), "<?php\n").unwrap();
+    std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    dir
+}
+
+/// Right-clicking a row opens a menu about *that* row.
+///
+/// The report #126 came from was "não dá pra apertar click direito" — there was no
+/// right-click handler in the crate at all. This is the assertion that the gesture now
+/// reaches something, and that what it offers depends on what was clicked: a directory
+/// can hold new files, a file cannot.
+#[gpui::test]
+async fn right_clicking_a_directory_offers_more_than_a_file(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        // Directories sort first, so row 0 is `app` and row 1 is `artisan`.
+        workspace.right_click_tree_row_for_test(0, window, cx);
+    });
+
+    let on_dir = workspace.read_with(cx, |workspace, cx| workspace.menu_actions_for_test(cx));
+    let on_dir = on_dir.expect("right-clicking a row must open a menu");
+    assert!(on_dir.contains(&MenuAction::NewFile), "a directory can hold a new file");
+    assert!(on_dir.contains(&MenuAction::Rename));
+    assert!(on_dir.contains(&MenuAction::Delete));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.right_click_tree_row_for_test(1, window, cx);
+    });
+    let on_file = workspace.read_with(cx, |workspace, cx| workspace.menu_actions_for_test(cx));
+    let on_file = on_file.expect("a file row must open a menu too");
+    assert!(!on_file.contains(&MenuAction::NewFile), "a file is not somewhere to create one");
+    assert!(on_file.contains(&MenuAction::Rename), "a file must still be renameable");
+
+    draw(cx);
+}
+
+/// Creating a file writes it, shows it, and opens it.
+#[gpui::test]
+async fn creating_a_file_from_the_menu_writes_it_and_opens_it(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.right_click_tree_row_for_test(0, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::NewFile, window, cx);
+        workspace.confirm_name_for_test("Post.php", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("app/Post.php").exists(), "the file must be on disk");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.overlay_is_open_for_test(), "the prompt must close");
+        assert_eq!(
+            workspace.tab_count_for_test(),
+            1,
+            "a new file opens, so the user is not left hunting for it in the tree"
+        );
+    });
+
+    draw(cx);
+}
+
+/// Renaming moves the file and leaves the old name behind.
+#[gpui::test]
+async fn renaming_from_the_menu_moves_the_file(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        // Row 1 is `artisan`, a file at the root.
+        workspace.right_click_tree_row_for_test(1, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Rename, window, cx);
+        workspace.confirm_name_for_test("artisan.bak", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("artisan.bak").exists());
+    assert!(!dir.path().join("artisan").exists());
+
+    // And the tree shows the new name without the user doing anything, which is the half
+    // that makes the operation feel finished rather than merely performed.
+    workspace.read_with(cx, |workspace, _cx| {
+        let names = workspace.tree_names_for_test();
+        assert!(names.contains(&"artisan.bak".to_string()), "the tree must refresh: {names:?}");
+        assert!(!names.contains(&"artisan".to_string()));
+    });
+
+    draw(cx);
+}
+
+/// Deleting asks first, and only then deletes.
+///
+/// The confirmation is the point: delete is the one action in this editor that cannot be
+/// undone (there is no trash), so picking `Delete` from the menu must *not* delete anything
+/// on its own. A version that deleted on the menu click would pass a test that only checked
+/// the file was gone at the end — so this asserts the file survives the menu step.
+#[gpui::test]
+async fn deleting_asks_before_it_deletes_and_closes_the_tab(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let victim = dir.path().join("artisan");
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(victim.clone()), "#!/usr/bin/env php\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.right_click_tree_row_for_test(1, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Delete, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(victim.exists(), "choosing Delete must only ask; nothing is destroyed yet");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.overlay_is_open_for_test(), "a confirmation must be on screen");
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.confirm_delete_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(!victim.exists(), "confirming must delete");
+    workspace.read_with(cx, |workspace, _cx| {
+        // A tab left open on a deleted file writes it back into existence on the next ⌘S,
+        // quietly undoing the delete.
+        assert_eq!(workspace.tab_count_for_test(), 0, "the tab on the deleted file must close");
+    });
+
+    draw(cx);
+}
+
+/// Dismissing the confirmation leaves the file alone.
+#[gpui::test]
+async fn cancelling_the_confirmation_deletes_nothing(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.right_click_tree_row_for_test(0, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Delete, window, cx);
+        workspace.dismiss_overlay_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("app/User.php").exists(), "cancelling must destroy nothing");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.overlay_is_open_for_test());
+    });
+
+    draw(cx);
+}
+
+/// A bad name is refused with a message, and nothing is created.
+#[gpui::test]
+async fn a_name_with_a_slash_is_reported_not_silently_mangled(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.right_click_tree_row_for_test(0, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::NewFile, window, cx);
+        workspace.confirm_name_for_test("sub/Post.php", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(!dir.path().join("app/sub").exists(), "a slash must not create a directory");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.status_for_test().is_some(),
+            "a refused name must say why, not fail silently"
+        );
+    });
+
+    draw(cx);
+}
+
+// --- setting the language for a buffer (#127) ---------------------------------------
+
+/// ⌘N then choosing PHP colours the buffer, without saving it first.
+///
+/// The whole of #127 as the user meets it: `Document::untitled()` has no path, so nothing
+/// detects a language and there is no syntax colour, and before this the only way to get
+/// one was to save the file. This goes through the real palette path — the same one the
+/// status-bar cell and the command both open — rather than calling `set_language` directly,
+/// because what was missing was the *route to it*, not the capability.
+#[gpui::test]
+async fn an_untitled_buffer_can_be_given_a_language_from_the_palette(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.new_file(window, cx);
+    });
+
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.active_language_for_test(cx),
+            Some(elle_syntax::Language::PlainText),
+            "a new buffer starts as plain text — that is the bug"
+        );
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_palette_for_test(PaletteMode::Languages, window, cx);
+        // The id is the language's own `name()`, which is what the rows carry.
+        workspace.confirm_palette_for_test("PHP", window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.active_language_for_test(cx),
+            Some(elle_syntax::Language::Php),
+            "choosing PHP must reach the document"
+        );
+        assert_eq!(
+            workspace.tab_count_for_test(),
+            1,
+            "the buffer must still be the same one, not a saved file"
+        );
+    });
+
+    draw(cx);
+}
+
+/// The language palette offers every language, and marks the one in effect.
+#[gpui::test]
+async fn the_language_palette_lists_every_language(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("User.php")), "<?php\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.toggle_palette_for_test(PaletteMode::Languages, window, cx);
+    });
+
+    workspace.read_with(cx, |workspace, cx| {
+        let labels = workspace.palette_labels_for_test(cx);
+        assert_eq!(
+            labels.len(),
+            elle_syntax::ALL_LANGUAGES.len(),
+            "every language must be offered: {labels:?}"
+        );
+        // The current one is marked rather than hidden, so the list says what the buffer is
+        // as well as what it could become.
+        assert!(
+            labels.iter().any(|label| label.starts_with("PHP") && label.contains('✓')),
+            "the language in effect must be marked: {labels:?}"
+        );
+    });
+
+    draw(cx);
+}
+
+/// Opening a folder actually starts a language server (#125).
+///
+/// The test that was missing, and whose absence is why #125 shipped. Everything else here
+/// uses `open_folder_for_test`, which stops at the tree on purpose — so nothing in the suite
+/// ever reached `start_lsp`, and the fact that ⌘O was its only caller went unseen.
+///
+/// Asserts on the *state*, not on a running process: whether a server is installed is a
+/// property of the machine. What must hold everywhere is that opening a PHP project makes
+/// the attempt and records the outcome, rather than leaving `Idle` — which is what "nothing
+/// happened, and nothing was logged" looked like.
+#[gpui::test]
+async fn opening_a_folder_starts_a_language_server(cx: &mut TestAppContext) {
+    use crate::lsp_session::LspState;
+
+    install_theme(cx);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("composer.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("User.php"), "<?php\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.lsp_state_for_test(), LspState::Idle, "nothing attempted yet");
+    });
+
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_and_start_lsp_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let state = workspace.lsp_state_for_test();
+        assert_ne!(
+            state,
+            LspState::Idle,
+            "opening a folder must attempt a server. Staying Idle is #125 exactly: no \
+             attempt, no log line, and a popup that can never open"
+        );
+        // Either outcome is legitimate and depends on the machine; what matters is that a
+        // decision was made and recorded.
+        assert!(
+            matches!(state, LspState::Starting | LspState::Unavailable),
+            "unexpected state after opening a folder: {state:?}"
+        );
+    });
+
+    draw(cx);
+}
+
+/// The list of completions occupies real pixels — the first geometry assertion in the suite.
+///
+/// # What this would have caught
+///
+/// The popup shipped with `flex_1` on its `uniform_list`, inside a wrapper whose height was
+/// content-driven (`max_h`, no `h`). Flex-basis 0 contributes no content height, so the two
+/// resolved to a popup exactly zero pixels tall — while every *state* test kept passing,
+/// because selection, filtering and accept do not live in layout. The owner's report was
+/// "funciona, mas não mostra nada": Enter inserted the member, the screen showed nothing.
+///
+/// `debug_selector` + `VisualTestContext::debug_bounds` is gpui 0.2.2's answer to exactly
+/// this (#112): the test build records the element's laid-out bounds under a string key,
+/// and a headless test can finally assert that a thing the user must see has a size. It
+/// still cannot see colour or position-on-screen — this is a narrow window, not the golden
+/// images #112 discusses — but zero-height is the failure mode that actually shipped.
+#[gpui::test]
+async fn the_completion_list_occupies_real_height(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(
+            vec![lsp_item("getName"), lsp_item("getEmail"), lsp_item("greet")],
+            cx,
+        );
+    });
+
+    draw(cx);
+
+    let bounds =
+        cx.debug_bounds("completion-list").expect("the list must be in the rendered frame at all");
+    assert_eq!(
+        bounds.size.height,
+        crate::completion::popup_height(3),
+        "three rows must lay out at three rows' height — zero is the bug that shipped"
+    );
+    assert!(bounds.size.width > px(0.), "and it must have width: {bounds:?}");
+}
+
+/// Hovering a squiggle produces a card with the server's message; leaving clears it.
+///
+/// What the status-bar affordance kept failing at in live testing: the reason for an error
+/// was reachable only with the *text cursor* inside the squiggle's bytes, which nobody
+/// discovers. The card follows the mouse, which is the gesture every comparable editor
+/// taught people. This test drives the same handlers the mouse events call.
+#[gpui::test]
+async fn hovering_a_diagnostic_shows_its_message_and_leaving_hides_it(cx: &mut TestAppContext) {
+    use elle_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    // Absolute, because it has to survive the `uri_for` round trip: publishing keys the
+    // diagnostics by URI, and a relative path has none.
+    let path = std::path::PathBuf::from("/srv/app/User.php");
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document =
+            Document::new(Some(path.clone()), "<?php\n$x = $undefined;\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        // Line 1, chars 5..15: `$undefined`.
+        workspace.publish_diagnostics_for_test(
+            &path,
+            &[Diagnostic {
+                range: Range {
+                    start: Position { line: 1, character: 5 },
+                    end: Position { line: 1, character: 15 },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Undefined variable '$undefined'.".into(),
+                ..Default::default()
+            }],
+            cx,
+        );
+    });
+    draw(cx);
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a tab is open");
+
+    // Driven at the offset level: the pixel conversion is the click tests' business, and
+    // the fake text system's advances are fiction anyway (`fonts.rs`). Byte 14 sits inside
+    // `$undefined` (bytes 11..21 of this fixture).
+    editor.update(cx, |editor, cx| {
+        editor.hover_at_for_test(14, 1, cx);
+    });
+    editor.read_with(cx, |editor, _cx| {
+        let hover = editor.hover_diagnostic.as_ref().expect("hovering the squiggle makes a card");
+        assert_eq!(hover.message.as_ref(), "Undefined variable '$undefined'.");
+        assert_eq!(hover.row, 1);
+    });
+
+    // Same row, byte 7 — off the squiggle. The card must go.
+    editor.update(cx, |editor, cx| {
+        editor.hover_at_for_test(7, 1, cx);
+    });
+    editor.read_with(cx, |editor, _cx| {
+        assert!(editor.hover_diagnostic.is_none(), "off the squiggle, no card");
+    });
+
+    // Back on, then the mouse leaves the row entirely.
+    editor.update(cx, |editor, cx| {
+        editor.hover_at_for_test(14, 1, cx);
+    });
+    editor.update(cx, |editor, cx| editor.hover_out_for_test(1, cx));
+    editor.read_with(cx, |editor, _cx| {
+        assert!(editor.hover_diagnostic.is_none(), "leaving the row clears the card");
+    });
+
+    draw(cx);
+}
+
+/// The file tree lays out at a real height.
+///
+/// Guards the wrapper the root context menu added around the rows: the list sizes itself
+/// with `flex_1`, and `flex_1` inside a parent that is not a flex column resolves to zero
+/// height — the resolution that shipped the invisible completion popup. Unlike the
+/// truncation bug (ink escaping a correctly-sized box, which bounds cannot see), a
+/// collapsed container is exactly what `debug_bounds` measures.
+#[gpui::test]
+async fn the_file_tree_occupies_real_height(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+    draw(cx);
+
+    let bounds = cx.debug_bounds("file-tree-list").expect("the tree is in the frame");
+    assert!(
+        bounds.size.height >= Metrics::ROW_HEIGHT,
+        "a tree with rows must be at least one row tall, got {:?}",
+        bounds.size.height
+    );
+}
+
+/// Renaming a file drags its open tab along — and the language follows the new name.
+///
+/// The hole this closes is save-resurrection, the same one `close_tabs_under` closed for
+/// delete: a tab keeps the path it was opened with, so renaming `notas.txt` to `User.php`
+/// with the tab open left ⌘S pointed at `notas.txt` — the next save would quietly recreate
+/// the file the user had just renamed away. The tab now follows the file, and because the
+/// retarget goes through `Document::set_path`, the buffer starts highlighting as PHP too,
+/// the same re-detection save-as performs.
+#[gpui::test]
+async fn renaming_an_open_file_retargets_its_tab(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let old_path = dir.path().join("notas.txt");
+    std::fs::write(&old_path, "<?php\nclass A {}\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(old_path.clone()), "<?php\nclass A {}\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        // Row order: `app` dir, then files alphabetically — `artisan`, `notas.txt`.
+        let row = workspace
+            .tree_names_for_test()
+            .iter()
+            .position(|name| name == "notas.txt")
+            .expect("the fixture file is in the tree");
+        workspace.right_click_tree_row_for_test(row, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Rename, window, cx);
+        workspace.confirm_name_for_test("Renamed.php", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("Renamed.php").exists());
+    assert!(!old_path.exists());
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the tab survived the rename");
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(
+            editor.document.path.as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("Renamed.php")),
+            "the document must follow the file, or the next save resurrects the old name"
+        );
+        assert_eq!(
+            editor.document.language(),
+            elle_syntax::Language::Php,
+            "a rename that changes the extension re-detects the language, like save-as"
+        );
+    });
 
     draw(cx);
 }

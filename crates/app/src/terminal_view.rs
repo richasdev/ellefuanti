@@ -18,8 +18,8 @@ use elle_terminal::{
 };
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, SharedString, StyledText, Task,
-    TextRun, Window, div, prelude::*, px,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, SharedString, Task, TextRun,
+    Window, div, prelude::*, px,
 };
 
 use crate::actions::{CloseTerminal, Copy, NewTerminal, Paste, SelectAll, SplitTerminal, context};

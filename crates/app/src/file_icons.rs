@@ -295,7 +295,6 @@ pub fn ayu_icon_for_name(name: &str) -> Option<(&'static str, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// The guard in the spirit of `panels_and_icons_stay_aligned`: it reads the *same*
     /// tables the renderer reads, rather than a list retyped here. A mapping naming an icon

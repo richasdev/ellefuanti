@@ -514,7 +514,21 @@ impl Render for CompletionPopup {
                             .collect()
                     })
                 })
-                .flex_1()
+                // An explicit height, never `flex_1`. The wrapper above has `max_h` and no
+                // `h`, so its height comes from its content — and `flex_1` is flex-basis 0,
+                // which *contributes no content height*. The two resolve to a popup exactly
+                // zero pixels tall: state, keyboard and accept all keep working, because
+                // none of them live in layout, and the list paints nothing at all. That
+                // shipped, and was reported as "funciona, mas não mostra nada" — Enter
+                // inserted the member while the screen showed nothing (#112's class again:
+                // 9 render tests drew this popup and none could see it had no height).
+                //
+                // The selector below is what finally lets a headless test see it: gpui's
+                // test build records this element's laid-out bounds under the key, and
+                // `completion_list_occupies_real_height` asserts them. First real geometry
+                // assertion in the suite — see #112 for why there were none before.
+                .h(popup_height(count))
+                .debug_selector(|| "completion-list".into())
                 .into_any_element()
             })
     }
@@ -554,15 +568,22 @@ fn completion_row(
                 cx.emit(CompletionEvent::Accepted(accepted));
             });
         })
+        // A row is one line, enforced, not assumed. `overflow_hidden` alone clips the box
+        // horizontally but lets the *text wrap* first — and wrapped text grows downward,
+        // painting over the rows below. Intelephense's detail for `$_SERVER` is an array
+        // shape hundreds of characters long, so with real data every global's detail
+        // bled across its neighbours and the list read as garbage. `truncate` is
+        // no-wrap plus ellipsis: a long detail ends in `…` inside its own row.
+        //
+        // Untested, and the attempt is worth recording: a `debug_bounds` test asserting the
+        // row stays ROW_HEIGHT tall passed *with the bug restored*, because the row's box
+        // never grew — `.h()` fixes it — the wrapped glyphs simply painted outside it.
+        // Bounds measure boxes, not ink, so this is #112's territory: only eyes catch it.
+        //
         // The label takes the space that is left, so the badge keeps its own.
-        .child(div().flex_1().overflow_hidden().child(item.label.clone()))
+        .child(div().flex_1().truncate().child(item.label.clone()))
         .children(item.detail.clone().map(|detail| {
-            div()
-                .flex_none()
-                .text_color(theme.text_muted)
-                .max_w(px(160.0))
-                .overflow_hidden()
-                .child(detail)
+            div().flex_none().text_color(theme.text_muted).max_w(px(160.0)).truncate().child(detail)
         }))
         .child(div().flex_none().text_color(badge_color).child(item.source.badge()))
         .into_any_element()

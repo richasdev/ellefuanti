@@ -118,6 +118,17 @@ impl FileDiagnostics {
             .min_by_key(|d| d.range.end - d.range.start)
     }
 
+    /// The first diagnostic overlapping a byte range — the cursor's line, in practice.
+    ///
+    /// The line-level fallback behind the status bar's message. `at` answers "what is under
+    /// the cursor"; this answers "what is wrong on this line", which is the question a
+    /// click on a marked line is actually asking. First rather than innermost: a line with
+    /// two problems shows one of them, and showing *a* reason beats a rule for choosing
+    /// between reasons nobody has needed yet.
+    pub fn on_line(&self, line: std::ops::Range<usize>) -> Option<&ResolvedDiagnostic> {
+        self.items.iter().find(|d| d.range.start < line.end && line.start <= d.range.end)
+    }
+
     /// Counts by severity, for the status bar: `(errors, warnings)`.
     ///
     /// Hints and information are counted as neither. They are advisory, and a status bar
@@ -414,14 +425,188 @@ fn split_command(raw: &str) -> Option<(String, Vec<String>)> {
     Some((command, parts.collect()))
 }
 
-/// Builds the config for a project root.
+/// Directories searched for the server binary when `PATH` does not have it.
+///
+/// # Why this list exists at all
+///
+/// `open target/ellefuanti.app` hands the app **launchd's** environment, and on a normal
+/// macOS install `launchctl getenv PATH` is empty — so a `.app` double-clicked from Finder
+/// sees none of what the user's shell sees. Every node-based language server installs under
+/// a version manager whose `bin` directory is put on `PATH` by a shell rc file that a
+/// Finder launch never runs. The result is #123: the editor works from a terminal and
+/// appears to have no LSP at all from the Dock, which reads as the feature being broken.
+///
+/// These are the prefixes those installers use, relative to `$HOME`. They name *installers*
+/// — nvm, Herd, Homebrew — never a language server, which is the RISKS.md #2 line the
+/// architecture test enforces: this file may know where binaries live and must not know
+/// which one it is looking for.
+///
+/// ponytail: a fixed list, not a `PATH` reconstruction. Reading the user's login shell and
+/// asking it for its `PATH` (`zsh -lic 'echo $PATH'`) is what a full fix does, and it costs
+/// a subprocess on every folder open plus a hang when someone's rc file blocks on input.
+/// Upgrade to that if a real install turns up outside these three.
+const BINARY_SEARCH_PREFIXES: [&str; 4] = [
+    // nvm, and Herd's bundled copy of it. The version component is a glob: `versions/node`
+    // holds one directory per installed node, and any of them may own the binary.
+    ".nvm/versions/node/*/bin",
+    "Library/Application Support/Herd/config/nvm/versions/node/*/bin",
+    // Homebrew on Apple silicon lives outside `$HOME`; `resolve_binary` also checks the
+    // two absolute prefixes below. These two are the per-user npm targets.
+    ".local/bin",
+    ".npm-global/bin",
+];
+
+/// Absolute directories searched after the `$HOME`-relative ones.
+const ABSOLUTE_SEARCH_PREFIXES: [&str; 3] =
+    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/opt/node/bin"];
+
+/// Finds `command` as an executable file, or `None` if it is not installed.
+///
+/// An absolute or relative path is taken at its word — someone who configured
+/// `ELLE_LSP_COMMAND=/opt/my-server` means that file, and searching for its basename
+/// somewhere else would run a different program than the one they named.
+///
+/// A bare name is looked up in `dirs`, in order, first hit wins. The caller supplies the
+/// list so this is testable against a `tempfile` directory rather than the real machine —
+/// a test that asserted against the developer's actual `PATH` would pass or fail depending
+/// on who ran it.
+fn resolve_binary(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if command.contains('/') {
+        let path = PathBuf::from(command);
+        return is_executable(&path).then_some(path);
+    }
+
+    dirs.iter().find_map(|dir| {
+        let candidate = dir.join(command);
+        is_executable(&candidate).then_some(candidate)
+    })
+}
+
+/// Whether `path` is a file this process could execute.
+///
+/// The mode check matters: `~/.local/bin` routinely holds a directory or a stray README,
+/// and treating either as the server turns "not installed" into a spawn failure with a
+/// confusing message.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Every directory a bare command name is looked for in, `PATH` first.
+///
+/// `PATH` wins because a user who put a server on it chose that one. The fallbacks are for
+/// the case where there is no `PATH` to consult at all (#123), and appending rather than
+/// prepending them means a shell launch behaves exactly as it did before this existed.
+fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for prefix in BINARY_SEARCH_PREFIXES {
+        let Some(home) = home.as_ref() else { break };
+        match prefix.split_once('*') {
+            // A glob prefix expands to one candidate per installed version.
+            Some((before, after)) => {
+                let after = after.trim_start_matches('/');
+                let Ok(entries) = std::fs::read_dir(home.join(before.trim_end_matches('/'))) else {
+                    continue;
+                };
+                dirs.extend(entries.flatten().map(|entry| entry.path().join(after)));
+            }
+            None => dirs.push(home.join(prefix)),
+        }
+    }
+    dirs.extend(ABSOLUTE_SEARCH_PREFIXES.iter().map(PathBuf::from));
+    dirs
+}
+
+/// Builds the config for a project root, or `None` if no server is installed.
+///
+/// # Why the binary is resolved here rather than left to the spawn
+///
+/// This used to return `Some` unconditionally and let `Command::spawn` fail. Two things
+/// came of that, and both were reported as "the completion popup never opens" (#125):
+///
+/// - the failure arrived as an `io::Error` on the background executor, logged at `debug`,
+///   so at the default level a machine with no server produced **no output at all** — the
+///   evidence that opened #125 was `grep -c` over the log returning zero;
+/// - the state went to `Unavailable` only after a spawn attempt, so the difference between
+///   "not installed" and "installed somewhere this process cannot see" (#123) was not
+///   recorded anywhere, and the two need different answers from the user.
+///
+/// Resolving first makes "not installed" a fact known before anything is spawned, which is
+/// what lets the status bar say so (#125) and what makes the Finder-launch case findable.
+///
+/// The path found is passed on as the command, so the spawn does not repeat the lookup
+/// against the empty `PATH` that caused #123 in the first place.
+///
+/// # Why the child is also given a `PATH`, which is not the same fix
+///
+/// Finding the binary is **not sufficient**, and assuming it was is what made the first
+/// attempt at #123 incomplete. Every node-based language server installs as a script whose
+/// first line is `#!/usr/bin/env node`, so executing it makes the kernel run `env`, and
+/// `env` looks up `node` in the child's `PATH`. With launchd's empty environment that fails
+/// with `env: node: No such file or directory` and exit status 127 — the binary was found,
+/// spawned, and died before writing a byte of LSP.
+///
+/// Measured on this machine, running the resolved Herd/nvm intelephense directly:
+///
+/// ```text
+/// with PATH:    exit status 1     (the script ran; the flag was wrong)
+/// without PATH: exit status 127   env: node: No such file or directory
+/// ```
+///
+/// So the child gets `PATH` set to the same directories the binary was searched in. The
+/// interpreter a server needs lives next to the server itself — `node` is in the very
+/// `bin/` directory nvm put `intelephense` in — so the list that found one finds the other.
 pub fn config_for(root: &Path) -> Option<ServerConfig> {
     let (command, args) = configured_command()?;
+
+    let dirs = search_dirs();
+    let Some(binary) = resolve_binary(&command, &dirs) else {
+        tracing::debug!("no language server: `{command}` is not installed on PATH");
+        return None;
+    };
+
     Some(
-        ServerConfig::new(command.clone(), command, root)
+        // The label stays the *configured* name, not the resolved path: it is what the user
+        // wrote and what they would search for. The path is only what gets executed.
+        ServerConfig::new(command, binary.to_string_lossy().into_owned(), root)
             .with_args(args)
+            // The interpreter the shebang needs. See this function's docs: without it a
+            // Finder launch spawns the server successfully and it dies at `env: node: No
+            // such file or directory` before writing a byte.
+            .with_env("PATH", join_paths(&dirs))
             .with_language_ids([LANGUAGE_ID]),
     )
+}
+
+/// Joins search directories into a `PATH` value for the child process.
+///
+/// `std::env::join_paths` rather than `join(":")`: the separator is a platform detail, and
+/// a directory containing one would silently split into two unusable entries. A path that
+/// cannot be expressed is dropped rather than corrupting the whole variable — losing one
+/// candidate directory is recoverable, a malformed `PATH` is not.
+fn join_paths(dirs: &[PathBuf]) -> String {
+    std::env::join_paths(dirs)
+        .or_else(|_| {
+            let usable: Vec<_> = dirs
+                .iter()
+                .filter(|dir| !dir.as_os_str().to_string_lossy().contains(':'))
+                .collect();
+            std::env::join_paths(usable)
+        })
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Whether this path is one the configured server should be told about.
@@ -502,6 +687,163 @@ mod tests {
         assert_eq!(args, ["language-server", "-vvv"]);
     }
 
+    // --- finding the binary (#123, and half of #125) -----------------------------
+
+    /// Creates `name` under `dir` with the mode `resolve_binary` requires.
+    fn install(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn a_server_that_is_not_installed_is_found_before_it_is_spawned() {
+        // The #125 case. Before this, `config_for` returned `Some` for a binary that does
+        // not exist, the spawn failed on the background executor, and the only trace was a
+        // `debug` line — so the log of a real session contained *nothing*, which is what
+        // made the bug look like the popup rather than the server.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_binary("nothing-is-installed", &[dir.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn a_bare_name_is_found_in_the_search_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = install(dir.path(), "some-language-server");
+
+        assert_eq!(
+            resolve_binary("some-language-server", &[dir.path().to_path_buf()]),
+            Some(installed)
+        );
+    }
+
+    #[test]
+    fn the_first_directory_holding_the_binary_wins() {
+        // `search_dirs` puts `PATH` in front of the fallbacks, so a server the user chose
+        // must beat one that merely happens to sit under a version manager. Asserting the
+        // order here is what pins that: a `find_map` over a set would pass a test that only
+        // checked "it was found somewhere".
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let preferred = install(first.path(), "some-language-server");
+        install(second.path(), "some-language-server");
+
+        let found = resolve_binary(
+            "some-language-server",
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        assert_eq!(found, Some(preferred), "PATH must win over the fallbacks");
+    }
+
+    #[test]
+    fn a_directory_with_the_right_name_is_not_a_server() {
+        // `~/.local/bin` holds whatever anyone put there. Accepting a directory would turn
+        // "not installed" into a spawn failure with a worse message than the true one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("some-language-server")).unwrap();
+
+        assert_eq!(resolve_binary("some-language-server", &[dir.path().to_path_buf()]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_the_executable_bit_is_not_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("some-language-server"), "not a program").unwrap();
+
+        assert_eq!(resolve_binary("some-language-server", &[dir.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn a_configured_path_is_taken_at_its_word() {
+        // Someone who writes `ELLE_LSP_COMMAND=/opt/theirs/server` means that file. Looking
+        // its basename up in the search directories could run a *different* program with
+        // the same name, which is worse than failing.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let installed = install(dir.path(), "some-language-server");
+        install(elsewhere.path(), "some-language-server");
+
+        let configured = installed.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_binary(&configured, &[elsewhere.path().to_path_buf()]),
+            Some(installed),
+            "an absolute path must not be re-resolved against the search list"
+        );
+    }
+
+    #[test]
+    fn a_configured_path_that_does_not_exist_is_not_invented() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        install(elsewhere.path(), "some-language-server");
+
+        assert_eq!(
+            resolve_binary("/nowhere/some-language-server", &[elsewhere.path().to_path_buf()]),
+            None,
+            "a named path that is absent must fail, not fall back to a namesake"
+        );
+    }
+
+    #[test]
+    fn the_child_is_given_a_path_because_finding_the_binary_is_not_enough() {
+        // The half of #123 the first fix missed, and the reason this test exists at all.
+        //
+        // Every node-based server installs as a script starting `#!/usr/bin/env node`, so
+        // running it makes the kernel run `env`, which looks `node` up in the **child's**
+        // PATH. Resolving the server's own path does nothing for that. Measured against the
+        // real Herd/nvm intelephense on this machine:
+        //
+        //     with PATH:    exit status 1     (ran; wrong flag)
+        //     without PATH: exit status 127   env: node: No such file or directory
+        //
+        // So the config must carry a PATH, or a Finder launch spawns a server that dies
+        // before writing a byte of LSP — which looks exactly like the server not existing.
+        let root = tempfile::tempdir().unwrap();
+        let Some(config) = config_for(root.path()) else {
+            // No server installed on this machine; nothing to assert about its environment.
+            return;
+        };
+
+        let path = config.env.get("PATH").expect("the child must be given a PATH (#123)");
+        assert!(!path.is_empty(), "an empty PATH is the bug, not the fix");
+        assert!(
+            std::env::split_paths(path).count() > 1,
+            "the child's PATH must carry the search directories, not a single entry"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_expressed_does_not_destroy_the_whole_path() {
+        // `join_paths` refuses a directory containing the separator. Dropping that one
+        // candidate is recoverable; returning an empty string would take every other
+        // directory with it and reintroduce #123 for everyone.
+        let dirs = vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/opt/we:rd")];
+
+        let joined = join_paths(&dirs);
+        assert!(joined.contains("/usr/local/bin"), "the usable directories must survive");
+    }
+
+    #[test]
+    fn the_search_list_extends_past_path() {
+        // #123: a Finder-launched `.app` gets launchd's environment, where `PATH` is empty.
+        // The fallbacks are the whole fix, so "the list is longer than `PATH`" is the thing
+        // worth pinning — the specific directories are a property of the machine and would
+        // make this a test about the developer's laptop.
+        let dirs = search_dirs();
+        let on_path =
+            std::env::var_os("PATH").map(|path| std::env::split_paths(&path).count()).unwrap_or(0);
+
+        assert!(
+            dirs.len() > on_path,
+            "a launch with no PATH must still have somewhere to look (#123)"
+        );
+    }
+
     #[test]
     fn only_php_files_are_sent_to_the_server() {
         assert!(handles(Path::new("/srv/app/User.php")));
@@ -513,6 +855,23 @@ mod tests {
         // lighting a template up red end to end. ADR-0006 keeps Blade away from the PHP
         // parser; this keeps it away from the PHP server for the same reason.
         assert!(!handles(Path::new("/srv/resources/views/home.blade.php")));
+    }
+
+    #[test]
+    fn a_diagnostic_is_found_from_anywhere_on_its_line() {
+        // The discoverability fix: the exact-span lookup made the reason invisible unless
+        // the cursor landed inside the squiggle's own bytes. Clicking anywhere on the
+        // marked line is what people do, so that is what must work.
+        let mut lsp = Lsp::new();
+        let text = "<?php\n$x = $undefined;\n";
+        lsp.set_diagnostics(uri(), &[diagnostic(1, 5, 15, DiagnosticSeverity::ERROR)], text);
+        let file = lsp.diagnostics_for(&uri()).unwrap();
+
+        // Line 1 spans bytes 6..22. Column 0 is nowhere near the squiggle at 11..21.
+        let line = 6..22;
+        assert!(file.on_line(line.clone()).is_some(), "anywhere on the line finds it");
+        // And the neighbouring line must not.
+        assert!(file.on_line(0..5).is_none(), "a clean line stays clean");
     }
 
     // --- restart bounding --------------------------------------------------------

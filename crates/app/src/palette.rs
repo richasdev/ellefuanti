@@ -18,6 +18,13 @@ pub enum PaletteMode {
     Symbols,
     /// Where a symbol is used, from the language server.
     References,
+    /// The syntax language for the current buffer (#127).
+    ///
+    /// Not a navigation like the others — it changes the active document rather than
+    /// opening something — but it is a filtered list of a few dozen fixed choices, which is
+    /// exactly what this overlay is. A dedicated dropdown would be a second implementation
+    /// of the same keyboard and filtering behaviour.
+    Languages,
 }
 
 impl PaletteMode {
@@ -28,6 +35,7 @@ impl PaletteMode {
             PaletteMode::Routes => "Go to a route…",
             PaletteMode::Symbols => "Go to a symbol…",
             PaletteMode::References => "Go to a usage…",
+            PaletteMode::Languages => "Set the language…",
         }
     }
 }
@@ -72,7 +80,9 @@ impl Palette {
             query: String::new(),
             filtered: items.clone(),
             // Commands are known up front; files arrive later via set_items.
-            loaded: mode == PaletteMode::Commands,
+            // Commands and languages are both known up front; files and the rest arrive
+            // later via `set_items`, and "No matches" would be a lie until they do.
+            loaded: matches!(mode, PaletteMode::Commands | PaletteMode::Languages),
             items,
             selected: 0,
         }
@@ -112,6 +122,12 @@ impl Palette {
     fn refilter(&mut self) {
         self.filtered = filter_items(&self.items, &self.query);
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+
+    /// The rows currently shown, after filtering.
+    #[cfg(test)]
+    pub fn labels_for_test(&self) -> Vec<String> {
+        self.filtered.iter().map(|item| item.label.to_string()).collect()
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {

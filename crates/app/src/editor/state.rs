@@ -200,6 +200,43 @@ impl Document {
         self.syntax.language()
     }
 
+    /// Sets the language explicitly, without giving the document a path.
+    ///
+    /// # Why this exists separately from `set_path`
+    ///
+    /// #127: `untitled()` produces a pathless buffer, which is correct — it is what makes
+    /// ⌘S fall through to save-as — but language detection runs off the path, so an
+    /// untitled buffer is plain text with no way to become anything else. The only way to
+    /// get syntax colour into a scratch buffer was to save it first, which is backwards:
+    /// people open a scratch buffer to try something *before* deciding where it lives.
+    ///
+    /// This is also the override for a file whose name lies about its contents, which
+    /// detection cannot get right in principle — a `.txt` holding SQL, a config file with
+    /// no extension. Every comparable editor puts that control in the status bar.
+    ///
+    /// The parse tree is rebuilt because the old one was produced by a different grammar,
+    /// or by none at all. On failure the document falls back to plain text rather than
+    /// keeping a tree that does not match the language it now claims — the same trade
+    /// `set_path` makes, and for the same reason: a stale tree colours confidently and
+    /// wrongly, which is worse than no colour.
+    pub fn set_language(&mut self, language: Language) -> anyhow::Result<()> {
+        if language == self.syntax.language() {
+            return Ok(());
+        }
+
+        match SyntaxTree::new(language, &self.buffer) {
+            Ok(syntax) => {
+                self.syntax = syntax;
+                Ok(())
+            }
+            Err(err) => {
+                self.syntax = SyntaxTree::new(Language::PlainText, &self.buffer)
+                    .expect("plain text needs no grammar");
+                Err(err)
+            }
+        }
+    }
+
     /// File name for a tab label.
     pub fn title(&self) -> String {
         self.path
@@ -2298,6 +2335,78 @@ mod tests {
         assert_eq!(d.title(), "User.php");
         assert!(d.syntax.tree().is_some(), "adopting a .php path must produce a parse tree");
         assert!(!d.syntax.has_error());
+    }
+
+    #[test]
+    fn an_untitled_buffer_can_be_given_a_language_without_being_saved() {
+        // #127, exactly as reported: ⌘N produces a buffer with no path, so nothing detects
+        // a language and there is no syntax colour. Before this the only way out was to
+        // save the file, which is backwards — a scratch buffer exists to try something
+        // *before* deciding where it lives.
+        let mut d = Document::untitled().unwrap();
+        assert_eq!(d.language(), Language::PlainText);
+        assert!(d.syntax.tree().is_none(), "plain text has no parse tree");
+
+        d.insert("<?php\nclass A {}\n");
+        d.set_language(Language::Php).unwrap();
+
+        assert_eq!(d.language(), Language::Php);
+        assert!(d.syntax.tree().is_some(), "choosing PHP must produce a real parse tree");
+        assert!(!d.syntax.has_error());
+        // And it is still untitled, so ⌘S still routes to save-as. Choosing how to colour a
+        // buffer must not invent a path for it.
+        assert_eq!(d.path, None);
+        assert_eq!(d.title(), "untitled");
+    }
+
+    #[test]
+    fn setting_a_language_reparses_text_that_was_already_there() {
+        // The tree has to be rebuilt against the *existing* buffer, not left empty until the
+        // next keystroke — otherwise choosing a language appears to do nothing until you
+        // type, which is how this would most plausibly be got wrong.
+        let mut d = Document::new(None, "{\"a\": 1}\n", false).unwrap();
+        d.set_language(Language::Json).unwrap();
+
+        assert_eq!(d.language(), Language::Json);
+        assert!(d.syntax.tree().is_some());
+        assert!(!d.syntax.has_error(), "the existing text must parse, not just future edits");
+    }
+
+    #[test]
+    fn a_detected_language_can_be_overridden() {
+        // The other half of #127: detection runs off the extension and cannot be right in
+        // principle for a file whose name lies about its contents.
+        let mut d = doc("<?php\n");
+        assert_eq!(d.language(), Language::Php);
+
+        d.set_language(Language::PlainText).unwrap();
+        assert_eq!(d.language(), Language::PlainText);
+        assert!(d.syntax.tree().is_none());
+    }
+
+    #[test]
+    fn choosing_the_language_a_buffer_already_has_changes_nothing() {
+        let mut d = doc("<?php $x = 1;\n");
+        let before = d.buffer.text();
+
+        d.set_language(Language::Php).unwrap();
+
+        assert_eq!(d.language(), Language::Php);
+        assert_eq!(d.buffer.text(), before, "the text must not be touched");
+    }
+
+    #[test]
+    fn saving_re_detects_and_overrides_the_chosen_language() {
+        // Deliberate, and the reason the override is not persisted: once the buffer has a
+        // path, the extension is the answer the user just gave. A language choice that
+        // outlived the save would mean a file called `.php` refusing to highlight as PHP
+        // because of a menu choice made ten minutes earlier.
+        let mut d = Document::untitled().unwrap();
+        d.set_language(Language::Json).unwrap();
+        assert_eq!(d.language(), Language::Json);
+
+        d.set_path(PathBuf::from("/tmp/User.php")).unwrap();
+        assert_eq!(d.language(), Language::Php, "the saved name wins over the earlier choice");
     }
 
     #[test]

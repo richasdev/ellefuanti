@@ -29,6 +29,7 @@ use crate::completion::{
     CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, CompletionTrigger,
     word_before,
 };
+use crate::context_menu::{self, MenuAction, Overlay, OverlayEvent};
 use crate::editor::{Document, EditorEvent, EditorView, search_project};
 use crate::file_cache;
 use crate::find_bar::{FindBar, FindEvent, Status};
@@ -76,6 +77,11 @@ enum Job {
     QuickOpenIndex,
     RouteIndex,
     ClosePrompt,
+    /// A create, rename or delete started from the tree's context menu (#126).
+    ///
+    /// One slot: these are all started by a click on a modal overlay, so two cannot be in
+    /// flight at once, and a second one superseding the first is the right behaviour anyway.
+    FileOperation,
     /// A find-in-project sweep, and the debounce timer in front of it (#80).
     ///
     /// **One slot for both on purpose.** The timer and the search it starts are the same
@@ -412,6 +418,33 @@ pub struct WorkspaceView {
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
+    /// The file tree's context menu, name prompt or delete confirmation (#126).
+    ///
+    /// One slot for all three because they are steps of one interaction: the menu opens the
+    /// prompt, the prompt replaces it. Two slots would let a stale menu outlive the dialog
+    /// it opened, which is visible as a menu sitting behind a confirmation.
+    overlay: Option<Entity<Overlay>>,
+    /// The buffer version last sent to the language server, per open file (#59's follow-up).
+    ///
+    /// What keeps diagnostics honest between saves: `poll_lsp` compares each PHP tab's
+    /// buffer version against this on every tick and resyncs the ones that moved, which
+    /// gives per-keystroke sync a free 250ms debounce — the timer already existed. Without
+    /// it, squiggles describe the buffer as it was at the last save (or the last completion
+    /// request, since #125's resync), and a squiggle over code the user has since fixed
+    /// reads as the editor being wrong about working code.
+    ///
+    /// Cleared when a server starts: a fresh server was just told everything via
+    /// `sync_open_documents`, and stale entries from the previous server would suppress the
+    /// first resync of every file.
+    lsp_synced: std::collections::HashMap<PathBuf, elle_text::Version>,
+    /// What the overlay is about — the row that was right-clicked, and what the pending
+    /// action is going to do to it.
+    ///
+    /// Held here rather than inside the overlay because the overlay is replaced between the
+    /// menu and the prompt, and this has to survive that. A path, never a row index: the
+    /// tree is rebuilt by saves and git polls, so an index is a different file by the time
+    /// an await returns (the same reasoning `MenuAction` records).
+    pending: Option<PendingFileAction>,
     /// The find/replace bar (#80). `Some` only while it is open.
     ///
     /// One bar for the window rather than one per tab, which is what VS Code does and
@@ -559,6 +592,9 @@ impl WorkspaceView {
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
+            overlay: None,
+            pending: None,
+            lsp_synced: std::collections::HashMap::new(),
             find: None,
             search_panel: None,
             search_cancel: None,
@@ -625,34 +661,72 @@ impl WorkspaceView {
 
             this.update(cx, |this, cx| {
                 match tree {
-                    Ok(tree) => {
-                        this.tree = Some(tree);
-                        this.status = None;
-                        // A run belongs to the project it was started in. Its results name
-                        // files in the old tree and its `--filter` names the old suite, so
-                        // carrying either into a new project would show verdicts about code
-                        // the user is no longer looking at. The panel goes with it, and is
-                        // rebuilt against the new root when it is next opened — which is
-                        // also what re-runs detection for a project that may not have Pest.
-                        this.cancel_test_run();
-                        this.tests = None;
-                        // A new project gets a new server, pointed at the new root. The
-                        // old one is dropped by `set_root`, which kills its process.
-                        this.start_lsp(cx);
-                        // First of the three refresh triggers (#64). The other two are
-                        // save and window focus; there is no timer.
-                        this.refresh_git_status(cx);
-                        // An open terminal points at wherever it was started, which before
-                        // this was the *previous* project — or nowhere, for a panel opened
-                        // before any folder was. Sessions already running keep their own
-                        // directory: a shell has state and its own `cd`, and moving it out
-                        // from under someone mid-command would be worse than leaving it.
-                        // New sessions land in the new project.
-                        let root = this.tree.as_ref().map(|tree| tree.root().to_path_buf());
-                        if let Some(terminal) = this.terminal.as_ref() {
-                            terminal.update(cx, |terminal, _| terminal.set_cwd(root));
-                        }
-                    }
+                    Ok(tree) => this.adopt_tree(tree, cx),
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::OpenFolder, task);
+    }
+
+    /// Makes `tree` the open project: the tree, the server, git, and the terminal's cwd.
+    ///
+    /// Split out of `open_folder` so the command line can reach it (`ellefuanti .`) without
+    /// duplicating any of it. A second copy is how one door ends up starting a language
+    /// server and the other one quietly not — which is the shape of #125, where `start_lsp`
+    /// had exactly one caller and nobody noticed.
+    fn adopt_tree(&mut self, tree: FileTree, cx: &mut Context<Self>) {
+        self.tree = Some(tree);
+        self.status = None;
+        // A run belongs to the project it was started in. Its results name files in the old
+        // tree and its `--filter` names the old suite, so carrying either into a new project
+        // would show verdicts about code the user is no longer looking at. The panel goes
+        // with it, and is rebuilt against the new root when it is next opened — which is
+        // also what re-runs detection for a project that may not have Pest.
+        self.cancel_test_run();
+        self.tests = None;
+        // A new project gets a new server, pointed at the new root. The old one is dropped
+        // by `set_root`, which kills its process.
+        self.start_lsp(cx);
+        // First of the three refresh triggers (#64). The other two are save and window
+        // focus; there is no timer.
+        self.refresh_git_status(cx);
+        // An open terminal points at wherever it was started, which before this was the
+        // *previous* project — or nowhere, for a panel opened before any folder was.
+        // Sessions already running keep their own directory: a shell has state and its own
+        // `cd`, and moving it out from under someone mid-command would be worse than
+        // leaving it. New sessions land in the new project.
+        let root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        if let Some(terminal) = self.terminal.as_ref() {
+            terminal.update(cx, |terminal, _| terminal.set_cwd(root));
+        }
+    }
+
+    /// Opens whatever the command line named: a folder as the project, a file in a tab.
+    ///
+    /// The blocking `FileTree::new` runs on the background pool, like every other open — a
+    /// large project must not delay the first frame (ADR-0007).
+    pub fn open_argument(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if path.is_file() {
+            self.open_path(path, window, cx);
+            return;
+        }
+
+        if !path.is_dir() {
+            // Neither, so it does not exist. Said out loud: a mistyped path that opens an
+            // empty window looks like the editor failed to start.
+            self.status = Some(format!("{} does not exist", path.display()).into());
+            cx.notify();
+            return;
+        }
+
+        let task = cx.spawn(async move |this, cx| {
+            let tree = cx.background_spawn(async move { FileTree::new(path) }).await;
+            this.update(cx, |this, cx| {
+                match tree {
+                    Ok(tree) => this.adopt_tree(tree, cx),
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
                 cx.notify();
@@ -1114,6 +1188,130 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Opens a folder *and* starts the language server, as ⌘O does.
+    ///
+    /// Separate from `open_folder_for_test` because that one deliberately stops at the tree:
+    /// most tests want a root and would otherwise spawn Intelephense. This is for the tests
+    /// that are about the server itself — and its absence is why #125 survived. Every test
+    /// used the tree-only seam, so `start_lsp` was never reached by anything, and the fact
+    /// that ⌘O was its only caller went unnoticed.
+    #[cfg(test)]
+    pub fn open_folder_and_start_lsp_for_test(
+        &mut self,
+        root: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.tree = FileTree::new(root).ok();
+        self.start_lsp(cx);
+        cx.notify();
+    }
+
+    /// The language server's state, for asserting that one was actually attempted.
+    #[cfg(test)]
+    pub fn lsp_state_for_test(&self) -> LspState {
+        self.lsp.state().clone()
+    }
+
+    /// Right-clicks a tree row, through the same handler the row's mouse-down uses.
+    ///
+    /// The position is arbitrary — nothing headless can assert where a menu was drawn (the
+    /// text system is a fake monospace, see `fonts`) — but it goes through the real path so
+    /// what is being tested is the real open, not a reimplementation of it.
+    #[cfg(test)]
+    pub fn right_click_tree_row_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_tree_menu(index, gpui::Point::default(), window, cx);
+    }
+
+    /// The entries the open context menu is offering, or `None` if no menu is open.
+    #[cfg(test)]
+    pub fn menu_actions_for_test(&self, cx: &App) -> Option<Vec<crate::context_menu::MenuAction>> {
+        let overlay = self.overlay.as_ref()?;
+        overlay.read(cx).entries_for_test()
+    }
+
+    /// Picks a menu entry, through the handler the click and the Enter key both use.
+    #[cfg(test)]
+    pub fn pick_menu_action_for_test(
+        &mut self,
+        action: crate::context_menu::MenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_menu_action(action, window, cx);
+    }
+
+    /// Confirms the open name prompt with `name`.
+    #[cfg(test)]
+    pub fn confirm_name_for_test(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_name_confirmed(name.to_string(), window, cx);
+    }
+
+    /// Accepts the open delete confirmation.
+    #[cfg(test)]
+    pub fn confirm_delete_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_delete_confirmed(window, cx);
+    }
+
+    /// Whether any tree overlay is open.
+    #[cfg(test)]
+    pub fn overlay_is_open_for_test(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Confirms a palette row by id, through the handler Enter and a click both use.
+    #[cfg(test)]
+    pub fn confirm_palette_for_test(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_palette(id.to_string(), window, cx);
+    }
+
+    /// The active tab's language, which is what the status bar's last cell shows.
+    #[cfg(test)]
+    pub fn active_language_for_test(&self, cx: &App) -> Option<elle_syntax::Language> {
+        Some(self.active_editor()?.read(cx).document.language())
+    }
+
+    /// The rows the open palette is showing.
+    #[cfg(test)]
+    pub fn palette_labels_for_test(&self, cx: &App) -> Vec<String> {
+        self.palette.as_ref().map(|palette| palette.read(cx).labels_for_test()).unwrap_or_default()
+    }
+
+    /// Dismisses the open overlay, as Escape and a click outside both do.
+    #[cfg(test)]
+    pub fn dismiss_overlay_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_overlay(window, cx);
+    }
+
+    /// The tree's visible row names, for asserting a refresh landed.
+    #[cfg(test)]
+    pub fn tree_names_for_test(&self) -> Vec<String> {
+        self.tree
+            .as_ref()
+            .map(|tree| tree.entries().iter().map(|entry| entry.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// How many tabs are open, for asserting a delete closed the right ones.
+    #[cfg(test)]
+    pub fn tab_count_for_test(&self) -> usize {
+        self.tabs.len()
+    }
+
     /// Clicks a result row, through the same handler the row's mouse-down uses.
     ///
     /// Takes a `Window` since #102: opening a result now focuses the editor it opened, and
@@ -1160,7 +1358,19 @@ impl WorkspaceView {
     /// The status-bar text for the language server, for tests that assert on silence.
     #[cfg(test)]
     pub fn lsp_label_for_test(&self) -> String {
-        lsp_label(&self.lsp)
+        lsp_label(&self.lsp, self.active_tab_wants_a_server())
+    }
+
+    /// Whether the file in front of the user is one a language server would handle.
+    ///
+    /// What turns §24's silence about a missing server into a single honest word (#125):
+    /// nobody needs telling there is no PHP server while they are looking at a `.txt`, and
+    /// everybody needs telling while they are looking at a `.php`.
+    fn active_tab_wants_a_server(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+            .is_some_and(crate::lsp_session::handles)
     }
 
     /// Puts an already-built document into a tab, synchronously.
@@ -1254,6 +1464,7 @@ impl WorkspaceView {
     ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
+            self.clear_hover_cards(cx);
             // A file already open still has to move: "go to definition" on something in the
             // current file is the common case, and leaving the cursor where it was would
             // make the command look broken.
@@ -1293,7 +1504,7 @@ impl WorkspaceView {
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
                                 this.status = None;
-                                this.open_on_lsp(&path, &text);
+                                this.open_on_lsp(&path, &text, cx);
                             }
                             // Focus stays where it was on a failure: the file the user asked
                             // for is not on screen, so moving the keyboard into whatever is
@@ -1527,6 +1738,7 @@ impl WorkspaceView {
             self.close_on_lsp(path);
         }
         self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
+        self.clear_hover_cards(cx);
         cx.notify();
     }
 
@@ -2519,10 +2731,33 @@ impl WorkspaceView {
         // prevent.
         self.cancel_completion_query();
 
+        // The buffer as it is *now*, for the resync below.
+        let text = self.active_editor().map(|editor| editor.read(cx).document.buffer.text());
+
         let Some(client) = self.lsp.client_mut() else {
             popup.update(cx, |popup, cx| popup.mark_loaded(cx));
             return;
         };
+
+        // Resync the document before asking. **Without this the popup can never show
+        // anything in a real session**, and it took a live one to find out: `did_change`
+        // goes to the server on save, not on keystroke (see `document_saved`), so its copy
+        // of the file is the one from open. The user types `$this->`, the request asks
+        // about an offset where the server's copy has no `$this->` — usually pointing into
+        // older text, or past the end of a line — and Intelephense correctly answers an
+        // empty list. `close_if_empty_trigger` then closes a popup that never rendered a
+        // frame, ~1ms after it opened (the measured warm p50 is 1.4ms), which on screen is
+        // indistinguishable from the popup never opening. That is the remaining piece of
+        // #125 after the server itself was fixed to start.
+        //
+        // Full-text rather than incremental, for `document_saved`'s reason: the workspace
+        // sees the buffer after the edit and holds no `Edit`, and PHP files are small.
+        // Cost is one notification per request issued — completion-rate, not typing-rate.
+        if let Some(text) = &text
+            && let Err(err) = client.did_change_full(&uri, text)
+        {
+            tracing::debug!("could not resync before completing: {err:#}");
+        }
 
         let id = match client.request_completion(&uri, offset) {
             Ok(id) => id,
@@ -2840,6 +3075,25 @@ impl WorkspaceView {
                 .iter()
                 .map(|command| (command.title.to_string(), command.id.0.to_string()))
                 .collect(),
+            // Known up front, and short: eleven fixed choices with no IO behind them.
+            // The current language is marked rather than filtered out, so the list always
+            // says what the buffer is now as well as what it could be (#127).
+            PaletteMode::Languages => {
+                let current =
+                    self.active_editor().map(|editor| editor.read(cx).document.language());
+                elle_syntax::ALL_LANGUAGES
+                    .iter()
+                    .map(|language| {
+                        let name = language.name();
+                        let label = if Some(*language) == current {
+                            format!("{name}  ✓")
+                        } else {
+                            name.to_string()
+                        };
+                        (label, name.to_string())
+                    })
+                    .collect()
+            }
             // Everything else arrives asynchronously — the palette opens empty and fills in.
             PaletteMode::Files
             | PaletteMode::Routes
@@ -2869,7 +3123,7 @@ impl WorkspaceView {
             // the offset they are about is the cursor position at the moment the user
             // pressed the key, which `toggle_palette` does not know.
             PaletteMode::References => {}
-            PaletteMode::Commands => {}
+            PaletteMode::Commands | PaletteMode::Languages => {}
         }
 
         cx.notify();
@@ -3357,6 +3611,443 @@ impl WorkspaceView {
         self.open_path_at(path, Some(point), window, cx);
     }
 
+    // --- the file tree's context menu (#126) ------------------------------------------
+
+    /// Opens the context menu for the tree row at `index`, at the mouse position.
+    ///
+    /// The row is also selected on the way, because a menu that appears next to a row it is
+    /// not visibly about is how people delete the wrong file. Right-click does not open the
+    /// file — that is what left-click is for, and opening a 4 MB file because someone wanted
+    /// to rename it is a surprise with a visible cost.
+    fn open_tree_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = self.tree.as_ref() else { return };
+        let Some(entry) = tree.entries().get(index) else { return };
+
+        let path = entry.path.clone();
+        let is_dir = entry.is_dir();
+
+        self.pending = Some(PendingFileAction { path, is_dir, kind: PendingKind::Menu });
+        self.show_overlay(
+            cx.new(|cx| Overlay::menu(context_menu::actions_for(is_dir), position, cx)),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the context menu for the project root — the tree's empty space.
+    ///
+    /// The root has no row, so without this there is no way to create a file at the top
+    /// level of a project: every row-bound menu creates *inside* the clicked directory.
+    fn open_tree_root_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        self.pending =
+            Some(PendingFileAction { path: root, is_dir: true, kind: PendingKind::Menu });
+        self.show_overlay(
+            cx.new(|cx| Overlay::menu(context_menu::actions_for_root(), position, cx)),
+            window,
+            cx,
+        );
+    }
+
+    /// Puts an overlay on screen, focuses it, and subscribes to what it reports.
+    ///
+    /// Everything that takes focus dismisses the completion popup first, for the reason
+    /// spelled out at the render root: the popup cannot see focus leave, so an overlay
+    /// opened over it would leave it on screen and unreachable.
+    fn show_overlay(
+        &mut self,
+        overlay: Entity<Overlay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_completion(window, cx);
+
+        cx.subscribe_in(&overlay, window, |this, _overlay, event, window, cx| match event {
+            OverlayEvent::Picked(action) => this.on_menu_action(action.clone(), window, cx),
+            OverlayEvent::Named(name) => this.on_name_confirmed(name.clone(), window, cx),
+            OverlayEvent::Accepted => this.on_delete_confirmed(window, cx),
+            OverlayEvent::Dismissed => this.dismiss_overlay(window, cx),
+        })
+        .detach();
+
+        window.focus(&overlay.read(cx).focus_handle(cx));
+        self.overlay = Some(overlay);
+        cx.notify();
+    }
+
+    /// Closes whatever overlay is open and gives the keyboard back.
+    fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = None;
+        self.pending = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// A menu entry was chosen: either act now, or open the prompt that the action needs.
+    fn on_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else { return };
+        let name = file_name_of(&pending.path);
+
+        match action {
+            // The two that need a name typed first.
+            MenuAction::NewFile | MenuAction::NewDirectory => {
+                let kind = if action == MenuAction::NewFile {
+                    PendingKind::CreateFile
+                } else {
+                    PendingKind::CreateDirectory
+                };
+                let subject = if kind == PendingKind::CreateFile { "file in" } else { "folder in" };
+                self.pending = Some(PendingFileAction { kind, ..pending });
+                self.show_overlay(
+                    cx.new(|cx| Overlay::prompt("New", format!("{subject} {name}"), "", cx)),
+                    window,
+                    cx,
+                );
+            }
+            MenuAction::Rename => {
+                self.pending = Some(PendingFileAction { kind: PendingKind::Rename, ..pending });
+                // Pre-filled with the current name: retyping a long class file to change
+                // one letter is what makes a rename box feel broken.
+                self.show_overlay(
+                    cx.new(|cx| Overlay::prompt("Rename", name.clone(), name, cx)),
+                    window,
+                    cx,
+                );
+            }
+            // The one that cannot be undone, and so the only one that asks.
+            MenuAction::Delete => {
+                self.pending = Some(PendingFileAction { kind: PendingKind::Delete, ..pending });
+                let detail = if pending.is_dir {
+                    "This folder and everything in it will be deleted permanently."
+                } else {
+                    "This file will be deleted permanently."
+                };
+                self.show_overlay(
+                    cx.new(|cx| Overlay::confirm(format!("Delete {name}?"), detail, cx)),
+                    window,
+                    cx,
+                );
+            }
+            // The two that act immediately: neither destroys anything, so neither asks.
+            MenuAction::RevealInFinder => {
+                self.reveal_in_finder(&pending.path, cx);
+                self.dismiss_overlay(window, cx);
+            }
+            MenuAction::CopyPath => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                    pending.path.display().to_string(),
+                ));
+                self.dismiss_overlay(window, cx);
+            }
+        }
+    }
+
+    /// Shows a path in Finder.
+    ///
+    /// ponytail: shells out to `open -R` rather than calling `NSWorkspace`. It is one
+    /// process for an action the user waits on anyway, and it keeps this file free of
+    /// Objective-C bridging for a feature that is not on any hot path. ADR-0004 is not at
+    /// stake — this is the app crate — but `domain_crates_have_no_platform_conditionals` is
+    /// why it could not live in `elle-workspace` even if it wanted to.
+    #[cfg(target_os = "macos")]
+    fn reveal_in_finder(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if let Err(err) = std::process::Command::new("open").arg("-R").arg(path).spawn() {
+            self.status = Some(format!("could not reveal {}: {err}", path.display()).into());
+            cx.notify();
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reveal_in_finder(&mut self, _path: &std::path::Path, _cx: &mut Context<Self>) {}
+
+    /// A name was typed and confirmed. Runs the create or rename it was for.
+    ///
+    /// The file operation is blocking, so it goes to the background executor (ADR-0007) and
+    /// the tree is refreshed on the main thread when it returns.
+    fn on_name_confirmed(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else { return };
+        self.dismiss_overlay(window, cx);
+
+        let path = pending.path.clone();
+        let kind = pending.kind;
+
+        /// What the background half hands back, so the main thread knows which follow-up
+        /// the operation earned — created files open, renames retarget their tabs.
+        enum Outcome {
+            Created(PathBuf),
+            Renamed { from: PathBuf, to: PathBuf },
+            Nothing,
+        }
+
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let name_for_op = name.clone();
+            let done = cx
+                .background_spawn(async move {
+                    match kind {
+                        PendingKind::CreateFile => {
+                            let target = path.join(name_for_op);
+                            elle_workspace::create_file(&target).map(|()| Outcome::Created(target))
+                        }
+                        PendingKind::CreateDirectory => {
+                            elle_workspace::create_directory(&path.join(name_for_op))
+                                .map(|()| Outcome::Nothing)
+                        }
+                        // Not opened afterwards — the user was already looking at whatever
+                        // they were looking at — but any tab already showing it must follow
+                        // the file to its new name, which is what `Renamed` carries.
+                        PendingKind::Rename => elle_workspace::rename(&path, &name_for_op)
+                            .map(|to| Outcome::Renamed { from: path, to }),
+                        // Unreachable: a delete never goes through the name prompt.
+                        PendingKind::Menu | PendingKind::Delete => Ok(Outcome::Nothing),
+                    }
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match done {
+                    // A new file is opened, because creating one and then having to find it
+                    // in the tree is the kind of missing half-step that makes a feature feel
+                    // unfinished. A new *folder* is not: there is nothing in it to show.
+                    Ok(Outcome::Created(target)) => {
+                        this.refresh_tree(cx);
+                        this.open_path(target, window, cx);
+                    }
+                    Ok(Outcome::Renamed { from, to }) => {
+                        this.refresh_tree(cx);
+                        this.retarget_tabs(&from, &to, cx);
+                    }
+                    Ok(Outcome::Nothing) => this.refresh_tree(cx),
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::FileOperation, task);
+    }
+
+    /// Points every open tab under `from` at its new home under `to`.
+    ///
+    /// # Why a rename must chase the tabs
+    ///
+    /// A tab keeps the path it was opened with. Rename `User.php` to `User2.php` with its
+    /// tab open and the tab still says `User.php` — so the next ⌘S writes the buffer to the
+    /// *old* name, quietly resurrecting the file the user just renamed away. That is the
+    /// same undo-by-save the delete path had (see `close_tabs_under`), reached through the
+    /// other file operation. Delete closes the tabs; rename has a better option, because
+    /// the file still exists — the tab follows it.
+    ///
+    /// `from` may be a directory, in which case every tab underneath moves — renaming
+    /// `app/` must not strand a tab on `app/Models/User.php`.
+    ///
+    /// Following the file means three updates per tab, not one:
+    /// - the tab's own path, which is what ⌘S writes to;
+    /// - the document's path via `set_path`, which re-detects the language — renaming
+    ///   `notes.txt` to `notes.php` must start highlighting, the same rule save-as follows;
+    /// - the language server's book-keeping: the old URI is closed and the new one opened,
+    ///   because to the server a rename *is* those two events, and diagnostics keyed to the
+    ///   old URI would otherwise point at a file that no longer exists. The sync ledger
+    ///   entry goes with it.
+    fn retarget_tabs(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        // Decided first, applied second: the LSP calls below need `&mut self` and the
+        // decision needs the tabs — the same split every multi-tab operation here uses.
+        let moves: Vec<(usize, PathBuf)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let open = tab.path.as_deref()?;
+                if !is_under(open, from) {
+                    return None;
+                }
+                // Canonical forms for the arithmetic, not the raw ones: `is_under` already
+                // tolerates the two spellings of one file (`/var` vs `/private/var` — the
+                // tab keeps whatever opened it, the tree canonicalises), and comparing the
+                // raw paths right after would re-open the exact hole on the very next
+                // line. That happened: the first version of this closure did `open ==
+                // from` literally, and the retarget silently skipped every tab whose
+                // spelling differed — found by this function's own test, not by reading.
+                let real_open = canonical_prefix(open).ok()?;
+                let real_from = canonical_prefix(from).ok()?;
+                let new_path = if real_open == real_from {
+                    to.to_path_buf()
+                } else {
+                    // Inside a renamed directory: keep the remainder of the path.
+                    to.join(real_open.strip_prefix(&real_from).ok()?)
+                };
+                Some((index, new_path))
+            })
+            .collect();
+
+        for (index, new_path) in moves {
+            let old_path = self.tabs[index].path.clone();
+            if let Some(old) = old_path.as_deref() {
+                self.close_on_lsp(old);
+                self.lsp_synced.remove(old);
+            }
+
+            let text = self.tabs[index].editor.update(cx, |editor, cx| {
+                // A failed grammar load falls back to plain text inside `set_path`; the
+                // rename itself already happened on disk either way.
+                let _ = editor.document.set_path(new_path.clone());
+                cx.notify();
+                editor.document.buffer.text()
+            });
+
+            self.tabs[index].path = Some(new_path.clone());
+            self.open_on_lsp(&new_path, &text, cx);
+        }
+    }
+
+    /// The delete confirmation was accepted.
+    ///
+    /// The `root` handed to `elle_workspace::delete` is what keeps a recursive delete inside
+    /// the project even if the path in hand is stale — see that function for why a tree path
+    /// is not trusted on its own.
+    fn on_delete_confirmed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else { return };
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        self.dismiss_overlay(window, cx);
+
+        let path = pending.path.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let deleted_path = path.clone();
+            let done = cx
+                .background_spawn(async move { elle_workspace::delete(&deleted_path, &root) })
+                .await;
+
+            this.update(cx, |this, cx| {
+                match done {
+                    Ok(()) => {
+                        // A tab showing a file that no longer exists would save it back into
+                        // being on the next ⌘S, quietly undoing the delete.
+                        this.close_tabs_under(&path, cx);
+                        this.refresh_tree(cx);
+                    }
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::FileOperation, task);
+    }
+
+    /// Closes any tab whose file was inside `path`, which may be a file or a directory.
+    ///
+    /// # Why this does not go through `close_tab_at`
+    ///
+    /// That is the ⌘W path, and it prompts "… has unsaved changes. Closing this tab will
+    /// discard them." on a dirty buffer. Asked about a file that has *just been deleted*,
+    /// every part of that dialog is wrong: there is nothing to discard the changes against,
+    /// "Cancel" cannot put the file back, and answering it does not change what is on disk.
+    /// It would also be asked *after* the deletion the user already confirmed, which reads
+    /// as the editor asking twice and doing something different the second time.
+    ///
+    /// So the tabs are removed outright. The user's confirmation to delete the file is the
+    /// consent for losing its buffer — that is what the confirmation said, naming the file
+    /// and the word *permanently*.
+    ///
+    /// The one thing genuinely lost here is unsaved changes to a file the user chose to
+    /// delete. Recovering those would mean offering to save a buffer whose path is gone,
+    /// which is save-as, which is a different question than the one being asked.
+    fn close_tabs_under(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        // Collected first: closing shifts every later index, so deciding and acting in one
+        // pass closes the wrong tabs — the same shift `tab_after_close` exists for.
+        let doomed: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.path.as_deref().is_some_and(|open| is_under(open, path)))
+            .map(|(index, _)| index)
+            .collect();
+
+        // Last first, so each removal cannot shift an index still to come.
+        for index in doomed.into_iter().rev() {
+            self.remove_tab(index, cx);
+        }
+    }
+
+    /// Drops every editor's hover card.
+    ///
+    /// Called when the active tab changes: the card is anchored at window coordinates that
+    /// meant something over the *previous* tab's text, and a tab revisited later must not
+    /// greet the user with a card about where their mouse rested minutes ago.
+    fn clear_hover_cards(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            tab.editor.update(cx, |editor, cx| {
+                if editor.hover_diagnostic.take().is_some() {
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    /// Re-reads the tree after a file operation, keeping the user's expansions.
+    fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = self.tree.as_mut()
+            && let Err(err) = tree.refresh()
+        {
+            self.status = Some(format!("{err:#}").into());
+        }
+        cx.notify();
+    }
+
+    /// Sets the syntax language for the active tab (#127).
+    ///
+    /// # Why this does not also rename the file
+    ///
+    /// Choosing "PHP" for an untitled buffer says how to colour it, not where it should
+    /// live. Inventing `untitled.php` on the strength of it would put a file on disk the
+    /// user never asked for and pre-empt the save-as dialog they are going to get anyway.
+    /// The language is a view of the buffer; the path is a decision about the filesystem.
+    ///
+    /// The choice does not survive a save, and that is deliberate rather than missing: once
+    /// the buffer has a path, `set_path` re-detects from the extension, which is the answer
+    /// the user just gave by choosing a name. A language override that outlived the save
+    /// would mean a file called `.php` that refuses to highlight as PHP because of a menu
+    /// choice made ten minutes earlier.
+    ///
+    /// ponytail: the override is per-document and unrecorded, so reopening a `.txt` full of
+    /// SQL means choosing again. Persisting it needs somewhere to write per-file state
+    /// (#60's settings layer, or the index), which is a store this does not have yet.
+    fn set_active_language(&mut self, language: elle_syntax::Language, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else { return };
+
+        let failed = editor.update(cx, |editor, cx| {
+            let failed = editor.document.set_language(language).err();
+            // A repaint has to be asked for explicitly: the buffer's text has not changed,
+            // so nothing else marks the view dirty. Highlights are read straight off the
+            // tree during render — there is no cache to invalidate — so redrawing is the
+            // whole of applying the new grammar.
+            cx.notify();
+            failed
+        });
+
+        // A grammar that will not load leaves the document as plain text, which is visible
+        // on screen — so saying nothing would look like the choice was ignored.
+        if let Some(err) = failed {
+            self.status = Some(format!("{err:#}").into());
+        }
+        cx.notify();
+    }
+
     // --- language server ------------------------------------------------------------
 
     /// Starts a language server for the open folder, if one is configured.
@@ -3372,11 +4063,48 @@ impl WorkspaceView {
     /// looking for it can find it.
     fn start_lsp(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        self.start_lsp_at(root, cx);
+    }
 
+    /// Starts a server for a file opened with no folder behind it.
+    ///
+    /// # Why a file gets a server at all
+    ///
+    /// A language server is given a project root at `initialize` and answers questions
+    /// against it. With no folder open there was nothing to hand it, so the previous
+    /// behaviour was to start nothing — ⌘O on a single `.php` file produced an editor with
+    /// no completion, no diagnostics and no explanation (#125). Opening a file the server
+    /// handles is as clear a signal that one is wanted as opening a folder is.
+    ///
+    /// Called on every file open, so it must be cheap and idempotent: a server already
+    /// running keeps running, and a project opened later replaces it through `open_folder`.
+    fn start_lsp_for_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        // A folder is the better root, and it already started a server. Nothing to do.
+        if self.tree.is_some() || self.lsp.client().is_some() {
+            return;
+        }
+        // Only the first attempt. Without this, every file opened on a machine with no
+        // server installed re-runs the binary search and re-spawns — cheap individually,
+        // but it is a retry loop keyed on user actions, and §24 says a missing server must
+        // be uneventful rather than persistent.
+        if !matches!(self.lsp.state(), LspState::Idle) {
+            return;
+        }
+        let Some(root) = project_root_for(path) else { return };
+        self.start_lsp_at(root, cx);
+    }
+
+    /// Starts a server rooted at `root`, replacing whatever was running.
+    fn start_lsp_at(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // A new server knows nothing; the sync ledger must not claim otherwise.
+        self.lsp_synced.clear();
         self.lsp.set_root(Some(root.clone()));
 
         let Some(config) = crate::lsp_session::config_for(&root) else {
-            // `ELLE_LSP_COMMAND=""` — switched off on purpose, so not even a log warning.
+            // Either `ELLE_LSP_COMMAND=""` — switched off on purpose — or the binary is not
+            // installed anywhere this process can see. `config_for` logs the second; both
+            // land here as the same silent state, because from the editor's point of view
+            // they are the same fact: there is no server, and typing must carry on (§24).
             self.lsp.set_state(LspState::Unavailable);
             return;
         };
@@ -3442,6 +4170,10 @@ impl WorkspaceView {
                 let Some(events) = this.lsp.client_mut().map(|client| client.drain_events()) else {
                     return false;
                 };
+                // Before applying, so a resync issued now produces diagnostics one tick
+                // from now rather than two. Riding this timer is what gives per-keystroke
+                // sync a 250ms debounce without a debouncer: the tick was already paid for.
+                this.sync_changed_documents(cx);
                 this.apply_lsp_events(events, cx)
             });
 
@@ -3563,7 +4295,12 @@ impl WorkspaceView {
                 .and_then(crate::lsp_session::uri_for)
                 .and_then(|uri| self.lsp.diagnostics_for(&uri))
                 .map(|file| {
-                    file.items.iter().map(|d| (d.range.clone(), d.severity)).collect::<Vec<_>>()
+                    file.items
+                        .iter()
+                        .map(|d| {
+                            (d.range.clone(), d.severity, SharedString::from(d.message.clone()))
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
 
@@ -3578,19 +4315,82 @@ impl WorkspaceView {
     fn cursor_diagnostic(&self, cx: &App) -> Option<String> {
         let tab = self.tabs.get(self.active_tab)?;
         let uri = crate::lsp_session::uri_for(tab.path.as_deref()?)?;
-        let offset = tab.editor.read(cx).document.selection.head;
+        let document = &tab.editor.read(cx).document;
+        let offset = document.selection.head;
 
-        self.lsp.diagnostics_for(&uri)?.at(offset).map(|d| d.message.clone())
+        let diagnostics = self.lsp.diagnostics_for(&uri)?;
+        if let Some(exact) = diagnostics.at(offset) {
+            return Some(exact.message.clone());
+        }
+
+        // Nothing under the cursor itself: fall back to the cursor's *line*. Requiring the
+        // cursor to land inside the squiggle's exact bytes made the message effectively
+        // undiscoverable — the owner asked for "the reason for the error" while the reason
+        // was already wired to a place their cursor never quite reached. Clicking anywhere
+        // on a marked line is the gesture people actually make.
+        let row = document.buffer.offset_to_point(offset).row;
+        let start = document.buffer.point_to_offset(elle_text::Point { row, column: 0 });
+        let end = start + document.buffer.line_len(row);
+        diagnostics.on_line(start..end).map(|d| d.message.clone())
     }
 
-    /// Tells the server about one newly opened file.
+    /// Resyncs every open PHP buffer the server's copy has fallen behind.
+    ///
+    /// Called from `poll_lsp`'s tick. Sends nothing for a buffer whose version is already
+    /// in the ledger — typing pauses, the tick keeps firing, and an unchanged file must
+    /// cost nothing. Full-text for `document_saved`'s reasons: no `Edit` in hand here, and
+    /// PHP files are small.
+    ///
+    /// Every tab rather than only the active one, deliberately: replace-in-project and a
+    /// future format-on-save can touch buffers that are not in front of the user, and a
+    /// rule with an exception ("active only, except…") is how one door falls behind.
+    fn sync_changed_documents(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<(PathBuf, String, elle_text::Version)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let path = tab.path.as_deref()?;
+                if !crate::lsp_session::handles(path) {
+                    return None;
+                }
+                let buffer = &tab.editor.read(cx).document.buffer;
+                let version = buffer.version();
+                if self.lsp_synced.get(path) == Some(&version) {
+                    return None;
+                }
+                Some((path.to_path_buf(), buffer.text(), version))
+            })
+            .collect();
+
+        for (path, text, version) in pending {
+            let Some(uri) = crate::lsp_session::uri_for(&path) else { continue };
+            let Some(client) = self.lsp.client_mut() else { return };
+            if let Err(err) = client.did_change_full(&uri, &text) {
+                tracing::debug!("could not resync {}: {err:#}", path.display());
+                continue;
+            }
+            // Recorded only after a successful send, so a failed one is retried next tick
+            // rather than silently never.
+            self.lsp_synced.insert(path, version);
+        }
+    }
+
+    /// Tells the server about one newly opened file, starting one if this is the first.
     ///
     /// A no-op with no server running, which is the ordinary case and deliberately not
     /// worth a branch at the call site.
-    fn open_on_lsp(&mut self, path: &std::path::Path, text: &str) {
+    fn open_on_lsp(&mut self, path: &std::path::Path, text: &str, cx: &mut Context<Self>) {
         if !crate::lsp_session::handles(path) {
             return;
         }
+        // #125's first cause. `start_lsp` was reachable only from `open_folder`, so a PHP
+        // file opened any other way — ⌘O on the file itself, a jump from the palette, a
+        // window that never had ⌘O run in it — got no server *and no log line*, which is
+        // why the report read as "the popup never opens" rather than "the LSP never
+        // started". Opening a file the server handles is as clear a signal that one is
+        // wanted as opening a folder is.
+        self.start_lsp_for_file(path, cx);
+
         let Some(uri) = crate::lsp_session::uri_for(path) else { return };
         let Some(client) = self.lsp.client_mut() else { return };
 
@@ -3681,6 +4481,17 @@ impl WorkspaceView {
                 }
                 self.open_path_at(path, target, window, cx);
             }
+            // #127. The id is the language's own `name()`, so the mapping back is a lookup
+            // over the same table the list was built from — no parallel list of strings to
+            // drift out of step with `Language`.
+            Some(PaletteMode::Languages) => {
+                let Some(language) =
+                    elle_syntax::ALL_LANGUAGES.iter().find(|language| language.name() == id)
+                else {
+                    return;
+                };
+                self.set_active_language(*language, cx);
+            }
             Some(PaletteMode::Commands) => {
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
@@ -3695,6 +4506,11 @@ impl WorkspaceView {
                         self.complete_laravel(&CompleteLaravel, window, cx)
                     }
                     Dispatch::GoToSymbol => self.go_to_symbol(&GoToSymbol, window, cx),
+                    // Reopens the palette in a different mode. Safe from here: the palette
+                    // that dispatched this was already dismissed at the top of the function.
+                    Dispatch::SetLanguage => {
+                        self.toggle_palette(PaletteMode::Languages, window, cx)
+                    }
                     Dispatch::GoToDefinition => self.go_to_definition(&GoToDefinition, window, cx),
                     Dispatch::FindReferences => self.find_references(&FindReferences, window, cx),
                     Dispatch::NavigateBack => self.navigate_back(&NavigateBack, window, cx),
@@ -3768,6 +4584,122 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
     (items, incomplete)
 }
 
+/// Which step of the context-menu interaction is in flight (#126).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PendingKind {
+    /// The menu is open and nothing has been chosen.
+    Menu,
+    CreateFile,
+    CreateDirectory,
+    Rename,
+    Delete,
+}
+
+/// The row a context menu is about, and what is about to happen to it.
+#[derive(Clone, Debug)]
+struct PendingFileAction {
+    /// The clicked row's path. For a create, the directory to create *inside*.
+    path: PathBuf,
+    is_dir: bool,
+    kind: PendingKind,
+}
+
+/// Whether `path` is `ancestor` or sits inside it.
+///
+/// # Why this is not `path.starts_with(ancestor)`
+///
+/// The two paths reach this comparison from different places and are not spelled the same
+/// way. `FileTree::new` canonicalises its root, so every path the tree hands out is
+/// canonical; a tab's path is whatever opened it, which for quick open is a path built from
+/// an index and for a test is a raw `TempDir` path. On macOS the system temp directory is a
+/// symlink, so those two spellings are `/private/var/…` and `/var/…` — `starts_with` says
+/// no, and a tab on a file that was just deleted stays open.
+///
+/// That tab is the problem this comparison exists for: it holds a buffer whose file is gone,
+/// and the next ⌘S writes it back, quietly undoing the delete the user confirmed.
+///
+/// Canonicalising resolves both spellings to one. It is done on the *deleted* path's
+/// ancestor and on the tab's path, and either may now fail — a deleted file cannot be
+/// canonicalised at all — so both fall back to the literal comparison, which is correct
+/// whenever the two spellings already agree.
+fn is_under(path: &std::path::Path, ancestor: &std::path::Path) -> bool {
+    if path.starts_with(ancestor) {
+        return true;
+    }
+    // `ancestor` has just been deleted, so it cannot be canonicalised directly. Its parent
+    // still exists, which is enough to normalise the prefix.
+    let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+        return false;
+    };
+    let (Ok(real_parent), Ok(real_path)) = (parent.canonicalize(), canonical_prefix(path)) else {
+        return false;
+    };
+    real_path.starts_with(real_parent.join(name))
+}
+
+/// Canonicalises as much of `path` as still exists.
+///
+/// A deleted file's own path cannot be canonicalised, so this resolves the deepest ancestor
+/// that does exist and re-appends the rest. Without it, every comparison against a path that
+/// has just been removed fails at the first step.
+fn canonical_prefix(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    if let Ok(real) = path.canonicalize() {
+        return Ok(real);
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(path.to_path_buf());
+    };
+    Ok(canonical_prefix(parent)?.join(name))
+}
+
+/// The last component of a path, for a message the user reads.
+///
+/// Falls back to the whole path rather than to an empty string: "Delete ?" is worse than a
+/// long question, and a path with no final component is a root, which is worth showing in
+/// full precisely because deleting it would be the most destructive thing on offer.
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Files that mark the directory containing them as a project root.
+///
+/// `composer.json` is the PHP answer and the one that matters here. `.git` is the general
+/// fallback for a file in a repository that has no manifest — a plain PHP script in a
+/// scripts repo, which is a real case and one where the repository is the right scope.
+///
+/// Order is significance, not precedence: the walk stops at the *nearest* ancestor holding
+/// any of these, so a `composer.json` inside a git repository wins by being closer.
+const ROOT_MARKERS: [&str; 2] = ["composer.json", ".git"];
+
+/// The project root for a file opened without a folder, or `None` if it has no parent.
+///
+/// # Why this walks up rather than taking the parent directory
+///
+/// The obvious answer — hand the server the file's own directory — is wrong in the case
+/// that actually happens. A Laravel model lives in `app/Models`, so opening one would root
+/// the server there: it would index that one directory, resolve none of the framework, and
+/// answer `$this->` with nothing. The user would see a server that started and still knew
+/// nothing, which is harder to diagnose than no server at all.
+///
+/// Walking up to the nearest [`ROOT_MARKERS`] entry gets the answer the user means. The
+/// parent directory remains the fallback for a file that belongs to no project, where
+/// something is still better than refusing to start.
+///
+/// This does not replace opening the folder. The tree is still what gives the workspace a
+/// root for search, git and everything else; this is only about not leaving the server
+/// pointed at a leaf directory.
+fn project_root_for(path: &std::path::Path) -> Option<PathBuf> {
+    let start = path.parent()?;
+    let marked =
+        start.ancestors().find(|dir| ROOT_MARKERS.iter().any(|marker| dir.join(marker).exists()));
+
+    // The parent directory when nothing is marked: a loose file still gets a server, it is
+    // just scoped to where it sits.
+    Some(marked.unwrap_or(start).to_path_buf())
+}
+
 /// The status-bar text for the language server, which is usually nothing at all.
 ///
 /// The rule this encodes is §24's, at the last step before pixels: **not having a language
@@ -3782,8 +4714,26 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
 ///   like nothing happening;
 /// - a failure, but only after the restart budget is spent — "the server you installed
 ///   keeps dying" is something the user cannot learn anywhere else.
-fn lsp_label(lsp: &Lsp) -> String {
+///
+/// # The one exception, added by #125
+///
+/// `Unavailable` stays silent *except* when the file in front of the user is one a server
+/// would handle. The §24 rule is that a missing server is not a problem the user has — and
+/// that is true of a text file, a folder of images, or any of the projects that are not PHP.
+/// It stops being true the moment a `.php` file is open: there, the user is entitled to
+/// expect completion, and silence is what made #125 take a round trip to diagnose. The
+/// report was "the popup never opens", because nothing on screen distinguished "no server
+/// installed" from "server running and returning nothing".
+///
+/// It is still not a complaint. It says what is true, in the cell that already exists, only
+/// while a file it applies to is open — no dialog, no icon, nothing to dismiss.
+///
+/// `php_open` rather than a `&Document`: the caller knows which tab is active and this
+/// function stays testable without one.
+fn lsp_label(lsp: &Lsp, php_open: bool) -> String {
     match lsp.state() {
+        // A file the server would have handled is open and there is no server. Say so.
+        LspState::Unavailable if php_open => "No language server".to_string(),
         // The two silent states, and the reason this function exists.
         LspState::Idle | LspState::Unavailable => String::new(),
         LspState::Starting => "Starting…".to_string(),
@@ -3972,6 +4922,57 @@ impl Render for WorkspaceView {
                     .clone()
                     .map(|popup| div().absolute().top_0().left_0().size_full().child(popup)),
             )
+            // The diagnostic hover card (#59): the message, at the mouse, one line below the
+            // squiggle it is about. The editor computes it (only it can turn a mouse position
+            // into a byte offset); this renders it, because the card sits at window
+            // coordinates over every panel — the same split the completion popup uses.
+            //
+            // Read directly from the active editor per frame rather than mirrored into
+            // workspace state: a mirror is a second copy that can go stale, and this is
+            // exactly the kind of derived value render passes exist to derive.
+            .children(self.active_editor().and_then(|editor| {
+                let hover = editor.read(cx).hover_diagnostic.clone()?;
+                Some(
+                    div().absolute().top_0().left_0().size_full().child(
+                        div()
+                            .absolute()
+                            .left(hover.position.x)
+                            .top(hover.position.y)
+                            .max_w(px(480.0))
+                            .px_2()
+                            .py_1()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(px(4.0))
+                            .shadow_lg()
+                            .text_color(theme.text)
+                            .text_size(Fonts::get(cx).ui_size)
+                            .child(hover.message),
+                    ),
+                )
+            }))
+            // The tree's menu, name prompt and delete confirmation (#126), above everything
+            // else because each is modal: while one is open it is the only thing the user
+            // can answer.
+            //
+            // The wrapper is a full-window absolute box so a child's own `left`/`top` mean
+            // window coordinates — the coordinates the tree row measured, and the same
+            // arrangement the completion popup above relies on. Dismissing on a click
+            // elsewhere is the overlay's own `on_mouse_down_out`, not a handler here; see
+            // `context_menu` for why a handler on this box would eat the entry clicks.
+            .children(self.overlay.clone().map(|overlay| {
+                let centred = overlay.read(cx).is_centred();
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    // A menu draws at the click; a prompt and a confirmation are dialogs
+                    // about the whole window and centre themselves.
+                    .when(centred, |el| el.flex().items_center().justify_center())
+                    .child(overlay)
+            }))
     }
 }
 
@@ -4164,10 +5165,48 @@ impl WorkspaceView {
                     None => div().into_any_element(),
                 },
                 Sidebar::Explorer => match self.tree.as_ref() {
+                    // Wrapped so the empty space *below* the rows is right-clickable: that
+                    // opens the root menu, which is the only way to create at the top
+                    // level (#126). Rows stop propagation, so this fires only for clicks
+                    // that miss every row. `flex_1` makes the wrapper own the leftover
+                    // height — a wrapper hugging the rows would leave the space below it
+                    // belonging to nothing.
                     Some(tree) if !tree.is_empty() => {
-                        self.render_tree_rows(tree.len(), theme, cx).into_any_element()
+                        let entity = cx.entity();
+                        div()
+                            // A flex column, not a block: the rows list sizes itself with
+                            // `flex_1`, which in a non-flex parent is the exact zero-height
+                            // resolution that made the completion popup invisible.
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.open_tree_root_menu(event.position, window, cx);
+                                });
+                            })
+                            .child(self.render_tree_rows(tree.len(), theme, cx))
+                            .into_any_element()
                     }
-                    _ => div()
+                    Some(_) => {
+                        // Open but empty: the menu is the only thing there is to offer.
+                        let entity = cx.entity();
+                        div()
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.open_tree_root_menu(event.position, window, cx);
+                                });
+                            })
+                            .child(
+                                div()
+                                    .p_3()
+                                    .text_color(theme.text_muted)
+                                    .child("Empty folder — right-click to create a file"),
+                            )
+                            .into_any_element()
+                    }
+                    None => div()
                         .p_3()
                         .text_color(theme.text_muted)
                         .child("Press ⌘O to open a folder")
@@ -4224,13 +5263,35 @@ impl WorkspaceView {
                                 .active(|el| el.bg(pressed))
                                 .cursor_pointer()
                                 .text_color(if is_dir { text } else { muted })
-                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                .on_mouse_down(MouseButton::Left, {
+                                    let entity = entity.clone();
+                                    move |_ev, window, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            if is_dir {
+                                                this.toggle_tree_entry(index, cx);
+                                            } else {
+                                                this.open_path(path.clone(), window, cx);
+                                            }
+                                        });
+                                    }
+                                })
+                                // #126. The menu opens at the mouse, which is where every
+                                // other file tree puts it and the only position that does
+                                // not require the user to look for it.
+                                //
+                                // `event.position` is in window coordinates, which is what
+                                // the overlay wrapper at the render root expects — it is a
+                                // full-window absolute box precisely so a child's own
+                                // `left`/`top` mean window coordinates (the completion
+                                // popup is positioned the same way).
+                                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                    // The wrapper behind the rows opens the *root* menu on
+                                    // the same event; without this, gpui's inside-out
+                                    // delivery would let it replace this row's menu a
+                                    // moment after it opened.
+                                    cx.stop_propagation();
                                     entity.update(cx, |this, cx| {
-                                        if is_dir {
-                                            this.toggle_tree_entry(index, cx);
-                                        } else {
-                                            this.open_path(path.clone(), window, cx);
-                                        }
+                                        this.open_tree_menu(index, event.position, window, cx);
                                     });
                                 })
                                 // The disclosure slot. Fixed width whether or not there is
@@ -4296,6 +5357,11 @@ impl WorkspaceView {
             })
         })
         .flex_1()
+        // Recorded bounds for `the_file_tree_occupies_real_height`: this list rides
+        // `flex_1`, which resolves to zero height the moment an ancestor stops being a
+        // flex column — the completion popup shipped invisible through exactly that, and
+        // the root-menu wrapper added around this list is one refactor away from it.
+        .debug_selector(|| "file-tree-list".into())
     }
 
     fn render_tab_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4344,6 +5410,7 @@ impl WorkspaceView {
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                         entity.update(cx, |this, cx| {
                             this.active_tab = index;
+                            this.clear_hover_cards(cx);
                             cx.notify();
                         });
                     })
@@ -4456,7 +5523,7 @@ impl WorkspaceView {
             })
             .unwrap_or_default();
 
-        let diagnostics = lsp_label(&self.lsp);
+        let diagnostics = lsp_label(&self.lsp, self.active_tab_wants_a_server());
 
         // Like the terminal count, only while the panel is open. A project with no test
         // framework — and one that has simply not run its tests — says nothing here, the
@@ -4496,7 +5563,30 @@ impl WorkspaceView {
             .child(SharedString::from(tests))
             .child(SharedString::from(terminals))
             .child(SharedString::from(position))
-            .child(SharedString::from(language))
+            // #127. The language cell is a button, which is where every comparable editor
+            // puts this control and the only affordance an untitled buffer has: it has no
+            // path, so nothing detects a language for it and it can never be anything but
+            // plain text otherwise.
+            //
+            // Only when a tab is open. An empty cell that is nonetheless clickable is the
+            // kind of dead target #71 is about.
+            .when(!language.is_empty(), |el| {
+                let entity = cx.entity();
+                el.child(
+                    div()
+                        .id("status-language")
+                        .px_1()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme.hover))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.toggle_palette(PaletteMode::Languages, window, cx);
+                            });
+                        })
+                        .child(SharedString::from(language)),
+                )
+            })
     }
 }
 
@@ -5139,11 +6229,37 @@ mod lsp_status_tests {
         let mut lsp = Lsp::new();
 
         // Never attempted: no folder open.
-        assert_eq!(lsp_label(&lsp), "");
+        assert_eq!(lsp_label(&lsp, false), "");
 
         // Attempted and the binary was not there.
         lsp.set_state(LspState::Unavailable);
-        assert_eq!(lsp_label(&lsp), "", "a missing server is not the user's problem");
+        assert_eq!(lsp_label(&lsp, false), "", "a missing server is not the user's problem");
+    }
+
+    #[test]
+    fn a_missing_server_is_named_while_a_php_file_is_open() {
+        // #125's third cause, and the narrow exception to the test above. §24's silence is
+        // right for someone who never wanted a PHP server; it is wrong for someone looking
+        // at a PHP file and waiting for a completion popup, which is exactly the state the
+        // report came from. Nothing on screen separated "no server" from "server running
+        // and returning nothing", so the bug was filed against the popup.
+        let mut lsp = Lsp::new();
+        lsp.set_state(LspState::Unavailable);
+
+        assert_eq!(lsp_label(&lsp, true), "No language server");
+    }
+
+    #[test]
+    fn the_exception_does_not_leak_into_the_states_that_are_fine() {
+        // The risk in adding any message here is that it becomes permanent chrome. These
+        // are the states where a PHP file is open and everything is working: they must stay
+        // exactly as silent with the flag set as without it.
+        let mut lsp = Lsp::new();
+
+        assert_eq!(lsp_label(&lsp, true), "", "no attempt yet is not a failure");
+
+        lsp.set_state(LspState::Running);
+        assert_eq!(lsp_label(&lsp, true), "", "a clean file says nothing");
     }
 
     #[test]
@@ -5151,7 +6267,7 @@ mod lsp_status_tests {
         // A clean file is the normal state. "0 problems" is chrome.
         let mut lsp = Lsp::new();
         lsp.set_state(LspState::Running);
-        assert_eq!(lsp_label(&lsp), "");
+        assert_eq!(lsp_label(&lsp, false), "");
     }
 
     #[test]
@@ -5160,7 +6276,7 @@ mod lsp_status_tests {
         // an empty status bar is indistinguishable from a broken one.
         let mut lsp = Lsp::new();
         lsp.set_state(LspState::Starting);
-        assert_eq!(lsp_label(&lsp), "Starting…");
+        assert_eq!(lsp_label(&lsp, false), "Starting…");
     }
 
     #[test]
@@ -5169,7 +6285,7 @@ mod lsp_status_tests {
         // one you have will not stay up", which the user cannot learn anywhere else.
         let mut lsp = Lsp::new();
         lsp.set_state(LspState::Failed("it exited".into()));
-        assert_eq!(lsp_label(&lsp), "LSP unavailable");
+        assert_eq!(lsp_label(&lsp, false), "LSP unavailable");
     }
 
     #[test]
@@ -5194,21 +6310,130 @@ mod lsp_status_tests {
         let text = "a\nb\nc\n";
 
         lsp.set_diagnostics(uri.clone(), &[at(0, DiagnosticSeverity::ERROR)], text);
-        assert_eq!(lsp_label(&lsp), "1 ✕");
+        assert_eq!(lsp_label(&lsp, false), "1 ✕");
 
         lsp.set_diagnostics(
             uri.clone(),
             &[at(0, DiagnosticSeverity::ERROR), at(1, DiagnosticSeverity::WARNING)],
             text,
         );
-        assert_eq!(lsp_label(&lsp), "1 ✕  1 ⚠");
+        assert_eq!(lsp_label(&lsp, false), "1 ✕  1 ⚠");
 
         lsp.set_diagnostics(uri.clone(), &[at(0, DiagnosticSeverity::WARNING)], text);
-        assert_eq!(lsp_label(&lsp), "1 ⚠");
+        assert_eq!(lsp_label(&lsp, false), "1 ⚠");
 
         // And back to silence when the file is fixed.
         lsp.set_diagnostics(uri, &[], text);
-        assert_eq!(lsp_label(&lsp), "");
+        assert_eq!(lsp_label(&lsp, false), "");
+    }
+
+    // --- the root a file opened without a folder gets (#125) ----------------------
+
+    #[test]
+    fn a_file_in_a_project_roots_the_server_at_the_project() {
+        // The case the obvious implementation gets wrong. Rooting the server at the file's
+        // own directory would index `app/Models` alone: the framework would not resolve,
+        // and the server would start and still answer nothing — which is harder to
+        // diagnose than no server, because something visibly happened.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("composer.json"), "{}").unwrap();
+        let models = project.path().join("app/Models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        assert_eq!(project_root_for(&models.join("User.php")), Some(project.path().to_path_buf()));
+    }
+
+    #[test]
+    fn the_nearest_marker_wins_over_the_outer_one() {
+        // A package inside a repository is its own project. Walking to the outermost marker
+        // would hand the server the monorepo and index everything in it.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outer.path().join(".git")).unwrap();
+        let inner = outer.path().join("packages/thing");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(inner.join("composer.json"), "{}").unwrap();
+
+        assert_eq!(project_root_for(&inner.join("src/Thing.php")), Some(inner));
+    }
+
+    #[test]
+    fn a_repository_with_no_manifest_still_roots_at_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let scripts = repo.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+
+        assert_eq!(project_root_for(&scripts.join("import.php")), Some(repo.path().to_path_buf()));
+    }
+
+    #[test]
+    fn a_loose_file_falls_back_to_its_own_directory() {
+        // Nothing to walk up to. A server rooted here is worth more than no server, which
+        // is what #125 reported: the editor started nothing and said nothing.
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            project_root_for(&dir.path().join("scratch.php")),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_parent_gets_no_root() {
+        assert_eq!(project_root_for(std::path::Path::new("/")), None);
+    }
+
+    // --- which tabs a delete closes (#126) ----------------------------------------
+
+    #[test]
+    fn a_file_inside_a_deleted_directory_is_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+
+        assert!(is_under(&app.join("User.php"), &app));
+        assert!(is_under(&app, &app), "the deleted path itself counts");
+        assert!(!is_under(&dir.path().join("artisan"), &app), "a sibling must survive");
+    }
+
+    #[test]
+    fn two_spellings_of_the_same_path_still_match() {
+        // The case that let a tab survive its file being deleted. `FileTree` canonicalises
+        // its root, a tab's path is whatever opened it, and on macOS the temp directory is
+        // a symlink — so the same file is `/private/var/…` from one and `/var/…` from the
+        // other, and a plain `starts_with` says they are unrelated.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // Only meaningful where the two actually differ, which is macOS; elsewhere this
+        // degenerates to the plain comparison and still holds.
+        let raw_file = dir.path().join("User.php");
+        std::fs::write(&raw_file, "<?php\n").unwrap();
+
+        assert!(
+            is_under(&raw_file, &canonical),
+            "a tab opened by one spelling must be closed by a delete named in the other"
+        );
+    }
+
+    #[test]
+    fn a_deleted_directory_still_matches_its_open_files() {
+        // `delete` has already run by the time this is asked, so neither the directory nor
+        // the file inside it can be canonicalised. Resolving the deepest ancestor that does
+        // still exist is what keeps the comparison working.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        let file = app.join("User.php");
+        std::fs::write(&file, "<?php\n").unwrap();
+
+        let canonical_app = app.canonicalize().unwrap();
+        std::fs::remove_dir_all(&app).unwrap();
+
+        assert!(
+            is_under(&file, &canonical_app),
+            "a tab must still be recognised as inside a directory that is already gone"
+        );
     }
 }
 

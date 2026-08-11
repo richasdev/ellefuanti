@@ -135,6 +135,54 @@ impl FileTree {
         Ok(())
     }
 
+    /// Re-reads the tree from disk, keeping every directory that was expanded expanded.
+    ///
+    /// # Why this is not `FileTree::new`
+    ///
+    /// Rebuilding from scratch is one line and loses the thing the user cares about most:
+    /// their place. Creating a file three directories deep would collapse the tree back to
+    /// the root and leave them to click their way down again, which makes the operation
+    /// feel like it went wrong even when it worked.
+    ///
+    /// So the expanded set is collected first, the root is re-read, and every directory
+    /// that was open is re-expanded if it is still there. A directory that was deleted —
+    /// or renamed, which is a delete as far as its old path is concerned — simply does not
+    /// come back, without that being an error.
+    ///
+    /// The walk is breadth-first by construction: expanding a directory splices its
+    /// children in immediately after it, so re-scanning from the current index onwards
+    /// reaches nested directories only after their parents have been opened.
+    ///
+    /// ponytail: re-reads every expanded directory rather than only the one that changed.
+    /// A caller knows which path it touched and could splice one level, but every operation
+    /// here follows a click, so this runs at human speed against directories already in the
+    /// page cache. Narrow it if a project with thousands of expanded directories ever makes
+    /// it visible.
+    pub fn refresh(&mut self) -> Result<()> {
+        let expanded: std::collections::HashSet<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir() && entry.expanded)
+            .map(|entry| entry.path.clone())
+            .collect();
+
+        self.entries = self.read_dir(&self.root.clone(), 0)?;
+
+        let mut index = 0;
+        while index < self.entries.len() {
+            let entry = &self.entries[index];
+            if entry.is_dir() && expanded.contains(&entry.path) {
+                // A directory that has become unreadable since it was opened is left
+                // collapsed rather than failing the refresh: the rest of the tree is still
+                // worth showing, which is the same fault-isolation rule `new` follows for a
+                // malformed .gitignore (§24).
+                let _ = self.toggle(index);
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
     /// Reads one directory level, filtered and sorted for display.
     fn read_dir(&self, dir: &Path, depth: usize) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
@@ -224,6 +272,69 @@ mod tests {
         let tree = FileTree::new(dir.path()).unwrap();
         assert!(tree.entries()[0].is_dir());
         assert!(!tree.entries()[1].is_dir());
+    }
+
+    // --- refresh, for the operations #126 adds -------------------------------------
+
+    #[test]
+    fn refreshing_shows_a_new_file_without_collapsing_the_tree() {
+        // The requirement that rules out "just call FileTree::new". A file created three
+        // directories deep must appear *and* leave the user where they were; collapsing to
+        // the root makes a successful operation feel like a failure.
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+
+        let app = tree.entries().iter().position(|e| e.name == "app").unwrap();
+        tree.toggle(app).unwrap();
+        let models = tree.entries().iter().position(|e| e.name == "Models").unwrap();
+        tree.toggle(models).unwrap();
+        assert!(tree.entries().iter().any(|e| e.name == "User.php"));
+
+        fs::write(dir.path().join("app/Models/Post.php"), "<?php").unwrap();
+        tree.refresh().unwrap();
+
+        assert!(tree.entries().iter().any(|e| e.name == "Post.php"), "the new file must appear");
+        assert!(
+            tree.entries().iter().any(|e| e.name == "User.php"),
+            "a nested expansion must survive the refresh"
+        );
+        let app = tree.entries().iter().find(|e| e.name == "app").unwrap();
+        assert!(app.expanded, "the tree must not collapse to the root");
+    }
+
+    #[test]
+    fn refreshing_drops_a_deleted_file_and_forgets_a_deleted_directory() {
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        let app = tree.entries().iter().position(|e| e.name == "app").unwrap();
+        tree.toggle(app).unwrap();
+
+        fs::remove_dir_all(dir.path().join("app")).unwrap();
+        // A directory that was expanded and is now gone must not make the refresh fail —
+        // the rest of the tree is still worth showing.
+        tree.refresh().unwrap();
+
+        assert!(tree.entries().iter().all(|e| e.name != "app"));
+        assert!(tree.entries().iter().any(|e| e.name == "artisan"), "the rest must survive");
+    }
+
+    #[test]
+    fn refreshing_keeps_hidden_files_hidden() {
+        // `refresh` re-reads through the same filter, so a setting the user chose is not
+        // quietly reset by an unrelated file operation.
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        assert!(tree.entries().iter().all(|e| e.name != ".env"));
+
+        tree.refresh().unwrap();
+        assert!(tree.entries().iter().all(|e| e.name != ".env"));
+
+        tree.set_show_hidden(true).unwrap();
+        tree.refresh().unwrap();
+        assert!(
+            tree.entries().iter().any(|e| e.name == ".env"),
+            "show_hidden must survive a refresh too"
+        );
     }
 
     #[test]

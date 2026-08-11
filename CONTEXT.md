@@ -10,66 +10,79 @@ deliberately absent.
 Written at `64c7871` (#111), 965 tests passing, v0.1.0 untagged. Amended at `4e66dbc`:
 #114 landed after this was drafted and closed #108 — see that entry below.
 
-**Amended again at `08d67b0`, 1053 tests.** See "Reported and unfixed" immediately below —
-that section is the current work queue and takes priority over anything else in this file.
+**Amended again at `e570cba`, 1103 tests.** The three things reported against `08d67b0` —
+#125, #126 and #127 — are **fixed and closed**, along with #123. What that cost, and the two
+bugs found on the way, is immediately below.
 
 ---
 
-## Reported and unfixed — start here
+## What the last three fixes taught — start here
 
-Three things the owner hit while testing `08d67b0`, now filed as **#125**, **#126** and
-**#127**. All three were verified against the code, not taken on report.
+#125, #126, #127 and #123 are closed. Read this before touching the LSP startup path, the
+file tree, or anything that compares two paths.
 
-### 1. The completion popup never opens — #125
+### #125 was three bugs wearing one symptom
 
-Reported: *"popup não abriu nem quando faz `$this->`"*, and ⌘⌥I does nothing either.
+Reported as _"popup não abriu nem quando faz `$this->`"_. It was never about the popup, and
+the evidence that said so was **zero log lines** — a spawn failure would have logged.
 
-**Confirmed:** `grep -ci 'lsp|intelephense' /tmp/elle.log` on a running instance returns
-**0** — the LSP is not merely failing to connect, it is producing no log line at all.
+1. **`start_lsp` was reachable only from `open_folder`.** Opening a _file_ — ⌘O on the file,
+   a palette jump, a window where ⌘O never ran — started nothing. This was the cause the log
+   pointed at, and the one an eye on `config_for` alone would have missed.
+2. **`config_for` returned `Some` unconditionally.** The spawn failed on the background
+   executor at `debug` level, so a machine with no server produced no output at all.
+3. **#123**, which is real and was verified on this machine: `launchctl getenv PATH` is
+   empty, intelephense exists _only_ under `~/Library/Application Support/Herd/config/nvm/…`,
+   so a Finder-launched `.app` cannot see it. `config_for` now resolves the binary against
+   `PATH` first and a fixed list of installer prefixes after. Checked by running the search
+   with `PATH` unset: it finds the Herd copy.
 
-Two conditions gate `start_lsp` (`workspace_view.rs:3374`):
+The **general lesson**, which is the one worth keeping: _the absence of a log line is
+evidence about which code ran, not about how well it ran._ Three plausible causes each
+explained the symptom, and only one explained the silence.
 
-- **A folder must be open.** `self.tree` is `None` until ⌘O, so a bare window never starts a
-  server. The owner may have been in that state.
-- **`config_for` does not check the binary exists** (`lsp_session.rs:418`). It builds a
-  `ServerConfig` from the configured command and returns `Some` unconditionally, so a
-  missing `intelephense` fails at spawn rather than being reported as unavailable.
+§24's "a missing server is silent" now has one narrow exception: it is named when the open
+file is one a server would handle. Silence is right for someone who never wanted a PHP
+server and wrong for someone staring at a `.php` file waiting for a popup — that gap is
+precisely why this was filed against the popup.
 
-Compounding it: **#123**. Intelephense installs to
-`~/Library/Application Support/Herd/config/nvm/versions/node/*/bin/` under nvm or Herd,
-which is on the shell `PATH` and **not** on the `PATH` a `.app` launched from Finder gets
-(`launchctl getenv PATH` is empty on this machine). Launching from a shell
-(`./target/ellefuanti.app/Contents/MacOS/ellefuanti`) is the current workaround, and the
-owner was launching from Finder.
+### Two bugs the #126 tests found that reading the code did not
 
-**Do not assume it is only #123.** The zero log lines suggest `start_lsp` is not being
-reached at all, which #123 would not explain — a spawn failure would log. Start by
-confirming whether `self.tree` was set.
+Both were found by _writing the test_, not by review, and both are the shape that survives
+review indefinitely.
 
-### 2. There is no context menu anywhere — #126
+- **`starts_with` on two paths that name the same file.** `FileTree` canonicalises its root;
+  a tab's path is whatever opened it. On macOS the temp directory is a symlink, so the same
+  file is `/private/var/…` from one and `/var/…` from the other. Deleting a file therefore
+  left its tab open — and a tab on a deleted file **writes it back on the next ⌘S**, silently
+  undoing the delete. `is_under` canonicalises as much of each path as still exists.
+  Anywhere two paths from different sources are compared, assume they are spelled
+  differently until proven otherwise.
+- **A dialog asked after the question was settled.** Closing those tabs went through
+  `close_tab_at`, which prompts _"discard unsaved changes?"_ — meaningless about a file that
+  is already gone, and asked _after_ the deletion the user confirmed.
 
-Reported: *"não dá pra apertar click direito e click esquerdo do mouse pra alterar ou
-apagar"*.
+### A test that could not fail, and why it stayed
 
-**Confirmed:** `grep -cE 'MouseButton::Right|context_menu'` across `crates/app/src` returns
-**0**. Not a bug — the feature was never built. There is no way to rename, delete, or create
-a file from the tree, and no way to reach any per-item action with the mouse.
+`deleting_a_symlink_removes_the_link_and_not_the_target` does **not** fail if `delete` is
+rewritten to use `metadata` instead of `symlink_metadata`. Current Rust's `remove_dir_all`
+refuses to recurse through a symlink — it unlinks and returns `Ok` — so both spellings leave
+the target intact and no assertion can separate them. This was established by running it,
+not assumed.
 
-This is a real gap against every editor it is being compared to, and it is larger than it
-looks: it needs a menu primitive (gpui has one for the *system* menu bar, #78, but that is
-not the same thing), plus the file operations themselves, plus confirmation for the
-destructive ones — deleting a file is the one action in the tree that cannot be undone.
+The guard stays anyway (correctness should not rest on an implementation detail std may
+change) and the test stays as a contract guard, with a comment saying exactly what it does
+not prove. **That comment is the point**: the alternative is the next reader assuming the
+test is what makes the code safe. Compare the vacuous tests in "Conventions" below — the
+difference is that this one is honestly labelled.
 
-### 3. ⌘N creates a buffer with no type and no way to give it one — #127
+### #127, and the thing it deliberately does not do
 
-Reported alongside the above.
-
-`Document::untitled()` (#42) creates a pathless buffer, which is correct — it is what makes
-`⌘S` fall through to save-as. But **an untitled buffer has no language**, so no syntax
-colour, and the only way to give it one is to save it. There is no "set language for this
-file" affordance, which every comparable editor has in the status bar.
-
-Related to 2: with no context menu, a new file cannot be renamed either.
+`set_language` gives a pathless buffer a grammar without giving it a path. It rebuilds the
+tree against the text already in the buffer — waiting for the next edit would make the
+choice look like it did nothing. `set_path` still re-detects on save and overrides it, which
+is tested: an override that outlived the save would mean a file called `.php` refusing to
+highlight as PHP because of a menu choice made earlier.
 
 ---
 
@@ -98,7 +111,7 @@ is the authority.
 | `core`        | command registry                                                   | yes                       |
 | `text`        | rope buffer (ropey), undo/redo, edit log                           | yes                       |
 | `syntax`      | tree-sitter parsing and highlighting, 9 grammars                   | yes                       |
-| `workspace`   | filesystem, lazy file tree, safe file IO, `CancelFlag`             | yes                       |
+| `workspace`   | filesystem, lazy file tree, safe file IO + create/rename/delete, `CancelFlag` | yes          |
 | `terminal`    | PTY sessions, alacritty VT/ANSI emulation, selection, key encoding | yes                       |
 | `lsp`         | generic LSP client, hand-rolled framing, no tokio                  | yes (#74)                 |
 | `index`       | SQLite file index (rusqlite, bundled)                              | yes (#72), file list only |
@@ -440,12 +453,14 @@ This is the general lesson: issue comments are dated snapshots. The repo is the 
 ### Open and unblocked
 
 - ~~**#108** indent guides as 1 px rules~~ — **closed by #114**, and the prediction made
-  while drafting this document was right: the blocks *had* returned. #110 removed the
+  while drafting this document was right: the blocks _had_ returned. #110 removed the
   character-background path they used, so they vanished as a side effect; #111 restored
   `paint_background` for the terminal cursor and brought them back with it. They are now
   quads drawn by `Line` at a measured x. #114 also ported Zed's backspace-to-tab-stop rule
   (`editor.rs:5010`): `((column - 1) / width) * width`, not a jump to column zero.
-- **#112** decide the rendering-verification story.
+- **#112** decide the rendering-verification story. Three more features have now shipped
+  whose visible behaviour is asserted as state and never observed — the context menu's
+  position, the confirmation's layout, and whether a language choice changes any colour.
 - **#53** grammars for the remaining languages. Nine exist; `.rs`, `.md` and others still
   open with no colour, which is a coverage gap, not a bug.
 - **#57** `cargo build --release --no-default-features` fails on Metal shader compilation —
@@ -457,9 +472,12 @@ This is the general lesson: issue comments are dated snapshots. The repo is the 
   reader thread could notify the window through `AsyncApp` + a channel, dropping idle cost to
   zero while the panel is open).
 - **#64** git items 3–5. **Write operations are deliberately unbuilt**: losing uncommitted
-  work is the one thing in this editor a user cannot undo, so the read-only panel ships before
-  the confirmation machinery exists. Item 4 (commit) has a known problem recorded in the crate
-  docs: **libgit2 does not run hooks**, so a commit would skip pre-commit.
+  work is one of the two things in this editor a user cannot undo, so the read-only panel
+  ships before the confirmation machinery exists. Item 4 (commit) has a known problem recorded
+  in the crate docs: **libgit2 does not run hooks**, so a commit would skip pre-commit.
+  The confirmation machinery now exists — #126 built a modal `Overlay` with a
+  destructive-action path, defaulting to Cancel — so "there is nowhere to ask" is no longer
+  the blocker it was when this was written.
 - **#63** Linux (deferred — the domain layers port, the UI ports when gpui does).
 - **#71 / #81 / #82 / #83 / #69** are umbrella issues, each substantially delivered by the PRs
   above but still open for their remaining items.
@@ -545,16 +563,27 @@ open target/ellefuanti.app                            # from Finder — does NOT
 
 **The two are not equivalent.** `open` gives the app launchd's environment, which on this
 machine has no `PATH` at all, so anything installed under nvm, Herd or Homebrew's non-default
-prefix is invisible to it. That is #123, and it is why the LSP appears to do nothing when the
-app is double-clicked.
+prefix is invisible to it. That was #123, and it is why the LSP appeared to do nothing when
+the app was double-clicked.
+
+**#123 is fixed** — `lsp_session::config_for` now searches a fixed list of installer prefixes
+(nvm, Herd, Homebrew, the per-user npm targets) when `PATH` does not have the binary, so both
+launches find a server. The two are still not equivalent for *anything else* a subprocess
+might need, so a feature that shells out is still worth testing from Finder.
 
 The `.app` is also the only way to see the icon (#55) — a bare binary gets the generic one.
 
 ## If you are about to claim something works
 
-Run `cargo test --no-fail-fast` (965 expected). Then, for anything that touches the screen,
+Run `cargo test --no-fail-fast` (1103 expected). Then, for anything that touches the screen,
 say plainly that it has not been seen. The five-PR sequence above is what happens otherwise.
 
 The two-minute human check, from #35: `cargo run` → ⌘O a Laravel project → click into a PHP
 file → **does a column of characters line up vertically?** → type something accented → ⌘P and
 search a nested file → ⌘⇧P → open a terminal and run `ls`.
+
+Three steps were added by the last batch, and they are the ones nothing headless can check:
+**right-click a file in the tree** (does a menu appear at the pointer, and does Delete ask
+before it acts?) → **⌘N then click the language cell in the status bar** (does the list open,
+and does choosing PHP colour the buffer?) → **⌘O a single `.php` file with no folder open**
+(does the status bar stop saying "No language server" once Intelephense starts?).
