@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+elle-laravel = { path = "../laravel" }
+elle-workspace = { path = "../workspace" }
 # `bundled` compiles SQLite from source rather than linking the system library. The
 # alternative is whatever SQLite the user's macOS shipped, whose version and compile-time
 # options we do not control — and the schema here is only as portable as the oldest SQLite

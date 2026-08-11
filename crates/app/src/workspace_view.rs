@@ -699,6 +699,28 @@ impl WorkspaceView {
         // First of the three refresh triggers (#64). The other two are save and window
         // focus; there is no timer.
         self.refresh_git_status(cx);
+        // The Laravel index (#21): models, columns with provenance, relationships.
+        // Fire-and-forget on the background pool — nothing consumes it yet (#22 will),
+        // and a failed build is a debug line, not a user problem: the index is a cache
+        // and every consumer must already survive its absence (ADR-0008).
+        if let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) {
+            cx.background_spawn(async move {
+                let Some(path) = crate::file_cache::index_path(&root) else { return };
+                match elle_index::Index::open(&path) {
+                    Ok((index, _)) => {
+                        if let Err(err) = elle_index::laravel::build(
+                            index.connection(),
+                            &root,
+                            &elle_workspace::CancelFlag::default(),
+                        ) {
+                            tracing::debug!("laravel index build failed: {err:#}");
+                        }
+                    }
+                    Err(err) => tracing::debug!("laravel index unavailable: {err:#}"),
+                }
+            })
+            .detach();
+        }
         // An open terminal points at wherever it was started, which before this was the
         // *previous* project — or nowhere, for a panel opened before any folder was.
         // Sessions already running keep their own directory: a shell has state and its own
