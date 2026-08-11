@@ -923,6 +923,52 @@ impl Document {
         self.sync_syntax();
     }
 
+    /// Applies a set of independent byte-range edits as **one** buffer edit — one undo
+    /// step. The formatting shape (#19): `splice_at`'s one-spanning-replace form,
+    /// generalised to a different new text per range.
+    ///
+    /// Order in the input is meaningless (LSP leaves it unspecified — only the ranges
+    /// are the truth), so the edits are sorted here; overlapping edits are a protocol
+    /// violation and the whole batch is dropped rather than half-applied.
+    pub fn apply_edits(&mut self, mut edits: Vec<(std::ops::Range<usize>, String)>) {
+        if edits.is_empty() {
+            return;
+        }
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            return;
+        }
+
+        let text = self.buffer.text();
+        let span = edits.first().map(|(r, _)| r.start).unwrap_or(0)
+            ..edits.last().map(|(r, _)| r.end).unwrap_or(0);
+
+        let mut combined = String::new();
+        let mut cursor = span.start;
+        for (range, new_text) in &edits {
+            combined.push_str(&text[cursor..range.start]);
+            combined.push_str(new_text);
+            cursor = range.end;
+        }
+
+        self.buffer.break_undo_group();
+        self.buffer.replace(span.clone(), &combined);
+        self.buffer.break_undo_group();
+
+        // Formatting moves text under the cursor; the least surprising landing is the
+        // same offset clamped into the new document — snapped back to a char boundary,
+        // because the old offset may now point into the middle of a codepoint.
+        let after = self.buffer.text();
+        let mut head = self.selection.head.min(after.len());
+        while head > 0 && !after.is_char_boundary(head) {
+            head -= 1;
+        }
+        self.extra_selections.clear();
+        self.selection = Selection::at(head);
+        self.goal_column = None;
+        self.sync_syntax();
+    }
+
     /// The byte span of the *word* under `offset`, or `None` when what is there is not one.
     ///
     /// The ⌘-hover link hint: only a word earns an underline and a pointing hand, because
@@ -2289,6 +2335,32 @@ mod tests {
         assert_eq!(d.buffer.text(), "alpha beta gamma", "one undo, not five");
         d.undo();
         assert_eq!(d.buffer.text(), "alpha beta gamma", "and nothing else was on the stack");
+    }
+
+    #[test]
+    fn applying_edits_rewrites_each_range_and_undoes_in_one_step() {
+        // The formatting shape (#19): several ranges, each with its own new text —
+        // splice_at's one-spanning-replace form, generalised past one replacement.
+        let mut d = doc("<?php\nif($x){\nreturn;\n}\n");
+        let text = d.buffer.text();
+        let after_if = text.find("if(").unwrap() + 2;
+        let before_return = text.find("return").unwrap();
+        let edits = vec![
+            (after_if..after_if, " ".to_string()),
+            (before_return..before_return, "    ".to_string()),
+        ];
+        d.apply_edits(edits);
+        assert_eq!(d.buffer.text(), "<?php\nif ($x){\n    return;\n}\n");
+        d.undo();
+        assert_eq!(d.buffer.text(), "<?php\nif($x){\nreturn;\n}\n", "one undo, not one per edit");
+    }
+
+    #[test]
+    fn edits_arriving_out_of_order_are_applied_where_they_say() {
+        // LSP leaves edit order unspecified; only the ranges are the truth.
+        let mut d = doc("abcdef");
+        d.apply_edits(vec![(4..5, "E".to_string()), (1..2, "B".to_string())]);
+        assert_eq!(d.buffer.text(), "aBcdEf");
     }
 
     #[test]

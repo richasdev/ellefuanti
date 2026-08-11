@@ -516,6 +516,30 @@ impl Client {
         )
     }
 
+    /// Issues a whole-document formatting request without waiting (#19).
+    ///
+    /// `tab_size`/`insert_spaces` are the two options every server honours; the rest of
+    /// `FormattingOptions` is server-specific tuning nothing here needs yet. The reply
+    /// is `Option<Vec<TextEdit>>` — `None` means the server chose not to format, which
+    /// is not an error and must not be reported as one (RISKS #4).
+    pub fn request_formatting(
+        &self,
+        uri: &Uri,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<RequestId> {
+        if self.document(uri).is_none() {
+            bail!("{} is not open on the {} language server", uri.as_str(), self.name);
+        }
+        self.send_request(
+            lsp_types::request::Formatting::METHOD,
+            json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": tab_size, "insertSpaces": insert_spaces },
+            }),
+        )
+    }
+
     fn reference_params(
         &self,
         uri: &Uri,

@@ -150,6 +150,9 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // `editor.find_in_project` was deliberately absent while it did not exist, on the
     // grounds that a palette row for it would be a lie. It exists now, so it is here.
     Command::new("editor.find", "Find…"),
+    // #19. Formatting is the server's answer; with none running the row does nothing
+    // silently, same as every navigation command — see the workspace handler's doc.
+    Command::new("editor.format", "Format Document"),
     Command::new("editor.replace", "Replace…"),
     Command::new("editor.find_in_project", "Find in Project…"),
     Command::new("palette.toggle", "Command Palette"),
