@@ -11,7 +11,7 @@ use rusqlite::Connection;
 /// Forgetting to bump this is the failure mode to watch for. It does not corrupt anything —
 /// the old file is opened against new query code, and the mismatch surfaces as a query
 /// error rather than silently wrong autocomplete.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Every table, created in one transaction.
 ///
@@ -56,6 +56,40 @@ CREATE TABLE symbols (
 CREATE INDEX symbols_by_file ON symbols(file_id);
 CREATE INDEX symbols_by_name ON symbols(name);
 CREATE INDEX symbols_by_fqn ON symbols(fqn);
+
+-- Laravel: models and what each declares (#21). Populated by `laravel::build`;
+-- provenance travels with every column because a migration's word and a cast's guess
+-- are different kinds of claim (#20), and flattening them here would lose that forever.
+CREATE TABLE models (
+    id         INTEGER PRIMARY KEY,
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    class      TEXT NOT NULL,
+    -- NULL when the file declares none: convention is the reader's to apply, and a
+    -- stored guess would be indistinguishable from a declared fact.
+    table_name TEXT
+);
+CREATE INDEX models_by_class ON models(class);
+
+CREATE TABLE model_columns (
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    name     TEXT NOT NULL,
+    -- The builder method for migration rows (`string`, `foreignId`), the cast for cast
+    -- rows (`boolean`), empty for fillable-only rows.
+    type     TEXT NOT NULL,
+    -- 'migration' | 'cast' | 'fillable' — the claim's strength, preserved.
+    source   TEXT NOT NULL
+);
+CREATE INDEX model_columns_by_model ON model_columns(model_id);
+
+CREATE TABLE model_relations (
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    name     TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    -- The target class exactly as written in the source; resolution is a consumer
+    -- concern (`extract_model`'s contract).
+    target   TEXT NOT NULL
+);
+CREATE INDEX model_relations_by_model ON model_relations(model_id);
 
 -- The dependency graph: "if `from_file` changed, `to_file` may need reanalysis".
 -- Edges are directed and deduplicated; a file importing another twice is one edge.

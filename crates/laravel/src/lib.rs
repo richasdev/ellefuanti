@@ -18,11 +18,13 @@
 //! Blocking and synchronous, like the rest of the domain layer — the caller decides which
 //! executor runs it (ADR-0007). No UI dependency (ADR-0004).
 
+mod models;
 mod references;
 mod resolved;
 mod routes;
 mod targets;
 
+pub use models::{ModelFacts, extract_migration_columns, extract_model};
 pub use references::{Reference, ReferenceKind, reference_at};
 pub use resolved::Resolved;
 pub use routes::{HttpMethod, Route, RouteAction, RouteExtraction, extract_routes};

@@ -16,6 +16,7 @@
 //! foundation those build on.
 
 mod db;
+pub mod laravel;
 mod records;
 mod schema;
 
