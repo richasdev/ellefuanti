@@ -10,6 +10,67 @@ deliberately absent.
 Written at `64c7871` (#111), 965 tests passing, v0.1.0 untagged. Amended at `4e66dbc`:
 #114 landed after this was drafted and closed #108 — see that entry below.
 
+**Amended again at `08d67b0`, 1053 tests.** See "Reported and unfixed" immediately below —
+that section is the current work queue and takes priority over anything else in this file.
+
+---
+
+## Reported and unfixed — start here
+
+Three things the owner hit while testing `08d67b0`, now filed as **#125**, **#126** and
+**#127**. All three were verified against the code, not taken on report.
+
+### 1. The completion popup never opens — #125
+
+Reported: *"popup não abriu nem quando faz `$this->`"*, and ⌘⌥I does nothing either.
+
+**Confirmed:** `grep -ci 'lsp|intelephense' /tmp/elle.log` on a running instance returns
+**0** — the LSP is not merely failing to connect, it is producing no log line at all.
+
+Two conditions gate `start_lsp` (`workspace_view.rs:3374`):
+
+- **A folder must be open.** `self.tree` is `None` until ⌘O, so a bare window never starts a
+  server. The owner may have been in that state.
+- **`config_for` does not check the binary exists** (`lsp_session.rs:418`). It builds a
+  `ServerConfig` from the configured command and returns `Some` unconditionally, so a
+  missing `intelephense` fails at spawn rather than being reported as unavailable.
+
+Compounding it: **#123**. Intelephense installs to
+`~/Library/Application Support/Herd/config/nvm/versions/node/*/bin/` under nvm or Herd,
+which is on the shell `PATH` and **not** on the `PATH` a `.app` launched from Finder gets
+(`launchctl getenv PATH` is empty on this machine). Launching from a shell
+(`./target/ellefuanti.app/Contents/MacOS/ellefuanti`) is the current workaround, and the
+owner was launching from Finder.
+
+**Do not assume it is only #123.** The zero log lines suggest `start_lsp` is not being
+reached at all, which #123 would not explain — a spawn failure would log. Start by
+confirming whether `self.tree` was set.
+
+### 2. There is no context menu anywhere — #126
+
+Reported: *"não dá pra apertar click direito e click esquerdo do mouse pra alterar ou
+apagar"*.
+
+**Confirmed:** `grep -cE 'MouseButton::Right|context_menu'` across `crates/app/src` returns
+**0**. Not a bug — the feature was never built. There is no way to rename, delete, or create
+a file from the tree, and no way to reach any per-item action with the mouse.
+
+This is a real gap against every editor it is being compared to, and it is larger than it
+looks: it needs a menu primitive (gpui has one for the *system* menu bar, #78, but that is
+not the same thing), plus the file operations themselves, plus confirmation for the
+destructive ones — deleting a file is the one action in the tree that cannot be undone.
+
+### 3. ⌘N creates a buffer with no type and no way to give it one — #127
+
+Reported alongside the above.
+
+`Document::untitled()` (#42) creates a pathless buffer, which is correct — it is what makes
+`⌘S` fall through to save-as. But **an untitled buffer has no language**, so no syntax
+colour, and the only way to give it one is to save it. There is no "set language for this
+file" affordance, which every comparable editor has in the status bar.
+
+Related to 2: with no context menu, a new file cannot be renamed either.
+
 ---
 
 ## What this is
@@ -72,6 +133,45 @@ transport is ~110 hand-rolled lines of `Content-Length` framing instead. It is a
 unresolved question in #65 (see below).
 
 ---
+
+## What landed after this document was first written
+
+`64c7871` → `08d67b0`, and the rendering half of it is the part worth knowing.
+
+**Rows are painted, not laid out** (#110). A row used to be `div().h(...).child(StyledText)`.
+`StyledText` resolves its line height from `window.text_style()` **at layout time**, not from
+an ancestor div — so a `.line_height()` set on the root never reached rows built inside a
+`uniform_list` callback. Four PRs (#106, #107, #109, #110) fixed the arithmetic before anyone
+found the channel was never read. `crates/app/src/editor/line.rs` is now a custom `Element`
+that shapes its own line and calls `ShapedLine::paint(origin, line_height, …)`, which takes
+the height as an argument. This is what Zed does.
+
+**`svg()` does not inherit its colour.** It fills its alpha mask from `style.text.color` **on
+the element itself**. Three PRs were needed to learn this (#121 tree and tabs, #122 activity
+bar) because the comment at the activity bar asserted the opposite — that the icon inherited
+from its parent — and it read as a considered decision. Every rendered `svg()` in the crate
+now sets a colour explicitly. **A wrong comment beside plausible code survives review.**
+
+**`ShapedLine::paint` draws glyphs only** (#111). Run backgrounds — the terminal cursor, a
+selection, a search match, a diagnostic — need `paint_background` called separately. Missing
+it made the terminal cursor a hole that walked along the line while typing.
+
+**Zed is cloned at `~/zed`** and is the reference for anything gpui-shaped. #114 took its
+backspace-to-tab-stop rule (`editor.rs:5010`), #117 its `surrounding_word` classification
+(`buffer.rs:4190` — `cmp::max(prev, next)`, not "the character to the right") and its
+autoscroll margin. Every port that worked was **read**, not reasoned about. #117 also found a
+real gpui bug on the way: `scroll_to_item_with_offset` documents shrinking the viewport by
+`offset` items but only shrinks from the top (`uniform_list.rs:406` vs `:409`).
+
+**Completion exists** (#118, #124). The popup carries provenance in the type
+(`CompletionItem.source`), cancels rather than queues, and opens on the **server's own**
+trigger characters. Intelephense declares ten single characters — `$ > : \ / ' " * . <` —
+and **not** `->` or `::`, so the obvious hardcode has the wrong shape and would never fire.
+
+**⌘⌥I opens it manually.** Not ⌃Space: the whole spacebar is claimed by macOS on a machine
+with more than one input source (`⌃Space` previous input, `⌘Space` Spotlight, `⌥⌘Space`
+Finder search — all verified enabled in `com.apple.symbolichotkeys`). A chord a keymap
+accepts is not a chord the OS delivers.
 
 ## The traps
 
@@ -434,6 +534,21 @@ are the product; the tool panels are features.**
   visual can be self-verified from here. Say so rather than implying otherwise.
 
 ---
+
+## How to run it, and why it matters which way
+
+```sh
+cargo build --release -p ellefuanti && sh scripts/bundle-macos.sh
+./target/ellefuanti.app/Contents/MacOS/ellefuanti     # from a shell — inherits PATH
+open target/ellefuanti.app                            # from Finder — does NOT
+```
+
+**The two are not equivalent.** `open` gives the app launchd's environment, which on this
+machine has no `PATH` at all, so anything installed under nvm, Herd or Homebrew's non-default
+prefix is invisible to it. That is #123, and it is why the LSP appears to do nothing when the
+app is double-clicked.
+
+The `.app` is also the only way to see the icon (#55) — a bare binary gets the generic one.
 
 ## If you are about to claim something works
 
