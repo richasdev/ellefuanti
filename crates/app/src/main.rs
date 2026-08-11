@@ -61,7 +61,74 @@ fn path_argument() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(raw))
 }
 
+/// Hands the terminal back: `ellefuanti .` must return the prompt, not squat on it.
+///
+/// The owner's report, verbatim: "pq quando dou um ellefuanti . fica um server aí
+/// rodando?" — a GUI binary in the foreground reads as a stuck dev-server, and `code .`
+/// taught everyone the prompt comes back. The process re-spawns itself detached (its own
+/// process group, streams to null) and the parent exits before gpui ever initialises.
+///
+/// Two escapes, both deliberate:
+/// - stdout not a TTY → stay in the foreground. Every debugging flow in this repo runs
+///   `ellefuanti . > log 2>&1 &`, and detaching there would sever the log redirection
+///   that five rounds of #125 depended on.
+/// - `ELLE_FOREGROUND=1` → stay put. Set by the respawn to stop the loop, and available
+///   to anyone who wants the blocking behaviour on purpose.
+///
+/// The LSP child needs no handling here: it exits on its stdin pipe closing, verified
+/// under SIGTERM and SIGKILL both — there is no orphan, only a borrowed prompt.
+fn detach_from_terminal() {
+    use std::io::IsTerminal;
+    if std::env::var_os("ELLE_FOREGROUND").is_some() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+
+    // Re-exec, not an in-process fork — and both failed attempts are worth their lines:
+    //
+    // - In-process fork dies on macOS regardless of signals: the Objective-C runtime is
+    //   initialised by static constructors *before* `main`, and a forked child that then
+    //   touches Cocoa (gpui's first window) aborts with objc's fork-safety check. GUI
+    //   daemonisation on this platform means a fresh process.
+    // - Plain re-exec loses a race instead: the parent exits, the pty tears down, and
+    //   SIGHUP reaches the child before its `setsid` (in pre_exec) has run. Measured
+    //   with a pty harness — the "detached" app died at 0ms, twice, two different ways.
+    //
+    // The fix is one line in the *parent*: ignore SIGHUP here, because signal
+    // dispositions inherit through fork **and exec** — the child is born immune, so the
+    // race stops mattering, and `setsid` then detaches it from the terminal for good.
+    // A GUI app has no use for SIGHUP, so the disposition staying ignored costs nothing.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(std::env::args_os().skip(1))
+        .env("ELLE_FOREGROUND", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    match command.spawn() {
+        // The child owns the window; this process's one remaining job is the prompt.
+        Ok(_) => std::process::exit(0),
+        Err(err) => eprintln!("ellefuanti: could not detach ({err}); running in foreground"),
+    }
+}
+
 fn main() {
+    detach_from_terminal();
+
     // First statement, so the startup clock includes everything — including the runtime
     // Metal shader compilation that `runtime_shaders` moves from build time to startup.
     let mut startup = perf::Startup::begin();

@@ -28,6 +28,7 @@ default = ["runtime-shaders"]
 runtime-shaders = ["gpui/runtime_shaders"]
 
 [dependencies]
+libc = "0.2"
 elle-core.workspace = true
 elle-text.workspace = true
 elle-syntax.workspace = true
