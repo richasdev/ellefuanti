@@ -3150,3 +3150,82 @@ async fn a_where_call_offers_the_models_columns_inside_the_literal(cx: &mut Test
 
     draw(cx);
 }
+
+/// `User::with('…')` offers the model's relationships, not its columns (#22).
+///
+/// The scanner says which list the literal wants (`Argument::Relation`); offering
+/// columns there would be a wrong answer wearing a confident badge, and offering both
+/// would bury the two real relations under thirty columns.
+#[gpui::test]
+async fn a_with_call_offers_relationships_not_columns(cx: &mut TestAppContext) {
+    // Same HOME race as the other index-backed popup tests; same lock.
+    let _home = crate::file_cache::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    std::fs::create_dir_all(dir.path().join("app/Http/Controllers")).unwrap();
+    std::fs::create_dir_all(dir.path().join("database/migrations")).unwrap();
+    std::fs::write(
+        dir.path().join("app/Models/User.php"),
+        "<?php\nclass User extends Model {\n    public function posts() { return $this->hasMany(Post::class); }\n}\n",
+    )
+    .unwrap();
+    // A migration too, so "columns exist and are NOT offered" is a real assertion
+    // rather than an empty set passing by accident.
+    std::fs::write(
+        dir.path().join("database/migrations/2026_01_01_create_users.php"),
+        "<?php\nreturn new class extends Migration {\n  public function up(): void {\n    Schema::create('users', function (Blueprint $table) {\n      $table->string('email');\n    });\n  }\n};\n",
+    )
+    .unwrap();
+    let controller_path = dir.path().join("app/Http/Controllers/UserController.php");
+    let controller = "<?php\nclass UserController extends Controller {\n    public function index() { return User::with(''); }\n}\n";
+    std::fs::write(&controller_path, controller).unwrap();
+
+    let canonical = dir.path().canonicalize().unwrap();
+    let index_path = crate::file_cache::index_path(&canonical).expect("index path");
+    {
+        let (index, _) = elle_index::Index::open(&index_path).expect("index opens");
+        elle_index::laravel::build(
+            index.connection(),
+            &canonical,
+            &elle_workspace::CancelFlag::default(),
+        )
+        .expect("index builds");
+    }
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(controller_path.clone()), controller, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    draw(cx);
+
+    let inside = controller.find("('')").unwrap() + 2;
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    editor.update(cx, |editor, _cx| editor.document.select_range_for_test(inside..inside));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("popup open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_ref()).collect();
+        assert!(labels.contains(&"posts"), "the relationship arrives: {labels:?}");
+        assert!(
+            !labels.contains(&"email"),
+            "columns are not an answer to with(): {labels:?}"
+        );
+        let posts = items.iter().find(|item| item.label.as_ref() == "posts").unwrap();
+        assert!(matches!(posts.source, CompletionSource::LaravelRelation));
+    });
+
+    draw(cx);
+}

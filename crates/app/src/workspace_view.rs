@@ -2949,7 +2949,14 @@ impl WorkspaceView {
                 let typed = text[context.range.start..offset].to_string();
                 popup.update(cx, |popup, cx| popup.set_query(typed, cx));
             }
-            self.request_columns_of(class, root, popup, cx);
+            // The scanner says which list this literal wants; the other one would be a
+            // wrong answer wearing a confident badge.
+            match context.expects {
+                elle_laravel::Argument::Column => self.request_columns_of(class, root, popup, cx),
+                elle_laravel::Argument::Relation => {
+                    self.request_relations_of(class, root, popup, cx)
+                }
+            }
             return;
         }
 
@@ -2971,10 +2978,7 @@ impl WorkspaceView {
             // Relationships after columns: both are index facts, but a column is data on
             // every row while a relationship is one method — and the detail says what the
             // method body claims (`hasMany · Post`), which is a scan's word, not a proof.
-            items.extend(relations.into_iter().map(|(name, kind, target)| {
-                CompletionItem::new(name, CompletionSource::LaravelRelation)
-                    .with_detail(Some(format!("{kind} · {target}")))
-            }));
+            items.extend(relations.into_iter().map(relation_item));
             if items.is_empty() {
                 return;
             }
@@ -3001,6 +3005,32 @@ impl WorkspaceView {
         let task = cx.spawn(async move |_this, cx| {
             let Some(columns) = task.await else { return };
             let items: Vec<CompletionItem> = columns.into_iter().map(column_item).collect();
+            if items.is_empty() {
+                return;
+            }
+            popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
+        });
+        self.jobs.start(Job::CompletionColumns, task);
+    }
+
+    /// Fetches one class's relationships from the index and feeds them to the popup —
+    /// what a `with('…')`-shaped literal wants. Relations only, for the mirror of
+    /// `request_columns_of`'s reason.
+    fn request_relations_of(
+        &mut self,
+        class: String,
+        root: std::path::PathBuf,
+        popup: Entity<CompletionPopup>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_spawn(async move {
+            let path = crate::file_cache::index_path(&root)?;
+            let (index, _) = elle_index::Index::open(&path).ok()?;
+            elle_index::laravel::relations_for_model(index.connection(), &class).ok()
+        });
+        let task = cx.spawn(async move |_this, cx| {
+            let Some(relations) = task.await else { return };
+            let items: Vec<CompletionItem> = relations.into_iter().map(relation_item).collect();
             if items.is_empty() {
                 return;
             }
@@ -4913,6 +4943,13 @@ fn column_item(column: elle_index::laravel::ModelColumn) -> CompletionItem {
         format!("{} · {}", column.column_type, column.source)
     };
     CompletionItem::new(column.name, CompletionSource::LaravelColumn).with_detail(Some(detail))
+}
+
+/// One indexed relationship as a popup item — the detail is what the method body says
+/// (`hasMany · Post`), a scan's word, not a proof.
+fn relation_item((name, kind, target): (String, String, String)) -> CompletionItem {
+    CompletionItem::new(name, CompletionSource::LaravelRelation)
+        .with_detail(Some(format!("{kind} · {target}")))
 }
 
 fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool) {
