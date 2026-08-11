@@ -40,7 +40,7 @@ use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
 use crate::search_panel::{SearchPanel, SearchPanelEvent, SearchState};
-use crate::terminal_view::TerminalView;
+use crate::terminal_view::{TerminalView, TerminalViewEvent};
 use crate::test_view::{RunState, TestView};
 use crate::theme::{Metrics, Theme, Themed};
 
@@ -736,6 +736,42 @@ impl WorkspaceView {
         self.jobs.start(Job::OpenFolder, task);
     }
 
+    /// Opens a path the terminal reported ⌘-clicked, if it actually names a file (#70).
+    ///
+    /// Relative paths resolve against the project root — a stack trace inside a project
+    /// prints paths relative to it, because that is where the command ran. A path that
+    /// resolves to nothing is dropped silently rather than reported: the detector matches
+    /// *shapes*, plain prose with a slash in it qualifies, and a status-bar error for
+    /// every such click would blame the user for the heuristic's reach. Declining to open
+    /// is the honest floor (RISKS.md #4) — nothing was claimed, so nothing is retracted.
+    ///
+    /// The line lands through `open_path_at`'s target, the same door every jump uses.
+    /// One-based in the trace, zero-based in the editor, saturating so `file.php:0` —
+    /// which some tools print — lands on the first line instead of underflowing.
+    fn open_terminal_link(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else {
+                return;
+            };
+            root.join(path)
+        };
+
+        if !resolved.is_file() {
+            return;
+        }
+
+        let target = line.map(|line| Point { row: (line.saturating_sub(1)) as usize, column: 0 });
+        self.open_path_at(resolved, target, window, cx);
+    }
+
     // --- source control (#64) ------------------------------------------------------
 
     /// Registers the window-activation observer, once.
@@ -1297,6 +1333,25 @@ impl WorkspaceView {
         self.dismiss_overlay(window, cx);
     }
 
+    /// A terminal link arriving, through the same resolver the subscription calls.
+    #[cfg(test)]
+    pub fn open_terminal_link_for_test(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_terminal_link(path, line, window, cx);
+    }
+
+    /// Where the active editor's cursor is, for asserting a jump landed.
+    #[cfg(test)]
+    pub fn cursor_row_for_test(&self, cx: &App) -> Option<usize> {
+        let editor = self.active_editor()?;
+        Some(editor.read(cx).document.cursor_point().row)
+    }
+
     /// The tree's visible row names, for asserting a refresh landed.
     #[cfg(test)]
     pub fn tree_names_for_test(&self) -> Vec<String> {
@@ -1767,6 +1822,19 @@ impl WorkspaceView {
                     // the user asked for a terminal, so start one.
                     terminal.open_session(cx);
                 });
+                // ⌘-clicked paths come back as events (#70): the terminal sees one line of
+                // output and cannot resolve `app/User.php` against anything, so it reports
+                // the claim and this side — which holds the project root — decides.
+                cx.subscribe_in(
+                    &terminal,
+                    window,
+                    |this, _terminal, event, window, cx| match event {
+                        TerminalViewEvent::OpenPath { path, line } => {
+                            this.open_terminal_link(path.clone(), *line, window, cx);
+                        }
+                    },
+                )
+                .detach();
                 window.focus(&terminal.read(cx).focus_handle(cx));
                 self.terminal = Some(terminal);
             }

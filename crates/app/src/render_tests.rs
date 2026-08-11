@@ -2751,3 +2751,60 @@ async fn renaming_an_open_file_retargets_its_tab(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// A ⌘-clicked `file.php:42` from the terminal opens the file at the line (#70).
+///
+/// Drives the workspace half through the same resolver the terminal's event reaches. The
+/// text-scanning half (`link_at`) has its own unit tests in `elle-terminal`; what this
+/// pins is the part the issue said was blocked — landing on the *line* — and the honesty
+/// rule: a shape that resolves to nothing opens nothing, silently.
+#[gpui::test]
+async fn a_terminal_path_click_opens_the_file_at_its_line(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join("app/User.php"), "<?php\nline2\nline3\nline4\nline5\nline6\n")
+        .unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    // Relative, exactly as a stack trace prints it: resolved against the project root.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_terminal_link_for_test(
+            std::path::PathBuf::from("app/User.php"),
+            Some(5),
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.tab_count_for_test(), 1, "the file must open");
+        assert_eq!(
+            workspace.cursor_row_for_test(cx),
+            Some(4),
+            "line 5 in the trace is row 4 in the editor — one-based to zero-based"
+        );
+    });
+
+    // A path-shaped token that names nothing opens nothing, and says nothing: the
+    // detector matches shapes, and prose with a slash in it qualifies.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_terminal_link_for_test(
+            std::path::PathBuf::from("does/not/exist.php"),
+            Some(1),
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.tab_count_for_test(), 1, "nothing new opens");
+        assert!(workspace.status_for_test().is_none(), "and nobody is blamed for it");
+    });
+
+    draw(cx);
+}

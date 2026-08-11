@@ -199,3 +199,62 @@ fn complete_at(
         }
     }
 }
+
+/// Go-to-definition answers with the declaration site, against a real server.
+///
+/// ⌘-click and F12 both end here: the editor emits `GoToDefinition`, the workspace asks
+/// Laravel first and the server second, and the server's answer is a `Location` whose
+/// range this test pins to the *declaration* line. The owner asked for the feature after
+/// it was already wired — reasonable, since until this session the popup was wired too
+/// and never worked; what was missing every time was the document reaching the server,
+/// which the resync now guarantees and this exercises through the same client calls.
+#[test]
+fn definition_round_trips_against_a_real_server() {
+    use elle_lsp::lsp_types::GotoDefinitionResponse;
+
+    let dir = project();
+    // `$this->name` on line 9 (0-based); `public string $name;` declared on line 4.
+    let text = "<?php\n\nclass User\n{\n    public string $name;\n    public string $email;\n\n    \
+                public function greet(): string\n    {\n        return $this->name;\n    }\n}\n";
+    std::fs::write(dir.path().join("app/Models/User.php"), text).unwrap();
+
+    let Some(config) = ellefuanti_config_for(dir.path()) else {
+        eprintln!("SKIPPED: no language server installed on this machine");
+        return;
+    };
+    let mut client = elle_lsp::Client::start(&config).expect("server starts");
+
+    let uri: elle_lsp::lsp_types::Uri =
+        format!("file://{}/app/Models/User.php", dir.path().canonicalize().unwrap().display())
+            .parse()
+            .unwrap();
+    client.did_open(uri.clone(), "php", text).unwrap();
+
+    // The byte offset of `name` inside `$this->name` — the place a ⌘-click lands.
+    let usage = text.rfind("name;").unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let answer = loop {
+        match client.definition(&uri, usage) {
+            Ok(Some(answer)) => break answer,
+            Ok(None) => {
+                // The server may still be indexing; a definition of nothing is its honest
+                // interim answer. Ask again until the deadline rather than failing on a
+                // cold server — the retry is the test's, not the app's.
+                assert!(std::time::Instant::now() < deadline, "server never resolved it");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(err) => panic!("definition failed: {err:#}"),
+        }
+    };
+
+    let location = match answer {
+        GotoDefinitionResponse::Scalar(location) => location,
+        GotoDefinitionResponse::Array(mut locations) => locations.remove(0),
+        GotoDefinitionResponse::Link(mut links) => {
+            let link = links.remove(0);
+            elle_lsp::lsp_types::Location { uri: link.target_uri, range: link.target_range }
+        }
+    };
+    assert_eq!(location.range.start.line, 4, "the declaration is `public string $name;`");
+}
