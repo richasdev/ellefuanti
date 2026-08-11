@@ -1741,6 +1741,7 @@ dependencies = [
  "elle-theme",
  "elle-workspace",
  "gpui",
+ "libc",
  "regex",
  "smol",
  "tempfile",

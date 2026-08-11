@@ -5057,6 +5057,26 @@ impl Render for WorkspaceView {
             .bg(theme.background)
             .text_size(Fonts::get(cx).ui_size)
             .text_color(theme.text)
+            // The window's own titlebar strip (#owner report): with `appears_transparent`
+            // the whole layout rose to y=0 and the activity bar's first icon sat under
+            // the traffic lights — the screenshot was a file-explorer icon overlapping
+            // the close button. This strip is the height the lights need, painted the
+            // theme's colour (which was the point of going transparent), and it carries
+            // the window title the transparency took away.
+            .child(
+                div()
+                    .h(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme.panel)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text_muted)
+                    .text_size(px(12.0))
+                    .child(SharedString::from(self.title(cx))),
+            )
             .child(
                 div()
                     .flex()
