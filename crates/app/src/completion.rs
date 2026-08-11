@@ -128,6 +128,37 @@ pub enum CompletionEvent {
     Backspaced,
 }
 
+/// Why the popup opened, which decides what it is allowed to say when it has nothing.
+///
+/// An explicit invoke (⌥⌘I) is a question the user asked, and a question deserves an answer
+/// even when the answer is "nothing" — silence there reads as a broken keybinding. A trigger
+/// character is not a question: the user typed `->` because they were writing code, and a box
+/// saying "No completions" over their cursor is the editor interrupting to report a non-event.
+///
+/// This is the whole difference a trigger introduces, and it is why the distinction is
+/// modelled rather than inferred. The popup fires on *every* keystroke of a declared
+/// character — in a string, in a comment, mid-word — and the measured behaviour of a real
+/// server is to answer those with an empty list (see `crates/lsp/tests/real_server.rs`).
+/// Rendering that emptiness is the difference between a feature and a flicker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompletionTrigger {
+    /// The explicit chord (⌥⌘I), or a palette command. The user asked.
+    Invoked,
+    /// A character the *server declared* as a trigger, typed in the ordinary course of
+    /// editing. Never a hardcoded `->` or `::` — see `Capabilities::completion_triggers`.
+    Character,
+}
+
+impl CompletionTrigger {
+    /// Whether an empty list should be shown as a box saying so.
+    ///
+    /// The caller closes the popup instead when this is false, which is what keeps a trigger
+    /// from leaving an empty rectangle over the code on every `->` inside a comment.
+    pub fn reports_emptiness(&self) -> bool {
+        matches!(self, CompletionTrigger::Invoked)
+    }
+}
+
 /// How many rows the popup shows before it scrolls.
 ///
 /// Ten because that is what fits without the popup becoming a panel: past that the list
@@ -159,6 +190,18 @@ pub struct CompletionPopup {
     /// Where the popup sits, in window coordinates: the top-left of the box, already
     /// flipped above the cursor and clamped to the window by [`Self::place`].
     origin: gpui::Point<Pixels>,
+    /// Why it opened. Decides whether an empty list is shown or closed — see
+    /// [`CompletionTrigger`].
+    trigger: CompletionTrigger,
+    /// The server said its list was truncated, so the next keystroke must ask again rather
+    /// than narrow what is already here.
+    ///
+    /// Measured, not assumed: against a real Intelephense on a 10k-file project, *every*
+    /// bare-word completion came back `isIncomplete: true` capped at exactly 100 items.
+    /// Filtering that stale list by one more character showed **1** row where re-requesting
+    /// showed 100 — the server re-ranks against the longer prefix and reaches past its own
+    /// cap. See `crates/lsp/tests/real_server.rs::a_real_server_marks_a_large_list_incomplete`.
+    incomplete: bool,
 }
 
 impl EventEmitter<CompletionEvent> for CompletionPopup {}
@@ -168,6 +211,7 @@ impl CompletionPopup {
         items: Vec<CompletionItem>,
         query: String,
         origin: gpui::Point<Pixels>,
+        trigger: CompletionTrigger,
         cx: &mut Context<Self>,
     ) -> Self {
         let filtered = filter_items(&items, &query);
@@ -179,7 +223,28 @@ impl CompletionPopup {
             selected: 0,
             loaded: false,
             origin,
+            trigger,
+            incomplete: false,
         }
+    }
+
+    pub fn trigger(&self) -> CompletionTrigger {
+        self.trigger
+    }
+
+    /// Whether the list on screen is a truncation the server wants re-asked.
+    ///
+    /// Read by the workspace on every keystroke: `true` means issue a fresh request at the
+    /// new offset instead of only narrowing. See the field's documentation for the
+    /// measurement behind it.
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+
+    /// Whether the popup currently has nothing to show, so a caller can close it rather
+    /// than leave an empty box over the code.
+    pub fn is_empty(&self) -> bool {
+        self.filtered.is_empty()
     }
 
     /// Adds items from a source that has just answered, keeping the query already typed.
@@ -193,10 +258,51 @@ impl CompletionPopup {
         cx.notify();
     }
 
+    /// Replaces everything a *single* source previously offered, for a re-request.
+    ///
+    /// The distinction from [`Self::add_items`] is the whole reason both exist. Appending is
+    /// right when two different sources answer the same question; it is wrong when the same
+    /// source answers again about a longer prefix, because the earlier answer described a
+    /// position the user has typed past. Appending there would leave the truncated
+    /// hundred-item list from `str` sitting underneath the fresh list for `strl`, and since
+    /// filtering preserves order the stale rows would sort *first*.
+    ///
+    /// Scoped by source rather than clearing everything: a re-request to the language server
+    /// must not delete the route names Laravel found, which nothing has re-asked.
+    pub fn replace_items(
+        &mut self,
+        source: CompletionSource,
+        items: Vec<CompletionItem>,
+        cx: &mut Context<Self>,
+    ) {
+        self.items.retain(|item| item.source != source);
+        self.items.extend(items);
+        self.refilter();
+        cx.notify();
+    }
+
+    /// Records that the server truncated its list.
+    ///
+    /// Sticky within one popup on purpose. A server that answers a re-request with a
+    /// complete list has genuinely finished, so this is set from each response rather than
+    /// only ever raised — passing `false` clears it and the popup goes back to filtering
+    /// locally, which is the cheaper path and the one the protocol asks for.
+    pub fn set_incomplete(&mut self, incomplete: bool) {
+        self.incomplete = incomplete;
+    }
+
     /// Marks every source as having reported, so "No matches" becomes sayable.
     pub fn mark_loaded(&mut self, cx: &mut Context<Self>) {
         self.loaded = true;
         cx.notify();
+    }
+
+    /// Whether every source has reported.
+    ///
+    /// Read by the workspace before closing an empty character-triggered popup: emptiness
+    /// only means "there is nothing here" once nobody is still looking.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
 
     /// Replaces the query, for a source that knows the typed span better than the opener did.
@@ -222,14 +328,22 @@ impl CompletionPopup {
 
     /// Extends the query by a character the user typed in the editor.
     ///
-    /// Returns whether anything still matches. The caller dismisses on `false`: a popup
-    /// showing "No matches" while the user keeps typing code is a popup in the way, and
-    /// every editor closes rather than sitting there empty.
+    /// Returns whether the popup should stay open. Normally that is "does anything still
+    /// match": a popup showing "No matches" while the user keeps typing code is a popup in
+    /// the way, and every editor closes rather than sitting there empty.
+    ///
+    /// **Unless the list is incomplete**, in which case an empty filter result is not
+    /// evidence of anything. The server truncated its answer, so the rows that match the
+    /// longer prefix may simply be the ones it cut — and closing here would delete a popup
+    /// that is about to be refilled by the re-request the caller is issuing. This is the
+    /// concrete failure the flag prevents, and it is not hypothetical: at `str` the measured
+    /// response was 100 items with `isIncomplete: true`, and the local filter for `strl`
+    /// found 1 of the 100 while the server's own answer for `strl` had 100.
     pub fn push_query(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         self.query.push_str(text);
         self.refilter();
         cx.notify();
-        !self.filtered.is_empty()
+        self.incomplete || !self.filtered.is_empty()
     }
 
     /// Shortens the query by one character, for a backspace in the editor.
@@ -381,6 +495,11 @@ impl Render for CompletionPopup {
                     .text_color(theme.text_muted)
                     // The distinction the palette makes for the same reason: with sources
                     // still answering, "No matches" is a claim nobody has established.
+                    //
+                    // A character-triggered popup reaches here only for the instant before
+                    // the workspace closes it — the empty case is *its* answer, not a
+                    // message. Rendering the same text either way would flash "No
+                    // completions" over the cursor on every `->` typed inside a comment.
                     .child(if self.loaded { "No completions" } else { "Completing…" })
                     .into_any_element()
             } else {
@@ -521,7 +640,7 @@ fn prefix_match(haystack: &str, needle: &str) -> bool {
 
 /// The word already typed before `offset`, which is what the popup opens pre-filtered by.
 ///
-/// Without this, pressing ⌃space in the middle of `str|` would offer every symbol in the
+/// Without this, invoking completion in the middle of `str|` would offer every symbol in the
 /// project rather than the ones starting `str`. The server is asked at the *cursor* and
 /// answers with the whole set for that position; the prefix is applied on our side, which is
 /// also what makes filtering-as-you-type work without a second request per keystroke.
@@ -721,5 +840,14 @@ mod tests {
         assert_eq!(popup_height(1), Metrics::ROW_HEIGHT);
         assert_eq!(popup_height(1000), Metrics::ROW_HEIGHT * MAX_VISIBLE_ROWS);
         assert_eq!(popup_height(0), Metrics::ROW_HEIGHT, "empty still shows a status line");
+    }
+
+    #[test]
+    fn only_a_deliberate_invoke_reports_that_there_is_nothing() {
+        // The asymmetry a trigger introduces, and the reason the two are distinguished at
+        // all. ⌥⌘I with nothing to offer must say so — silence reads as a broken key. A `->`
+        // typed inside a comment must not, because the user asked no question.
+        assert!(CompletionTrigger::Invoked.reports_emptiness());
+        assert!(!CompletionTrigger::Character.reports_emptiness());
     }
 }

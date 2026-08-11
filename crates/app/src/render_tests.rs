@@ -1467,7 +1467,7 @@ async fn searching_with_no_folder_open_renders_a_hint_rather_than_no_results(
 // still receives text while the popup holds focus, an accepted item replaces the word being
 // typed rather than appending to it, and no source answering stays silent.
 
-/// Opens a PHP file and returns the workspace, ready for ⌃space.
+/// Opens a PHP file and returns the workspace, ready for an explicit completion invoke.
 fn open_php(workspace: &gpui::Entity<WorkspaceView>, cx: &mut VisualTestContext) {
     workspace.update_in(cx, |workspace, window, cx| {
         let document =
@@ -1504,7 +1504,7 @@ async fn the_completion_popup_renders_with_items_from_both_sources(cx: &mut Test
 
     let popup = workspace
         .read_with(cx, |workspace, _cx| workspace.completion_for_test())
-        .expect("⌃space in an open PHP file opens the popup");
+        .expect("invoking completion in an open PHP file opens the popup");
 
     workspace.update(cx, |workspace, cx| {
         workspace.offer_completions_for_test(
@@ -1551,7 +1551,7 @@ async fn the_popup_renders_while_its_sources_are_still_answering(cx: &mut TestAp
 async fn typing_while_the_popup_is_open_still_reaches_the_buffer(cx: &mut TestAppContext) {
     // The failure this popup exists to avoid. The popup holds keyboard focus — that is what
     // makes its arrows work without stealing the editor's — so a character typed while it is
-    // open arrives at the *popup*. If it stopped there, ⌃space would become a mode where
+    // open arrives at the *popup*. If it stopped there, completion would become a mode where
     // typing is silently swallowed.
     install_theme(cx);
     let registry = registry();
@@ -1616,6 +1616,267 @@ async fn typing_past_every_match_closes_the_popup(cx: &mut TestAppContext) {
     );
     let text = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
     assert!(text.contains("$user->z"), "the keystroke is not lost on the way out: {text:?}");
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn a_typed_character_opens_no_popup_when_no_server_declared_any_trigger(
+    cx: &mut TestAppContext,
+) {
+    // The default state of the app and of every non-PHP project: no language server, so no
+    // declared triggers, so typing must behave exactly as it did before #61 existed.
+    //
+    // This is the honest headless test of the trigger path. `is_completion_trigger` consults
+    // a live client's capabilities, and there is no server in a `gpui::test` — so what can be
+    // established here is the *negative*, and it is worth establishing because the failure it
+    // rules out is a popup opening on every `>` typed by a user who has no PHP server at all.
+    // The positive case is covered against a real Intelephense in
+    // `crates/lsp/tests/real_server.rs::a_real_server_declares_its_own_trigger_characters`.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.read_with(cx, |workspace, _cx| {
+        // Every character Intelephense declares, none of which anything here has been told
+        // about. A hardcoded list anywhere in the trigger path makes each of these true.
+        for character in ["$", ">", ":", "\\", "/", "'", "\"", "*", ".", "<", "-"] {
+            assert!(
+                !workspace.is_completion_trigger_for_test(character),
+                "{character:?} must not be a trigger with no server: a `true` here means the \
+                 list came from somewhere other than the server's own declaration"
+            );
+        }
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.editor_typed_for_test(">", window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "with no server there are no declared triggers, so nothing opens"
+    );
+
+    draw(cx);
+}
+
+#[test]
+fn a_trigger_opens_a_popup_only_when_declared_and_none_is_already_open() {
+    // Both halves of the rule, which is why this is a unit test on the predicate rather than
+    // a render test on the handler.
+    //
+    // The render-test version of this was **written first and was vacuous**: a headless test
+    // has no language server, so `is_completion_trigger` is always false there, and the
+    // handler returns at that check before ever reaching the already-open guard. Deleting the
+    // guard left the test passing. That is the trap CONTEXT.md describes, caught here by
+    // deleting the guard and watching nothing fail — so the rule was extracted into
+    // `should_open_on_trigger`, where both inputs can actually be varied.
+    assert!(
+        WorkspaceView::should_open_on_trigger_for_test(false, true),
+        "a declared trigger with no popup open must open one"
+    );
+    assert!(
+        !WorkspaceView::should_open_on_trigger_for_test(true, true),
+        "a declared trigger with a popup already open must not open a second: the keystroke \
+         belongs to `completion_typed`, and running both would double it in the query"
+    );
+    assert!(
+        !WorkspaceView::should_open_on_trigger_for_test(false, false),
+        "an undeclared character must never open a popup"
+    );
+    assert!(!WorkspaceView::should_open_on_trigger_for_test(true, false));
+}
+
+#[gpui::test]
+async fn the_editor_path_does_nothing_while_a_popup_is_open(cx: &mut TestAppContext) {
+    // The plumbing half of the rule above, through the real handler. It establishes less than
+    // its name might suggest — with no server the trigger check also declines — so the
+    // decision itself is pinned by the unit test above. What this adds is that the wiring
+    // does not insert, narrow, or replace the popup as a side effect.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("getName"), lsp_item("getAge")], cx);
+    });
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    let before = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.editor_typed_for_test("g", window, cx);
+    });
+
+    let after = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(before, after, "the editor path must not also insert while a popup is open");
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("the popup is still the same one");
+    popup.read_with(cx, |popup, _cx| {
+        assert_eq!(popup.visible_items().len(), 2, "and it must not have narrowed");
+    });
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn an_incomplete_list_stays_open_even_when_nothing_matches(cx: &mut TestAppContext) {
+    // The behaviour `is_incomplete` buys, and the reason it is not merely an optimisation.
+    //
+    // With a *complete* list, no matches means the user has typed past everything the server
+    // had and the popup closes. With an incomplete one it means nothing of the kind: the
+    // server truncated its answer, so the rows matching the longer prefix may be exactly the
+    // ones it cut. Closing there would delete a popup that the re-request is about to refill.
+    //
+    // Mutation-checked: making `push_query` ignore `incomplete` closes the popup here.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    // A truncated list, exactly as Intelephense sends one: a hundred rows that happen not to
+    // include the thing the user is about to type.
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_incomplete_completions_for_test(vec![lsp_item("STREAM_BUFFER_FULL")], cx);
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test("z", window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()),
+        "an incomplete list must survive a keystroke that matches none of it — the server's \
+         answer was never the whole answer"
+    );
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn a_complete_list_still_closes_when_nothing_matches(cx: &mut TestAppContext) {
+    // The other side of the branch above, and the reason it is a branch rather than a rule.
+    // Without this, `an_incomplete_list_stays_open_even_when_nothing_matches` would also pass
+    // against an implementation that simply never closed the popup.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(vec![lsp_item("STREAM_BUFFER_FULL")], cx);
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test("z", window, cx);
+    });
+
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_none()),
+        "a complete list that matches nothing has genuinely run out, so it closes"
+    );
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn backspacing_an_incomplete_list_keeps_the_popup_open(cx: &mut TestAppContext) {
+    // Backspace widens the prefix, which matches *more* — so a truncated list is even less
+    // of the answer than it was, and the popup must survive to be refilled. The complete-list
+    // rule is the opposite and unchanged: backspacing past where the popup opened closes it,
+    // because the user has left the word.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+        workspace.active_editor_for_test().expect("a file is open")
+    });
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_incomplete_completions_for_test(vec![lsp_item("STREAM_BUFFER_FULL")], cx);
+    });
+
+    // Type a character the list does not contain, then take it back. Both keystrokes have to
+    // reach the buffer, which is the half a filter-only implementation loses.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_typed_for_test("z", window, cx);
+    });
+    let typed = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(typed.contains("$user->z"), "the character reaches the buffer: {typed:?}");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.completion_backspace_for_test(window, cx);
+    });
+
+    let after = editor.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert!(!after.contains("$user->z"), "and the backspace removes it again: {after:?}");
+    assert!(
+        workspace.read_with(cx, |workspace, _cx| workspace.completion_for_test().is_some()),
+        "an incomplete list must survive the backspace that widens its prefix"
+    );
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn a_fresh_answer_replaces_the_servers_previous_one_rather_than_stacking(
+    cx: &mut TestAppContext,
+) {
+    // What the re-request would corrupt if it appended. The second answer describes the same
+    // source at a longer prefix, so the first is stale — and because filtering preserves
+    // source order, appending would leave the stale rows sorting *ahead* of the fresh ones.
+    //
+    // The route item is the control: a re-request to the language server must not delete what
+    // Laravel found, because nothing re-asked Laravel.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+    open_php(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_completions_for_test(
+            vec![
+                CompletionItem::new("users.show".to_string(), CompletionSource::LaravelRoute),
+                lsp_item("STREAM_BUFFER_FULL"),
+            ],
+            cx,
+        );
+    });
+
+    // The server answers again, as it does after a keystroke on an incomplete list.
+    workspace.update(cx, |workspace, cx| {
+        workspace.offer_incomplete_completions_for_test(vec![lsp_item("strlen")], cx);
+    });
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("the popup is still open");
+    popup.read_with(cx, |popup, _cx| {
+        let labels: Vec<&str> = popup.visible_items().iter().map(|i| i.label.as_ref()).collect();
+        assert!(
+            !labels.contains(&"STREAM_BUFFER_FULL"),
+            "the server's stale answer must be gone, not stacked underneath: {labels:?}"
+        );
+        assert!(labels.contains(&"strlen"), "the fresh answer must be there: {labels:?}");
+        assert!(
+            labels.contains(&"users.show"),
+            "and the other source must survive a re-request it was not part of: {labels:?}"
+        );
+    });
 
     draw(cx);
 }

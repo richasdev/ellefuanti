@@ -265,6 +265,16 @@ impl Lsp {
         self.client.as_mut()
     }
 
+    /// The client for a caller that only reads — capabilities, liveness.
+    ///
+    /// Separate from [`Self::client_mut`] so asking "what did the server declare?" does not
+    /// need a mutable borrow of the whole session. The trigger-character check (#61) runs on
+    /// every keystroke from inside a `&self` context, and taking `&mut` there would conflict
+    /// with the editor borrow the same handler holds.
+    pub fn client(&self) -> Option<&Client> {
+        self.client.as_ref()
+    }
+
     pub fn diagnostics_for(&self, uri: &Uri) -> Option<&FileDiagnostics> {
         self.diagnostics.get(uri)
     }

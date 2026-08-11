@@ -76,8 +76,9 @@ actions!(
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
-        // Completion (#61). `Complete` is ⌃space and opens the popup at the cursor with
-        // every source that has something to say.
+        // Completion (#61). `Complete` is ⌥⌘I and opens the popup at the cursor with every
+        // source that has something to say. Not ⌃space, which macOS intercepts — the chord
+        // is chosen and justified where it is bound, below.
         //
         // `CompleteLaravel` is kept and is no longer bound to a key: #83 registered it as a
         // palette *command* (`laravel.route_name`), so removing it would delete a row from
@@ -181,14 +182,47 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("f12", GoToDefinition, Some(context::WORKSPACE)),
         KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
-        // ⌃space is the universal "complete here". It opened #83's route-name palette until
-        // #61; it now opens the popup, which asks the language server *and* Laravel and
-        // shows both in one list with their sources marked.
+        // Explicit "complete here". It opened #83's route-name palette until #61; it now
+        // opens the popup, which asks the language server *and* Laravel and shows both in
+        // one list with their sources marked.
+        //
+        // # Why this is not ⌃space, which is what every other editor uses
+        //
+        // **macOS takes ⌃space before the app ever sees it.** It is bound system-wide to
+        // "select the previous input source", and on a machine with more than one keyboard
+        // layout installed pressing it switches language instead of reaching us. That is not
+        // an exotic configuration — it is every user who types in more than one language,
+        // which is most users outside the US. The popup shipped in #118 was therefore
+        // *unreachable* by keyboard for them.
+        //
+        // The replacement was checked against the system table rather than guessed, because
+        // a chord gpui accepts is not the same as a chord the OS delivers — the same lesson
+        // #104 learned checking gpui's own `keymap.rs` for context shadowing before binding
+        // ⌘W in the terminal. Reading `com.apple.symbolichotkeys` on the reporting machine,
+        // **every** modifier combination on the spacebar is already claimed and enabled:
+        //
+        // | id  | chord   | macOS uses it for              |
+        // | --- | ------- | ------------------------------ |
+        // | 60  | ⌃space  | select the previous input source |
+        // | 61  | ⌃⌥space | select the next input source   |
+        // | 64  | ⌘space  | Spotlight                      |
+        // | 65  | ⌥⌘space | Finder search window           |
+        // | 156 | ⌃⇧space | the character picker           |
+        //
+        // ⌥⌘space was the first choice and id 65 rules it out, so the nearest free chord
+        // wins instead: ⌥⌘I is absent from that table entirely and unbound anywhere in this
+        // keymap. It keeps the ⌥⌘ shape that was asked for and gives up only the mnemonic
+        // of the spacebar, which was never available.
+        //
+        // **Trigger characters are the real answer to this.** Typing `->` opens the popup
+        // with no chord at all (see `WorkspaceView::editor_typed`), so completion works for
+        // a user whose every spacebar chord is spoken for. This binding is the deliberate
+        // invoke on top of that, not the only way in.
         //
         // Still workspace-scoped rather than editor-scoped, matching every other binding
         // that acts on the active tab. It is silent with no tab and no server, which stays
         // the common case (#74).
-        KeyBinding::new("ctrl-space", Complete, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-alt-i", Complete, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl--", NavigateBack, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift--", NavigateForward, Some(context::WORKSPACE)),
         // ctrl-` is the conventional terminal toggle. It is bound workspace-wide so it
@@ -508,22 +542,59 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_space_opens_the_general_completion_rather_than_only_laravel_routes() {
-        // #83 bound ⌃space to `CompleteLaravel` because no popup existed. #61 is the popup,
-        // and the key has to reach it — otherwise the feature ships unreachable, which is
-        // the kind of thing that passes every other test in this file.
+    fn the_explicit_completion_chord_opens_the_general_popup_not_only_laravel_routes() {
+        // #83 bound the explicit chord to `CompleteLaravel` because no popup existed. #61 is
+        // the popup, and the key has to reach it — otherwise the feature ships unreachable,
+        // which is the kind of thing that passes every other test in this file.
+        //
+        // Found by action rather than by chord, so retargeting the binding does not silently
+        // stop testing anything: the property is "whatever key invokes completion reaches
+        // `Complete`", and it holds whichever chord that turns out to be.
         let source = keymap_source();
         let binding = source
             .lines()
             .map(str::trim)
-            .find(|line| line.contains("\"ctrl-space\"") && !line.starts_with("//"))
-            .expect("⌃space must still be bound");
+            .find(|line| line.contains("Complete,") && line.contains("context::WORKSPACE"))
+            .expect("some chord must invoke completion");
 
-        assert!(binding.contains("Complete,"), "⌃space must open the popup, got: {binding}");
         assert!(
             !binding.contains("CompleteLaravel"),
-            "⌃space must no longer be the route-name-only path: {binding}"
+            "the completion chord must no longer be the route-name-only path: {binding}"
         );
+    }
+
+    #[test]
+    fn the_completion_chord_is_one_macos_actually_delivers() {
+        // The bug this is here to keep fixed: #118 bound ⌃space, which macOS intercepts
+        // system-wide as "select the previous input source". On any machine with a second
+        // keyboard layout installed — most machines outside the US — the keystroke never
+        // reached the app and the popup was unreachable by keyboard.
+        //
+        // Read from `com.apple.symbolichotkeys` on the reporting machine, *every* modifier
+        // combination on the spacebar is claimed and enabled: ⌃space (60), ⌃⌥space (61),
+        // ⌘space (64, Spotlight), ⌥⌘space (65, Finder search) and ⌃⇧space (156). So the rule
+        // is not "avoid ⌃space", it is **avoid the spacebar entirely** for this action.
+        //
+        // A list of forbidden chords rather than an assertion about the one we chose: the
+        // next person to retarget this needs to be stopped from reaching for the spacebar
+        // again, and naming only the current binding would not do that.
+        const CLAIMED_BY_MACOS: [&str; 5] =
+            ["ctrl-space", "ctrl-alt-space", "cmd-space", "cmd-alt-space", "ctrl-shift-space"];
+
+        let source = keymap_source();
+        let binding = source
+            .lines()
+            .map(str::trim)
+            .find(|line| line.contains("Complete,") && line.contains("context::WORKSPACE"))
+            .expect("some chord must invoke completion");
+
+        for chord in CLAIMED_BY_MACOS {
+            assert!(
+                !binding.contains(&format!("\"{chord}\"")),
+                "macOS claims {chord} before the app sees it, so binding completion to it \
+                 ships the popup unreachable by keyboard: {binding}"
+            );
+        }
     }
 
     #[test]

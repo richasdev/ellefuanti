@@ -26,7 +26,8 @@ use crate::actions::{
     dispatch_for,
 };
 use crate::completion::{
-    CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, word_before,
+    CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, CompletionTrigger,
+    word_before,
 };
 use crate::editor::{Document, EditorEvent, EditorView, search_project};
 use crate::file_cache;
@@ -536,7 +537,7 @@ pub struct WorkspaceView {
     /// **A separate slot from [`Self::in_flight_query`] deliberately.** That one is shared
     /// by definition, references and symbols because those genuinely supersede each other —
     /// they are all "answer a question about the cursor" and a new one means the old answer
-    /// is unwanted. Completion is not one of those: pressing ⌃space while a
+    /// is unwanted. Completion is not one of those: invoking completion while a
     /// find-references sweep runs must not abandon the sweep, and typing a character while
     /// the popup is open must cancel the *previous completion* and nothing else. Sharing the
     /// slot would have made every keystroke in the popup cancel an unrelated navigation.
@@ -869,7 +870,7 @@ impl WorkspaceView {
         self.toggle_terminal(&ToggleTerminal, window, cx);
     }
 
-    /// ⌃space, through the real action handler, for the same reason (#61).
+    /// The explicit invoke, through the real action handler, for the same reason (#61).
     #[cfg(test)]
     pub fn complete_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.complete(&Complete, window, cx);
@@ -957,6 +958,59 @@ impl WorkspaceView {
                 popup.mark_loaded(cx);
             });
         }
+    }
+
+    /// Feeds the popup an answer the server called *incomplete*, as Intelephense does.
+    ///
+    /// Separate from [`Self::offer_completions_for_test`] rather than a boolean on it,
+    /// because the two describe different server behaviour and a test naming which one it
+    /// means is a test that says what it is about.
+    #[cfg(test)]
+    pub fn offer_incomplete_completions_for_test(
+        &mut self,
+        items: Vec<CompletionItem>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popup) = self.completion.clone() {
+            popup.update(cx, |popup, cx| {
+                popup.set_incomplete(true);
+                popup.replace_items(CompletionSource::Lsp, items, cx);
+                popup.mark_loaded(cx);
+            });
+        }
+    }
+
+    /// A character typed into the *editor* with no popup open — the trigger path (#61).
+    ///
+    /// Goes through the real `editor_typed`, so the test exercises the decision about
+    /// whether the character is a declared trigger rather than reimplementing it.
+    #[cfg(test)]
+    pub fn editor_typed_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_typed(text, window, cx);
+    }
+
+    /// Whether the server declared `text` a trigger, for a test that has no live server.
+    #[cfg(test)]
+    pub fn is_completion_trigger_for_test(&self, text: &str) -> bool {
+        self.is_completion_trigger(text)
+    }
+
+    /// The trigger-opening rule as a pure function, which is the only way both of its inputs
+    /// can be varied — see the test that explains why.
+    #[cfg(test)]
+    pub fn should_open_on_trigger_for_test(popup_is_open: bool, declared: bool) -> bool {
+        Self::should_open_on_trigger(popup_is_open, declared)
+    }
+
+    /// Backspace while the popup holds focus, through the real path.
+    #[cfg(test)]
+    pub fn completion_backspace_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.completion_backspace(window, cx);
     }
 
     #[cfg(test)]
@@ -1151,6 +1205,9 @@ impl WorkspaceView {
             // clicked position — which is both where the query is about and where Back
             // should return to.
             EditorEvent::GoToDefinition => this.go_to_definition_at_cursor(window, cx),
+            // A character reached the buffer. Only the workspace knows whether the server
+            // declared it a completion trigger, so only the workspace can decide (#61).
+            EditorEvent::Typed(text) => this.editor_typed(text, window, cx),
         })
         .detach();
         editor
@@ -2133,7 +2190,7 @@ impl WorkspaceView {
         self.toggle_palette(PaletteMode::Routes, window, cx);
     }
 
-    /// ⌃space: open the completion popup at the cursor (#61).
+    /// ⌥⌘I: open the completion popup at the cursor (#61).
     ///
     /// Both sources are asked, and each answers about a different thing: Laravel knows route
     /// names inside a `route('…')` and nothing else, the language server knows identifiers
@@ -2145,13 +2202,13 @@ impl WorkspaceView {
     /// and if nothing answered it closes itself rather than sitting there saying "No
     /// completions" about a question the user's setup cannot answer (#74, §24).
     fn complete(&mut self, _: &Complete, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_completion(window, cx);
+        self.open_completion(CompletionTrigger::Invoked, window, cx);
     }
 
     /// The `laravel.route_name` palette command (#83), now opening the popup.
     ///
     /// Kept as its own entry point because the command row exists and people may have
-    /// learned it; it is no longer bound to a key, since ⌃space is now the general
+    /// learned it; it is no longer bound to a key, since ⌥⌘I is now the general
     /// completion this command was standing in for.
     fn complete_laravel(
         &mut self,
@@ -2159,10 +2216,85 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_completion(window, cx);
+        self.open_completion(CompletionTrigger::Invoked, window, cx);
     }
 
     // --- completion (#61) ---------------------------------------------------------------
+
+    /// A character typed into the editor with no popup open: open one if the server asked.
+    ///
+    /// # Where the list of trigger characters comes from
+    ///
+    /// [`Capabilities::completion_triggers`](elle_lsp::Capabilities::completion_triggers),
+    /// which is the server's own declaration read off the `initialize` response. **Nothing
+    /// here knows that PHP spells member access `->`.** A real Intelephense declares
+    /// `["$", ">", ":", "\\", "/", "'", "\"", "*", ".", "<"]` — ten single characters, not
+    /// the two-character sequences a hardcoded implementation would have matched, which is
+    /// itself the argument against hardcoding: the obvious guess is the wrong shape.
+    ///
+    /// A different backend declaring a different set therefore works with no change here,
+    /// which is the substitutability RISKS.md #2 is about, and
+    /// `crates/app/tests/architecture.rs` fails the build if a backend name ever appears
+    /// alongside this logic.
+    ///
+    /// # Why a trigger is not just the explicit chord fired automatically
+    ///
+    /// It fires on every keystroke of a matching character in every context — inside a
+    /// string, inside a comment, in the middle of a word. Three things follow, and each is
+    /// handled somewhere different:
+    ///
+    /// - **Context.** Measured rather than guessed: against a real Intelephense, `->` inside
+    ///   a single-quoted string, a double-quoted string, a line comment and a block comment
+    ///   each returned **zero** items. The server already knows PHP's grammar and we do not
+    ///   need to re-derive it — attempting to would mean the editor holding a second, worse
+    ///   model of when a completion is appropriate. So the request goes out and the empty
+    ///   answer closes the popup.
+    /// - **Emptiness.** [`CompletionTrigger::Character`] does not render "No completions",
+    ///   because the answer to a question nobody asked is not worth a box.
+    /// - **Cost.** No debounce, and that is a measurement rather than a preference. On a
+    ///   10,061-file project with a 199 MB `vendor/`, the *first* completion request issued
+    ///   478 ms after spawning Intelephense answered in **15 ms**, and the warm p50 was
+    ///   1.4 ms. A 250 ms debounce — find-in-project's figure from #103 — would add sixteen
+    ///   times the measured cost as pure latency to hide work that is not there. #103's
+    ///   number is a fact about walking a directory tree, not a constant, and importing it
+    ///   here would be the mistake `BASELINE.md` opens by warning about.
+    fn editor_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Already open: this event cannot fire, because the popup holds focus and the
+        // character reaches `completion_typed` instead. Guarded anyway — the two paths
+        // narrowing the same popup would double every character in the query.
+        let declared = self.is_completion_trigger(text);
+        if !Self::should_open_on_trigger(self.completion.is_some(), declared) {
+            return;
+        }
+        self.open_completion(CompletionTrigger::Character, window, cx);
+    }
+
+    /// Whether a character typed in the editor should open a popup.
+    ///
+    /// Split out from [`Self::editor_typed`] as a pure predicate so both of its conditions
+    /// are testable, which they are not inside the handler: a headless test has no language
+    /// server, so `declared` is always false there and the already-open guard can never be
+    /// reached through the real path. That is not a hypothetical gap — the first version of
+    /// this was written inside `editor_typed`, and the test named for the already-open case
+    /// passed with the guard deleted.
+    ///
+    /// The ordering the caller uses is the cheap check first. This function states the rule
+    /// independently of that, so it stays true if the order ever changes.
+    fn should_open_on_trigger(popup_is_open: bool, declared: bool) -> bool {
+        declared && !popup_is_open
+    }
+
+    /// Whether the server declared `text` as a completion trigger.
+    ///
+    /// A whole-string comparison against each declared trigger rather than a per-character
+    /// scan. The specification lets a server declare a multi-character trigger, and a
+    /// `contains` over characters would fire on the `>` inside `=>` while claiming to
+    /// implement whatever the server actually said. One keystroke produces one `key_char`,
+    /// so equality is the honest test of "the user just typed this trigger".
+    fn is_completion_trigger(&self, text: &str) -> bool {
+        let Some(client) = self.lsp.client() else { return false };
+        client.capabilities().completion_triggers.iter().any(|trigger| trigger == text)
+    }
 
     /// Opens the popup at the cursor and asks every source.
     ///
@@ -2170,8 +2302,13 @@ impl WorkspaceView {
     /// synchronously available, because both sources are asynchronous and a popup that
     /// appears only once the server answers is a popup that appears after the user has
     /// typed three more characters. It fills in as answers land.
-    fn open_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A second ⌃space with the popup already open re-asks rather than toggling: the
+    fn open_completion(
+        &mut self,
+        trigger: CompletionTrigger,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A second invoke with the popup already open re-asks rather than toggling: the
         // list is not a panel being shown, it is an answer about a position, and pressing
         // the key again means "I have typed since you asked".
         self.dismiss_completion(window, cx);
@@ -2188,7 +2325,7 @@ impl WorkspaceView {
 
         let Some(origin) = self.completion_origin(&editor, window, cx) else { return };
 
-        let popup = cx.new(|cx| CompletionPopup::new(Vec::new(), prefix, origin, cx));
+        let popup = cx.new(|cx| CompletionPopup::new(Vec::new(), prefix, origin, trigger, cx));
         cx.subscribe_in(&popup, window, |this, _popup, event, window, cx| match event {
             CompletionEvent::Accepted(item) => this.accept_completion(item.clone(), window, cx),
             CompletionEvent::Dismissed => this.dismiss_completion(window, cx),
@@ -2225,8 +2362,34 @@ impl WorkspaceView {
         self.completion_word_start = Some((editor.clone(), word_start));
 
         self.request_route_completions(popup.clone(), cx);
-        self.request_lsp_completions(popup, offset, cx);
+        self.request_lsp_completions(popup, offset, window, cx);
         cx.notify();
+    }
+
+    /// Closes a character-triggered popup that every source has answered and left empty.
+    ///
+    /// The three conditions are each load-bearing and none is redundant:
+    ///
+    /// - **Triggered by a character**, not invoked. ⌥⌘I must still show "No completions",
+    ///   because the user asked and silence would read as a dead keybinding.
+    /// - **Loaded**, so this is not fired while a source is still thinking. Closing early
+    ///   would make the popup flicker shut just as the server's answer lands.
+    /// - **Empty**, which is the whole point.
+    ///
+    /// This is where the string-and-comment question is answered, and the answer is that we
+    /// do not answer it — the *server* does. Intelephense returns nothing for `->` inside a
+    /// string or a comment, so no popup appears there, and it does so knowing PHP's grammar
+    /// including heredocs, interpolation and nested comments. Re-deriving that here would
+    /// mean the editor keeping a second, worse model of PHP syntax and disagreeing with the
+    /// server about it, which is the same class of confident wrongness RISKS.md #4 forbids.
+    fn close_if_empty_trigger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(popup) = self.completion.clone() else { return };
+        let popup = popup.read(cx);
+        let should_close =
+            !popup.trigger().reports_emptiness() && popup.is_loaded() && popup.is_empty();
+        if should_close {
+            self.dismiss_completion(window, cx);
+        }
     }
 
     /// Where on screen the popup goes, in window coordinates.
@@ -2301,7 +2464,7 @@ impl WorkspaceView {
         // up on names with a dot, which is most of them.
         //
         // The cursor must be *inside* the literal, both ends. `reference_at` matches
-        // inclusively on `start..=end`, so ⌃space with the caret mid-name — after `users.`
+        // inclusively on `start..=end`, so an invoke with the caret mid-name — after `users.`
         // in an existing `route('users.show')` — is reachable, and there the text after the
         // cursor is not part of what the accept replaces. Taking the whole literal as the
         // query while replacing only `start..cursor` gives `users.showshow`: the same
@@ -2333,10 +2496,14 @@ impl WorkspaceView {
     /// since it was written. The non-blocking variant is what #61 asks for: the request is
     /// issued, its id is kept, and the *next* keystroke sends `$/cancelRequest` for it
     /// before issuing its own. Nothing queues.
+    ///
+    /// Takes a `Window` because the continuation may need to *close* the popup — a trigger
+    /// that found nothing — and dismissing moves focus back to the editor.
     fn request_lsp_completions(
         &mut self,
         popup: Entity<CompletionPopup>,
         offset: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // No server is the common case and stays silent — the popup shows whatever Laravel
@@ -2367,7 +2534,7 @@ impl WorkspaceView {
         };
 
         let query = id.clone();
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let found = Self::poll_query::<CompletionResponse>(&this, &query, cx).await;
             // Compare before clearing. An unconditional clear lets a slow task wipe the slot
             // belonging to the request that *superseded* it, after which the next keystroke
@@ -2379,23 +2546,35 @@ impl WorkspaceView {
             })
             .ok();
 
-            let items = match found {
+            let (items, incomplete) = match found {
                 Ok(Some(response)) => completion_items(response),
                 // No answer is an ordinary outcome — a keyword, a comment, a position the
                 // server has nothing for. The popup simply has no LSP rows.
-                Ok(None) => Vec::new(),
+                Ok(None) => (Vec::new(), false),
                 Err(err) => {
                     tracing::debug!("completion request failed: {err:#}");
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             };
 
             popup
                 .update(cx, |popup, cx| {
-                    popup.add_items(items, cx);
+                    // Replace rather than append: this may be a *re-request* for a longer
+                    // prefix, and the previous truncated answer describes a position the
+                    // user has typed past. Scoped to the LSP source so the route names
+                    // Laravel found — which nobody re-asked — survive.
+                    popup.set_incomplete(incomplete);
+                    popup.replace_items(CompletionSource::Lsp, items, cx);
                     popup.mark_loaded(cx);
                 })
                 .ok();
+
+            // A trigger that turned up nothing closes rather than reporting. This is the
+            // string-and-comment case: measured against a real Intelephense, `->` inside a
+            // string or either kind of comment answers with an empty list, and the honest
+            // rendering of "the server had nothing to say about a character you typed while
+            // writing code" is no popup at all.
+            this.update_in(cx, |this, window, cx| this.close_if_empty_trigger(window, cx)).ok();
         });
 
         // The cancel already happened, above, before the request went out.
@@ -2419,7 +2598,7 @@ impl WorkspaceView {
     /// A character typed while the popup has focus: insert it, and narrow the list.
     ///
     /// Both, and in that order. The popup holding focus must not mean the buffer stops
-    /// receiving text — that would make ⌃space a modal state where typing is swallowed,
+    /// receiving text — that would make the popup a modal state where typing is swallowed,
     /// which is the failure the palette-based stopgap had and the reason a popup was worth
     /// building.
     fn completion_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2454,6 +2633,55 @@ impl WorkspaceView {
         // #20, and it is what makes the cancellation real rather than nominal: without it,
         // fast typing leaves one `$/cancelRequest`-less request per keystroke on the server.
         self.supersede_completion_query();
+
+        // …and if the list on screen is a truncation, superseding is not enough: there has
+        // to be a *new* request, because the rows matching the longer prefix may be the ones
+        // the server cut off. See [`Self::rerequest_if_incomplete`].
+        self.rerequest_if_incomplete(&popup, window, cx);
+    }
+
+    /// Re-asks the server when it said its previous answer was truncated (#61).
+    ///
+    /// # Why filtering the list we already have is not good enough
+    ///
+    /// `isIncomplete: true` is the server saying "this is not the whole answer". Treating it
+    /// as though it were — narrowing the rows already on screen — silently under-reports, and
+    /// the size of the gap is not marginal. Measured against a real Intelephense on a
+    /// 10,061-file project:
+    ///
+    /// | prefix | server's own answer | filtering the previous answer |
+    /// | ------ | ------------------- | ----------------------------- |
+    /// | `str`  | 100 items, incomplete | —                           |
+    /// | `strl` | 100 items, incomplete | **1 item**                  |
+    ///
+    /// Both lists contain `strlen`, so this is not the popup showing something *wrong* — it
+    /// is the popup showing one row where the server had a hundred, because the other
+    /// ninety-nine sat past a cap the server re-ranks against each new prefix. Under-reporting
+    /// is the failure mode RISKS.md #4 names: a short list reads as "that is all there is".
+    ///
+    /// # Why this is affordable
+    ///
+    /// It fires per keystroke, so it is exactly the volume the cancellation machinery was
+    /// built for — and the preceding `supersede_completion_query` has already dropped the
+    /// task and sent `$/cancelRequest` before this issues anything. The measured cost of a
+    /// completion request against that same project was 1.4 ms at the warm median and 15 ms
+    /// for the very first request on a server 478 ms old, so there is no queue to build up.
+    fn rerequest_if_incomplete(
+        &mut self,
+        popup: &Entity<CompletionPopup>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !popup.read(cx).is_incomplete() {
+            return;
+        }
+        // The offset *after* the character just inserted, which is where the user now is.
+        // Reading it from the editor rather than tracking it here is deliberate: the buffer
+        // is the authority on where the caret ended up, and bracket auto-closing means an
+        // arithmetic guess would be wrong exactly when it mattered.
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let offset = editor.read(cx).document.selection.head;
+        self.request_lsp_completions(popup.clone(), offset, window, cx);
     }
 
     /// Backspace while the popup has focus: delete, and widen the list.
@@ -2473,6 +2701,9 @@ impl WorkspaceView {
         // Same reasoning as typing: the cursor moved, so an in-flight answer is about a
         // position that no longer exists.
         self.supersede_completion_query();
+        // And the same re-request, for the same reason in the other direction: a *shorter*
+        // prefix matches more, so a truncated list is even less of the answer than it was.
+        self.rerequest_if_incomplete(&popup, window, cx);
     }
 
     /// Drops a completion request whose answer is no longer wanted, without closing the
@@ -3511,16 +3742,20 @@ impl WorkspaceView {
 /// genuinely differ: Intelephense labels a method `getName` but can ask for `getName()` to
 /// be inserted, and a label like `strlen(string $string): int` is a signature to read rather
 /// than text to type.
-fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
-    let items = match response {
-        CompletionResponse::Array(items) => items,
-        // `is_incomplete` is dropped deliberately: it means "ask again as the user types",
-        // which is a re-request policy this popup does not have yet. Recording it and
-        // ignoring it would be worse than not carrying it — #20 is where it belongs.
-        CompletionResponse::List(list) => list.items,
+/// Returns the items and whether the server called its own list incomplete.
+///
+/// `is_incomplete` is carried now rather than dropped (#61's second half). It means "this is
+/// not the whole answer — ask again as the prefix grows", and against a real Intelephense on
+/// a 10,061-file project **every** bare-word completion set it, capped at exactly 100 items.
+/// A bare `Array` response has no such flag and is complete by definition, which is why the
+/// two arms differ rather than defaulting.
+fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool) {
+    let (items, incomplete) = match response {
+        CompletionResponse::Array(items) => (items, false),
+        CompletionResponse::List(list) => (list.items, list.is_incomplete),
     };
 
-    items
+    let items = items
         .into_iter()
         .map(|item| {
             let insert = item.insert_text.clone().unwrap_or_else(|| item.label.clone());
@@ -3528,7 +3763,9 @@ fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
                 .with_insert(insert)
                 .with_detail(item.detail)
         })
-        .collect()
+        .collect();
+
+    (items, incomplete)
 }
 
 /// The status-bar text for the language server, which is usually nothing at all.
@@ -4268,6 +4505,53 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// A `CompletionList` carrying the server's own `isIncomplete`.
+    fn incomplete_list(labels: &[&str], is_incomplete: bool) -> CompletionResponse {
+        CompletionResponse::List(elle_lsp::lsp_types::CompletionList {
+            is_incomplete,
+            items: labels
+                .iter()
+                .map(|label| elle_lsp::lsp_types::CompletionItem {
+                    label: (*label).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn the_servers_incompleteness_survives_the_trip_off_the_wire() {
+        // The flag #61's re-request is driven by, tested where it is actually decoded.
+        //
+        // This is a unit test rather than a render test for a reason worth recording: this
+        // function only runs with a live server, so **no headless test reaches it**. Making
+        // `completion_items` return `false` unconditionally left the entire 1000-test suite
+        // green — checked, not assumed — which is exactly the vacuum this repository keeps
+        // finding. The decode is pure, so it can be tested directly, and now is.
+        let (items, incomplete) = completion_items(incomplete_list(&["strlen", "strpos"], true));
+        assert_eq!(items.len(), 2);
+        assert!(incomplete, "a truncated list must be reported as truncated");
+        assert!(items.iter().all(|item| item.source == CompletionSource::Lsp));
+
+        let (_, complete) = completion_items(incomplete_list(&["strlen"], false));
+        assert!(!complete, "and a complete one must not be");
+    }
+
+    #[test]
+    fn a_bare_array_response_is_complete_by_definition() {
+        // The protocol gives an `Array` response no `isIncomplete` field at all, so there is
+        // nothing to read and the honest default is "this is the whole answer". Defaulting
+        // the other way would make every such server re-requested on every keystroke for no
+        // reason.
+        let response = CompletionResponse::Array(vec![elle_lsp::lsp_types::CompletionItem {
+            label: "strlen".into(),
+            ..Default::default()
+        }]);
+        let (items, incomplete) = completion_items(response);
+        assert_eq!(items.len(), 1);
+        assert!(!incomplete);
+    }
 
     /// `render_activity_bar` zips its panel list against `icons::ACTIVITY_ICONS`, and `zip`
     /// stops at the shorter side — so adding a panel without adding an icon would silently
@@ -5047,7 +5331,7 @@ mod laravel_navigation_tests {
 
     /// An empty `route('')` is the normal state when someone has just typed the call and
     /// wants the list. It must read as a route reference with an empty name rather than as
-    /// no reference at all, or ⌃space would do nothing exactly when it is most wanted.
+    /// no reference at all, or completion would do nothing exactly when it is most wanted.
     #[test]
     fn an_empty_route_literal_still_opens_the_completion() {
         let source = "<?php\n$url = route('');\n";
