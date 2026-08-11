@@ -3329,6 +3329,52 @@ async fn confirming_an_artisan_row_opens_the_terminal_to_type_into(cx: &mut Test
     draw(cx);
 }
 
+/// With no server, mid-word invoke offers the buffer's own words (#20).
+///
+/// The degradation path: Intelephense not installed, the user types `$user` and invokes
+/// — the file's identifiers are the honest answer. The trigger-char path stays empty on
+/// purpose (`$user->` has no typed word, and with no signal every word is noise) — the
+/// `typed.is_empty()` guard in `offer_buffer_words`, which the popup layout tests pin by
+/// still expecting exactly their offered rows.
+#[gpui::test]
+async fn a_mid_word_invoke_with_no_server_offers_buffer_words(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        let text = "<?php\n$username = 1;\n$user\n";
+        let document =
+            Document::new(Some(std::path::PathBuf::from("User.php")), text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        if let Some(editor) = workspace.active_editor_for_test() {
+            editor.update(cx, |editor, _cx| {
+                let end = text.rfind("$user").unwrap() + "$user".len();
+                editor.document.move_to(end, false);
+            });
+        }
+    });
+    draw(cx);
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    cx.run_until_parked();
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("popup open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        let username = items
+            .iter()
+            .find(|item| item.label.as_ref() == "username")
+            .expect("the file's identifier is offered");
+        assert!(matches!(username.source, CompletionSource::Buffer));
+        assert!(
+            !items.iter().any(|item| item.label.as_ref() == "user"),
+            "the word being typed is not offered back"
+        );
+    });
+
+    draw(cx);
+}
+
 /// Saving a model rebuilds the Laravel index, so completions track the buffer (#21).
 ///
 /// The staleness that matters in practice: the index was built at folder open, the user

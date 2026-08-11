@@ -3094,6 +3094,36 @@ impl WorkspaceView {
         self.jobs.start(Job::CompletionColumns, task);
     }
 
+    /// Adds the buffer's own words to the popup — the no-server degradation (#20).
+    ///
+    /// Synchronous: the words come from the buffer already in memory, so there is no IO
+    /// to move off the main thread, and a task would only add a frame of latency to the
+    /// exact case (no server) where this is the whole list.
+    fn offer_buffer_words(
+        &mut self,
+        popup: &Entity<CompletionPopup>,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_editor() else { return };
+        let text = editor.read(cx).document.buffer.text();
+        let typed = crate::completion::word_before(&text, offset);
+        // The typed word is the only signal this source has. With none — the cursor
+        // after `$user->`, say — every word of the file is noise, so nothing is offered;
+        // mid-word (⌘⌥I on `use|`) is the moment this list is an answer.
+        if typed.is_empty() {
+            return;
+        }
+        let items: Vec<CompletionItem> = crate::completion::buffer_words(&text, typed)
+            .into_iter()
+            .map(|word| CompletionItem::new(word, CompletionSource::Buffer))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        popup.update(cx, |popup, cx| popup.add_items(items, cx));
+    }
+
     /// Asks the language server, without blocking, and cancels whatever it supersedes.
     ///
     /// This is the first caller of `request_completion` (#45), which has existed uncalled
@@ -3110,9 +3140,11 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // No server is the common case and stays silent — the popup shows whatever Laravel
-        // found, or closes. It must not say "no language server" (#74).
+        // No server is the common case and stays silent — it must not say "no language
+        // server" (#74). What it degrades to is the buffer's own words (#20): the weakest
+        // source, but a popup of this file's identifiers beats a popup of nothing.
         let Some((uri, _)) = self.navigation_origin(cx) else {
+            self.offer_buffer_words(&popup, offset, cx);
             popup.update(cx, |popup, cx| popup.mark_loaded(cx));
             return;
         };
@@ -3127,6 +3159,9 @@ impl WorkspaceView {
         let text = self.active_editor().map(|editor| editor.read(cx).document.buffer.text());
 
         let Some(client) = self.lsp.client_mut() else {
+            // Same degradation as above — an origin without a live client is still a
+            // buffer full of words.
+            self.offer_buffer_words(&popup, offset, cx);
             popup.update(cx, |popup, cx| popup.mark_loaded(cx));
             return;
         };
