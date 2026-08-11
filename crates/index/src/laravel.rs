@@ -142,10 +142,10 @@ fn snake_plural(class: &str) -> String {
         }
         snake.extend(c.to_lowercase());
     }
-    if let Some(stem) = snake.strip_suffix('y') {
-        if !stem.ends_with(['a', 'e', 'i', 'o', 'u']) {
-            return format!("{stem}ies");
-        }
+    if let Some(stem) = snake.strip_suffix('y')
+        && !stem.ends_with(['a', 'e', 'i', 'o', 'u'])
+    {
+        return format!("{stem}ies");
     }
     format!("{snake}s")
 }
