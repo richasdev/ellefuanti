@@ -3368,6 +3368,64 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     draw(cx);
 }
 
+/// The branch palette lists the repo's branches and confirming switches (#64).
+///
+/// Through a real repository — the dirty-tree refusal is the crate's and is proven
+/// there; what this pins is the wiring: branches arrive labelled, the current one
+/// marked, and confirm really moves HEAD.
+#[gpui::test]
+async fn the_branch_palette_lists_and_switches(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let run = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?}"
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@t"]);
+    run(&["config", "user.name", "t"]);
+    std::fs::write(dir.path().join("a.php"), "<?php\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "init"]);
+    run(&["branch", "-M", "main"]);
+    run(&["branch", "feature"]);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.toggle_palette_for_test(crate::palette::PaletteMode::Branches, window, cx);
+    });
+    cx.run_until_parked();
+
+    let labels = workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
+    assert!(labels.contains(&"main  ✓".to_string()), "current marked: {labels:?}");
+    assert!(labels.contains(&"feature".to_string()));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.confirm_palette_for_test("feature", window, cx);
+    });
+    cx.run_until_parked();
+
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["branch", "--show-current"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feature", "HEAD really moved");
+
+    draw(cx);
+}
+
 /// The Database panel reads the project's sqlite schema when shown (#65).
 ///
 /// What this pins: showing the panel is what loads (the baseline assert says the state

@@ -175,6 +175,12 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("editor.quick_fix", "Quick Fix…"),
     // #82. Fold/unfold-at-cursor are chords (⌥⌘[ / ⌥⌘]); the all-variants are the ones
     // worth a palette name.
+    // #64 item 5, the safe half: fetch/push touch no working-tree file, and switch
+    // refuses a dirty tree outright. Force push and stash stay unbuilt behind the
+    // danger note — a force flag that does not exist cannot be run.
+    Command::new("git.fetch", "Git: Fetch"),
+    Command::new("git.push", "Git: Push"),
+    Command::new("git.switch_branch", "Git: Switch Branch…"),
     Command::new("editor.fold_all", "Fold All"),
     Command::new("editor.unfold_all", "Unfold All"),
     // #100: ⌘, is the panel; the file keeps a named door for the people who prefer it.

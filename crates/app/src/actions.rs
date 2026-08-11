@@ -461,6 +461,9 @@ pub enum Dispatch {
     QuickFix,
     FoldAll,
     UnfoldAll,
+    GitFetch,
+    GitPush,
+    GitSwitchBranch,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -500,6 +503,9 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "navigate.workspace_symbol" => Dispatch::GoToWorkspaceSymbol,
         "editor.rename" => Dispatch::RenameSymbol,
         "editor.quick_fix" => Dispatch::QuickFix,
+        "git.fetch" => Dispatch::GitFetch,
+        "git.push" => Dispatch::GitPush,
+        "git.switch_branch" => Dispatch::GitSwitchBranch,
         "editor.fold_all" => Dispatch::FoldAll,
         "editor.unfold_all" => Dispatch::UnfoldAll,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.

@@ -189,6 +189,68 @@ pub fn commit(root: &Path, message: &str) -> anyhow::Result<String> {
     Ok(stdout)
 }
 
+/// Fetches from the configured remotes, through the CLI like every write (#64).
+///
+/// Safe by construction: fetch updates remote-tracking refs and touches no working-tree
+/// file, so the danger note on this issue (uncommitted work is unrecoverable) does not
+/// reach it. Credentials come from the user's own git — ssh agent, credential helper —
+/// which is the entire reason this is the CLI and not libgit2's auth callbacks.
+pub fn fetch(root: &Path) -> anyhow::Result<String> {
+    run_git(root, &["fetch", "--prune"])
+}
+
+/// Pushes the current branch, plain. **There is no force flag on purpose** — a force
+/// push is one of the destructive operations #25 names, and the way to guarantee this
+/// panel never runs one is for the argument not to exist in the signature.
+pub fn push(root: &Path) -> anyhow::Result<String> {
+    run_git(root, &["push"])
+}
+
+/// Local branches, current first: `(name, is_current)`.
+pub fn branches(root: &Path) -> anyhow::Result<Vec<(String, bool)>> {
+    let out = run_git(root, &["branch", "--list", "--format=%(HEAD) %(refname:short)"])?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let current = line.starts_with('*');
+            let name = line.trim_start_matches(['*', ' ']).trim();
+            (!name.is_empty()).then(|| (name.to_string(), current))
+        })
+        .collect())
+}
+
+/// Switches to `name`, refusing outright if the working tree has any change.
+///
+/// Stricter than `git switch` on purpose: git carries compatible changes across, which
+/// is exactly the surprise the #64 danger note exists to prevent — a file that silently
+/// travelled to another branch is uncommitted work in a place the user did not put it.
+/// The refusal message says what to do instead of doing it for them.
+pub fn switch_branch(root: &Path, name: &str) -> anyhow::Result<String> {
+    let status = run_git(root, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        anyhow::bail!("the working tree has changes; commit or stash before switching");
+    }
+    run_git(root, &["switch", name])
+}
+
+/// One CLI call, stderr surfaced on failure — a remote's rejection message is for the
+/// user, same rule as commit's hook output.
+fn run_git(root: &Path, args: &[&str]) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .context("could not run git — is it installed?")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        anyhow::bail!("{}", if stderr.trim().is_empty() { stdout } else { stderr });
+    }
+    Ok(stdout)
+}
+
 pub fn discover_workdir(path: &Path) -> Option<PathBuf> {
     Repo::discover(path)?.workdir().map(Path::to_path_buf)
 }
@@ -221,6 +283,82 @@ mod write_tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "init"]);
         dir
+    }
+
+    #[test]
+    fn fetch_and_push_round_trip_through_a_local_remote() {
+        let dir = repo();
+        // A bare sibling as `origin` — file:// transport, no credentials involved.
+        let remote = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success(),
+                "git {args:?}"
+            );
+        };
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--bare", remote.path().to_str().unwrap()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        run(&["remote", "add", "origin", remote.path().to_str().unwrap()]);
+        run(&["branch", "-M", "main"]);
+        run(&["config", "push.default", "current"]);
+
+        push(dir.path()).expect("plain push to the bare remote");
+        fetch(dir.path()).expect("fetch after push");
+
+        // The remote really has the commit — read it back from the bare side.
+        let heads = Command::new("git")
+            .arg("-C")
+            .arg(remote.path())
+            .args(["log", "--oneline", "main"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&heads.stdout).contains("init"));
+    }
+
+    #[test]
+    fn branches_list_marks_the_current_one() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success()
+            );
+        };
+        run(&["branch", "-M", "main"]);
+        run(&["branch", "feature"]);
+        let mut all = branches(dir.path()).unwrap();
+        all.sort();
+        assert_eq!(all, [("feature".to_string(), false), ("main".to_string(), true)]);
+    }
+
+    #[test]
+    fn switching_with_a_dirty_tree_is_refused_whole() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success()
+            );
+        };
+        run(&["branch", "-M", "main"]);
+        run(&["branch", "feature"]);
+
+        std::fs::write(dir.path().join("a.php"), "<?php // edited
+").unwrap();
+        let refused = switch_branch(dir.path(), "feature");
+        assert!(refused.is_err(), "dirty tree must refuse — stricter than git, on purpose");
+        assert!(porcelain(dir.path()).contains("a.php"), "and the change is untouched");
+
+        // Clean tree: the switch goes through.
+        run(&["checkout", "--", "a.php"]);
+        switch_branch(dir.path(), "feature").expect("clean switch");
+        let current: Vec<_> =
+            branches(dir.path()).unwrap().into_iter().filter(|(_, cur)| *cur).collect();
+        assert_eq!(current[0].0, "feature");
     }
 
     fn porcelain(dir: &std::path::Path) -> String {
