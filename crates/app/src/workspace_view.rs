@@ -1464,6 +1464,7 @@ impl WorkspaceView {
     ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
+            self.clear_hover_cards(cx);
             // A file already open still has to move: "go to definition" on something in the
             // current file is the common case, and leaving the cursor where it was would
             // make the command look broken.
@@ -1737,6 +1738,7 @@ impl WorkspaceView {
             self.close_on_lsp(path);
         }
         self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
+        self.clear_hover_cards(cx);
         cx.notify();
     }
 
@@ -3638,6 +3640,26 @@ impl WorkspaceView {
         );
     }
 
+    /// Opens the context menu for the project root — the tree's empty space.
+    ///
+    /// The root has no row, so without this there is no way to create a file at the top
+    /// level of a project: every row-bound menu creates *inside* the clicked directory.
+    fn open_tree_root_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        self.pending =
+            Some(PendingFileAction { path: root, is_dir: true, kind: PendingKind::Menu });
+        self.show_overlay(
+            cx.new(|cx| Overlay::menu(context_menu::actions_for_root(), position, cx)),
+            window,
+            cx,
+        );
+    }
+
     /// Puts an overlay on screen, focuses it, and subscribes to what it reports.
     ///
     /// Everything that takes focus dismisses the completion popup first, for the reason
@@ -3760,6 +3782,14 @@ impl WorkspaceView {
         let path = pending.path.clone();
         let kind = pending.kind;
 
+        /// What the background half hands back, so the main thread knows which follow-up
+        /// the operation earned — created files open, renames retarget their tabs.
+        enum Outcome {
+            Created(PathBuf),
+            Renamed { from: PathBuf, to: PathBuf },
+            Nothing,
+        }
+
         let task = cx.spawn_in(window, async move |this, cx| {
             let name_for_op = name.clone();
             let done = cx
@@ -3767,18 +3797,19 @@ impl WorkspaceView {
                     match kind {
                         PendingKind::CreateFile => {
                             let target = path.join(name_for_op);
-                            elle_workspace::create_file(&target).map(|()| Some(target))
+                            elle_workspace::create_file(&target).map(|()| Outcome::Created(target))
                         }
                         PendingKind::CreateDirectory => {
-                            elle_workspace::create_directory(&path.join(name_for_op)).map(|()| None)
+                            elle_workspace::create_directory(&path.join(name_for_op))
+                                .map(|()| Outcome::Nothing)
                         }
-                        // Opening the renamed file would be wrong: the user was already
-                        // looking at whatever they were looking at.
-                        PendingKind::Rename => {
-                            elle_workspace::rename(&path, &name_for_op).map(|_| None)
-                        }
+                        // Not opened afterwards — the user was already looking at whatever
+                        // they were looking at — but any tab already showing it must follow
+                        // the file to its new name, which is what `Renamed` carries.
+                        PendingKind::Rename => elle_workspace::rename(&path, &name_for_op)
+                            .map(|to| Outcome::Renamed { from: path, to }),
                         // Unreachable: a delete never goes through the name prompt.
-                        PendingKind::Menu | PendingKind::Delete => Ok(None),
+                        PendingKind::Menu | PendingKind::Delete => Ok(Outcome::Nothing),
                     }
                 })
                 .await;
@@ -3788,12 +3819,15 @@ impl WorkspaceView {
                     // A new file is opened, because creating one and then having to find it
                     // in the tree is the kind of missing half-step that makes a feature feel
                     // unfinished. A new *folder* is not: there is nothing in it to show.
-                    Ok(created) => {
+                    Ok(Outcome::Created(target)) => {
                         this.refresh_tree(cx);
-                        if let Some(target) = created {
-                            this.open_path(target, window, cx);
-                        }
+                        this.open_path(target, window, cx);
                     }
+                    Ok(Outcome::Renamed { from, to }) => {
+                        this.refresh_tree(cx);
+                        this.retarget_tabs(&from, &to, cx);
+                    }
+                    Ok(Outcome::Nothing) => this.refresh_tree(cx),
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
                 cx.notify();
@@ -3801,6 +3835,84 @@ impl WorkspaceView {
             .ok();
         });
         self.jobs.start(Job::FileOperation, task);
+    }
+
+    /// Points every open tab under `from` at its new home under `to`.
+    ///
+    /// # Why a rename must chase the tabs
+    ///
+    /// A tab keeps the path it was opened with. Rename `User.php` to `User2.php` with its
+    /// tab open and the tab still says `User.php` — so the next ⌘S writes the buffer to the
+    /// *old* name, quietly resurrecting the file the user just renamed away. That is the
+    /// same undo-by-save the delete path had (see `close_tabs_under`), reached through the
+    /// other file operation. Delete closes the tabs; rename has a better option, because
+    /// the file still exists — the tab follows it.
+    ///
+    /// `from` may be a directory, in which case every tab underneath moves — renaming
+    /// `app/` must not strand a tab on `app/Models/User.php`.
+    ///
+    /// Following the file means three updates per tab, not one:
+    /// - the tab's own path, which is what ⌘S writes to;
+    /// - the document's path via `set_path`, which re-detects the language — renaming
+    ///   `notes.txt` to `notes.php` must start highlighting, the same rule save-as follows;
+    /// - the language server's book-keeping: the old URI is closed and the new one opened,
+    ///   because to the server a rename *is* those two events, and diagnostics keyed to the
+    ///   old URI would otherwise point at a file that no longer exists. The sync ledger
+    ///   entry goes with it.
+    fn retarget_tabs(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        // Decided first, applied second: the LSP calls below need `&mut self` and the
+        // decision needs the tabs — the same split every multi-tab operation here uses.
+        let moves: Vec<(usize, PathBuf)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let open = tab.path.as_deref()?;
+                if !is_under(open, from) {
+                    return None;
+                }
+                // Canonical forms for the arithmetic, not the raw ones: `is_under` already
+                // tolerates the two spellings of one file (`/var` vs `/private/var` — the
+                // tab keeps whatever opened it, the tree canonicalises), and comparing the
+                // raw paths right after would re-open the exact hole on the very next
+                // line. That happened: the first version of this closure did `open ==
+                // from` literally, and the retarget silently skipped every tab whose
+                // spelling differed — found by this function's own test, not by reading.
+                let real_open = canonical_prefix(open).ok()?;
+                let real_from = canonical_prefix(from).ok()?;
+                let new_path = if real_open == real_from {
+                    to.to_path_buf()
+                } else {
+                    // Inside a renamed directory: keep the remainder of the path.
+                    to.join(real_open.strip_prefix(&real_from).ok()?)
+                };
+                Some((index, new_path))
+            })
+            .collect();
+
+        for (index, new_path) in moves {
+            let old_path = self.tabs[index].path.clone();
+            if let Some(old) = old_path.as_deref() {
+                self.close_on_lsp(old);
+                self.lsp_synced.remove(old);
+            }
+
+            let text = self.tabs[index].editor.update(cx, |editor, cx| {
+                // A failed grammar load falls back to plain text inside `set_path`; the
+                // rename itself already happened on disk either way.
+                let _ = editor.document.set_path(new_path.clone());
+                cx.notify();
+                editor.document.buffer.text()
+            });
+
+            self.tabs[index].path = Some(new_path.clone());
+            self.open_on_lsp(&new_path, &text, cx);
+        }
     }
 
     /// The delete confirmation was accepted.
@@ -3869,6 +3981,21 @@ impl WorkspaceView {
         // Last first, so each removal cannot shift an index still to come.
         for index in doomed.into_iter().rev() {
             self.remove_tab(index, cx);
+        }
+    }
+
+    /// Drops every editor's hover card.
+    ///
+    /// Called when the active tab changes: the card is anchored at window coordinates that
+    /// meant something over the *previous* tab's text, and a tab revisited later must not
+    /// greet the user with a card about where their mouse rested minutes ago.
+    fn clear_hover_cards(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            tab.editor.update(cx, |editor, cx| {
+                if editor.hover_diagnostic.take().is_some() {
+                    cx.notify();
+                }
+            });
         }
     }
 
@@ -5038,10 +5165,48 @@ impl WorkspaceView {
                     None => div().into_any_element(),
                 },
                 Sidebar::Explorer => match self.tree.as_ref() {
+                    // Wrapped so the empty space *below* the rows is right-clickable: that
+                    // opens the root menu, which is the only way to create at the top
+                    // level (#126). Rows stop propagation, so this fires only for clicks
+                    // that miss every row. `flex_1` makes the wrapper own the leftover
+                    // height — a wrapper hugging the rows would leave the space below it
+                    // belonging to nothing.
                     Some(tree) if !tree.is_empty() => {
-                        self.render_tree_rows(tree.len(), theme, cx).into_any_element()
+                        let entity = cx.entity();
+                        div()
+                            // A flex column, not a block: the rows list sizes itself with
+                            // `flex_1`, which in a non-flex parent is the exact zero-height
+                            // resolution that made the completion popup invisible.
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.open_tree_root_menu(event.position, window, cx);
+                                });
+                            })
+                            .child(self.render_tree_rows(tree.len(), theme, cx))
+                            .into_any_element()
                     }
-                    _ => div()
+                    Some(_) => {
+                        // Open but empty: the menu is the only thing there is to offer.
+                        let entity = cx.entity();
+                        div()
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.open_tree_root_menu(event.position, window, cx);
+                                });
+                            })
+                            .child(
+                                div()
+                                    .p_3()
+                                    .text_color(theme.text_muted)
+                                    .child("Empty folder — right-click to create a file"),
+                            )
+                            .into_any_element()
+                    }
+                    None => div()
                         .p_3()
                         .text_color(theme.text_muted)
                         .child("Press ⌘O to open a folder")
@@ -5120,6 +5285,11 @@ impl WorkspaceView {
                                 // `left`/`top` mean window coordinates (the completion
                                 // popup is positioned the same way).
                                 .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                    // The wrapper behind the rows opens the *root* menu on
+                                    // the same event; without this, gpui's inside-out
+                                    // delivery would let it replace this row's menu a
+                                    // moment after it opened.
+                                    cx.stop_propagation();
                                     entity.update(cx, |this, cx| {
                                         this.open_tree_menu(index, event.position, window, cx);
                                     });
@@ -5187,6 +5357,11 @@ impl WorkspaceView {
             })
         })
         .flex_1()
+        // Recorded bounds for `the_file_tree_occupies_real_height`: this list rides
+        // `flex_1`, which resolves to zero height the moment an ancestor stops being a
+        // flex column — the completion popup shipped invisible through exactly that, and
+        // the root-menu wrapper added around this list is one refactor away from it.
+        .debug_selector(|| "file-tree-list".into())
     }
 
     fn render_tab_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5235,6 +5410,7 @@ impl WorkspaceView {
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                         entity.update(cx, |this, cx| {
                             this.active_tab = index;
+                            this.clear_hover_cards(cx);
                             cx.notify();
                         });
                     })

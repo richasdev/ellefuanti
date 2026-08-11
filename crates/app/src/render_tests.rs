@@ -2668,3 +2668,86 @@ async fn hovering_a_diagnostic_shows_its_message_and_leaving_hides_it(cx: &mut T
 
     draw(cx);
 }
+
+/// The file tree lays out at a real height.
+///
+/// Guards the wrapper the root context menu added around the rows: the list sizes itself
+/// with `flex_1`, and `flex_1` inside a parent that is not a flex column resolves to zero
+/// height — the resolution that shipped the invisible completion popup. Unlike the
+/// truncation bug (ink escaping a correctly-sized box, which bounds cannot see), a
+/// collapsed container is exactly what `debug_bounds` measures.
+#[gpui::test]
+async fn the_file_tree_occupies_real_height(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+    draw(cx);
+
+    let bounds = cx.debug_bounds("file-tree-list").expect("the tree is in the frame");
+    assert!(
+        bounds.size.height >= Metrics::ROW_HEIGHT,
+        "a tree with rows must be at least one row tall, got {:?}",
+        bounds.size.height
+    );
+}
+
+/// Renaming a file drags its open tab along — and the language follows the new name.
+///
+/// The hole this closes is save-resurrection, the same one `close_tabs_under` closed for
+/// delete: a tab keeps the path it was opened with, so renaming `notas.txt` to `User.php`
+/// with the tab open left ⌘S pointed at `notas.txt` — the next save would quietly recreate
+/// the file the user had just renamed away. The tab now follows the file, and because the
+/// retarget goes through `Document::set_path`, the buffer starts highlighting as PHP too,
+/// the same re-detection save-as performs.
+#[gpui::test]
+async fn renaming_an_open_file_retargets_its_tab(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let old_path = dir.path().join("notas.txt");
+    std::fs::write(&old_path, "<?php\nclass A {}\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(old_path.clone()), "<?php\nclass A {}\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        // Row order: `app` dir, then files alphabetically — `artisan`, `notas.txt`.
+        let row = workspace
+            .tree_names_for_test()
+            .iter()
+            .position(|name| name == "notas.txt")
+            .expect("the fixture file is in the tree");
+        workspace.right_click_tree_row_for_test(row, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Rename, window, cx);
+        workspace.confirm_name_for_test("Renamed.php", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("Renamed.php").exists());
+    assert!(!old_path.exists());
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the tab survived the rename");
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(
+            editor.document.path.as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("Renamed.php")),
+            "the document must follow the file, or the next save resurrects the old name"
+        );
+        assert_eq!(
+            editor.document.language(),
+            elle_syntax::Language::Php,
+            "a rename that changes the extension re-detects the language, like save-as"
+        );
+    });
+
+    draw(cx);
+}

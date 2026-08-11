@@ -78,6 +78,21 @@ impl MenuAction {
 /// A directory gets the creation actions because "new file" means "new file *in here*", and
 /// a file does not: creating a sibling from a file row is a guess about intent, and the
 /// directory the user wants is always one row up and visible.
+/// The entries offered for the project root, reached by right-clicking the tree's empty
+/// space — the only way to create something at the top level, since the root has no row.
+///
+/// No rename and no delete: the root is the open project itself. `fs::delete` refuses it
+/// anyway, but an entry that always errors is worse than no entry — it reads as broken
+/// rather than as impossible.
+pub fn actions_for_root() -> Vec<MenuAction> {
+    vec![
+        MenuAction::NewFile,
+        MenuAction::NewDirectory,
+        MenuAction::RevealInFinder,
+        MenuAction::CopyPath,
+    ]
+}
+
 pub fn actions_for(is_dir: bool) -> Vec<MenuAction> {
     let mut actions = Vec::new();
     if is_dir {
@@ -454,6 +469,16 @@ mod tests {
             assert!(actions.contains(&MenuAction::Rename), "rename must be offered");
             assert!(actions.contains(&MenuAction::Delete), "delete must be offered");
         }
+    }
+
+    #[test]
+    fn the_root_offers_creation_but_never_destruction() {
+        // The root is the open project. Renaming or deleting it from inside itself is
+        // refused by the fs layer, and an entry that always errors reads as broken.
+        let actions = actions_for_root();
+        assert!(actions.contains(&MenuAction::NewFile), "the root is where new files start");
+        assert!(!actions.contains(&MenuAction::Delete));
+        assert!(!actions.contains(&MenuAction::Rename));
     }
 
     #[test]

@@ -973,6 +973,15 @@ impl Render for EditorView {
         div()
             .key_context(context::EDITOR)
             .track_focus(&self.focus_handle(cx))
+            // The hover card is anchored at window coordinates captured when the mouse
+            // stopped; scrolling moves the text out from under it, leaving a card pinned
+            // over whatever scrolled in. Clearing on wheel is honest: the mouse is now
+            // over different bytes, and the next pause re-asks.
+            .on_scroll_wheel(cx.listener(|editor, _event: &gpui::ScrollWheelEvent, _window, cx| {
+                if editor.hover_diagnostic.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
