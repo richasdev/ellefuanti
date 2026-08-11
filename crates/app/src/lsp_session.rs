@@ -381,6 +381,83 @@ pub fn flatten_symbols(response: &DocumentSymbolResponse) -> Vec<Symbol> {
     out
 }
 
+/// Applies LSP `TextEdit`s to a string, or `None` when the batch is malformed (#19).
+///
+/// The closed-file half of a rename: a buffer the editor holds goes through
+/// `Document::apply_edits` (undo, cursor); a file it has never opened goes through this
+/// and back to disk. The positions are UTF-16 (`ação` is four units but six bytes — a
+/// byte-naive application corrupts the line), and an overlapping batch is a protocol
+/// violation refused whole, the same rule as `Document::apply_edits`.
+pub fn apply_lsp_edits_to_text(
+    text: &str,
+    edits: Vec<elle_lsp::lsp_types::TextEdit>,
+) -> Option<String> {
+    let index = elle_lsp::LineIndex::new(text);
+    let mut byte_edits: Vec<(std::ops::Range<usize>, String)> = edits
+        .into_iter()
+        .map(|edit| {
+            (index.byte_range(text, edit.range, elle_lsp::OffsetEncoding::Utf16), edit.new_text)
+        })
+        .collect();
+    byte_edits.sort_by_key(|(range, _)| (range.start, range.end));
+    if byte_edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (range, new_text) in byte_edits {
+        out.push_str(&text[cursor..range.start]);
+        out.push_str(&new_text);
+        cursor = range.end;
+    }
+    out.push_str(&text[cursor..]);
+    Some(out)
+}
+
+/// Flattens a `WorkspaceEdit` into per-file text edits, or `None` when it contains
+/// anything beyond text (#19).
+///
+/// `None` for file create/rename/delete operations, deliberately whole: a rename that
+/// needed a file operation and got only the text half would leave the project broken in
+/// the way that is worst to debug — everything compiles except the one file whose name
+/// no longer matches its class. Refusing is honest; the status line says why.
+pub fn workspace_edit_changes(
+    edit: elle_lsp::lsp_types::WorkspaceEdit,
+) -> Option<Vec<(PathBuf, Vec<elle_lsp::lsp_types::TextEdit>)>> {
+    use elle_lsp::lsp_types::{DocumentChanges, OneOf};
+    let mut out: Vec<(PathBuf, Vec<elle_lsp::lsp_types::TextEdit>)> = Vec::new();
+
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            out.push((elle_lsp::uri_to_path(&uri).ok()?, edits));
+        }
+    }
+    match edit.document_changes {
+        None => {}
+        Some(DocumentChanges::Edits(document_edits)) => {
+            for document_edit in document_edits {
+                let path = elle_lsp::uri_to_path(&document_edit.text_document.uri).ok()?;
+                let edits = document_edit
+                    .edits
+                    .into_iter()
+                    .map(|edit| match edit {
+                        OneOf::Left(edit) => edit,
+                        OneOf::Right(annotated) => annotated.text_edit,
+                    })
+                    .collect();
+                out.push((path, edits));
+            }
+        }
+        // File operations: refuse the whole edit rather than apply half a rename.
+        Some(DocumentChanges::Operations(_)) => return None,
+    }
+
+    // Deterministic order so failures and status messages are stable.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(out)
+}
+
 /// Palette rows for a workspace-wide symbol search (#19): `(label, target id)`.
 ///
 /// The label qualifies with the container when there is one — two `handle` methods in
@@ -684,7 +761,7 @@ pub fn start(config: &ServerConfig) -> anyhow::Result<Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elle_lsp::lsp_types::{Position, Range};
+    use elle_lsp::lsp_types::{Position, Range, TextEdit};
 
     fn uri() -> Uri {
         "file:///srv/app/User.php".parse().unwrap()
@@ -1201,6 +1278,54 @@ mod tests {
         assert_eq!(rows[1].0, "Post");
         assert_eq!(rows[1].2, 0, "URI-only lands at the top of the file, not dropped");
         assert!(rows[0].1.ends_with("User.php"));
+    }
+
+    #[test]
+    fn lsp_edits_apply_to_text_through_utf16_positions() {
+        // The multibyte trap, stated as a fixture: `ação` is 4 UTF-16 units but 6 bytes,
+        // so a byte-naive application lands mid-codepoint and corrupts the line.
+        let text = "<?php\n$ação = 1;\n$ação = 2;\n";
+        let edits = vec![
+            TextEdit {
+                range: Range {
+                    start: Position { line: 1, character: 1 },
+                    end: Position { line: 1, character: 5 },
+                },
+                new_text: "nome".into(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position { line: 2, character: 1 },
+                    end: Position { line: 2, character: 5 },
+                },
+                new_text: "nome".into(),
+            },
+        ];
+        let renamed = apply_lsp_edits_to_text(text, edits).expect("edits apply");
+        assert_eq!(renamed, "<?php\n$nome = 1;\n$nome = 2;\n");
+    }
+
+    #[test]
+    fn overlapping_lsp_edits_are_refused_whole() {
+        // A protocol violation must not half-apply — same rule as Document::apply_edits.
+        let text = "abcdef";
+        let overlapping = vec![
+            TextEdit {
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 3 },
+                },
+                new_text: "X".into(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position { line: 0, character: 2 },
+                    end: Position { line: 0, character: 4 },
+                },
+                new_text: "Y".into(),
+            },
+        ];
+        assert_eq!(apply_lsp_edits_to_text(text, overlapping), None);
     }
 
     #[test]

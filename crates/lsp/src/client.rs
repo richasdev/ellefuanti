@@ -516,6 +516,18 @@ impl Client {
         )
     }
 
+    /// Issues a rename request without waiting (#19).
+    ///
+    /// The reply is a `WorkspaceEdit` that may touch files this editor has never opened;
+    /// deciding what to do with those is the caller's problem, and the one rule worth
+    /// stating here is the caller's too: a rename applied to *some* of its files is
+    /// corruption, not partial progress.
+    pub fn request_rename(&self, uri: &Uri, offset: usize, new_name: &str) -> Result<RequestId> {
+        let mut params = self.text_document_position(uri, offset)?;
+        params["newName"] = json!(new_name);
+        self.send_request(lsp_types::request::Rename::METHOD, params)
+    }
+
     /// Issues a workspace-wide symbol search without waiting (#19).
     ///
     /// No open-document guard, deliberately: the question is about the workspace, not a

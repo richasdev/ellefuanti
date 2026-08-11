@@ -20,7 +20,7 @@ use gpui::{
 use crate::actions::{
     CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
     FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
-    IncreaseFontSize,
+    IncreaseFontSize, RenameSymbol,
     NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
     RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
@@ -522,6 +522,11 @@ pub struct WorkspaceView {
     /// is the handle that lets a superseding navigation say `$/cancelRequest` and reclaim
     /// both — ADR-0007's "cancellation, not queueing", which needs the id to mean anything.
     in_flight_query: Option<elle_lsp::RequestId>,
+    /// Where a rename prompt was opened from: the document and byte offset the typed
+    /// new name will apply to. Captured at prompt-open because the cursor may move
+    /// under the overlay; taken (not read) at confirm so a dismissed prompt leaves
+    /// nothing armed.
+    pending_rename: Option<(elle_lsp::lsp_types::Uri, usize)>,
     /// The source control panel (#64), and whether it is the visible sidebar.
     ///
     /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
@@ -621,6 +626,7 @@ impl WorkspaceView {
             lsp: Lsp::new(),
             history: JumpHistory::default(),
             in_flight_query: None,
+            pending_rename: None,
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -1134,6 +1140,16 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn save_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save(&Save, window, cx);
+    }
+
+    /// The rename applier, for tests — a real `WorkspaceEdit` needs a live server.
+    #[cfg(test)]
+    pub fn apply_workspace_edit_for_test(
+        &mut self,
+        edit: elle_lsp::lsp_types::WorkspaceEdit,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<usize> {
+        self.apply_workspace_edit(edit, cx)
     }
 
     /// The open palette entity, for tests that drive its input directly.
@@ -3565,7 +3581,8 @@ impl WorkspaceView {
             | PaletteMode::Symbols
             | PaletteMode::References
             | PaletteMode::Artisan
-            | PaletteMode::WorkspaceSymbols => Vec::new(),
+            | PaletteMode::WorkspaceSymbols
+            | PaletteMode::Rename => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3600,7 +3617,7 @@ impl WorkspaceView {
             PaletteMode::WorkspaceSymbols => {
                 self.load_workspace_symbol_items(palette, String::new(), cx)
             }
-            PaletteMode::Commands | PaletteMode::Languages => {}
+            PaletteMode::Commands | PaletteMode::Languages | PaletteMode::Rename => {}
         }
 
         cx.notify();
@@ -3942,6 +3959,179 @@ impl WorkspaceView {
             .ok();
         });
         self.jobs.start(Job::LspQuery, task);
+    }
+
+    /// Opens the rename prompt for the symbol under the cursor (#19, F2).
+    ///
+    /// Silent when there is no server or no word under the cursor, like every
+    /// navigation command. The prompt opens pre-filled with the current name — most
+    /// renames edit a word rather than retype it — and the position is captured now,
+    /// because the cursor may move under the overlay.
+    fn rename_symbol(&mut self, _: &RenameSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((uri, offset)) = self.navigation_origin(cx) else { return };
+        if self.lsp.client_mut().is_none() {
+            return;
+        }
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let (word, span) = {
+            let document = &editor.read(cx).document;
+            let Some(span) = document.word_span_at(offset) else { return };
+            (document.buffer.text()[span.clone()].to_string(), span)
+        };
+        let _ = span;
+
+        self.pending_rename = Some((uri, offset));
+        self.toggle_palette(PaletteMode::Rename, window, cx);
+        if let Some(palette) = self.palette.clone() {
+            palette.update(cx, |palette, cx| palette.preset_query(&word, cx));
+        }
+    }
+
+    /// Sends the rename and applies the server's `WorkspaceEdit` — all files or none.
+    fn perform_rename(
+        &mut self,
+        uri: elle_lsp::lsp_types::Uri,
+        offset: usize,
+        new_name: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The server renames against *its* copy — resync, the formatting lesson.
+        if let Some(tab) = self.tabs.get(self.active_tab)
+            && let Some(path) = tab.path.clone()
+        {
+            let text = tab.editor.read(cx).document.buffer.text();
+            self.notify_lsp_of_change(&path, &text);
+        }
+        let Some(client) = self.lsp.client_mut() else { return };
+        let id = match client.request_rename(&uri, offset, &new_name) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for a rename: {err:#}");
+                return;
+            }
+        };
+
+        self.status = Some("Renaming…".into());
+        cx.notify();
+
+        let query = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = Self::poll_query::<elle_lsp::lsp_types::WorkspaceEdit>(&this, &query, cx)
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.in_flight_query = None;
+                match reply {
+                    // The server declining (null) is not an error (RISKS #4).
+                    None => this.status = None,
+                    Some(edit) => match this.apply_workspace_edit(edit, cx) {
+                        Ok(files) => {
+                            this.status = Some(format!("Renamed in {files} file(s)").into());
+                        }
+                        Err(err) => {
+                            // Refused whole — the one honest failure mode for a rename.
+                            this.status = Some(format!("Rename not applied: {err}").into());
+                        }
+                    },
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.start_query(id, task);
+    }
+
+    /// Applies a `WorkspaceEdit` to open buffers and closed files — all or nothing.
+    ///
+    /// Two phases on purpose. Everything is read and converted first, and any failure —
+    /// a file operation in the edit, an unreadable file, an overlapping batch — aborts
+    /// before a single byte has changed anywhere. Only then are buffers edited and
+    /// files written: a rename applied to *some* of its files is corruption wearing a
+    /// success message.
+    fn apply_workspace_edit(
+        &mut self,
+        edit: elle_lsp::lsp_types::WorkspaceEdit,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<usize> {
+        use anyhow::Context as _;
+        let changes = crate::lsp_session::workspace_edit_changes(edit)
+            .context("the edit includes file operations this editor does not apply")?;
+
+        enum Planned {
+            Buffer(Entity<EditorView>, Vec<(std::ops::Range<usize>, String)>, PathBuf, String),
+            Disk(PathBuf, String),
+        }
+
+        // Phase 1: plan everything, touching nothing.
+        let mut plan = Vec::new();
+        for (path, edits) in changes {
+            let open_tab = self.tabs.iter().find(|tab| {
+                tab.path.as_ref().is_some_and(|tab_path| {
+                    tab_path == &path
+                        || tab_path.canonicalize().ok() == path.canonicalize().ok()
+                })
+            });
+            match open_tab {
+                Some(tab) => {
+                    let editor = tab.editor.clone();
+                    let text = editor.read(cx).document.buffer.text();
+                    let index = elle_lsp::LineIndex::new(&text);
+                    let mut byte_edits: Vec<(std::ops::Range<usize>, String)> = edits
+                        .into_iter()
+                        .map(|edit| {
+                            (
+                                index.byte_range(
+                                    &text,
+                                    edit.range,
+                                    elle_lsp::OffsetEncoding::Utf16,
+                                ),
+                                edit.new_text,
+                            )
+                        })
+                        .collect();
+                    byte_edits.sort_by_key(|(range, _)| (range.start, range.end));
+                    if byte_edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+                        anyhow::bail!("overlapping edits in {}", path.display());
+                    }
+                    plan.push(Planned::Buffer(editor, byte_edits, path, text));
+                }
+                None => {
+                    let text = read_file(&path)
+                        .with_context(|| format!("could not read {}", path.display()))?
+                        .text;
+                    let new_text = crate::lsp_session::apply_lsp_edits_to_text(&text, edits)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("overlapping edits in {}", path.display())
+                        })?;
+                    plan.push(Planned::Disk(path, new_text));
+                }
+            }
+        }
+
+        // Phase 2: apply. Buffer edits cannot fail past this point; a disk write that
+        // fails mid-way is reported, which is the one residual risk of writing files at
+        // all — recorded rather than hidden.
+        let files = plan.len();
+        for planned in plan {
+            match planned {
+                Planned::Buffer(editor, byte_edits, path, _old_text) => {
+                    let new_text = editor.update(cx, |editor, cx| {
+                        editor.document.apply_edits(byte_edits);
+                        cx.notify();
+                        editor.document.buffer.text()
+                    });
+                    // Keep the server's copy in step with the buffer it just renamed.
+                    self.notify_lsp_of_change(&path, &new_text);
+                }
+                Planned::Disk(path, new_text) => {
+                    write_file(&path, &new_text)
+                        .with_context(|| format!("could not write {}", path.display()))?;
+                }
+            }
+        }
+        cx.notify();
+        Ok(files)
     }
 
     /// Go to definition from wherever the cursor is.
@@ -5131,6 +5321,13 @@ impl WorkspaceView {
                     window.focus(&terminal.read(cx).focus_handle(cx));
                 }
             }
+            // #19. The "id" is the typed new name; the position it applies to was
+            // captured when the prompt opened.
+            Some(PaletteMode::Rename) => {
+                if let Some((uri, offset)) = self.pending_rename.take() {
+                    self.perform_rename(uri, offset, id, window, cx);
+                }
+            }
             // #127. The id is the language's own `name()`, so the mapping back is a lookup
             // over the same table the list was built from — no parallel list of strings to
             // drift out of step with `Language`.
@@ -5194,6 +5391,7 @@ impl WorkspaceView {
                     Dispatch::GoToWorkspaceSymbol => {
                         self.toggle_palette(PaletteMode::WorkspaceSymbols, window, cx)
                     }
+                    Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -5580,6 +5778,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::format_document))
+            .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::find_references))
             .on_action(cx.listener(Self::navigate_back))
             .on_action(cx.listener(Self::navigate_forward))

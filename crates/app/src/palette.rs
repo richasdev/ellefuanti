@@ -21,6 +21,9 @@ pub enum PaletteMode {
     /// The project's artisan commands (#23). Confirming types the command into the
     /// terminal; nothing executes out of sight.
     Artisan,
+    /// A single-input prompt for a symbol's new name (#19). The only mode with no list:
+    /// Confirm emits the *query* — the typed name is the answer, not a row.
+    Rename,
     /// Symbols across the whole project, from the language server (#19). The server is
     /// the matcher — every keystroke re-asks it — so this mode does NOT filter locally:
     /// the server's fuzzy match (camel humps, mid-word) would be second-guessed by a
@@ -45,6 +48,7 @@ impl PaletteMode {
             PaletteMode::References => "Go to a usage…",
             PaletteMode::Artisan => "Type an artisan command into the terminal…",
             PaletteMode::WorkspaceSymbols => "Go to a symbol in the project…",
+            PaletteMode::Rename => "New name…",
             PaletteMode::Languages => "Set the language…",
         }
     }
@@ -95,7 +99,10 @@ impl Palette {
             // Commands are known up front; files arrive later via set_items.
             // Commands and languages are both known up front; files and the rest arrive
             // later via `set_items`, and "No matches" would be a lie until they do.
-            loaded: matches!(mode, PaletteMode::Commands | PaletteMode::Languages),
+            loaded: matches!(
+                mode,
+                PaletteMode::Commands | PaletteMode::Languages | PaletteMode::Rename
+            ),
             items,
             selected: 0,
         }
@@ -210,9 +217,34 @@ impl Palette {
     }
 
     fn confirm(&mut self, _: &Confirm, _w: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_inner(cx);
+    }
+
+    fn confirm_inner(&mut self, cx: &mut Context<Self>) {
+        // Rename has no rows; the typed name is the answer. An empty name is a rename
+        // to nothing, which is not a thing — Escape is how you decline.
+        if self.mode == PaletteMode::Rename {
+            if !self.query.trim().is_empty() {
+                cx.emit(PaletteEvent::Confirmed(self.query.trim().to_string()));
+            }
+            return;
+        }
         if let Some(item) = self.filtered.get(self.selected) {
             cx.emit(PaletteEvent::Confirmed(item.id.clone()));
         }
+    }
+
+    /// Pre-fills the input — the rename prompt opens holding the current name, because
+    /// most renames edit a word rather than retype it.
+    pub fn preset_query(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.query = text.to_string();
+        self.refilter();
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn confirm_for_test(&mut self, cx: &mut Context<Self>) {
+        self.confirm_inner(cx);
     }
 
     fn cancel(&mut self, _: &Cancel, _w: &mut Window, cx: &mut Context<Self>) {

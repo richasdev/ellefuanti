@@ -171,6 +171,7 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // #19. Palette-only, like ToggleTheme: the obvious chord (⌘T) is one this keymap
     // deliberately declines to claim — see the comment beside the zoom bindings.
     Command::new("navigate.workspace_symbol", "Go to Symbol in Project…"),
+    Command::new("editor.rename", "Rename Symbol…"),
     // #100: ⌘, is the panel; the file keeps a named door for the people who prefer it.
     Command::new("settings.file", "Open settings.json"),
     // #127. Findable by name for the same reason: the status-bar cell is the affordance,

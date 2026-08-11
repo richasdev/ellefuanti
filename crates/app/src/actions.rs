@@ -93,6 +93,7 @@ actions!(
         SelectNextOccurrence,
         GoToDefinition,
         FormatDocument,
+        RenameSymbol,
         FindReferences,
         NavigateBack,
         NavigateForward,
@@ -190,6 +191,8 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // ⇧⌥F is VS Code's chord, on the workspace like F12: it acts on the active
         // editor and must not require focus juggling to reach.
         KeyBinding::new("shift-alt-f", FormatDocument, Some(context::WORKSPACE)),
+        // F2 is the rename key everywhere; like F12 it acts on the active editor.
+        KeyBinding::new("f2", RenameSymbol, Some(context::WORKSPACE)),
         KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
         // Explicit "complete here". It opened #83's route-name palette until #61; it now
@@ -446,6 +449,7 @@ pub enum Dispatch {
     Artisan,
     FormatDocument,
     GoToWorkspaceSymbol,
+    RenameSymbol,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -483,6 +487,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "laravel.artisan" => Dispatch::Artisan,
         "editor.format" => Dispatch::FormatDocument,
         "navigate.workspace_symbol" => Dispatch::GoToWorkspaceSymbol,
+        "editor.rename" => Dispatch::RenameSymbol,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }
