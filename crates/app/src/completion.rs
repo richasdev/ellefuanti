@@ -55,6 +55,10 @@ pub enum CompletionSource {
     /// model declares `scopeActive`. The one list where the declared method name — the
     /// thing the server offers — is exactly what the user must not type.
     LaravelScope,
+    /// A word that occurs in the current buffer (#20) — the weakest claim there is,
+    /// offered only when no language server is running, so an uninstalled Intelephense
+    /// degrades to "the words of this file" rather than to nothing.
+    Buffer,
     /// A route name read out of the project's route files by static analysis (#83).
     ///
     /// A *weaker* claim than it looks, and deliberately labelled so: `route_names` only
@@ -74,6 +78,7 @@ impl CompletionSource {
             CompletionSource::LaravelColumn => "column",
             CompletionSource::LaravelRelation => "relation",
             CompletionSource::LaravelScope => "scope",
+            CompletionSource::Buffer => "text",
         }
     }
 
@@ -92,6 +97,8 @@ impl CompletionSource {
             CompletionSource::LaravelColumn => theme.accent,
             CompletionSource::LaravelRelation => theme.accent,
             CompletionSource::LaravelScope => theme.accent,
+            // The quiet colour: buffer words are filler, not project facts.
+            CompletionSource::Buffer => theme.text_muted,
         }
     }
 }
@@ -706,6 +713,26 @@ fn prefix_match(haystack: &str, needle: &str) -> bool {
     needle.len() <= haystack.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
+/// The buffer's own identifiers, deduplicated, first appearance first — the weakest
+/// completion source (#20), offered only when no server is running. The claim is only
+/// "this word occurs in this file", the badge says so, and three characters is the floor
+/// because one- and two-character fragments are noise that would bury everything else.
+/// The word currently being typed is excluded: completing to itself is a no-op in a row.
+pub fn buffer_words(text: &str, typed: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut words = Vec::new();
+    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if word.len() >= 3
+            && !word.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && word != typed
+            && seen.insert(word)
+        {
+            words.push(word.to_string());
+        }
+    }
+    words
+}
+
 /// The word already typed before `offset`, which is what the popup opens pre-filtered by.
 ///
 /// Without this, invoking completion in the middle of `str|` would offer every symbol in the
@@ -789,6 +816,28 @@ mod tests {
         let matched = filter_items(&all, "");
         assert_eq!(matched[0].label, "zebra", "must not sort");
         assert_eq!(matched[1].label, "alpha");
+    }
+
+    #[test]
+    fn buffer_words_are_the_files_own_identifiers_deduplicated() {
+        let text = "<?php\n$userName = load();\n$userName->refresh();\nfunction load() {}\n";
+        let words = buffer_words(text, "us");
+        // `userName` once despite two appearances; `load` once; `php` is real text too.
+        // Order is first appearance — there is no better signal in a plain word list.
+        assert_eq!(words, ["php", "userName", "load", "refresh", "function"]);
+    }
+
+    #[test]
+    fn the_word_being_typed_is_not_offered_as_its_own_completion() {
+        // Typing `use` with only `use` in the buffer must not offer `use` back — a
+        // completion that inserts what is already typed is a no-op wearing a row.
+        let words = buffer_words("use use use", "use");
+        assert!(words.is_empty(), "{words:?}");
+    }
+
+    #[test]
+    fn short_fragments_are_not_words() {
+        assert!(buffer_words("$a = $b + $c;", "").is_empty(), "two-char noise stays out");
     }
 
     // --- ranking (#20) -----------------------------------------------------------
