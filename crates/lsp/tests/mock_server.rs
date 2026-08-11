@@ -1181,3 +1181,28 @@ fn wait_for_n_params(server: &MockServer, method: &str, count: usize) -> Vec<Val
         server.methods()
     );
 }
+
+#[test]
+fn formatting_reaches_the_server_with_options_and_rejects_unopened_documents() {
+    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+        "textDocument/formatting" => Reply::Result(json!([{
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "newText": "x"
+        }])),
+        _ => Reply::Silence,
+    });
+
+    // Unopened documents are rejected like every other request — a RequestId for a file
+    // the server has never seen is the gap #45 closed for document_symbols.
+    assert!(client.request_formatting(&uri(), 4, true).is_err());
+
+    client.did_open(uri(), "php", "<?php\n").unwrap();
+    let id = client.request_formatting(&uri(), 4, true).unwrap();
+    let edits: Option<Vec<lsp_types::TextEdit>> =
+        client.await_response(&id, Duration::from_secs(5)).unwrap();
+    assert_eq!(edits.expect("edits arrive").len(), 1);
+
+    let params = server.params_for("textDocument/formatting");
+    assert_eq!(params[0]["options"]["tabSize"], json!(4));
+    assert_eq!(params[0]["options"]["insertSpaces"], json!(true));
+}

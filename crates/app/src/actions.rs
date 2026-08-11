@@ -92,6 +92,7 @@ actions!(
         SetLanguage,
         SelectNextOccurrence,
         GoToDefinition,
+        FormatDocument,
         FindReferences,
         NavigateBack,
         NavigateForward,
@@ -186,6 +187,9 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // PhpStorm's "go to symbol in file". ⌃- / ⌃⇧- are the JetBrains back/forward pair,
         // chosen over ⌘[ / ⌘] because those are already indent and outdent in the editor.
         KeyBinding::new("f12", GoToDefinition, Some(context::WORKSPACE)),
+        // ⇧⌥F is VS Code's chord, on the workspace like F12: it acts on the active
+        // editor and must not require focus juggling to reach.
+        KeyBinding::new("shift-alt-f", FormatDocument, Some(context::WORKSPACE)),
         KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
         // Explicit "complete here". It opened #83's route-name palette until #61; it now
@@ -440,6 +444,7 @@ pub enum Dispatch {
     RerunFailedTests,
     FindInProject,
     Artisan,
+    FormatDocument,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -475,6 +480,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "tests.rerun_failed" => Dispatch::RerunFailedTests,
         "editor.find_in_project" => Dispatch::FindInProject,
         "laravel.artisan" => Dispatch::Artisan,
+        "editor.format" => Dispatch::FormatDocument,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

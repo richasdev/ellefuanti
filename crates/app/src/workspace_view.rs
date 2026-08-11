@@ -19,7 +19,8 @@ use gpui::{
 
 use crate::actions::{
     CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
-    FindPrev, FindReferences, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize,
+    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
+    IncreaseFontSize,
     NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
     RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
@@ -3848,6 +3849,85 @@ impl WorkspaceView {
         self.go_to_definition_at_cursor(window, cx);
     }
 
+    /// Formats the whole document through the language server (#19, ⇧⌥F).
+    ///
+    /// Silent with no server, like every navigation command (§24). The buffer is
+    /// resynced first — the server formats *its* copy, so its copy must be this one
+    /// (the same resync completion needs, for the same reason). The reply is applied
+    /// only if the buffer has not changed since the ask: edits are byte ranges into a
+    /// specific text, and applying them to a different one would corrupt the file the
+    /// user is typing in.
+    fn format_document(
+        &mut self,
+        _: &FormatDocument,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((uri, _)) = self.navigation_origin(cx) else { return };
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(path) = tab.path.clone() else { return };
+        let editor = tab.editor.clone();
+        let text = editor.read(cx).document.buffer.text();
+
+        self.notify_lsp_of_change(&path, &text);
+        let Some(client) = self.lsp.client_mut() else { return };
+        // PSR-12's four spaces — PHP's own convention, and what every generated Laravel
+        // file uses. A settings key can arrive when someone asks for tabs.
+        let id = match client.request_formatting(&uri, 4, true) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for formatting: {err:#}");
+                return;
+            }
+        };
+
+        self.status = Some("Formatting…".into());
+        cx.notify();
+
+        let query = id.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let reply = Self::poll_query::<Vec<elle_lsp::lsp_types::TextEdit>>(&this, &query, cx)
+                .await
+                .unwrap_or_default();
+
+            this.update_in(cx, |this, _window, cx| {
+                this.status = None;
+                // `None` is the server declining, which is not an error (RISKS #4).
+                let Some(edits) = reply else {
+                    cx.notify();
+                    return;
+                };
+                editor.update(cx, |editor, cx| {
+                    if editor.document.buffer.text() != text {
+                        // Typed since the ask: the edits describe a text that no longer
+                        // exists. Dropping them is the only application that cannot
+                        // corrupt anything.
+                        return;
+                    }
+                    let index = elle_lsp::LineIndex::new(&text);
+                    let byte_edits = edits
+                        .into_iter()
+                        .map(|edit| {
+                            (
+                                index.byte_range(
+                                    &text,
+                                    edit.range,
+                                    elle_lsp::OffsetEncoding::Utf16,
+                                ),
+                                edit.new_text,
+                            )
+                        })
+                        .collect();
+                    editor.document.apply_edits(byte_edits);
+                    cx.notify();
+                });
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::LspQuery, task);
+    }
+
     /// Go to definition from wherever the cursor is.
     ///
     /// Shared by F12 and ⌘click rather than duplicated, so the two cannot drift into
@@ -5043,6 +5123,9 @@ impl WorkspaceView {
                     Dispatch::FindInProject => self.find_in_project(&FindInProject, window, cx),
                     // Reopens the palette in artisan mode, like SetLanguage above.
                     Dispatch::Artisan => self.toggle_palette(PaletteMode::Artisan, window, cx),
+                    Dispatch::FormatDocument => {
+                        self.format_document(&FormatDocument, window, cx)
+                    }
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -5428,6 +5511,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::complete_laravel))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
+            .on_action(cx.listener(Self::format_document))
             .on_action(cx.listener(Self::find_references))
             .on_action(cx.listener(Self::navigate_back))
             .on_action(cx.listener(Self::navigate_forward))
