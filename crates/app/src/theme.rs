@@ -148,6 +148,13 @@ pub enum ThemeVariant {
 }
 
 impl ThemeVariant {
+    /// Every built-in, in the order the settings panel's picker cycles them (#100).
+    ///
+    /// A `match`-adjacent list is a drift risk; the compiler closes it: adding a variant
+    /// without extending this fails the exhaustiveness test in this file's tests.
+    pub const ALL: [ThemeVariant; 5] =
+        [Self::Dark, Self::Light, Self::OneDarkPro, Self::GitHubDark, Self::GitHubLight];
+
     pub fn build(self) -> Theme {
         match self {
             Self::Dark => Theme::dark(),
@@ -1340,6 +1347,23 @@ mod tests {
                 "{} hides a bracket inside the current search match",
                 variant.label()
             );
+        }
+    }
+
+    #[test]
+    fn every_built_in_variant_is_in_all() {
+        // The match is the drift guard: a new variant refuses to compile here until it
+        // gains an arm, and the length assert then refuses to pass until `ALL` grows too.
+        match ThemeVariant::default() {
+            ThemeVariant::Dark
+            | ThemeVariant::Light
+            | ThemeVariant::OneDarkPro
+            | ThemeVariant::GitHubDark
+            | ThemeVariant::GitHubLight => {}
+        }
+        assert_eq!(ThemeVariant::ALL.len(), 5);
+        for variant in ThemeVariant::ALL {
+            assert!(!variant.name().is_empty());
         }
     }
 }

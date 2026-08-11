@@ -18,6 +18,7 @@ mod perf;
 mod render_tests;
 mod search_panel;
 mod settings;
+mod settings_panel;
 mod terminal_view;
 mod test_view;
 mod theme;

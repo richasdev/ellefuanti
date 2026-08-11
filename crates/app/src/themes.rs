@@ -115,6 +115,23 @@ pub fn load(cx: &mut App) {
 /// name, so no file can shadow Dark. A name that is neither falls back to the default and
 /// says which name it did not recognise — and, as in #76, does **not** rewrite the file, so
 /// the typo the user needs to see is still there to be corrected.
+/// Every selectable theme name, for the settings panel's picker (#100).
+///
+/// Built-ins first, then disk themes (#58), which is precedence order — the same list the
+/// palette offers, so the two ways of choosing a theme cannot disagree about what exists.
+pub fn selectable_names(cx: &App) -> Vec<String> {
+    let mut names: Vec<String> =
+        crate::theme::ThemeVariant::ALL.iter().map(|variant| variant.name().to_string()).collect();
+    if let Some(disk) = cx.try_global::<DiskThemes>() {
+        for name in disk.names() {
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 pub fn apply_named(name: &str, cx: &mut App) {
     match ThemeChoice::from_name(name) {
         ThemeChoice::BuiltIn(variant) => set_theme(variant, cx),

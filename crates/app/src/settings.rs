@@ -210,6 +210,44 @@ pub fn adjust_font_size(delta: Option<f32>, cx: &mut App) -> Pixels {
     size
 }
 
+/// Applies one settings mutation live and persists it, the panel's single door (#100).
+///
+/// The same three steps `adjust_font_size` established, generalised: mutate the live
+/// document, re-resolve [`Fonts`] from it (family, sizes, ratio and the monospace check
+/// all travel through `fonts::resolve`, so the panel cannot apply a family the startup
+/// path would have refused), and save in the background. When there is no `LiveSettings`
+/// — the malformed-file launch — the change still applies to the session through a
+/// scratch document, and nothing is written: #60's rule that an unreadable file is never
+/// overwritten holds for the panel exactly as it does for the zoom keys.
+pub fn update_settings(cx: &mut App, mutate: impl FnOnce(&mut Settings)) {
+    let mut scratch =
+        cx.try_global::<LiveSettings>().map(|live| live.settings.clone()).unwrap_or_default();
+    mutate(&mut scratch);
+
+    let fonts = fonts::resolve(&scratch, cx);
+    fonts::set_fonts(fonts, cx);
+
+    if cx.try_global::<LiveSettings>().is_some() {
+        let live = cx.global_mut::<LiveSettings>();
+        live.settings = scratch;
+        let (settings, path) = (live.settings.clone(), live.path.clone());
+        cx.background_spawn(async move {
+            if let Err(err) = settings.save(&path) {
+                tracing::error!("could not save settings: {err:#}");
+            }
+        })
+        .detach();
+    }
+}
+
+/// The current live settings values, for the panel to display.
+///
+/// A read-only snapshot rather than a handle: the panel renders from this and writes
+/// through [`update_settings`], so there is exactly one mutation path.
+pub fn current(cx: &App) -> Settings {
+    cx.try_global::<LiveSettings>().map(|live| live.settings.clone()).unwrap_or_default()
+}
+
 /// The compiled-in variant the settings named, or the default.
 ///
 /// An unrecognised name logs and falls back rather than failing, and — importantly — does
