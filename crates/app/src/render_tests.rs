@@ -2505,3 +2505,51 @@ async fn the_language_palette_lists_every_language(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Opening a folder actually starts a language server (#125).
+///
+/// The test that was missing, and whose absence is why #125 shipped. Everything else here
+/// uses `open_folder_for_test`, which stops at the tree on purpose — so nothing in the suite
+/// ever reached `start_lsp`, and the fact that ⌘O was its only caller went unseen.
+///
+/// Asserts on the *state*, not on a running process: whether a server is installed is a
+/// property of the machine. What must hold everywhere is that opening a PHP project makes
+/// the attempt and records the outcome, rather than leaving `Idle` — which is what "nothing
+/// happened, and nothing was logged" looked like.
+#[gpui::test]
+async fn opening_a_folder_starts_a_language_server(cx: &mut TestAppContext) {
+    use crate::lsp_session::LspState;
+
+    install_theme(cx);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("composer.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("User.php"), "<?php\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.lsp_state_for_test(), LspState::Idle, "nothing attempted yet");
+    });
+
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_and_start_lsp_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let state = workspace.lsp_state_for_test();
+        assert_ne!(
+            state,
+            LspState::Idle,
+            "opening a folder must attempt a server. Staying Idle is #125 exactly: no \
+             attempt, no log line, and a popup that can never open"
+        );
+        // Either outcome is legitimate and depends on the machine; what matters is that a
+        // decision was made and recorded.
+        assert!(
+            matches!(state, LspState::Starting | LspState::Unavailable),
+            "unexpected state after opening a folder: {state:?}"
+        );
+    });
+
+    draw(cx);
+}

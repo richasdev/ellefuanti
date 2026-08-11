@@ -33,6 +33,33 @@ use gpui::{
 use crate::actions::Quit;
 use crate::workspace_view::WorkspaceView;
 
+/// What to open at launch, from the command line.
+///
+/// # Why this exists
+///
+/// `ellefuanti .` is how anyone who lives in a terminal opens an editor, and it is the only
+/// launch that inherits the shell's `PATH` — which for a long time was the *sole* way to get
+/// a working language server (#123, now fixed on both paths). Without it the app could only
+/// be started by double-clicking and then reaching for ⌘O, which is also why every log
+/// captured while diagnosing #125 was from a window that had never opened a folder.
+///
+/// A directory becomes the project root; a file is opened in a tab, and #125's
+/// `start_lsp_for_file` gives it a server rooted at its nearest `composer.json`. Anything
+/// that is neither is reported rather than ignored: a typo'd path that silently opens an
+/// empty window is worse than an error.
+///
+/// ponytail: `std::env::args` rather than a parser. There is one optional positional
+/// argument and no flags. Reach for `clap` at the second one.
+fn path_argument() -> Option<std::path::PathBuf> {
+    let raw = std::env::args().nth(1)?;
+    // macOS hands a `.app` launched by the Finder a `-psn_0_12345` process-serial argument.
+    // Treating that as a path would make every Finder launch report a missing file.
+    if raw.starts_with('-') {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
+
 fn main() {
     // First statement, so the startup clock includes everything — including the runtime
     // Metal shader compilation that `runtime_shaders` moves from build time to startup.
@@ -116,6 +143,22 @@ fn main() {
         });
         if let Err(err) = focused {
             tracing::error!("could not focus the workspace: {err:#}");
+        }
+
+        // After focus, because opening a file moves the keyboard into its editor (#95) and
+        // doing that before the workspace has focus leaves it nowhere.
+        if let Some(path) = path_argument() {
+            // Relative paths are the point — `ellefuanti .` is the case this exists for —
+            // and they resolve against the shell's working directory, which is already this
+            // process's. Canonicalising here rather than later so the tree, the LSP root and
+            // any error message all name the same thing.
+            let path = path.canonicalize().unwrap_or(path);
+            let opened = window.update(cx, |view, window, cx| {
+                view.open_argument(path, window, cx);
+            });
+            if let Err(err) = opened {
+                tracing::error!("could not open the path given on the command line: {err:#}");
+            }
         }
 
         cx.activate(true);

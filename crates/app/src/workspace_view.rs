@@ -647,34 +647,72 @@ impl WorkspaceView {
 
             this.update(cx, |this, cx| {
                 match tree {
-                    Ok(tree) => {
-                        this.tree = Some(tree);
-                        this.status = None;
-                        // A run belongs to the project it was started in. Its results name
-                        // files in the old tree and its `--filter` names the old suite, so
-                        // carrying either into a new project would show verdicts about code
-                        // the user is no longer looking at. The panel goes with it, and is
-                        // rebuilt against the new root when it is next opened — which is
-                        // also what re-runs detection for a project that may not have Pest.
-                        this.cancel_test_run();
-                        this.tests = None;
-                        // A new project gets a new server, pointed at the new root. The
-                        // old one is dropped by `set_root`, which kills its process.
-                        this.start_lsp(cx);
-                        // First of the three refresh triggers (#64). The other two are
-                        // save and window focus; there is no timer.
-                        this.refresh_git_status(cx);
-                        // An open terminal points at wherever it was started, which before
-                        // this was the *previous* project — or nowhere, for a panel opened
-                        // before any folder was. Sessions already running keep their own
-                        // directory: a shell has state and its own `cd`, and moving it out
-                        // from under someone mid-command would be worse than leaving it.
-                        // New sessions land in the new project.
-                        let root = this.tree.as_ref().map(|tree| tree.root().to_path_buf());
-                        if let Some(terminal) = this.terminal.as_ref() {
-                            terminal.update(cx, |terminal, _| terminal.set_cwd(root));
-                        }
-                    }
+                    Ok(tree) => this.adopt_tree(tree, cx),
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::OpenFolder, task);
+    }
+
+    /// Makes `tree` the open project: the tree, the server, git, and the terminal's cwd.
+    ///
+    /// Split out of `open_folder` so the command line can reach it (`ellefuanti .`) without
+    /// duplicating any of it. A second copy is how one door ends up starting a language
+    /// server and the other one quietly not — which is the shape of #125, where `start_lsp`
+    /// had exactly one caller and nobody noticed.
+    fn adopt_tree(&mut self, tree: FileTree, cx: &mut Context<Self>) {
+        self.tree = Some(tree);
+        self.status = None;
+        // A run belongs to the project it was started in. Its results name files in the old
+        // tree and its `--filter` names the old suite, so carrying either into a new project
+        // would show verdicts about code the user is no longer looking at. The panel goes
+        // with it, and is rebuilt against the new root when it is next opened — which is
+        // also what re-runs detection for a project that may not have Pest.
+        self.cancel_test_run();
+        self.tests = None;
+        // A new project gets a new server, pointed at the new root. The old one is dropped
+        // by `set_root`, which kills its process.
+        self.start_lsp(cx);
+        // First of the three refresh triggers (#64). The other two are save and window
+        // focus; there is no timer.
+        self.refresh_git_status(cx);
+        // An open terminal points at wherever it was started, which before this was the
+        // *previous* project — or nowhere, for a panel opened before any folder was.
+        // Sessions already running keep their own directory: a shell has state and its own
+        // `cd`, and moving it out from under someone mid-command would be worse than
+        // leaving it. New sessions land in the new project.
+        let root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        if let Some(terminal) = self.terminal.as_ref() {
+            terminal.update(cx, |terminal, _| terminal.set_cwd(root));
+        }
+    }
+
+    /// Opens whatever the command line named: a folder as the project, a file in a tab.
+    ///
+    /// The blocking `FileTree::new` runs on the background pool, like every other open — a
+    /// large project must not delay the first frame (ADR-0007).
+    pub fn open_argument(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if path.is_file() {
+            self.open_path(path, window, cx);
+            return;
+        }
+
+        if !path.is_dir() {
+            // Neither, so it does not exist. Said out loud: a mistyped path that opens an
+            // empty window looks like the editor failed to start.
+            self.status = Some(format!("{} does not exist", path.display()).into());
+            cx.notify();
+            return;
+        }
+
+        let task = cx.spawn(async move |this, cx| {
+            let tree = cx.background_spawn(async move { FileTree::new(path) }).await;
+            this.update(cx, |this, cx| {
+                match tree {
+                    Ok(tree) => this.adopt_tree(tree, cx),
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
                 cx.notify();
@@ -1134,6 +1172,30 @@ impl WorkspaceView {
     pub fn open_folder_for_test(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
         self.tree = FileTree::new(root).ok();
         cx.notify();
+    }
+
+    /// Opens a folder *and* starts the language server, as ⌘O does.
+    ///
+    /// Separate from `open_folder_for_test` because that one deliberately stops at the tree:
+    /// most tests want a root and would otherwise spawn Intelephense. This is for the tests
+    /// that are about the server itself — and its absence is why #125 survived. Every test
+    /// used the tree-only seam, so `start_lsp` was never reached by anything, and the fact
+    /// that ⌘O was its only caller went unnoticed.
+    #[cfg(test)]
+    pub fn open_folder_and_start_lsp_for_test(
+        &mut self,
+        root: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.tree = FileTree::new(root).ok();
+        self.start_lsp(cx);
+        cx.notify();
+    }
+
+    /// The language server's state, for asserting that one was actually attempted.
+    #[cfg(test)]
+    pub fn lsp_state_for_test(&self) -> LspState {
+        self.lsp.state().clone()
     }
 
     /// Right-clicks a tree row, through the same handler the row's mouse-down uses.
