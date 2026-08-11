@@ -2751,3 +2751,112 @@ async fn renaming_an_open_file_retargets_its_tab(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// A ⌘-clicked `file.php:42` from the terminal opens the file at the line (#70).
+///
+/// Drives the workspace half through the same resolver the terminal's event reaches. The
+/// text-scanning half (`link_at`) has its own unit tests in `elle-terminal`; what this
+/// pins is the part the issue said was blocked — landing on the *line* — and the honesty
+/// rule: a shape that resolves to nothing opens nothing, silently.
+#[gpui::test]
+async fn a_terminal_path_click_opens_the_file_at_its_line(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join("app/User.php"), "<?php\nline2\nline3\nline4\nline5\nline6\n")
+        .unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    // Relative, exactly as a stack trace prints it: resolved against the project root.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_terminal_link_for_test(
+            std::path::PathBuf::from("app/User.php"),
+            Some(5),
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.tab_count_for_test(), 1, "the file must open");
+        assert_eq!(
+            workspace.cursor_row_for_test(cx),
+            Some(4),
+            "line 5 in the trace is row 4 in the editor — one-based to zero-based"
+        );
+    });
+
+    // A path-shaped token that names nothing opens nothing, and says nothing: the
+    // detector matches shapes, and prose with a slash in it qualifies.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_terminal_link_for_test(
+            std::path::PathBuf::from("does/not/exist.php"),
+            Some(1),
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.tab_count_for_test(), 1, "nothing new opens");
+        assert!(workspace.status_for_test().is_none(), "and nobody is blamed for it");
+    });
+
+    draw(cx);
+}
+
+/// A definition jump lands on the identifier, through both doors, in UTF-16-correct columns.
+///
+/// The jump used to land at column 0 with a comment explaining that converting the
+/// server's UTF-16 character needed a buffer nobody had yet — true where it was written,
+/// and exactly why the conversion moved to where the buffer exists (`Target::resolve`).
+/// The fixture is accented on purpose: `$ação`'s `ç`/`ã` are one UTF-16 unit but two
+/// UTF-8 bytes, so an unconverted column lands mid-identifier on the code this editor
+/// is for, and an ASCII fixture would pass with the conversion deleted.
+#[gpui::test]
+async fn a_definition_jump_lands_on_the_identifier(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    // UTF-16 character 11 on line 1 is past `$ação = $b` — byte column 13.
+    let accented = "<?php\n$ação = $bem;\nmais\n";
+    let on_disk = dir.path().join("app/Acentos.php");
+    std::fs::write(&on_disk, accented).unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    // Door one: the file is already open — the `$this->name` same-file case.
+    let open_path = std::path::PathBuf::from("/srv/app/Aberto.php");
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(open_path.clone()), accented, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.open_path_at_lsp_for_test(open_path.clone(), 1, 11, window, cx);
+    });
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.cursor_point_for_test(cx),
+            Some(elle_text::Point::new(1, 13)),
+            "UTF-16 character 11 is byte column 13 on this line — column 0 or 11 is the bug"
+        );
+    });
+
+    // Door two: the file loads first, and the conversion waits for it.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_path_at_lsp_for_test(on_disk.clone(), 1, 11, window, cx);
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.tab_count_for_test(), 2, "the second door opened a new tab");
+        assert_eq!(
+            workspace.cursor_point_for_test(cx),
+            Some(elle_text::Point::new(1, 13)),
+            "the loaded door must convert too, after the text exists"
+        );
+    });
+
+    draw(cx);
+}

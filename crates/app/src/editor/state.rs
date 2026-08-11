@@ -246,6 +246,38 @@ impl Document {
             .unwrap_or_else(|| "untitled".to_string())
     }
 
+    /// Converts an LSP position — line plus UTF-16 character — into a byte-column [`Point`].
+    ///
+    /// # Why this lives on the document
+    ///
+    /// The server counts columns in UTF-16 code units and a `Point` column is a byte
+    /// offset; the two agree only on ASCII. Converting needs the line's actual text, so
+    /// for a long time definition jumps landed at column 0 with a comment explaining that
+    /// the buffer "does not exist until the file has loaded" — true at the call site it
+    /// was written for, and the reason the fix is *here*: by the time anything reveals a
+    /// position, a document exists, and it can do the conversion the free function could
+    /// not. Landing at line start was correct but read as "almost worked" next to every
+    /// IDE that puts the cursor on the identifier.
+    ///
+    /// Clamps in both axes: a line past EOF becomes the last line, a character past the
+    /// end of its line becomes the line's end. Servers answer from *their* copy of the
+    /// text, and a stale answer must land somewhere sane rather than panic on a slice.
+    pub fn point_from_lsp(&self, line: usize, character_utf16: u32) -> Point {
+        let row = line.min(self.buffer.len_lines().saturating_sub(1));
+        let text = self.buffer.line(row);
+
+        let mut utf16_seen: u32 = 0;
+        let mut byte_column = 0;
+        for c in text.chars() {
+            if utf16_seen >= character_utf16 {
+                break;
+            }
+            utf16_seen += c.len_utf16() as u32;
+            byte_column += c.len_utf8();
+        }
+        Point::new(row, byte_column)
+    }
+
     pub fn cursor_point(&self) -> Point {
         self.buffer.offset_to_point(self.selection.head)
     }
@@ -521,6 +553,28 @@ impl Document {
     /// hardcodes `$` in [`CharClass::of`] instead and that limitation is already documented
     /// there; wiring per-language scopes is the same much-bigger change.
     pub fn select_word_at(&mut self, offset: usize) {
+        let Some((_, start, end)) = self.class_run_at(offset) else {
+            // Empty buffer: there is no run to select.
+            self.selection = Selection::at(0);
+            self.goal_column = None;
+            return;
+        };
+
+        let rope = self.buffer.rope();
+        self.selection =
+            Selection { anchor: rope.char_to_byte(start), head: rope.char_to_byte(end) };
+        self.goal_column = None;
+        // A click is a jump: the same reason `move_to` breaks the run.
+        self.buffer.break_undo_group();
+    }
+
+    /// The run of one character class around `offset`: `(class, start, end)` in **chars**.
+    ///
+    /// The shared core of double-click selection and the ⌘-hover link hint — extracted so
+    /// the two cannot disagree about what "the word here" means. All of `select_word_at`'s
+    /// documented subtleties (the `max` of both sides, the newline stop, the 128 cap) live
+    /// here now; see that method's comment for why each is the way it is.
+    fn class_run_at(&self, offset: usize) -> Option<(CharClass, usize, usize)> {
         let rope = self.buffer.rope();
         let len = rope.len_chars();
         let mid = rope.byte_to_char(offset.min(self.buffer.len_bytes()));
@@ -530,12 +584,7 @@ impl Document {
         // `Option`'s own `Ord` puts `None` below every `Some`, which is what Zed's
         // `cmp::max` over two `Option<CharKind>` relies on: one side being past the end of
         // the buffer must not win.
-        let Some(kind) = prev.max(next) else {
-            // Empty buffer: there is no run to select.
-            self.selection = Selection::at(0);
-            self.goal_column = None;
-            return;
-        };
+        let kind = prev.max(next)?;
 
         const MAX_SCAN: usize = 128;
 
@@ -557,11 +606,22 @@ impl Document {
             end += 1;
         }
 
-        self.selection =
-            Selection { anchor: rope.char_to_byte(start), head: rope.char_to_byte(end) };
-        self.goal_column = None;
-        // A click is a jump: the same reason `move_to` breaks the run.
-        self.buffer.break_undo_group();
+        Some((kind, start, end))
+    }
+
+    /// The byte span of the *word* under `offset`, or `None` when what is there is not one.
+    ///
+    /// The ⌘-hover link hint: only a word earns an underline and a pointing hand, because
+    /// only a word is something go-to-definition can answer about. Whitespace and
+    /// punctuation return `None` — ⌘ held over `->` must not promise a jump the server
+    /// will refuse, which is the same honesty rule as everywhere else, applied to a hint.
+    pub fn word_span_at(&self, offset: usize) -> Option<std::ops::Range<usize>> {
+        let (kind, start, end) = self.class_run_at(offset)?;
+        if kind != CharClass::Word || start == end {
+            return None;
+        }
+        let rope = self.buffer.rope();
+        Some(rope.char_to_byte(start)..rope.char_to_byte(end))
     }
 
     /// Triple-click: selects the whole line `row` sits on, including its line ending.
@@ -2319,6 +2379,49 @@ mod tests {
     fn title_falls_back_to_untitled() {
         assert_eq!(Document::new(None, "", false).unwrap().title(), "untitled");
         assert_eq!(doc("").title(), "t.php");
+    }
+
+    #[test]
+    fn the_link_hint_answers_only_for_words() {
+        // The ⌘-hover underline promises a jump; only a word can keep that promise.
+        let d = doc("<?php \n$this->name;\n");
+
+        // On `name` (bytes 14..18): the word, whole.
+        assert_eq!(d.word_span_at(15), Some(14..18));
+        // On `$this`: `$` is a word character here (see CharClass::of), so the span
+        // includes it — the same answer double-click gives.
+        assert_eq!(d.word_span_at(8), Some(7..12));
+        // Inside the `->` (both neighbours punctuation): nothing to promise.
+        assert_eq!(d.word_span_at(13), None);
+        // At the boundary between `$this` and `->`, the word side wins — the same `max`
+        // rule double-click uses, so hint and selection cannot disagree there.
+        assert_eq!(d.word_span_at(12), Some(7..12));
+        // On whitespace: nothing.
+        assert_eq!(d.word_span_at(6), None);
+    }
+
+    #[test]
+    fn lsp_positions_convert_through_the_lines_real_text() {
+        // `ação` is the fixture for a reason: `ç` and `ã` are one UTF-16 unit but two
+        // UTF-8 bytes each, so a position after them differs between the server's count
+        // and ours — exactly the Portuguese source this editor exists for.
+        let d = Document::new(
+            None,
+            "<?php
+$ação = 1;
+",
+            false,
+        )
+        .unwrap();
+
+        // Line 1, UTF-16 character 5 — just past `$ação`. Bytes: $ + a + ç(2) + ã(2) + o = 7.
+        assert_eq!(d.point_from_lsp(1, 5), Point::new(1, 7));
+        // ASCII agrees in both units.
+        assert_eq!(d.point_from_lsp(0, 3), Point::new(0, 3));
+        // Past the end of the line clamps to its end, not beyond.
+        assert_eq!(d.point_from_lsp(0, 99), Point::new(0, 5));
+        // Past EOF clamps to the last line.
+        assert_eq!(d.point_from_lsp(99, 0).row, 2);
     }
 
     #[test]

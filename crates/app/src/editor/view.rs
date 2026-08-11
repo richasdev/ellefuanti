@@ -63,6 +63,15 @@ pub struct EditorView {
     /// handed cannot go stale in a way that matters — it is simply the last thing the
     /// server said, and an empty one is the correct rendering when there is no server.
     diagnostics: Vec<(Range<usize>, Severity, SharedString)>,
+    /// The word under a ⌘-hover, underlined as a clickable link (#81's polish).
+    ///
+    /// Byte range in the buffer. `Some` only while ⌘ is held and the pointer rests on a
+    /// word — punctuation and whitespace promise nothing, so they hint nothing. Cleared
+    /// when ⌘ lifts, when the mouse leaves the rows, and on scroll, the same lifecycle as
+    /// the hover card. An edit while ⌘ is held and the mouse is still can leave the
+    /// underline one edit stale until the next mouse move; recomputing per keystroke for
+    /// that corner is not worth wiring every edit path through here.
+    link_hint: Option<Range<usize>>,
     /// The diagnostic under the mouse, if any: its message and where to draw the card.
     ///
     /// Editor-owned because the editor is the only thing that can turn a mouse position
@@ -145,6 +154,7 @@ impl EditorView {
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
             diagnostics: Vec::new(),
+            link_hint: None,
             hover_diagnostic: None,
             text_origin_x: None,
             cursor_row_origin_y: None,
@@ -783,6 +793,14 @@ impl EditorView {
         let fonts = Fonts::get(cx);
         let position = gpui::point(event.position.x, event.position.y + fonts.line_height());
         self.hover_for_offset(offset, row, position, cx);
+
+        // The ⌘-hover link hint. Recomputed on every move while ⌘ is held; notified only
+        // on change, for the same per-pixel reason as the card above.
+        let hint = if event.modifiers.platform { self.document.word_span_at(offset) } else { None };
+        if hint != self.link_hint {
+            self.link_hint = hint;
+            cx.notify();
+        }
     }
 
     /// The hover decision itself, split from the mouse event for the reason
@@ -821,8 +839,15 @@ impl EditorView {
 
     /// Clears the card when the mouse leaves `row`, unless a neighbour already owns it.
     fn on_row_hover_out(&mut self, row: usize, cx: &mut Context<Self>) {
+        let mut changed = false;
         if self.hover_diagnostic.as_ref().is_some_and(|hover| hover.row == row) {
             self.hover_diagnostic = None;
+            changed = true;
+        }
+        if self.link_hint.take().is_some() {
+            changed = true;
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -978,10 +1003,26 @@ impl Render for EditorView {
             // over whatever scrolled in. Clearing on wheel is honest: the mouse is now
             // over different bytes, and the next pause re-asks.
             .on_scroll_wheel(cx.listener(|editor, _event: &gpui::ScrollWheelEvent, _window, cx| {
-                if editor.hover_diagnostic.take().is_some() {
+                let cleared =
+                    editor.hover_diagnostic.take().is_some() | editor.link_hint.take().is_some();
+                if cleared {
                     cx.notify();
                 }
             }))
+            // ⌘ lifting must take the underline and the hand with it, even with the mouse
+            // still — a hint that outlives its modifier promises a jump a plain click will
+            // not make.
+            .on_modifiers_changed(cx.listener(
+                |editor, event: &gpui::ModifiersChangedEvent, _window, cx| {
+                    if !event.modifiers.platform && editor.link_hint.take().is_some() {
+                        cx.notify();
+                    }
+                },
+            ))
+            // The pointing hand, whenever a word is hinted. Root-level is right, not
+            // coarse: the hint follows the pointer, so over whitespace it is None and the
+            // arrow returns.
+            .when(self.link_hint.is_some(), |el| el.cursor_pointer())
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -1265,11 +1306,16 @@ impl EditorView {
                         // (matches → guides → bracket → cursor) intact minus the one that
                         // no longer exists.
                         div().flex_1().child({
+                            let row_link = self
+                                .link_hint
+                                .clone()
+                                .filter(|range| range.start < line_end && range.end > line_start);
                             let rendered = styled_line(
                                 &line,
                                 line_start,
                                 &spans,
                                 &row_diagnostics,
+                                row_link,
                                 brackets,
                                 &row_matches,
                                 &theme,
@@ -1357,18 +1403,20 @@ fn autoscroll_fit(
 /// than between two, and at end-of-line it had nothing to paint on without appending a
 /// padding space. It is now a painted quad positioned by measurement; see
 /// [`crate::editor::caret::Caret`], which `render_rows` overlays as a sibling of this text.
+#[allow(clippy::too_many_arguments)]
 fn styled_line(
     line: &str,
     line_start: usize,
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
+    link: Option<Range<usize>>,
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
     fonts: &Fonts,
 ) -> Line {
     let (text, highlights) =
-        line_runs(line, line_start, spans, diagnostics, brackets, matches, theme);
+        line_runs(line, line_start, spans, diagnostics, link, brackets, matches, theme);
     // Guides come from the line's own indent, so they are computed here and painted by the
     // element — not folded into the runs above, which is what made them blocks (#108).
     let guides = indent_guide_columns(&text).into_iter().map(|range| range.start).collect();
@@ -1443,11 +1491,13 @@ fn to_runs(
 ///
 /// `matches` is `(range, is_current)`: search hits touching this line, already sliced to
 /// the viewport by the caller (#80).
+#[allow(clippy::too_many_arguments)]
 fn line_runs(
     line: &str,
     line_start: usize,
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
+    link: Option<Range<usize>>,
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
@@ -1506,6 +1556,26 @@ fn line_runs(
         });
 
         highlights = merge_underline(highlights, start..end, underline);
+    }
+
+    // The ⌘-hover link hint: a *straight* underline in the accent colour, where a
+    // diagnostic's is wavy in a severity colour — same channel, visibly different claim.
+    // "This is clickable" and "this is broken" must not be confusable at a glance, and
+    // straight-vs-wavy is how every IDE draws that distinction.
+    if let Some(range) = link
+        && range.end > line_start
+        && range.start < line_end
+    {
+        let start = floor_boundary(&text, range.start.max(line_start) - line_start);
+        let end = ceil_boundary(&text, range.end.min(line_end) - line_start);
+        if start < end {
+            let underline = Some(gpui::UnderlineStyle {
+                color: Some(theme.accent),
+                thickness: px(1.0),
+                wavy: false,
+            });
+            highlights = merge_underline(highlights, start..end, underline);
+        }
     }
 
     // Search matches paint a *background* and leave the foreground alone, for the same
@@ -2034,7 +2104,7 @@ mod tests {
         spans: &[HighlightSpan],
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, &[], theme)
+        super::line_runs(line, line_start, spans, &[], None, None, &[], theme)
     }
 
     /// `line_runs` with search matches, spelled out.
@@ -2045,7 +2115,7 @@ mod tests {
         matches: &[(Range<usize>, bool)],
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, matches, theme)
+        super::line_runs(line, line_start, spans, &[], None, None, matches, theme)
     }
 
     /// Byte ranges carrying a foreground colour.
@@ -2368,6 +2438,7 @@ mod tests {
             0,
             &[span(0..4, HighlightStyle::Function)],
             &[],
+            None,
             Some((1, 3)),
             &[],
             &theme,
@@ -2386,7 +2457,7 @@ mod tests {
         brackets: Option<(usize, usize)>,
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, &[], &[], brackets, &[], theme)
+        super::line_runs(line, line_start, &[], &[], None, brackets, &[], theme)
     }
 
     // --- diagnostics ----------------------------------------------------------------
@@ -2591,7 +2662,7 @@ mod tests {
         diagnostics: &[(Range<usize>, Severity)],
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, diagnostics, None, &[], theme)
+        super::line_runs(line, line_start, spans, diagnostics, None, None, &[], theme)
     }
 
     // --- search match highlighting (#80) --------------------------------------------
@@ -2758,12 +2829,32 @@ mod tests {
             &[],
             &[(0..3, Severity::Error)],
             None,
+            None,
             &[(0..3, false)],
             &theme,
         );
         let run = runs.iter().find(|(r, _)| *r == (0..3)).expect("the covered run exists");
         assert!(run.1.underline.is_some(), "the diagnostic underline survived the match");
         assert_eq!(run.1.background_color, Some(theme.search_match()));
+    }
+
+    #[test]
+    fn the_link_hint_underlines_straight_where_diagnostics_are_wavy() {
+        // "Clickable" and "broken" share the underline channel and must not be confusable:
+        // straight accent for the ⌘-hover hint, wavy severity colour for a squiggle. If
+        // either assertion here starts failing the two have collapsed into one claim.
+        let theme = Theme::dark();
+
+        let (_, runs) = super::line_runs("abcdef", 0, &[], &[], Some(1..4), None, &[], &theme);
+        let link = runs.iter().find(|(r, _)| *r == (1..4)).expect("the hinted run exists");
+        let underline = link.1.underline.expect("the hint underlines");
+        assert!(!underline.wavy, "a link hint is straight — wavy claims breakage");
+        assert_eq!(underline.color, Some(theme.accent));
+
+        let (_, runs) =
+            super::line_runs("abcdef", 0, &[], &[(1..4, Severity::Error)], None, None, &[], &theme);
+        let diag = runs.iter().find(|(r, _)| *r == (1..4)).expect("the squiggled run exists");
+        assert!(diag.1.underline.expect("diagnostics underline").wavy);
     }
 
     #[test]
@@ -2815,7 +2906,7 @@ mod tests {
         );
 
         let (_, runs) =
-            super::line_runs("f(1)", 0, &[], &[], Some((1, 3)), &[(0..4, true)], &theme);
+            super::line_runs("f(1)", 0, &[], &[], None, Some((1, 3)), &[(0..4, true)], &theme);
 
         assert_eq!(
             backgrounds(&runs, theme.bracket_match()),

@@ -14,12 +14,14 @@
 
 mod grid;
 mod keys;
+mod link;
 mod manager;
 mod selection;
 mod session;
 
 pub use grid::{Cell, CellColor, CursorPos, GridSnapshot};
 pub use keys::{Key, Modifiers, TermFlags, encode, encode_paste};
+pub use link::{Link, link_at};
 pub use manager::TerminalManager;
 pub use selection::{
     GridGeometry, Selection, SelectionMode, SelectionPoint, cell_at, select_all, selected_columns,

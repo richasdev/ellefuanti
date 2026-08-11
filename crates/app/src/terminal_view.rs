@@ -41,6 +41,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 // was why a zoomed terminal overlapped its own rows. One function returning both is what
 // keeps the three consumers below (layout, PTY resize, selection hit-testing) agreeing.
 
+/// What the terminal asks the workspace to do on its behalf.
+pub enum TerminalViewEvent {
+    /// A ⌘-clicked path, exactly as it appeared in the output. May be relative and may
+    /// not exist — the receiver resolves against the project and declines what is not
+    /// there, because only it can check without guessing.
+    OpenPath { path: std::path::PathBuf, line: Option<u32> },
+}
+
 pub struct TerminalView {
     focus_handle: FocusHandle,
     manager: TerminalManager,
@@ -571,6 +579,14 @@ impl TerminalView {
         let Some(geometry) = self.geometry() else { return };
         let Some(point) = self.point_at(event.position, geometry, cell) else { return };
 
+        // ⌘-click follows a link instead of selecting (#70): a stack trace names files as
+        // `app/User.php:42`, and jumping to them is the reason a terminal lives inside an
+        // editor at all. Falls through to selection when nothing link-shaped is under the
+        // pointer, so a ⌘-click on plain text is a plain click rather than a dead one.
+        if event.modifiers.platform && self.follow_link_at(point, geometry, cx) {
+            return;
+        }
+
         // gpui reports a running click count, so the mode falls straight out of it.
         let mode = match event.click_count {
             1 => SelectionMode::Char,
@@ -629,6 +645,39 @@ impl TerminalView {
         let snapshot = session.snapshot();
         let geometry = GridGeometry::of(&snapshot);
         elle_terminal::selected_text(selection, &snapshot, geometry)
+    }
+
+    /// Follows whatever link sits under `point`. True if the click was consumed.
+    ///
+    /// URLs open here — the browser needs no knowledge the view lacks. Paths are *emitted*,
+    /// not opened: the view sees one line of grid text and cannot honestly resolve a
+    /// relative `app/User.php` or check it exists — the workspace holds the project root
+    /// and the open machinery, so it gets the claim and decides (RISKS.md #4: the view
+    /// never asserts "this file exists", it reports "the user clicked something shaped
+    /// like this").
+    fn follow_link_at(
+        &mut self,
+        point: elle_terminal::SelectionPoint,
+        geometry: GridGeometry,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.manager.active() else { return false };
+        let snapshot = session.snapshot();
+        let Some(row) = geometry.row_of(point.line) else { return false };
+        let Some(cells) = snapshot.lines.get(row) else { return false };
+        let text: String = cells.iter().map(|cell| cell.c).collect();
+
+        match elle_terminal::link_at(&text, point.column) {
+            Some(elle_terminal::Link::Url(url)) => {
+                cx.open_url(&url);
+                true
+            }
+            Some(elle_terminal::Link::Path { path, line }) => {
+                cx.emit(TerminalViewEvent::OpenPath { path: path.into(), line });
+                true
+            }
+            None => false,
+        }
     }
 
     /// ⌘C. Note this is *not* ⌃C: that stays SIGINT and goes through `on_key_down`, which
@@ -710,6 +759,8 @@ impl TerminalView {
         }
     }
 }
+
+impl gpui::EventEmitter<TerminalViewEvent> for TerminalView {}
 
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
