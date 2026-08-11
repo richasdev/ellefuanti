@@ -173,6 +173,10 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("navigate.workspace_symbol", "Go to Symbol in Project…"),
     Command::new("editor.rename", "Rename Symbol…"),
     Command::new("editor.quick_fix", "Quick Fix…"),
+    // #82. Fold/unfold-at-cursor are chords (⌥⌘[ / ⌥⌘]); the all-variants are the ones
+    // worth a palette name.
+    Command::new("editor.fold_all", "Fold All"),
+    Command::new("editor.unfold_all", "Unfold All"),
     // #100: ⌘, is the panel; the file keeps a named door for the people who prefer it.
     Command::new("settings.file", "Open settings.json"),
     // #127. Findable by name for the same reason: the status-bar cell is the affordance,

@@ -3368,6 +3368,91 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     draw(cx);
 }
 
+/// Folding hides a block's body from the row map and the safety rules hold (#82).
+///
+/// The row↔line map is the piece the issue warned corrupts edits if wrong; rows here
+/// are read through the same map the render callback uses, so what this asserts is what
+/// the gutter numbers, the mouse handlers and the painted content are all built from.
+#[gpui::test]
+async fn folding_maps_rows_past_the_hidden_body_and_reveals_on_entry(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    let text = "class A {\n    fn b() {\n        body;\n        more;\n    }\n    fn c() {}\n}\n";
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document = Document::new(Some(std::path::PathBuf::from("A.php")), text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+
+    // Cursor on `fn b`, fold its block.
+    editor.update(cx, |editor, cx| {
+        let offset = text.find("fn b").unwrap();
+        editor.document.move_to(offset, false);
+        editor.fold_block_at_cursor(cx);
+        assert_eq!(
+            editor.visible_lines_for_test(),
+            [0, 1, 4, 5, 6, 7],
+            "rows skip the hidden body — the closing brace shares the header's indent \
+             and stays visible, which is how indent folding reads everywhere"
+        );
+    });
+    draw(cx);
+
+    // Entering the fold reveals it — an invisible caret is an edit about to land
+    // somewhere invisible.
+    editor.update(cx, |editor, cx| {
+        let offset = text.find("body").unwrap();
+        editor.document.move_to(offset, false);
+        let _ = cx;
+    });
+    draw(cx);
+    editor.update(cx, |editor, _cx| {
+        assert_eq!(
+            editor.visible_lines_for_test().len(),
+            8,
+            "the render pass revealed the fold the cursor entered"
+        );
+    });
+}
+
+/// An edit that changes the line count clears every fold — the survival rule (#82).
+#[gpui::test]
+async fn a_line_count_change_invalidates_folds_at_the_render_funnel(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    let text = "fn a() {\n    one;\n    two;\n}\nfn z() {}\n";
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document = Document::new(Some(std::path::PathBuf::from("A.php")), text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+
+    editor.update(cx, |editor, cx| {
+        editor.document.move_to(text.find("fn z").unwrap(), false);
+        editor.fold_all(cx);
+        assert_eq!(editor.visible_lines_for_test(), [0, 3, 4, 5], "the body folded");
+    });
+    draw(cx);
+
+    // A newline at the cursor changes the line count; the ranges name lines that moved.
+    editor.update(cx, |editor, _cx| {
+        let at = editor.document.selection.head;
+        editor.document.buffer.insert(at, "\n");
+    });
+    draw(cx);
+    editor.update(cx, |editor, _cx| {
+        assert_eq!(
+            editor.visible_lines_for_test().len(),
+            7,
+            "all folds cleared rather than pointing at moved lines"
+        );
+    });
+}
+
 /// The rename prompt confirms the typed name, and an empty name is not a rename (#19).
 #[gpui::test]
 async fn the_rename_prompt_confirms_its_query_not_a_row(cx: &mut TestAppContext) {
