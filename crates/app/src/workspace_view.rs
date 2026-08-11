@@ -706,26 +706,11 @@ impl WorkspaceView {
         // focus; there is no timer.
         self.refresh_git_status(cx);
         // The Laravel index (#21): models, columns with provenance, relationships.
-        // Fire-and-forget on the background pool — nothing consumes it yet (#22 will),
-        // and a failed build is a debug line, not a user problem: the index is a cache
-        // and every consumer must already survive its absence (ADR-0008).
+        // Fire-and-forget on the background pool — a failed build is a debug line, not a
+        // user problem: the index is a cache and every consumer must already survive its
+        // absence (ADR-0008). Rebuilt again on every model/migration save, same helper.
         if let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) {
-            cx.background_spawn(async move {
-                let Some(path) = crate::file_cache::index_path(&root) else { return };
-                match elle_index::Index::open(&path) {
-                    Ok((index, _)) => {
-                        if let Err(err) = elle_index::laravel::build(
-                            index.connection(),
-                            &root,
-                            &elle_workspace::CancelFlag::default(),
-                        ) {
-                            tracing::debug!("laravel index build failed: {err:#}");
-                        }
-                    }
-                    Err(err) => tracing::debug!("laravel index unavailable: {err:#}"),
-                }
-            })
-            .detach();
+            rebuild_laravel_index(root, cx);
         }
         // An open terminal points at wherever it was started, which before this was the
         // *previous* project — or nowhere, for a panel opened before any folder was.
@@ -1123,6 +1108,12 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn terminal_for_test(&self) -> Option<Entity<TerminalView>> {
         self.terminal.clone()
+    }
+
+    /// ⌘S through the real handler — the path that must rebuild the Laravel index (#21).
+    #[cfg(test)]
+    pub fn save_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save(&Save, window, cx);
     }
 
     #[cfg(test)]
@@ -1782,6 +1773,17 @@ impl WorkspaceView {
                         // changes the working tree, so it is the only internal event that
                         // can invalidate the status (#64).
                         this.refresh_git_status(cx);
+                        // Saving a model or migration is the in-editor event that can
+                        // stale the Laravel index; the wholesale rebuild is milliseconds
+                        // (#21's documented starting point). `is_under` canonicalises —
+                        // a tab's path and the tree's root spell the temp dir
+                        // differently on macOS, the /var-vs-/private/var trap.
+                        if let Some(root) = this.tree.as_ref().map(|tree| tree.root().to_path_buf())
+                            && (is_under(&synced.0, &root.join("app/Models"))
+                                || is_under(&synced.0, &root.join("database/migrations")))
+                        {
+                            rebuild_laravel_index(root, cx);
+                        }
                     }
                     // The buffer is untouched on failure, so the user loses nothing.
                     Err(err) => this.status = Some(format!("save failed: {err:#}").into()),
@@ -5017,6 +5019,30 @@ impl WorkspaceView {
 /// a 10,061-file project **every** bare-word completion set it, capped at exactly 100 items.
 /// A bare `Array` response has no such flag and is complete by definition, which is why the
 /// two arms differ rather than defaulting.
+/// Rebuilds the Laravel index for `root` on the background pool, fire-and-forget.
+///
+/// Both triggers — folder open and a model/migration save — go through here, so they
+/// cannot drift on how failure is handled: a failed build is a debug line, because the
+/// index is a cache and every consumer already survives its absence (ADR-0008).
+fn rebuild_laravel_index(root: PathBuf, cx: &mut Context<WorkspaceView>) {
+    cx.background_spawn(async move {
+        let Some(path) = crate::file_cache::index_path(&root) else { return };
+        match elle_index::Index::open(&path) {
+            Ok((index, _)) => {
+                if let Err(err) = elle_index::laravel::build(
+                    index.connection(),
+                    &root,
+                    &elle_workspace::CancelFlag::default(),
+                ) {
+                    tracing::debug!("laravel index build failed: {err:#}");
+                }
+            }
+            Err(err) => tracing::debug!("laravel index unavailable: {err:#}"),
+        }
+    })
+    .detach();
+}
+
 /// One indexed column as a popup item, provenance in the detail (`string · migration`).
 /// A cast with no migration behind it says just `cast` — an empty type is not a type.
 fn column_item(column: elle_index::laravel::ModelColumn) -> CompletionItem {

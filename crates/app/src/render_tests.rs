@@ -3328,3 +3328,65 @@ async fn confirming_an_artisan_row_opens_the_terminal_to_type_into(cx: &mut Test
 
     draw(cx);
 }
+
+/// Saving a model rebuilds the Laravel index, so completions track the buffer (#21).
+///
+/// The staleness that matters in practice: the index was built at folder open, the user
+/// adds a cast and saves, and the popup must know the new column without a reopen. The
+/// rebuild is wholesale — two directories, milliseconds — which is #21's documented
+/// starting point; the dependency-graph incremental pass replaces the *trigger's cost*,
+/// not this behaviour.
+#[gpui::test]
+async fn saving_a_model_rebuilds_the_laravel_index(cx: &mut TestAppContext) {
+    // Same HOME race as the other index-backed tests; same lock.
+    let _home = crate::file_cache::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    let model_path = dir.path().join("app/Models/User.php");
+    let before = "<?php\nclass User extends Model {\n    protected $casts = ['is_admin' => 'boolean'];\n}\n";
+    std::fs::write(&model_path, before).unwrap();
+
+    let canonical = dir.path().canonicalize().unwrap();
+    let index_path = crate::file_cache::index_path(&canonical).expect("index path");
+    {
+        let (index, _) = elle_index::Index::open(&index_path).expect("index opens");
+        elle_index::laravel::build(
+            index.connection(),
+            &canonical,
+            &elle_workspace::CancelFlag::default(),
+        )
+        .expect("index builds");
+    }
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(model_path.clone()), before, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    draw(cx);
+
+    // The user adds a column-bearing cast and saves.
+    let after = "<?php\nclass User extends Model {\n    protected $casts = ['is_admin' => 'boolean', 'settings' => 'array'];\n}\n";
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    editor.update(cx, |editor, _cx| {
+        let len = editor.document.buffer.text().len();
+        editor.document.buffer.replace(0..len, after);
+    });
+    workspace.update_in(cx, |workspace, window, cx| workspace.save_for_test(window, cx));
+    cx.run_until_parked();
+
+    let (index, _) = elle_index::Index::open(&index_path).expect("index reopens");
+    let columns =
+        elle_index::laravel::columns_for_model(index.connection(), "User").expect("query");
+    assert!(
+        columns.iter().any(|column| column.name == "settings"),
+        "the saved cast is in the index without a folder reopen: {:?}",
+        columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    );
+
+    draw(cx);
+}
