@@ -21,6 +21,9 @@ pub enum PaletteMode {
     /// The project's artisan commands (#23). Confirming types the command into the
     /// terminal; nothing executes out of sight.
     Artisan,
+    /// Local branches (#64). Confirming switches — with the crate-level dirty-tree
+    /// refusal as the guard, not a prompt.
+    Branches,
     /// The quick fixes the server offered at the cursor (#19). Items are known at open
     /// (the request ran before the palette appeared); the id is the action's index.
     CodeActions,
@@ -53,6 +56,7 @@ impl PaletteMode {
             PaletteMode::WorkspaceSymbols => "Go to a symbol in the project…",
             PaletteMode::Rename => "New name…",
             PaletteMode::CodeActions => "Apply a fix…",
+            PaletteMode::Branches => "Switch to a branch…",
             PaletteMode::Languages => "Set the language…",
         }
     }

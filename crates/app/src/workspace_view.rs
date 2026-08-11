@@ -3684,7 +3684,8 @@ impl WorkspaceView {
             | PaletteMode::Artisan
             | PaletteMode::WorkspaceSymbols
             | PaletteMode::Rename
-            | PaletteMode::CodeActions => Vec::new(),
+            | PaletteMode::CodeActions
+            | PaletteMode::Branches => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3719,6 +3720,7 @@ impl WorkspaceView {
             PaletteMode::WorkspaceSymbols => {
                 self.load_workspace_symbol_items(palette, String::new(), cx)
             }
+            PaletteMode::Branches => self.load_branch_items(palette, cx),
             PaletteMode::Commands
             | PaletteMode::Languages
             | PaletteMode::Rename
@@ -5495,6 +5497,11 @@ impl WorkspaceView {
                     window.focus(&terminal.read(cx).focus_handle(cx));
                 }
             }
+            // #64. The id is the branch name; the dirty-tree guard lives in the crate.
+            Some(PaletteMode::Branches) => self.run_git_operation(
+                move |root| elle_git::switch_branch(&root, &id).map(|_| format!("On {id}")),
+                cx,
+            ),
             // #19. The id is the chosen action's index into the pending edits.
             Some(PaletteMode::CodeActions) => {
                 let pending = std::mem::take(&mut self.pending_code_actions);
@@ -5582,6 +5589,20 @@ impl WorkspaceView {
                     }
                     Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
                     Dispatch::QuickFix => self.quick_fix(&QuickFix, window, cx),
+                    Dispatch::GitFetch => self.run_git_operation(
+                        |root| elle_git::fetch(&root).map(|_| "Fetched".to_string()),
+                        cx,
+                    ),
+                    Dispatch::GitPush => self.run_git_operation(
+                        |root| elle_git::push(&root).map(|out| {
+                            let out = out.trim();
+                            if out.is_empty() { "Pushed".to_string() } else { out.to_string() }
+                        }),
+                        cx,
+                    ),
+                    Dispatch::GitSwitchBranch => {
+                        self.toggle_palette(PaletteMode::Branches, window, cx)
+                    }
                     Dispatch::FoldAll => {
                         if let Some(editor) = self.active_editor().cloned() {
                             editor.update(cx, |editor, cx| editor.fold_all(cx));
@@ -6277,6 +6298,57 @@ impl WorkspaceView {
                         }))
                 },
             ))
+    }
+
+    /// Fills the branch palette from the repository.
+    fn load_branch_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let branches =
+                cx.background_spawn(async move { elle_git::branches(&root) }).await;
+            let items = branches
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, current)| {
+                    let label = if current { format!("{name}  ✓") } else { name.clone() };
+                    (label, name)
+                })
+                .collect();
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
+    }
+
+    /// Runs one git write on the background pool and reports its outcome (#64).
+    ///
+    /// One funnel for fetch/push/switch: the status line carries the CLI's own message
+    /// on failure (a remote's rejection is for the user — the commit rule), and the
+    /// panel refreshes after, success or not, because a failed operation may still have
+    /// moved refs (a fetch that pruned, say).
+    fn run_git_operation(
+        &mut self,
+        operation: impl FnOnce(std::path::PathBuf) -> anyhow::Result<String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = cx.background_spawn(async move { operation(root) }).await;
+            this.update(cx, |this, cx| {
+                this.status = Some(match outcome {
+                    Ok(message) => {
+                        let message = message.trim();
+                        if message.is_empty() { "Done".to_string() } else { message.to_string() }
+                    }
+                    Err(err) => format!("git: {err}"),
+                }
+                .into());
+                this.refresh_git_status(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::GitWrite, task);
     }
 
     /// Reads the project database's schema on the background pool, superseding.
