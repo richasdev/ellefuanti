@@ -59,6 +59,7 @@ enum Sidebar {
     Search,
     Git,
     Database,
+    Docker,
 }
 
 /// An open tab.
@@ -84,6 +85,8 @@ enum Job {
     DbSchema,
     /// Reading the Laravel log for the panel (#25). Same superseding reasoning.
     LogRead,
+    /// Asking docker compose for its services (#25). Own slot, same reasoning.
+    DockerPs,
     /// Asking the project's artisan for its command list (#23). Its own slot: the palette
     /// that consumes it may be swapped to another mode while artisan is still answering,
     /// and the swap must cancel the ask rather than race it.
@@ -542,6 +545,9 @@ pub struct WorkspaceView {
     /// the honest failure line. Kept across sidebar switches like git's panel — a
     /// re-read is a refocus or a re-click, not every switch.
     db_schema: Option<std::result::Result<Vec<elle_db::TableInfo>, String>>,
+    /// The Docker panel's state (#25): `None` before first entry, then services or the
+    /// daemon's own words about why not.
+    docker_services: Option<std::result::Result<Vec<(String, bool)>, String>>,
     /// The source control panel (#64), and whether it is the visible sidebar.
     ///
     /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
@@ -645,6 +651,7 @@ impl WorkspaceView {
             pending_rename: None,
             pending_code_actions: Vec::new(),
             db_schema: None,
+            docker_services: None,
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -854,6 +861,9 @@ impl WorkspaceView {
         // only while the panel is actually up — a hidden panel refreshing is idle cost.
         if self.sidebar == Sidebar::Database {
             self.load_db_schema(cx);
+        }
+        if self.sidebar == Sidebar::Docker {
+            self.load_docker_services(cx);
         }
         // And the log: the error you came back to read may have just been written.
         self.refresh_log_panel(cx);
@@ -1176,6 +1186,21 @@ impl WorkspaceView {
         _cx: &mut Context<Self>,
     ) {
         self.pending_code_actions = edits;
+    }
+
+    /// The activity-bar Docker click, through the real load path.
+    #[cfg(test)]
+    pub fn show_docker_panel_for_test(&mut self, cx: &mut Context<Self>) {
+        self.load_docker_services(cx);
+        self.sidebar = Sidebar::Docker;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn docker_services_for_test(
+        &self,
+    ) -> Option<std::result::Result<Vec<(String, bool)>, String>> {
+        self.docker_services.clone()
     }
 
     /// The log toggle, through the real handler.
@@ -5609,6 +5634,9 @@ impl WorkspaceView {
                     Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
                     Dispatch::QuickFix => self.quick_fix(&QuickFix, window, cx),
                     Dispatch::ToggleLogPanel => self.toggle_log_panel(cx),
+                    Dispatch::DockerUp => self.type_docker_command("up -d", window, cx),
+                    Dispatch::DockerStop => self.type_docker_command("stop", window, cx),
+                    Dispatch::DockerLogs => self.type_docker_command("logs -f", window, cx),
                     Dispatch::GitFetch => self.run_git_operation(
                         |root| elle_git::fetch(&root).map(|_| "Fetched".to_string()),
                         cx,
@@ -6213,7 +6241,7 @@ const ACTIVITY_PANELS: [(&str, Option<Sidebar>); 7] = [
     ("Git", Some(Sidebar::Git)),
     ("Laravel", None),
     ("Database", Some(Sidebar::Database)),
-    ("Docker", None),
+    ("Docker", Some(Sidebar::Docker)),
     ("Tests", None),
 ];
 
@@ -6295,6 +6323,9 @@ impl WorkspaceView {
                                     // cost nothing until someone asks to look at it.
                                     if target == Sidebar::Database {
                                         this.load_db_schema(cx);
+                                    }
+                                    if target == Sidebar::Docker {
+                                        this.load_docker_services(cx);
                                     }
                                     this.sidebar = target;
                                     cx.notify();
@@ -6502,6 +6533,66 @@ impl WorkspaceView {
         }
     }
 
+    /// Asks docker compose for the project's services, on entry and refocus (#25).
+    ///
+    /// Never at startup, and a daemon that is down or absent lands as its own words in
+    /// the panel — "a broken Docker daemon cannot break the editor" is the issue's rule
+    /// and this is its whole enforcement: background call, text outcome, no retry.
+    fn load_docker_services(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if elle_docker::detect(&root).is_none() {
+                        return Err("Not a Docker project (no Dockerfile or compose file)"
+                            .to_string());
+                    }
+                    elle_docker::services(&root).map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.docker_services = Some(result);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::DockerPs, task);
+    }
+
+    /// The Docker panel's rows: service names with a text state marker. The actions
+    /// (up/stop/logs) live in the palette and TYPE into the terminal — the #146 rule.
+    fn render_docker_panel(&self, theme: &Theme) -> gpui::Div {
+        let body = div().flex_1().flex().flex_col().overflow_hidden().px_3().py_2().gap_1();
+        match &self.docker_services {
+            None => body.child(div().text_color(theme.text_muted).child("Asking docker compose…")),
+            Some(Err(message)) => body
+                .child(div().text_color(theme.text_muted).child(SharedString::from(message.clone()))),
+            Some(Ok(services)) if services.is_empty() => {
+                body.child(div().text_color(theme.text_muted).child("No compose services"))
+            }
+            Some(Ok(services)) => body.children(services.iter().map(|(name, running)| {
+                let marker = if *running { "running" } else { "stopped" };
+                div()
+                    .text_color(if *running { theme.text } else { theme.text_muted })
+                    .child(SharedString::from(format!("{name}  ·  {marker}")))
+            })),
+        }
+    }
+
+    /// Types a docker compose command into the terminal, opening it if needed — the
+    /// artisan door (#146): arguments are the user's to add, Enter is theirs to press.
+    fn type_docker_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal.is_none() {
+            self.toggle_terminal(&ToggleTerminal, window, cx);
+        }
+        if let Some(terminal) = self.terminal.clone() {
+            terminal.update(cx, |terminal, cx| {
+                terminal.feed_text(&format!("docker compose {command} "), cx);
+            });
+            window.focus(&terminal.read(cx).focus_handle(cx));
+        }
+    }
+
     /// The sidebar: the file tree, source control, or find-in-project.
     ///
     /// One sidebar with several possible contents rather than stacked columns, which is
@@ -6518,6 +6609,7 @@ impl WorkspaceView {
             Sidebar::Git => "SOURCE CONTROL".to_string(),
             Sidebar::Search => "SEARCH".to_string(),
             Sidebar::Database => "DATABASE".to_string(),
+            Sidebar::Docker => "DOCKER".to_string(),
         };
 
         div()
@@ -6563,6 +6655,7 @@ impl WorkspaceView {
                     None => div().into_any_element(),
                 },
                 Sidebar::Database => self.render_db_panel(theme).into_any_element(),
+                Sidebar::Docker => self.render_docker_panel(theme).into_any_element(),
                 Sidebar::Explorer => match self.tree.as_ref() {
                     // Wrapped so the empty space *below* the rows is right-clickable: that
                     // opens the root menu, which is the only way to create at the top

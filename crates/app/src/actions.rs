@@ -465,6 +465,9 @@ pub enum Dispatch {
     GitPush,
     GitSwitchBranch,
     ToggleLogPanel,
+    DockerUp,
+    DockerStop,
+    DockerLogs,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -505,6 +508,9 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "editor.rename" => Dispatch::RenameSymbol,
         "editor.quick_fix" => Dispatch::QuickFix,
         "laravel.logs" => Dispatch::ToggleLogPanel,
+        "docker.up" => Dispatch::DockerUp,
+        "docker.stop" => Dispatch::DockerStop,
+        "docker.logs" => Dispatch::DockerLogs,
         "git.fetch" => Dispatch::GitFetch,
         "git.push" => Dispatch::GitPush,
         "git.switch_branch" => Dispatch::GitSwitchBranch,

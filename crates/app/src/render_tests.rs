@@ -4003,3 +4003,31 @@ async fn the_log_panel_lists_entries_and_jumps_to_the_frame(cx: &mut TestAppCont
 
     draw(cx);
 }
+
+/// A project with no Docker files gets the honest line, and nothing ran (#25).
+///
+/// The deterministic half: the with-daemon path depends on a docker install the test
+/// machine is not guaranteed, so the service merge is tested pure in `elle-docker` and
+/// this pins the detection refusal plus never-at-entry-without-files.
+#[gpui::test]
+async fn a_dockerless_project_is_told_so_not_probed(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.show_docker_panel_for_test(cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let state = workspace.docker_services_for_test().expect("loaded");
+        assert_eq!(
+            state.unwrap_err(),
+            "Not a Docker project (no Dockerfile or compose file)",
+            "detection refuses before any docker CLI call"
+        );
+    });
+
+    draw(cx);
+}
