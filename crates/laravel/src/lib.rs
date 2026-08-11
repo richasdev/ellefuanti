@@ -25,7 +25,7 @@ mod resolved;
 mod routes;
 mod targets;
 
-pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at};
+pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at, scope_context_at};
 pub use models::{ModelFacts, extract_migration_columns, extract_model};
 pub use references::{Reference, ReferenceKind, reference_at};
 pub use resolved::Resolved;

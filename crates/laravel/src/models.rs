@@ -26,6 +26,9 @@ pub struct ModelFacts {
     pub casts: Vec<(String, String)>,
     /// Relationship methods: `(method name, kind, target class as written)`.
     pub relations: Vec<(String, String, String)>,
+    /// Query scopes by their *call* name: `scopeActive` is stored as `active`, because
+    /// the name the user types is the one completion answers with.
+    pub scopes: Vec<String>,
 }
 
 /// The relationship builders worth recognising — the set Eloquent documents.
@@ -100,6 +103,22 @@ pub fn extract_model(source: &str) -> Option<ModelFacts> {
             if !method.is_empty() && !target.is_empty() {
                 facts.relations.push((method, kind.to_string(), target));
             }
+        }
+    }
+
+    // Scopes: `function scopeActive(` → `active`. The prefix must be followed by an
+    // uppercase letter — a method merely *named* `scope` (or `scoped_thing`) is not one.
+    let mut from = 0;
+    while let Some(at) = source[from..].find("function scope") {
+        let at = from + at + "function scope".len();
+        from = at;
+        let rest: String =
+            source[at..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let mut chars = rest.chars();
+        if let Some(first) = chars.next()
+            && first.is_uppercase()
+        {
+            facts.scopes.push(first.to_lowercase().chain(chars).collect());
         }
     }
 
@@ -258,6 +277,16 @@ class User extends Authenticatable
                 ("company".into(), "belongsTo".into(), "App\\Models\\Company".into()),
             ]
         );
+    }
+
+    #[test]
+    fn scopes_are_reported_by_their_call_name() {
+        // `scopeActive` is *called* as `active()` — the index stores the name the user
+        // types, because completion is the consumer.
+        let src = "<?php\nclass User extends Model {\n  public function scopeActive($query) { return $query; }\n  public function scopePopularIn($query, $region) { return $query; }\n  public function scope($query) { return $query; }\n}\n";
+        let facts = extract_model(src).expect("a model");
+        assert_eq!(facts.scopes, ["active", "popularIn"]);
+        // Bare `scope` is not a scope method — there is no name left after the prefix.
     }
 
     #[test]

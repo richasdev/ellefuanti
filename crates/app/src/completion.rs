@@ -51,6 +51,10 @@ pub enum CompletionSource {
     /// method the class really defines, but the kind/target in the detail are read from
     /// the method body by scan, not proven by execution.
     LaravelRelation,
+    /// A query scope from the Laravel index (#22), by *call* name: `active` because the
+    /// model declares `scopeActive`. The one list where the declared method name — the
+    /// thing the server offers — is exactly what the user must not type.
+    LaravelScope,
     /// A route name read out of the project's route files by static analysis (#83).
     ///
     /// A *weaker* claim than it looks, and deliberately labelled so: `route_names` only
@@ -69,6 +73,7 @@ impl CompletionSource {
             CompletionSource::LaravelRoute => "route",
             CompletionSource::LaravelColumn => "column",
             CompletionSource::LaravelRelation => "relation",
+            CompletionSource::LaravelScope => "scope",
         }
     }
 
@@ -86,6 +91,7 @@ impl CompletionSource {
             // spot (the index sees what artisan wrote, not what a package injected).
             CompletionSource::LaravelColumn => theme.accent,
             CompletionSource::LaravelRelation => theme.accent,
+            CompletionSource::LaravelScope => theme.accent,
         }
     }
 }

@@ -68,6 +68,12 @@ pub fn build(conn: &Connection, root: &Path, cancel: &CancelFlag) -> Result<()> 
                 rusqlite::params![model_id, name, kind, target],
             )?;
         }
+        for name in &facts.scopes {
+            conn.execute(
+                "INSERT INTO model_scopes (model_id, name) VALUES (?1, ?2)",
+                rusqlite::params![model_id, name],
+            )?;
+        }
     }
 
     for entry in read_dir_sorted(&root.join("database/migrations")) {
@@ -131,6 +137,16 @@ pub fn relations_for_model(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+/// The query scopes a model declares, by call name (`active`, never `scopeActive`).
+pub fn scopes_for_model(conn: &Connection, class: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT s.name FROM model_scopes s
+         JOIN models m ON m.id = s.model_id WHERE m.class = ?1 ORDER BY s.rowid",
+    )?;
+    let rows = statement.query_map([class], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 /// Laravel's table-name convention, naive on purpose: `Person`→`persons`-style
 /// irregulars are exactly the models that declare `$table`, which wins over this guess
 /// at the one seam that applies it.
@@ -173,7 +189,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("database/migrations")).unwrap();
         std::fs::write(
             dir.path().join("app/Models/User.php"),
-            "<?php\nclass User extends Model {\n  protected $casts = ['is_admin' => 'boolean'];\n  public function posts() { return $this->hasMany(Post::class); }\n}\n",
+            "<?php\nclass User extends Model {\n  protected $casts = ['is_admin' => 'boolean'];\n  public function posts() { return $this->hasMany(Post::class); }\n  public function scopeActive($query) { return $query; }\n}\n",
         )
         .unwrap();
         // `$table` deliberately DIFFERENT from the convention (`posts`): the fixture's
@@ -221,6 +237,9 @@ mod tests {
         let relations = relations_for_model(conn, "User").unwrap();
         assert_eq!(relations, [("posts".to_string(), "hasMany".into(), "Post".into())]);
 
+        let scopes = scopes_for_model(conn, "User").unwrap();
+        assert_eq!(scopes, ["active"], "the call name, not scopeActive — completion is the consumer");
+
         // Post's columns attach through its *declared* table (`articles`), not the
         // convention (`posts`) — the assertion that makes declared-wins falsifiable.
         let post: Vec<String> =
@@ -238,6 +257,8 @@ mod tests {
 
         let columns = columns_for_model(conn, "User").unwrap();
         assert_eq!(columns.len(), 5, "two builds, one set of rows — the index is a cache");
+        let scopes = scopes_for_model(conn, "User").unwrap();
+        assert_eq!(scopes.len(), 1, "scopes ride the same cascade");
     }
 
     #[test]

@@ -2960,6 +2960,30 @@ impl WorkspaceView {
             return;
         }
 
+        // `User::ac` mid-typing: the scanner reads the class off the prefix, and the
+        // items are the scopes by *call* name — the one list where the declared method
+        // name (the server's answer) is exactly what the user must not type.
+        if let Some((class, _)) = elle_laravel::scope_context_at(&text, offset) {
+            let task = cx.background_spawn(async move {
+                let path = crate::file_cache::index_path(&root)?;
+                let (index, _) = elle_index::Index::open(&path).ok()?;
+                elle_index::laravel::scopes_for_model(index.connection(), &class).ok()
+            });
+            let task = cx.spawn(async move |_this, cx| {
+                let Some(scopes) = task.await else { return };
+                let items: Vec<CompletionItem> = scopes
+                    .into_iter()
+                    .map(|name| CompletionItem::new(name, CompletionSource::LaravelScope))
+                    .collect();
+                if items.is_empty() {
+                    return;
+                }
+                popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
+            });
+            self.jobs.start(Job::CompletionColumns, task);
+            return;
+        }
+
         let Some(facts) = elle_laravel::extract_model(&text) else { return };
         let class = facts.class;
 
