@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 elle-syntax.workspace = true
 elle-text.workspace = true
 tree-sitter.workspace = true

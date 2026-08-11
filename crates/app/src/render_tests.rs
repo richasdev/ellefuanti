@@ -4031,3 +4031,36 @@ async fn a_dockerless_project_is_told_so_not_probed(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// The composer-script palette lists composer.json's own scripts, and confirming
+/// opens the terminal to type into — never runs (#26).
+#[gpui::test]
+async fn the_composer_script_palette_lists_and_types(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(
+        dir.path().join("composer.json"),
+        r#"{"scripts": {"test": "pest", "lint": "pint"}}"#,
+    )
+    .unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.toggle_palette_for_test(crate::palette::PaletteMode::ComposerScripts, window, cx);
+    });
+    cx.run_until_parked();
+
+    let labels = workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
+    assert_eq!(labels, ["lint", "test"], "the file's own scripts, alphabetical");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.confirm_palette_for_test("test", window, cx);
+    });
+    workspace.read_with(cx, |workspace, cx| {
+        let terminal = workspace.terminal_for_test().expect("the terminal opened to type into");
+        assert!(terminal.read(cx).session_count() > 0);
+    });
+
+    draw(cx);
+}

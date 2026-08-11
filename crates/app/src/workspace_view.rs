@@ -3729,7 +3729,8 @@ impl WorkspaceView {
             | PaletteMode::WorkspaceSymbols
             | PaletteMode::Rename
             | PaletteMode::CodeActions
-            | PaletteMode::Branches => Vec::new(),
+            | PaletteMode::Branches
+            | PaletteMode::ComposerScripts => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3765,6 +3766,7 @@ impl WorkspaceView {
                 self.load_workspace_symbol_items(palette, String::new(), cx)
             }
             PaletteMode::Branches => self.load_branch_items(palette, cx),
+            PaletteMode::ComposerScripts => self.load_composer_script_items(palette, cx),
             PaletteMode::Commands
             | PaletteMode::Languages
             | PaletteMode::Rename
@@ -5541,6 +5543,10 @@ impl WorkspaceView {
                     window.focus(&terminal.read(cx).focus_handle(cx));
                 }
             }
+            // #26. The id is the script name; confirming types, never runs.
+            Some(PaletteMode::ComposerScripts) => {
+                self.type_terminal_command(&format!("composer run-script {id} "), window, cx);
+            }
             // #64. The id is the branch name; the dirty-tree guard lives in the crate.
             Some(PaletteMode::Branches) => self.run_git_operation(
                 move |root| elle_git::switch_branch(&root, &id).map(|_| format!("On {id}")),
@@ -5634,6 +5640,18 @@ impl WorkspaceView {
                     Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
                     Dispatch::QuickFix => self.quick_fix(&QuickFix, window, cx),
                     Dispatch::ToggleLogPanel => self.toggle_log_panel(cx),
+                    Dispatch::ComposerInstall => {
+                        self.type_terminal_command("composer install ", window, cx)
+                    }
+                    Dispatch::ComposerUpdate => {
+                        self.type_terminal_command("composer update ", window, cx)
+                    }
+                    Dispatch::ComposerRequire => {
+                        self.type_terminal_command("composer require ", window, cx)
+                    }
+                    Dispatch::ComposerScript => {
+                        self.toggle_palette(PaletteMode::ComposerScripts, window, cx)
+                    }
                     Dispatch::DockerUp => self.type_docker_command("up -d", window, cx),
                     Dispatch::DockerStop => self.type_docker_command("stop", window, cx),
                     Dispatch::DockerLogs => self.type_docker_command("logs -f", window, cx),
@@ -6579,18 +6597,41 @@ impl WorkspaceView {
         }
     }
 
-    /// Types a docker compose command into the terminal, opening it if needed — the
-    /// artisan door (#146): arguments are the user's to add, Enter is theirs to press.
-    fn type_docker_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Types a command into the terminal, opening it if needed — the artisan door
+    /// (#146): the command sits visibly on the prompt line, arguments are the user's to
+    /// add, Enter is theirs to press. Artisan, docker and composer all walk through it.
+    fn type_terminal_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal.is_none() {
             self.toggle_terminal(&ToggleTerminal, window, cx);
         }
         if let Some(terminal) = self.terminal.clone() {
             terminal.update(cx, |terminal, cx| {
-                terminal.feed_text(&format!("docker compose {command} "), cx);
+                terminal.feed_text(command, cx);
             });
             window.focus(&terminal.read(cx).focus_handle(cx));
         }
+    }
+
+    fn type_docker_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.type_terminal_command(&format!("docker compose {command} "), window, cx);
+    }
+
+    /// Fills the composer-script palette from composer.json's own scripts.
+    fn load_composer_script_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let scripts = cx
+                .background_spawn(async move {
+                    let text =
+                        std::fs::read_to_string(root.join("composer.json")).unwrap_or_default();
+                    elle_laravel::composer_scripts(&text)
+                })
+                .await;
+            let items = scripts.into_iter().map(|name| (name.clone(), name)).collect();
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
     }
 
     /// The sidebar: the file tree, source control, or find-in-project.
