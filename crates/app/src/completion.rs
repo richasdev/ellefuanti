@@ -42,6 +42,10 @@ pub enum CompletionSource {
     /// The language server answered. The strongest claim available here — Intelephense has
     /// the whole project indexed and knows what is actually in scope.
     Lsp,
+    /// A column from the Laravel index (#22): a migration's word, a cast's, or
+    /// `$fillable`'s — the provenance is in the item's detail, because which claim backs
+    /// a column is exactly what #20 says the user must be able to see.
+    LaravelColumn,
     /// A route name read out of the project's route files by static analysis (#83).
     ///
     /// A *weaker* claim than it looks, and deliberately labelled so: `route_names` only
@@ -58,6 +62,7 @@ impl CompletionSource {
         match self {
             CompletionSource::Lsp => "LSP",
             CompletionSource::LaravelRoute => "route",
+            CompletionSource::LaravelColumn => "column",
         }
     }
 
@@ -71,6 +76,9 @@ impl CompletionSource {
             // Laravel's are the ones worth noticing — they come from this project rather
             // than from the language, and they are the ones with a known blind spot.
             CompletionSource::LaravelRoute => theme.accent,
+            // Same voice as routes: project facts, worth noticing, with a known blind
+            // spot (the index sees what artisan wrote, not what a package injected).
+            CompletionSource::LaravelColumn => theme.accent,
         }
     }
 }

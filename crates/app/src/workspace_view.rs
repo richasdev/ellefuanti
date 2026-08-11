@@ -148,6 +148,8 @@ enum Job {
     /// side had already called `mark_loaded`, settling on "No completions": a false claim,
     /// which is the exact thing `loaded` was introduced to prevent.
     CompletionRoutes,
+    /// The Laravel-column source (#22), its own slot for `CompletionRoutes`'s reason.
+    CompletionColumns,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -2774,6 +2776,7 @@ impl WorkspaceView {
         self.completion_word_start = Some((editor.clone(), word_start));
 
         self.request_route_completions(popup.clone(), cx);
+        self.request_column_completions(popup.clone(), cx);
         self.request_lsp_completions(popup, offset, window, cx);
         cx.notify();
     }
@@ -2900,6 +2903,58 @@ impl WorkspaceView {
             popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
         });
         self.jobs.start(Job::CompletionRoutes, task);
+    }
+
+    /// Offers the model's own columns, when the file being edited *is* a model (#22).
+    ///
+    /// The first consumer of #21's index, shaped by the same honesty rules as routes:
+    /// items appear only where the claim holds (the class under edit extends Model —
+    /// judged by `extract_model` on the live buffer, so an ordinary class gets nothing),
+    /// each item's detail carries its provenance (`string · migration` is a different
+    /// promise than `boolean · cast`), and an empty or missing index contributes
+    /// nothing silently — the index is a cache and this source must survive its absence
+    /// (ADR-0008).
+    ///
+    /// Buffer-text detection rather than a path heuristic: a model outside `app/Models`
+    /// still completes, and a helper class inside it still does not.
+    fn request_column_completions(
+        &mut self,
+        popup: Entity<CompletionPopup>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let Some(editor) = self.active_editor() else { return };
+        let text = editor.read(cx).document.buffer.text();
+
+        let Some(facts) = elle_laravel::extract_model(&text) else { return };
+        let class = facts.class;
+
+        let task = cx.background_spawn(async move {
+            let path = crate::file_cache::index_path(&root)?;
+            let (index, _) = elle_index::Index::open(&path).ok()?;
+            elle_index::laravel::columns_for_model(index.connection(), &class).ok()
+        });
+
+        let task = cx.spawn(async move |_this, cx| {
+            let Some(columns) = task.await else { return };
+            let items: Vec<CompletionItem> = columns
+                .into_iter()
+                .map(|column| {
+                    let detail = if column.column_type.is_empty() {
+                        column.source.clone()
+                    } else {
+                        format!("{} · {}", column.column_type, column.source)
+                    };
+                    CompletionItem::new(column.name, CompletionSource::LaravelColumn)
+                        .with_detail(Some(detail))
+                })
+                .collect();
+            if items.is_empty() {
+                return;
+            }
+            popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
+        });
+        self.jobs.start(Job::CompletionColumns, task);
     }
 
     /// Asks the language server, without blocking, and cancels whatever it supersedes.

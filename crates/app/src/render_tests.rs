@@ -2922,3 +2922,81 @@ async fn the_theme_picker_cycles_and_applies(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Editing a model offers its own columns, provenance in the detail (#22).
+///
+/// The first consumer of #21's index, driven end to end: a real project, a really-built
+/// index, the real popup. A non-model file must get nothing — the source's claim is
+/// scoped to where it holds, which is the routes source's rule inherited.
+#[gpui::test]
+async fn a_model_offers_its_columns_with_provenance(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    std::fs::create_dir_all(dir.path().join("database/migrations")).unwrap();
+    let model_path = dir.path().join("app/Models/User.php");
+    std::fs::write(
+        &model_path,
+        "<?php\nclass User extends Model {\n    protected $casts = ['is_admin' => 'boolean'];\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("database/migrations/2026_01_01_create_users.php"),
+        "<?php\nreturn new class extends Migration {\n  public function up(): void {\n    Schema::create('users', function (Blueprint $table) {\n      $table->id();\n      $table->string('name');\n    });\n  }\n};\n",
+    )
+    .unwrap();
+
+    // Build the index the way the folder-open task does, synchronously here — against
+    // the CANONICAL root, because that is what the workspace's tree hands the background
+    // build. The raw tempdir spelling produced a different index file entirely: the
+    // /var-vs-/private/var trap's fifth appearance in this codebase, this time between
+    // a test and the code it tests.
+    let canonical = dir.path().canonicalize().unwrap();
+    let index_path = crate::file_cache::index_path(&canonical).expect("index path");
+    {
+        let (index, _) = elle_index::Index::open(&index_path).expect("index opens");
+        elle_index::laravel::build(
+            index.connection(),
+            &canonical,
+            &elle_workspace::CancelFlag::default(),
+        )
+        .expect("index builds");
+    }
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let text = std::fs::read_to_string(&model_path).unwrap();
+        let document = Document::new(Some(model_path.clone()), &text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    // A frame first: the popup anchors at a measured cursor origin, and measurement
+    // happens in prepaint — invoking before any frame returns early with no popup.
+    draw(cx);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("popup open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_ref()).collect();
+        assert!(labels.contains(&"id"), "migration columns arrive: {labels:?}");
+        assert!(labels.contains(&"is_admin"), "cast columns arrive: {labels:?}");
+        let is_admin = items.iter().find(|item| item.label.as_ref() == "is_admin").unwrap();
+        assert_eq!(
+            is_admin.detail.as_ref().map(|d| d.as_ref()),
+            Some("boolean · cast"),
+            "the provenance is the detail — a cast's word is a different promise"
+        );
+        assert!(
+            items.iter().any(|item| matches!(item.source, CompletionSource::LaravelColumn)),
+            "the source is modelled, not inferred"
+        );
+    });
+
+    draw(cx);
+}
