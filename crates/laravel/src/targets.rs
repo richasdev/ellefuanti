@@ -32,13 +32,40 @@ pub struct Target {
 /// (ADR-0007). The cost is a handful of `exists()` calls for a view or component, and for a
 /// route, parsing `routes/*.php`. Nothing is cached here: caching a *click* would be
 /// solving a problem nobody has, and the caller already runs this off the UI thread.
-pub fn resolve(root: &Path, reference: &Reference) -> Option<Target> {
+pub fn resolve(root: &Path, current: &Path, reference: &Reference) -> Option<Target> {
     match reference.kind {
         ReferenceKind::Route => route_target(root, &reference.name),
         ReferenceKind::Config => config_target(root, &reference.name),
         ReferenceKind::View => view_target(root, &reference.name).map(file),
         ReferenceKind::Component => component_target(root, &reference.name).map(file),
+        ReferenceKind::WireAction => wire_member_target(root, current, &reference.name, true),
+        ReferenceKind::WireProperty => {
+            wire_member_target(root, current, &reference.name, false)
+        }
     }
+}
+
+/// A Livewire member's declaration, inside the class the current view belongs to (#24).
+///
+/// The line search is a scan for the declaration shape (`function name(` or `$name`),
+/// which is exactly as strong as the extractor that offered the name in the first
+/// place. Falling back to the file with no line when the member is not found keeps the
+/// jump useful for a member the scan cannot see (a trait's, say) — the file is certain,
+/// the line is not, and `None` says so (RISKS #4).
+fn wire_member_target(
+    root: &Path,
+    current: &Path,
+    name: &str,
+    action: bool,
+) -> Option<Target> {
+    let class_path = crate::livewire::livewire_class_path(root, current)?;
+    let source = std::fs::read_to_string(&class_path).ok()?;
+    let needle =
+        if action { format!("function {name}(") } else { format!("${name}") };
+    let line = source
+        .find(&needle)
+        .map(|at| source[..at].matches('\n').count() + 1);
+    Some(Target { path: class_path, line })
 }
 
 fn file(path: PathBuf) -> Target {
@@ -239,5 +266,47 @@ mod tests {
     fn a_string_without_an_arrow_is_not_a_key() {
         let source = "<?php\nreturn [\n    'driver' => 'name',\n];\n";
         assert_eq!(key_line(source, "name"), None);
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::references::{Reference, ReferenceKind};
+
+    #[test]
+    fn a_wire_reference_resolves_into_the_components_class_at_the_member_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("app/Livewire")).unwrap();
+        std::fs::write(
+            root.join("app/Livewire/UserTable.php"),
+            "<?php\nclass UserTable extends Component {\n    public $search;\n    public function sortBy($c) {}\n}\n",
+        )
+        .unwrap();
+        let view = root.join("resources/views/livewire/user-table.blade.php");
+
+        let action = Reference {
+            kind: ReferenceKind::WireAction,
+            name: "sortBy".into(),
+            range: 0..0,
+        };
+        let target = resolve(root, &view, &action).expect("resolves");
+        assert!(target.path.ends_with("app/Livewire/UserTable.php"));
+        assert_eq!(target.line, Some(4), "1-based line of the function declaration");
+
+        let property = Reference {
+            kind: ReferenceKind::WireProperty,
+            name: "search".into(),
+            range: 0..0,
+        };
+        let target = resolve(root, &view, &property).expect("resolves");
+        assert_eq!(target.line, Some(3));
+
+        // A member the scan cannot see: the file is certain, the line is not.
+        let ghost =
+            Reference { kind: ReferenceKind::WireAction, name: "fromTrait".into(), range: 0..0 };
+        let target = resolve(root, &view, &ghost).expect("still the class file");
+        assert_eq!(target.line, None, "no invented line (RISKS #4)");
     }
 }

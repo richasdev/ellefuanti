@@ -54,7 +54,10 @@ fn write(root: &Path, relative: &str, contents: &str) {
 fn go_to(root: &Path, source: &str, needle: &str, blade: bool) -> Option<(PathBuf, Option<usize>)> {
     let offset = source.find(needle).unwrap_or_else(|| panic!("{needle:?} not in source"));
     let reference = reference_at(source, offset, blade)?;
-    resolve(root, &reference).map(|target| (target.path, target.line))
+    // The current-file argument matters only to wire references; these tests navigate
+    // from project-level constructs, so any in-project path serves.
+    resolve(root, &root.join("resources/views/any.blade.php"), &reference)
+        .map(|target| (target.path, target.line))
 }
 
 #[test]

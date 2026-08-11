@@ -51,6 +51,10 @@ pub enum ReferenceKind {
     View,
     /// `<x-forms.input>` — a Blade component, which resolves to one of two directories.
     Component,
+    /// `wire:click="sortBy"` — a Livewire action; resolves into the component's class.
+    WireAction,
+    /// `wire:model="search"` — a Livewire property; same class, different member shape.
+    WireProperty,
 }
 
 /// The Laravel reference at `offset`, if the cursor is inside one.
@@ -187,6 +191,7 @@ const VIEW_DIRECTIVES: [&str; 4] = ["include", "extends", "component", "each"];
 /// unlike a second tree it cannot desync from the highlighter's view of the same file.
 fn blade_reference_at(source: &str, offset: usize) -> Option<Reference> {
     component_at(source, offset)
+        .or_else(|| wire_at(source, offset))
         .or_else(|| directive_at(source, offset))
         // `{{ route('x') }}` and `{{ config('y') }}` in a template. The scanner cannot tell
         // a call inside an echo from one inside a `{{-- comment --}}`, which is the price
@@ -194,6 +199,25 @@ fn blade_reference_at(source: &str, offset: usize) -> Option<Reference> {
         // and the failure is a ⌘click that navigates from a commented line rather than a
         // wrong destination.
         .or_else(|| helper_call_at(source, offset))
+}
+
+/// The value of a `wire:` attribute under the cursor, as a navigable reference (#24).
+///
+/// `wire:click="sortBy(1)"` navigates by the method name alone — the reference is the
+/// leading identifier, and arguments stay out of the name the resolver looks up.
+fn wire_at(source: &str, offset: usize) -> Option<Reference> {
+    let (target, range) = crate::livewire::wire_context_at(source, offset)?;
+    let value = &source[range.clone()];
+    let name: String =
+        value.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() {
+        return None;
+    }
+    let kind = match target {
+        crate::livewire::WireTarget::Action => ReferenceKind::WireAction,
+        crate::livewire::WireTarget::Property => ReferenceKind::WireProperty,
+    };
+    Some(Reference { kind, name, range: range.start..range.start + value.len().min(range.len()) })
 }
 
 /// `<x-forms.input>` or `<x:forms.input>`, returning the component name.
@@ -405,6 +429,21 @@ mod tests {
         assert_eq!(reference_at(src, at(src, "route"), false), None);
         // On the trailing semicolon.
         assert_eq!(reference_at(src, at(src, ";"), false), None);
+    }
+
+    #[test]
+    fn a_wire_value_is_a_reference_to_the_components_member() {
+        let source = r#"<button wire:click="sortBy(1)">x</button>"#;
+        let at = source.find("sortBy").unwrap() + 2;
+        let reference = reference_at(source, at, true).expect("a reference");
+        assert_eq!(reference.kind, ReferenceKind::WireAction);
+        assert_eq!(reference.name, "sortBy", "arguments stay out of the looked-up name");
+
+        let model = r#"<input wire:model="search">"#;
+        let at = model.find("search").unwrap();
+        let reference = reference_at(model, at, true).expect("a reference");
+        assert_eq!(reference.kind, ReferenceKind::WireProperty);
+        assert_eq!(reference.name, "search");
     }
 
     #[test]
