@@ -516,6 +516,19 @@ impl Client {
         )
     }
 
+    /// Issues a workspace-wide symbol search without waiting (#19).
+    ///
+    /// No open-document guard, deliberately: the question is about the workspace, not a
+    /// file, and demanding one would break the search in a window with no tabs yet. The
+    /// server is the matcher — the query goes through as typed and the reply is already
+    /// filtered, which is why the palette must not filter it a second time.
+    pub fn request_workspace_symbols(&self, query: &str) -> Result<RequestId> {
+        self.send_request(
+            lsp_types::request::WorkspaceSymbolRequest::METHOD,
+            json!({ "query": query }),
+        )
+    }
+
     /// Issues a whole-document formatting request without waiting (#19).
     ///
     /// `tab_size`/`insert_spaces` are the two options every server honours; the rest of

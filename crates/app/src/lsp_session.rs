@@ -381,6 +381,45 @@ pub fn flatten_symbols(response: &DocumentSymbolResponse) -> Vec<Symbol> {
     out
 }
 
+/// Palette rows for a workspace-wide symbol search (#19): `(label, target id)`.
+///
+/// The label qualifies with the container when there is one — two `handle` methods in
+/// two controllers must be distinguishable in a project-wide list. A nested-shape reply
+/// whose location carries only a URI (the spec allows it) lands at the top of its file:
+/// an honest degradation, not a guess at a line.
+pub fn workspace_symbol_items(
+    response: &elle_lsp::lsp_types::WorkspaceSymbolResponse,
+) -> Vec<(String, std::path::PathBuf, u32)> {
+    use elle_lsp::lsp_types::{OneOf, WorkspaceSymbolResponse};
+    let label = |name: &str, container: &Option<String>| match container {
+        Some(container) if !container.is_empty() => format!("{container}::{name}"),
+        _ => name.to_string(),
+    };
+    match response {
+        WorkspaceSymbolResponse::Flat(symbols) => symbols
+            .iter()
+            .filter_map(|symbol| {
+                let path = elle_lsp::uri_to_path(&symbol.location.uri).ok()?;
+                Some((
+                    label(&symbol.name, &symbol.container_name),
+                    path,
+                    symbol.location.range.start.line,
+                ))
+            })
+            .collect(),
+        WorkspaceSymbolResponse::Nested(symbols) => symbols
+            .iter()
+            .filter_map(|symbol| {
+                let (uri, line) = match &symbol.location {
+                    OneOf::Left(location) => (&location.uri, location.range.start.line),
+                    OneOf::Right(workspace_location) => (&workspace_location.uri, 0),
+                };
+                Some((label(&symbol.name, &symbol.container_name), elle_lsp::uri_to_path(uri).ok()?, line))
+            })
+            .collect(),
+    }
+}
+
 fn push_nested(symbols: &[DocumentSymbol], depth: usize, out: &mut Vec<Symbol>) {
     for symbol in symbols {
         out.push(Symbol {
@@ -1123,6 +1162,45 @@ mod tests {
         // A file the server has not indexed yet answers with an empty list, not an error.
         assert!(flatten_symbols(&DocumentSymbolResponse::Nested(vec![])).is_empty());
         assert!(flatten_symbols(&DocumentSymbolResponse::Flat(vec![])).is_empty());
+    }
+
+    #[test]
+    fn workspace_symbols_become_rows_with_container_and_line() {
+        use elle_lsp::lsp_types::{
+            Location, OneOf, SymbolKind, WorkspaceSymbol, WorkspaceSymbolResponse,
+        };
+        let range = Range {
+            start: Position { line: 7, character: 0 },
+            end: Position { line: 7, character: 6 },
+        };
+        let response = WorkspaceSymbolResponse::Nested(vec![
+            WorkspaceSymbol {
+                name: "handle".into(),
+                kind: SymbolKind::METHOD,
+                tags: None,
+                container_name: Some("UserController".into()),
+                location: OneOf::Left(Location { uri: uri(), range }),
+                data: None,
+            },
+            // The spec allows a URI-only location; it must land at the top of its file
+            // rather than being dropped or guessed at.
+            WorkspaceSymbol {
+                name: "Post".into(),
+                kind: SymbolKind::CLASS,
+                tags: None,
+                container_name: None,
+                location: OneOf::Right(elle_lsp::lsp_types::WorkspaceLocation { uri: uri() }),
+                data: None,
+            },
+        ]);
+
+        let rows = workspace_symbol_items(&response);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "UserController::handle", "the container disambiguates");
+        assert_eq!(rows[0].2, 7);
+        assert_eq!(rows[1].0, "Post");
+        assert_eq!(rows[1].2, 0, "URI-only lands at the top of the file, not dropped");
+        assert!(rows[0].1.ends_with("User.php"));
     }
 
     #[test]

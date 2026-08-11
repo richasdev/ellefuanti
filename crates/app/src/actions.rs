@@ -445,6 +445,7 @@ pub enum Dispatch {
     FindInProject,
     Artisan,
     FormatDocument,
+    GoToWorkspaceSymbol,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -481,6 +482,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "editor.find_in_project" => Dispatch::FindInProject,
         "laravel.artisan" => Dispatch::Artisan,
         "editor.format" => Dispatch::FormatDocument,
+        "navigate.workspace_symbol" => Dispatch::GoToWorkspaceSymbol,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

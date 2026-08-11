@@ -3329,6 +3329,45 @@ async fn confirming_an_artisan_row_opens_the_terminal_to_type_into(cx: &mut Test
     draw(cx);
 }
 
+/// The workspace-symbol palette shows what the server sent, not a local re-filter (#19).
+///
+/// The server is the matcher — Intelephense matches camel humps and mid-word fragments a
+/// subsequence scan would reject, so filtering its answer again would make real hits
+/// vanish as the user types. The fixture makes that falsifiable: the typed query shares
+/// no subsequence with the row, and the row must survive.
+#[gpui::test]
+async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
+    cx: &mut TestAppContext,
+) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_palette_for_test(crate::palette::PaletteMode::WorkspaceSymbols, window, cx);
+    });
+    let palette = workspace
+        .read_with(cx, |workspace, _cx| workspace.palette_for_test())
+        .expect("palette open");
+
+    // The user types something the server would fuzzy-match but a subsequence scan
+    // rejects outright…
+    palette.update(cx, |palette, cx| palette.type_for_test("zzz", cx));
+    // …and the server answers with a hit anyway (fed directly — no server in tests).
+    palette.update(cx, |palette, cx| {
+        palette.set_items(vec![("UserController::handle".into(), "x".into())], cx);
+    });
+
+    let labels =
+        workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
+    assert_eq!(
+        labels,
+        ["UserController::handle"],
+        "the server's hit must survive the local query"
+    );
+
+    draw(cx);
+}
+
 /// With no server, mid-word invoke offers the buffer's own words (#20).
 ///
 /// The degradation path: Intelephense not installed, the user types `$user` and invokes
