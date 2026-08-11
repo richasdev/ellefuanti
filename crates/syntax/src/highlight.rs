@@ -77,6 +77,21 @@ impl SyntaxTree {
             }
         }
 
+        if self.language().paints_inline_markup() {
+            // The HTML that lives inside PHP's `text` / `text_interpolation` nodes — the
+            // grammar treats it as opaque bytes, so tags, attributes and quoted values
+            // get their colour from a hand lexer, region-bounded by the tree so a `<` in
+            // PHP code can never start a phantom tag. Same ADR-0006 trade as the Blade
+            // scanner below: a real Blade grammar with injections is the long-term
+            // answer; this is the part of it that fixes an entirely uncoloured template
+            // today.
+            if let Some(tree) = self.tree() {
+                for region in text_regions(&tree.root_node(), &range) {
+                    spans.extend(html_markup_spans(buffer, region));
+                }
+            }
+        }
+
         if self.language().has_blade_directives() {
             // Blade spans go in after the tree's, so on an exact tie flatten() keeps the
             // Blade one — inside a Blade file, `{{ }}` beats whatever PHP called it.
@@ -344,7 +359,12 @@ fn node_style(node: Node, parent: Node) -> Option<HighlightStyle> {
         // `$this` is not its own kind: it parses as `variable_name` containing `name
         // "this"`, so it already reads as Variable and needs no arm. Checked, not assumed.
         "name" => return name_style(node, parent),
-        "php_tag" | "text_interpolation" | "?>" => Tag,
+        // `text_interpolation` is deliberately NOT here any more: it is the node that
+        // wraps *every byte of HTML* between `?>` and the next `<?php`, and painting it
+        // Tag flooded whole Livewire SFC templates in one colour — the owner's report
+        // was a screenshot of an entirely green file. The markup inside those regions is
+        // coloured by `html_markup_spans` from the walk instead.
+        "php_tag" | "?>" => Tag,
         "class_declaration"
         | "interface_declaration"
         | "trait_declaration"
@@ -448,6 +468,184 @@ fn name_style(node: Node, parent: Node) -> Option<HighlightStyle> {
         "argument" => return None,
         _ => return None,
     })
+}
+
+/// The ranges of raw-markup nodes (`text`, `text_interpolation`) inside the viewport.
+///
+/// Tree-bounded on purpose: running the markup lexer over the whole slice would let a
+/// `<` inside PHP code (`$a < $b`) open a phantom tag. The tree already knows exactly
+/// which bytes are not PHP; the lexer stays inside them.
+fn text_regions(root: &Node, range: &Range<usize>) -> Vec<Range<usize>> {
+    let mut regions = Vec::new();
+    let mut cursor = root.walk();
+    collect_text_regions(&mut cursor, range, &mut regions);
+    regions
+}
+
+fn collect_text_regions(
+    cursor: &mut tree_sitter::TreeCursor,
+    range: &Range<usize>,
+    out: &mut Vec<Range<usize>>,
+) {
+    loop {
+        let node = cursor.node();
+        if node.end_byte() > range.start && node.start_byte() < range.end {
+            match node.kind() {
+                "text" | "text_interpolation" => {
+                    out.push(node.start_byte().max(range.start)..node.end_byte().min(range.end));
+                }
+                _ => {
+                    if cursor.goto_first_child() {
+                        collect_text_regions(cursor, range, out);
+                        cursor.goto_parent();
+                    }
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            return;
+        }
+    }
+}
+
+/// Tags, attributes and quoted values inside one raw-markup region.
+///
+/// A lexer in the mould of [`blade_spans`]: literal scanning, no tree, cannot desync.
+/// Three rules carry all of it:
+///
+/// - `<name`/`</name` starts a tag; the name and both angle brackets read as [`Tag`],
+///   attribute names as [`Attribute`], quoted values as [`String`].
+/// - Blade constructs — `{{ }}`, `{!! !!}`, `{{-- --}}` — are skipped *everywhere*,
+///   including inside quoted values: a `wire:key="post-{{ $id }}"` must leave the
+///   interpolation for the Blade scanner, and a string span covering it would win the
+///   flatten and paint it as string. The value is emitted as segments around them.
+/// - Everything else is prose and stays plain — colouring text content is not the job,
+///   the same rule the real HTML grammar's test pins.
+fn html_markup_spans(buffer: &Buffer, region: Range<usize>) -> Vec<HighlightSpan> {
+    let base = region.start;
+    let text = buffer.slice(region.clone());
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+
+    // The Blade openers, longest first, shared by both scanning positions.
+    fn blade_skip(text: &str, i: usize) -> Option<usize> {
+        for (open, close) in [("{{--", "--}}"), ("{!!", "!!}"), ("{{", "}}")] {
+            if text[i..].starts_with(open) {
+                let end = text[i + open.len()..]
+                    .find(close)
+                    .map_or(text.len(), |p| i + open.len() + p + close.len());
+                return Some(end);
+            }
+        }
+        None
+    }
+
+    while i < bytes.len() {
+        if let Some(end) = blade_skip(&text, i) {
+            i = end;
+            continue;
+        }
+        if text[i..].starts_with("<!--") {
+            let end = text[i + 4..].find("-->").map_or(text.len(), |p| i + 4 + p + 3);
+            spans.push(HighlightSpan {
+                range: base + i..base + end,
+                style: HighlightStyle::Comment,
+            });
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'<'
+            && bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'/' || *b == b'!')
+        {
+            // The tag opener and name: `<div`, `</article`, `<!DOCTYPE`.
+            let name_start = if bytes[i + 1] == b'/' { i + 2 } else { i + 1 };
+            let name_end = bytes[name_start..]
+                .iter()
+                .position(|b| !b.is_ascii_alphanumeric() && *b != b'-' && *b != b'!')
+                .map_or(bytes.len(), |p| name_start + p);
+            spans.push(HighlightSpan {
+                range: base + i..base + name_end,
+                style: HighlightStyle::Tag,
+            });
+            i = name_end;
+
+            // Inside the tag until `>`: attributes and values.
+            while i < bytes.len() && bytes[i] != b'>' {
+                if let Some(end) = blade_skip(&text, i) {
+                    i = end;
+                    continue;
+                }
+                let b = bytes[i];
+                if b.is_ascii_alphabetic() || b == b'_' || b == b':' || b == b'@' || b == b'#' {
+                    // An attribute name, in the wide alphabet templates actually use:
+                    // `class`, `wire:key`, `x-on:click`, `@click`, `#ref`.
+                    let end = bytes[i..]
+                        .iter()
+                        .position(|c| {
+                            !c.is_ascii_alphanumeric()
+                                && !matches!(c, b'-' | b'_' | b':' | b'.' | b'@' | b'#')
+                        })
+                        .map_or(bytes.len(), |p| i + p);
+                    spans.push(HighlightSpan {
+                        range: base + i..base + end,
+                        style: HighlightStyle::Attribute,
+                    });
+                    i = end;
+                } else if b == b'"' || b == b'\'' {
+                    // A quoted value, emitted as string segments around any Blade inside.
+                    let quote = b;
+                    let mut seg_start = i;
+                    let mut j = i + 1;
+                    loop {
+                        if j >= bytes.len() {
+                            spans.push(HighlightSpan {
+                                range: base + seg_start..base + bytes.len(),
+                                style: HighlightStyle::String,
+                            });
+                            i = bytes.len();
+                            break;
+                        }
+                        if let Some(end) = blade_skip(&text, j) {
+                            if seg_start < j {
+                                spans.push(HighlightSpan {
+                                    range: base + seg_start..base + j,
+                                    style: HighlightStyle::String,
+                                });
+                            }
+                            j = end;
+                            seg_start = j;
+                            continue;
+                        }
+                        if bytes[j] == quote {
+                            spans.push(HighlightSpan {
+                                range: base + seg_start..base + j + 1,
+                                style: HighlightStyle::String,
+                            });
+                            i = j + 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            // The closing `>` (or the `/` of `/>`), painted as markup.
+            if i < bytes.len() && bytes[i] == b'>' {
+                let start = if i > 0 && bytes[i - 1] == b'/' { i - 1 } else { i };
+                spans.push(HighlightSpan {
+                    range: base + start..base + i + 1,
+                    style: HighlightStyle::Tag,
+                });
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    spans
 }
 
 /// Blade constructs the PHP grammar does not know about.
@@ -985,6 +1183,67 @@ mod tests {
         assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"// c"));
         assert!(styled(src, &spans, HighlightStyle::String).contains(&"'x'"));
         assert!(styled(src, &spans, HighlightStyle::Number).contains(&"42"));
+    }
+
+    #[test]
+    fn blade_markup_is_not_one_colour() {
+        // The owner's report, as a fixture: a Livewire template rendered entirely green,
+        // because `text_interpolation` — the node wrapping every byte of HTML between
+        // PHP tags — painted as one Tag span. The shape below is lifted from the
+        // screenshot that reported it.
+        let src = "<article class=\"admin-post\" wire:key=\"post-{{ $post->id }}\">\n\
+                   <p>{{ $post->excerpt() }}</p>\n</article>\n";
+        let spans = spans_of(Language::Blade, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Tag).contains(&"<article"));
+        assert!(styled(src, &spans, HighlightStyle::Attribute).contains(&"class"));
+        assert!(styled(src, &spans, HighlightStyle::Attribute).contains(&"wire:key"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"admin-post\""));
+        // The interpolation inside the attribute keeps its Blade colour: the quoted-value
+        // lexer emits string *segments* around it, because a string span covering it
+        // would win the flatten and paint the Blade construct as string.
+        assert!(
+            styled(src, &spans, HighlightStyle::BladeDirective)
+                .iter()
+                .any(|s| s.contains("$post->id")),
+            "blade inside an attribute value keeps its own colour"
+        );
+        // And no span drowns the whole line: the tag name and the attribute are separate
+        // spans, which is the difference between markup and a flood.
+        assert!(!styled(src, &spans, HighlightStyle::Tag).iter().any(|s| s.contains("class")));
+    }
+
+    #[test]
+    fn a_volt_sfc_colours_both_halves() {
+        // `<?php ... ?>` then a template: the PHP half keeps its walk, the HTML half gets
+        // the lexer, and neither floods the other.
+        let src = "<?php $count = 1; ?>\n<div class=\"box\">@if ($count) sim @endif</div>\n";
+        let spans = spans_of(Language::Blade, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Variable).contains(&"$count"));
+        assert!(styled(src, &spans, HighlightStyle::Tag).contains(&"<div"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"box\""));
+        assert!(styled(src, &spans, HighlightStyle::BladeDirective).contains(&"@if"));
+        // Prose stays prose.
+        assert!(
+            !spans.iter().any(|span| {
+                let piece = &src[span.range.clone()];
+                piece.contains("sim")
+            }),
+            "text content stays plain: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn php_comparisons_do_not_become_phantom_tags() {
+        // The reason the lexer is tree-bounded: `$a < $b` contains a `<`, and a lexer
+        // running over the whole slice would open a tag there.
+        let src = "<?php if ($a < $b) { echo 1; }\n";
+        let spans = spans_of(Language::Php, src);
+        assert!(
+            !styled(src, &spans, HighlightStyle::Tag).iter().any(|s| s.starts_with("< ")),
+            "a less-than in PHP is not markup"
+        );
     }
 
     #[test]
