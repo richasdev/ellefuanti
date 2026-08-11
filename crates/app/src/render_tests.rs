@@ -3390,3 +3390,64 @@ async fn saving_a_model_rebuilds_the_laravel_index(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Returning to the window rebuilds the Laravel index — the external-change trigger (#21).
+///
+/// `artisan make:model` in a terminal, a `git checkout` — none of them pass through this
+/// editor's save path. The same reasoning as the git panel's third trigger (#64): to
+/// notice stale completions you must first look at the window, and looking is the event.
+/// No watcher, no timer — the perf gate measures idle CPU and would call a poll a
+/// regression.
+#[gpui::test]
+async fn returning_to_the_window_rebuilds_the_laravel_index(cx: &mut TestAppContext) {
+    // Same HOME race as the other index-backed tests; same lock.
+    let _home = crate::file_cache::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    std::fs::write(
+        dir.path().join("app/Models/User.php"),
+        "<?php\nclass User extends Model {}\n",
+    )
+    .unwrap();
+
+    let canonical = dir.path().canonicalize().unwrap();
+    let index_path = crate::file_cache::index_path(&canonical).expect("index path");
+    {
+        let (index, _) = elle_index::Index::open(&index_path).expect("index opens");
+        elle_index::laravel::build(
+            index.connection(),
+            &canonical,
+            &elle_workspace::CancelFlag::default(),
+        )
+        .expect("index builds");
+    }
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+    cx.run_until_parked();
+
+    // `artisan make:model Post` outside the editor — a file this session never touched.
+    std::fs::write(
+        dir.path().join("app/Models/Post.php"),
+        "<?php\nclass Post extends Model {\n    protected $casts = ['published' => 'boolean'];\n}\n",
+    )
+    .unwrap();
+
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.window_became_active_for_test(cx);
+    });
+    cx.run_until_parked();
+
+    let (index, _) = elle_index::Index::open(&index_path).expect("index reopens");
+    let columns =
+        elle_index::laravel::columns_for_model(index.connection(), "Post").expect("query");
+    assert!(
+        columns.iter().any(|column| column.name == "published"),
+        "the externally created model is indexed after refocus"
+    );
+
+    draw(cx);
+}
