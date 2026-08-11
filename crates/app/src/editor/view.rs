@@ -345,13 +345,26 @@ impl EditorView {
         // auto-closing all replace the plain insert. `insert_with_pairs` reports whether it
         // handled the keystroke rather than deciding here, because what counts as a pair is
         // domain knowledge and `Document` is where that lives.
-        if !self.document.insert_with_pairs(text) {
+        let plain = !self.document.insert_with_pairs(text);
+        if plain {
             self.document.insert(text);
         }
         self.scroll_cursor_into_view();
         // The case the blink exists to get right: a caret must not blink mid-keystroke.
         self.restart_blink(cx);
         cx.notify();
+
+        // Reported *after* the buffer has it, so a listener asking for the cursor offset
+        // reads the position the character now occupies rather than the one before it.
+        //
+        // Only for a plain insertion. The two `insert_with_pairs` branches are the same
+        // exclusion `insert_typed` documents: typing over a closer inserts nothing and
+        // auto-closing inserts two, so in neither case is "the user typed this character
+        // here" a true description of what the buffer now contains — and a trigger fired on
+        // an auto-inserted `"` would open a popup about a quote nobody typed.
+        if plain {
+            cx.emit(EditorEvent::Typed(text.to_string()));
+        }
     }
 
     // --- action handlers ---------------------------------------------------------
@@ -791,12 +804,23 @@ impl EditorView {
 
 /// What the editor tells the workspace.
 ///
-/// One variant, because there is one thing an editor knows that the workspace has to act
-/// on: the user asked to navigate from a place only the editor knows the coordinates of.
-/// An event rather than a call into the workspace keeps the editor unaware that a language
-/// server exists — the same split `set_diagnostics` already has in the other direction.
+/// Both variants exist for the same reason: the editor knows something only it can know —
+/// a coordinate, a keystroke — and the workspace owns what to *do* about it. An event
+/// rather than a call keeps the editor unaware that a language server exists, which is the
+/// same split `set_diagnostics` already has in the other direction.
 pub enum EditorEvent {
     GoToDefinition,
+    /// A character was typed straight into the buffer, and it is already there.
+    ///
+    /// The editor emits this without knowing why anyone would care. It is the workspace
+    /// that holds the server's declared trigger characters and decides whether this one
+    /// opens a completion popup (#61) — deciding here would mean the editor consulting
+    /// capabilities, which is precisely the coupling `EditorEvent` exists to avoid.
+    ///
+    /// Not emitted while a popup already has focus: this fires from the *editor's* key
+    /// handler, and with a popup open the keystroke goes to
+    /// [`CompletionEvent::Typed`](crate::completion::CompletionEvent::Typed) instead.
+    Typed(String),
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}

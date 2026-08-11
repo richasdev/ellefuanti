@@ -240,6 +240,292 @@ fn a_real_server_completes_a_member_access() {
     client.stop().unwrap();
 }
 
+/// What the real server *declares* as trigger characters (#61).
+///
+/// The whole trigger feature reads this list, so it is worth recording what a real server
+/// actually puts in it — and the answer is not what a hardcoded implementation would have
+/// guessed. Intelephense declares ten **single** characters, not the two-character `->` and
+/// `::` sequences the feature is usually described in terms of.
+///
+/// The assertion is deliberately weak about the exact set. Pinning all ten would make this
+/// test fail on an Intelephense upgrade that added one, which is not a regression in this
+/// codebase — the property that matters is that the list is non-empty, comes from the
+/// server, and is made of the single characters the trigger check compares against.
+#[test]
+fn a_real_server_declares_its_own_trigger_characters() {
+    let Some(command) = real_command() else {
+        eprintln!("ELLE_LSP_REAL not set; skipping");
+        return;
+    };
+
+    let mut client = Client::start(&config(&command)).expect("the server must start");
+    let triggers = client.capabilities().completion_triggers.clone();
+    eprintln!("declared completion triggers: {triggers:?}");
+
+    assert!(!triggers.is_empty(), "a real PHP server must declare some trigger characters");
+    // The shape the app's `is_completion_trigger` compares against: one keystroke produces
+    // one `key_char`, so a multi-character trigger could never match it. Recording that the
+    // real server declares single characters is what makes whole-string equality the right
+    // test rather than a lucky one.
+    assert!(
+        triggers.iter().all(|t| t.chars().count() == 1),
+        "the trigger check compares one keystroke against each entry: {triggers:?}"
+    );
+    // The two PHP cares about most, as *characters* — `>` completes `->` and `:` completes
+    // `::`, which is why no `->` string appears anywhere in the implementation.
+    assert!(triggers.iter().any(|t| t == ">"), "member access must be triggerable: {triggers:?}");
+    assert!(triggers.iter().any(|t| t == ":"), "static access must be triggerable: {triggers:?}");
+
+    client.stop().unwrap();
+}
+
+/// Whether the *server* declines to complete inside strings and comments (#61).
+///
+/// This is the question that decides who owns context-sensitivity. A trigger fires on every
+/// keystroke of a matching character, so `->` typed inside a string or a comment issues a
+/// request — and if the server answered those with the same list it answers real code with,
+/// the editor would have to re-derive PHP's grammar to suppress them.
+///
+/// It does not. Every one of the four positions below comes back empty, so the popup opens,
+/// receives nothing, and closes itself. The editor keeps no second model of PHP syntax,
+/// which is the point: the server knows about heredocs, interpolation and nested comments,
+/// and a hand-rolled guess here would disagree with it somewhere and be confidently wrong
+/// (RISKS.md #4).
+#[test]
+fn a_real_server_offers_nothing_after_an_arrow_in_a_string_or_comment() {
+    let Some(command) = real_command() else {
+        eprintln!("ELLE_LSP_REAL not set; skipping");
+        return;
+    };
+
+    let mut client = Client::start(&config(&command)).expect("the server must start");
+
+    let path = std::path::PathBuf::from(root()).join("context_for_test.php");
+    let source = concat!(
+        "<?php\n",
+        "\n",
+        "class Ctx {\n",
+        "    public function alpha(): string { return ''; }\n",
+        "}\n",
+        "\n",
+        "$ctx = new Ctx();\n",
+        "$real = $ctx->;\n",
+        "$single = 'ctx->x';\n",
+        "$double = \"ctx->x\";\n",
+        "// a line comment saying $ctx-> here\n",
+        "/* a block comment saying $ctx-> here */\n",
+    );
+    std::fs::write(&path, source).unwrap();
+    let uri = path_to_uri(&path).unwrap();
+    client.did_open(uri.clone(), "php", source).unwrap();
+
+    let ask = |client: &Client, offset: usize| -> usize {
+        let id = client.request_completion(&uri, offset).expect("the request must go out");
+        let answer = client
+            .await_response::<elle_lsp::lsp_types::CompletionResponse>(&id, Duration::from_secs(20))
+            .expect("the server must answer rather than erroring");
+        match answer {
+            Some(elle_lsp::lsp_types::CompletionResponse::Array(items)) => items.len(),
+            Some(elle_lsp::lsp_types::CompletionResponse::List(list)) => list.items.len(),
+            None => 0,
+        }
+    };
+
+    // The control, and it has to come first: if real code offers nothing either, then the
+    // server has simply not indexed and the four assertions below would pass while
+    // establishing nothing at all. This is the shape of vacuous test this repository keeps
+    // finding, so the control is the test.
+    let real = source.find("$ctx->;").unwrap() + "$ctx->".len();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut in_code = ask(&client, real);
+    while in_code == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        in_code = ask(&client, real);
+    }
+    eprintln!("after `$ctx->` in real code:      {in_code} items");
+    assert!(in_code > 0, "the control must offer something, or the rest proves nothing");
+
+    for (name, offset) in [
+        ("single-quoted string", source.find("'ctx->x'").unwrap() + "'ctx->".len()),
+        ("double-quoted string", source.find("\"ctx->x\"").unwrap() + "\"ctx->".len()),
+        (
+            "line comment",
+            source.find("// a line comment saying $ctx->").unwrap()
+                + "// a line comment saying $ctx->".len(),
+        ),
+        (
+            "block comment",
+            source.find("/* a block comment saying $ctx->").unwrap()
+                + "/* a block comment saying $ctx->".len(),
+        ),
+    ] {
+        let count = ask(&client, offset);
+        eprintln!("after `->` inside a {name:22} {count} items");
+        assert_eq!(
+            count, 0,
+            "the server must decline inside a {name}, or the editor would have to know PHP's \
+             grammar itself to suppress the popup"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    client.stop().unwrap();
+}
+
+/// The measurement that ruled out a debounce (#61).
+///
+/// A trigger multiplies request volume, and #103 settled find-in-project on a 250 ms
+/// debounce, so the obvious move was to reuse that number here. This is the test that says
+/// not to: on a real project a completion request is roughly two orders of magnitude cheaper
+/// than the debounce that would hide it, and adding one would be pure latency.
+///
+/// **It asserts a generous bound, not the measured figure.** The numbers observed while
+/// writing this — 15 ms for the very first request against a server 478 ms old on a
+/// 10,061-file project with a 199 MB `vendor/`, and a 1.4 ms warm median — are recorded here
+/// as prose because they are facts about one machine. What the assertion pins is the
+/// decision they support: that a completion is far below the 250 ms a debounce would cost,
+/// which stays true across any machine where the conclusion holds.
+#[test]
+fn a_real_server_answers_a_completion_far_faster_than_a_debounce_would_cost() {
+    let Some(command) = real_command() else {
+        eprintln!("ELLE_LSP_REAL not set; skipping");
+        return;
+    };
+
+    // The number #103 chose for find-in-project, and the one this test exists to reject.
+    const FIND_IN_PROJECT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+    let spawned = Instant::now();
+    let mut client = Client::start(&config(&command)).expect("the server must start");
+    eprintln!("handshake took {:?}", spawned.elapsed());
+
+    let path = std::path::PathBuf::from(root()).join("debounce_for_test.php");
+    let source = "<?php\n$x = str;\n";
+    std::fs::write(&path, source).unwrap();
+    let uri = path_to_uri(&path).unwrap();
+    client.did_open(uri.clone(), "php", source).unwrap();
+    let offset = source.find("= str;").unwrap() + "= str".len();
+
+    // The very first request, with no settle at all — the cold case the debounce question
+    // was really about.
+    let started = Instant::now();
+    let id = client.request_completion(&uri, offset).expect("the request must go out");
+    let _ = client
+        .await_response::<elle_lsp::lsp_types::CompletionResponse>(&id, Duration::from_secs(30));
+    let cold = started.elapsed();
+    eprintln!("the first completion, {:?} after spawn, took {cold:?}", spawned.elapsed());
+
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let id = client.request_completion(&uri, offset).expect("the request must go out");
+        let _ = client.await_response::<elle_lsp::lsp_types::CompletionResponse>(
+            &id,
+            Duration::from_secs(30),
+        );
+        times.push(started.elapsed());
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    eprintln!("warm: min {:?} median {median:?} max {:?}", times[0], times[times.len() - 1]);
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        cold < FIND_IN_PROJECT_DEBOUNCE,
+        "a 250 ms debounce would cost more than the request it hides, even cold: {cold:?}"
+    );
+    assert!(median < FIND_IN_PROJECT_DEBOUNCE, "and far more than the warm case: {median:?}");
+
+    client.stop().unwrap();
+}
+
+/// `isIncomplete`, and why filtering the stale list is not good enough (#61).
+///
+/// This is the measurement behind the re-request. Intelephense caps a bare-word completion
+/// at 100 items and marks the list incomplete; it then **re-ranks against each longer
+/// prefix**, reaching past its own cap. So the list for `strl` is not a subset of the list
+/// for `str` — filtering the earlier answer locally shows a fraction of what the server
+/// would have said.
+///
+/// The honest statement of the harm is *under-reporting*, not wrongness. Both lists here
+/// contain `strlen`; what filtering loses is the other matches, and a completion list that
+/// shows one row reads as "that is all there is" (RISKS.md #4).
+#[test]
+fn a_real_server_marks_a_large_list_incomplete_and_re_ranks_on_the_next_character() {
+    let Some(command) = real_command() else {
+        eprintln!("ELLE_LSP_REAL not set; skipping");
+        return;
+    };
+
+    let mut client = Client::start(&config(&command)).expect("the server must start");
+
+    let path = std::path::PathBuf::from(root()).join("incomplete_for_test.php");
+    let uri = path_to_uri(&path).unwrap();
+
+    let labels_for = |client: &mut Client, typed: &str| -> (Vec<String>, bool) {
+        let source = format!("<?php\n$x = {typed};\n");
+        std::fs::write(&path, &source).unwrap();
+        let _ = client.did_close(&uri);
+        client.did_open(uri.clone(), "php", &source).unwrap();
+        let offset = source.find(&format!("= {typed};")).unwrap() + 2 + typed.len();
+        let id = client.request_completion(&uri, offset).expect("the request must go out");
+        let answer = client
+            .await_response::<elle_lsp::lsp_types::CompletionResponse>(&id, Duration::from_secs(30))
+            .expect("the server must answer");
+        match answer {
+            Some(elle_lsp::lsp_types::CompletionResponse::List(list)) => {
+                (list.items.into_iter().map(|i| i.label).collect(), list.is_incomplete)
+            }
+            Some(elle_lsp::lsp_types::CompletionResponse::Array(items)) => {
+                (items.into_iter().map(|i| i.label).collect(), false)
+            }
+            None => (Vec::new(), false),
+        }
+    };
+
+    // Wait for enough of an index that a bare word is a big answer; without this the list is
+    // small, complete, and the test proves nothing.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut at_str = labels_for(&mut client, "str");
+    while at_str.0.len() < 50 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(2));
+        at_str = labels_for(&mut client, "str");
+    }
+    let (str_labels, str_incomplete) = at_str;
+    eprintln!("`str`  -> {} items, isIncomplete={str_incomplete}", str_labels.len());
+    assert!(
+        str_labels.len() >= 50,
+        "the server never returned a large list, so there is nothing to truncate: {}",
+        str_labels.len()
+    );
+    assert!(
+        str_incomplete,
+        "a truncated list must be marked incomplete, or #61's re-request \
+                             has no trigger to act on"
+    );
+
+    let (strl_labels, _) = labels_for(&mut client, "strl");
+    eprintln!("`strl` -> {} items", strl_labels.len());
+
+    // What a client that filtered the stale list would have shown instead.
+    let filtered: Vec<&String> =
+        str_labels.iter().filter(|l| l.to_lowercase().starts_with("strl")).collect();
+    eprintln!("filtering the stale `str` list by `strl` would show {} items", filtered.len());
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        strl_labels.len() > filtered.len(),
+        "re-requesting must beat filtering the stale list, or the whole re-request is \
+         pointless: {} vs {}",
+        strl_labels.len(),
+        filtered.len()
+    );
+
+    client.stop().unwrap();
+}
+
 /// Cancellation against a real server: the claim #61 makes about typing fast (#45's
 /// `request_completion` plus `cancel`).
 ///

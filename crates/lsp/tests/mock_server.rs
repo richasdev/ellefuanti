@@ -283,6 +283,57 @@ fn trigger_characters_come_from_the_server() {
 }
 
 #[test]
+fn two_servers_declaring_different_triggers_both_come_through_unchanged() {
+    // The substitutability claim stated as an experiment rather than as prose (RISKS.md #2).
+    // #61 makes trigger characters *behavioural* — they now decide when a popup opens — so
+    // "the client relays them" is no longer enough on its own: what has to hold is that the
+    // relayed set is the one that server sent, with nothing merged in from PHP's or from a
+    // previous connection's.
+    //
+    // The second set is deliberately disjoint from the first and contains a character no PHP
+    // server would ever declare. If anything anywhere reached for a built-in list, one of
+    // these two assertions fails.
+    let (php_ish, _a) = open_client(
+        json!({
+            "textDocumentSync": 1,
+            "completionProvider": { "triggerCharacters": ["$", ">", ":"] },
+        }),
+        |_, _| Reply::Silence,
+    );
+    let (other, _b) = open_client(
+        json!({
+            "textDocumentSync": 1,
+            "completionProvider": { "triggerCharacters": ["@", "#"] },
+        }),
+        |_, _| Reply::Silence,
+    );
+
+    assert_eq!(php_ish.capabilities().completion_triggers, ["$", ">", ":"]);
+    assert_eq!(other.capabilities().completion_triggers, ["@", "#"]);
+    // And neither picked up the other's, which is what a shared or defaulted list would do.
+    assert!(!php_ish.capabilities().completion_triggers.iter().any(|t| t == "@"));
+    assert!(!other.capabilities().completion_triggers.iter().any(|t| t == "$"));
+}
+
+#[test]
+fn a_server_declaring_no_triggers_gets_an_empty_list_not_a_php_default() {
+    // The case where a helpful default is most tempting and most wrong. A server that
+    // declares completion but no trigger characters wants completion *only* on explicit
+    // invoke, and substituting `["$", "->"]` here would make this client fire requests that
+    // server never asked for — inventing behaviour on its behalf.
+    let (client, _server) =
+        open_client(json!({ "textDocumentSync": 1, "completionProvider": {} }), |_, _| {
+            Reply::Silence
+        });
+
+    assert!(client.capabilities().completion, "the server does offer completion");
+    assert!(
+        client.capabilities().completion_triggers.is_empty(),
+        "no declaration means no triggers, not PHP's"
+    );
+}
+
+#[test]
 fn a_server_omitting_sync_capability_gets_full_documents() {
     // Guessing incremental would corrupt the server's copy silently.
     let (client, _server) = open_client(json!({}), |_, _| Reply::Silence);

@@ -93,6 +93,61 @@ fn a_backend_is_named_only_where_the_default_is_declared() {
     );
 }
 
+/// RISKS.md #2 again, at the new place #61 opened up.
+///
+/// Trigger characters used to be inert data: `Capabilities::completion_triggers` was read
+/// off the handshake and nothing consulted it. #61 made it **behavioural** — it now decides
+/// when a popup opens — and that creates a leak the two tests above cannot see. Neither
+/// `no_php_specific_behaviour_is_baked_in` (which scans `crates/lsp`) nor
+/// `a_backend_is_named_only_where_the_default_is_declared` (which looks for backend *names*)
+/// would notice `if text == "->"` in `crates/app`: it names no server and lives in the crate
+/// where naming one is permitted.
+///
+/// But it would be exactly the failure the risk register describes. `->` and `::` are PHP's
+/// answer, and a phpactor or a future first-party engine declaring a different set must work
+/// unchanged. The measured evidence that hardcoding is wrong is not subtle: a real
+/// Intelephense declares ten **single** characters (`$ > : \ / ' " * . <`), so an
+/// implementation matching the two-character `->` would never fire at all.
+///
+/// So: the PHP operators may not appear as literals in the completion path. They may be
+/// discussed in comments — the explanation above is itself full of them — and tests may use
+/// them as fixtures, which is what `shipped_code` strips.
+#[test]
+fn php_operators_are_not_hardcoded_where_triggers_are_decided() {
+    // The files that decide when a completion popup opens. Scoped rather than crate-wide
+    // because `->` is legitimate elsewhere: the Laravel crate's callers, PHP fixtures in
+    // render tests, and doc examples all contain it honestly.
+    const TRIGGER_PATH: [&str; 2] = ["workspace_view.rs", "completion.rs"];
+    // How a hardcoded PHP trigger would actually be spelled.
+    const OPERATORS: [&str; 4] = ["\"->\"", "\"::\"", "'->'", "'::'"];
+
+    let mut violations = Vec::new();
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    for file in walk_rust_files(&src) {
+        let name = file.file_name().unwrap().to_string_lossy().to_string();
+        if !TRIGGER_PATH.contains(&name.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(&file).unwrap();
+        for (number, line) in shipped_code(&text).lines().enumerate() {
+            for operator in OPERATORS {
+                if line.contains(operator) {
+                    violations.push(format!("{}:{}: {}", file.display(), number + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "RISKS.md #2: PHP's completion triggers must come from the server's declared \
+         `completion_triggers`, never from a literal here — a different backend declares a \
+         different set and must work unchanged. A real Intelephense declares single \
+         characters, so a hardcoded `->` would not even fire. Found: {violations:#?}"
+    );
+}
+
 /// The shipped logic of a file: comments and `#[cfg(test)]` modules removed.
 ///
 /// Same scanner, and the same two exclusions, as `crates/lsp/tests/substitutability.rs` —
