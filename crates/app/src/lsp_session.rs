@@ -414,11 +414,141 @@ fn split_command(raw: &str) -> Option<(String, Vec<String>)> {
     Some((command, parts.collect()))
 }
 
-/// Builds the config for a project root.
+/// Directories searched for the server binary when `PATH` does not have it.
+///
+/// # Why this list exists at all
+///
+/// `open target/ellefuanti.app` hands the app **launchd's** environment, and on a normal
+/// macOS install `launchctl getenv PATH` is empty — so a `.app` double-clicked from Finder
+/// sees none of what the user's shell sees. Every node-based language server installs under
+/// a version manager whose `bin` directory is put on `PATH` by a shell rc file that a
+/// Finder launch never runs. The result is #123: the editor works from a terminal and
+/// appears to have no LSP at all from the Dock, which reads as the feature being broken.
+///
+/// These are the prefixes those installers use, relative to `$HOME`. They name *installers*
+/// — nvm, Herd, Homebrew — never a language server, which is the RISKS.md #2 line the
+/// architecture test enforces: this file may know where binaries live and must not know
+/// which one it is looking for.
+///
+/// ponytail: a fixed list, not a `PATH` reconstruction. Reading the user's login shell and
+/// asking it for its `PATH` (`zsh -lic 'echo $PATH'`) is what a full fix does, and it costs
+/// a subprocess on every folder open plus a hang when someone's rc file blocks on input.
+/// Upgrade to that if a real install turns up outside these three.
+const BINARY_SEARCH_PREFIXES: [&str; 4] = [
+    // nvm, and Herd's bundled copy of it. The version component is a glob: `versions/node`
+    // holds one directory per installed node, and any of them may own the binary.
+    ".nvm/versions/node/*/bin",
+    "Library/Application Support/Herd/config/nvm/versions/node/*/bin",
+    // Homebrew on Apple silicon lives outside `$HOME`; `resolve_binary` also checks the
+    // two absolute prefixes below. These two are the per-user npm targets.
+    ".local/bin",
+    ".npm-global/bin",
+];
+
+/// Absolute directories searched after the `$HOME`-relative ones.
+const ABSOLUTE_SEARCH_PREFIXES: [&str; 3] =
+    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/opt/node/bin"];
+
+/// Finds `command` as an executable file, or `None` if it is not installed.
+///
+/// An absolute or relative path is taken at its word — someone who configured
+/// `ELLE_LSP_COMMAND=/opt/my-server` means that file, and searching for its basename
+/// somewhere else would run a different program than the one they named.
+///
+/// A bare name is looked up in `dirs`, in order, first hit wins. The caller supplies the
+/// list so this is testable against a `tempfile` directory rather than the real machine —
+/// a test that asserted against the developer's actual `PATH` would pass or fail depending
+/// on who ran it.
+fn resolve_binary(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if command.contains('/') {
+        let path = PathBuf::from(command);
+        return is_executable(&path).then_some(path);
+    }
+
+    dirs.iter().find_map(|dir| {
+        let candidate = dir.join(command);
+        is_executable(&candidate).then_some(candidate)
+    })
+}
+
+/// Whether `path` is a file this process could execute.
+///
+/// The mode check matters: `~/.local/bin` routinely holds a directory or a stray README,
+/// and treating either as the server turns "not installed" into a spawn failure with a
+/// confusing message.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Every directory a bare command name is looked for in, `PATH` first.
+///
+/// `PATH` wins because a user who put a server on it chose that one. The fallbacks are for
+/// the case where there is no `PATH` to consult at all (#123), and appending rather than
+/// prepending them means a shell launch behaves exactly as it did before this existed.
+fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for prefix in BINARY_SEARCH_PREFIXES {
+        let Some(home) = home.as_ref() else { break };
+        match prefix.split_once('*') {
+            // A glob prefix expands to one candidate per installed version.
+            Some((before, after)) => {
+                let after = after.trim_start_matches('/');
+                let Ok(entries) = std::fs::read_dir(home.join(before.trim_end_matches('/'))) else {
+                    continue;
+                };
+                dirs.extend(entries.flatten().map(|entry| entry.path().join(after)));
+            }
+            None => dirs.push(home.join(prefix)),
+        }
+    }
+    dirs.extend(ABSOLUTE_SEARCH_PREFIXES.iter().map(PathBuf::from));
+    dirs
+}
+
+/// Builds the config for a project root, or `None` if no server is installed.
+///
+/// # Why the binary is resolved here rather than left to the spawn
+///
+/// This used to return `Some` unconditionally and let `Command::spawn` fail. Two things
+/// came of that, and both were reported as "the completion popup never opens" (#125):
+///
+/// - the failure arrived as an `io::Error` on the background executor, logged at `debug`,
+///   so at the default level a machine with no server produced **no output at all** — the
+///   evidence that opened #125 was `grep -c` over the log returning zero;
+/// - the state went to `Unavailable` only after a spawn attempt, so the difference between
+///   "not installed" and "installed somewhere this process cannot see" (#123) was not
+///   recorded anywhere, and the two need different answers from the user.
+///
+/// Resolving first makes "not installed" a fact known before anything is spawned, which is
+/// what lets the status bar say so (#125) and what makes the Finder-launch case findable.
+///
+/// The path found is passed on as the command, so the spawn does not repeat the lookup
+/// against the empty `PATH` that caused #123 in the first place.
 pub fn config_for(root: &Path) -> Option<ServerConfig> {
     let (command, args) = configured_command()?;
+
+    let Some(binary) = resolve_binary(&command, &search_dirs()) else {
+        tracing::debug!("no language server: `{command}` is not installed on PATH");
+        return None;
+    };
+
     Some(
-        ServerConfig::new(command.clone(), command, root)
+        // The label stays the *configured* name, not the resolved path: it is what the user
+        // wrote and what they would search for. The path is only what gets executed.
+        ServerConfig::new(command, binary.to_string_lossy().into_owned(), root)
             .with_args(args)
             .with_language_ids([LANGUAGE_ID]),
     )
@@ -500,6 +630,124 @@ mod tests {
         let (command, args) = split_command("phpactor language-server -vvv").unwrap();
         assert_eq!(command, "phpactor");
         assert_eq!(args, ["language-server", "-vvv"]);
+    }
+
+    // --- finding the binary (#123, and half of #125) -----------------------------
+
+    /// Creates `name` under `dir` with the mode `resolve_binary` requires.
+    fn install(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn a_server_that_is_not_installed_is_found_before_it_is_spawned() {
+        // The #125 case. Before this, `config_for` returned `Some` for a binary that does
+        // not exist, the spawn failed on the background executor, and the only trace was a
+        // `debug` line — so the log of a real session contained *nothing*, which is what
+        // made the bug look like the popup rather than the server.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_binary("nothing-is-installed", &[dir.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn a_bare_name_is_found_in_the_search_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = install(dir.path(), "some-language-server");
+
+        assert_eq!(
+            resolve_binary("some-language-server", &[dir.path().to_path_buf()]),
+            Some(installed)
+        );
+    }
+
+    #[test]
+    fn the_first_directory_holding_the_binary_wins() {
+        // `search_dirs` puts `PATH` in front of the fallbacks, so a server the user chose
+        // must beat one that merely happens to sit under a version manager. Asserting the
+        // order here is what pins that: a `find_map` over a set would pass a test that only
+        // checked "it was found somewhere".
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let preferred = install(first.path(), "some-language-server");
+        install(second.path(), "some-language-server");
+
+        let found = resolve_binary(
+            "some-language-server",
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        assert_eq!(found, Some(preferred), "PATH must win over the fallbacks");
+    }
+
+    #[test]
+    fn a_directory_with_the_right_name_is_not_a_server() {
+        // `~/.local/bin` holds whatever anyone put there. Accepting a directory would turn
+        // "not installed" into a spawn failure with a worse message than the true one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("some-language-server")).unwrap();
+
+        assert_eq!(resolve_binary("some-language-server", &[dir.path().to_path_buf()]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_the_executable_bit_is_not_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("some-language-server"), "not a program").unwrap();
+
+        assert_eq!(resolve_binary("some-language-server", &[dir.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn a_configured_path_is_taken_at_its_word() {
+        // Someone who writes `ELLE_LSP_COMMAND=/opt/theirs/server` means that file. Looking
+        // its basename up in the search directories could run a *different* program with
+        // the same name, which is worse than failing.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let installed = install(dir.path(), "some-language-server");
+        install(elsewhere.path(), "some-language-server");
+
+        let configured = installed.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_binary(&configured, &[elsewhere.path().to_path_buf()]),
+            Some(installed),
+            "an absolute path must not be re-resolved against the search list"
+        );
+    }
+
+    #[test]
+    fn a_configured_path_that_does_not_exist_is_not_invented() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        install(elsewhere.path(), "some-language-server");
+
+        assert_eq!(
+            resolve_binary("/nowhere/some-language-server", &[elsewhere.path().to_path_buf()]),
+            None,
+            "a named path that is absent must fail, not fall back to a namesake"
+        );
+    }
+
+    #[test]
+    fn the_search_list_extends_past_path() {
+        // #123: a Finder-launched `.app` gets launchd's environment, where `PATH` is empty.
+        // The fallbacks are the whole fix, so "the list is longer than `PATH`" is the thing
+        // worth pinning — the specific directories are a property of the machine and would
+        // make this a test about the developer's laptop.
+        let dirs = search_dirs();
+        let on_path =
+            std::env::var_os("PATH").map(|path| std::env::split_paths(&path).count()).unwrap_or(0);
+
+        assert!(
+            dirs.len() > on_path,
+            "a launch with no PATH must still have somewhere to look (#123)"
+        );
     }
 
     #[test]

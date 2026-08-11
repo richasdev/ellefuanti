@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use elle_core::{BUILTIN_COMMANDS, CommandRegistry};
-use gpui::{Focusable, TestAppContext, VisualTestContext, px, size};
+use gpui::{TestAppContext, VisualTestContext, px, size};
 
 use crate::completion::{CompletionItem, CompletionSource};
 use crate::editor::{Document, EditorView};

@@ -1160,7 +1160,19 @@ impl WorkspaceView {
     /// The status-bar text for the language server, for tests that assert on silence.
     #[cfg(test)]
     pub fn lsp_label_for_test(&self) -> String {
-        lsp_label(&self.lsp)
+        lsp_label(&self.lsp, self.active_tab_wants_a_server())
+    }
+
+    /// Whether the file in front of the user is one a language server would handle.
+    ///
+    /// What turns §24's silence about a missing server into a single honest word (#125):
+    /// nobody needs telling there is no PHP server while they are looking at a `.txt`, and
+    /// everybody needs telling while they are looking at a `.php`.
+    fn active_tab_wants_a_server(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+            .is_some_and(crate::lsp_session::handles)
     }
 
     /// Puts an already-built document into a tab, synchronously.
@@ -1293,7 +1305,7 @@ impl WorkspaceView {
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
                                 this.status = None;
-                                this.open_on_lsp(&path, &text);
+                                this.open_on_lsp(&path, &text, cx);
                             }
                             // Focus stays where it was on a failure: the file the user asked
                             // for is not on screen, so moving the keyboard into whatever is
@@ -3372,11 +3384,46 @@ impl WorkspaceView {
     /// looking for it can find it.
     fn start_lsp(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        self.start_lsp_at(root, cx);
+    }
 
+    /// Starts a server for a file opened with no folder behind it.
+    ///
+    /// # Why a file gets a server at all
+    ///
+    /// A language server is given a project root at `initialize` and answers questions
+    /// against it. With no folder open there was nothing to hand it, so the previous
+    /// behaviour was to start nothing — ⌘O on a single `.php` file produced an editor with
+    /// no completion, no diagnostics and no explanation (#125). Opening a file the server
+    /// handles is as clear a signal that one is wanted as opening a folder is.
+    ///
+    /// Called on every file open, so it must be cheap and idempotent: a server already
+    /// running keeps running, and a project opened later replaces it through `open_folder`.
+    fn start_lsp_for_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        // A folder is the better root, and it already started a server. Nothing to do.
+        if self.tree.is_some() || self.lsp.client().is_some() {
+            return;
+        }
+        // Only the first attempt. Without this, every file opened on a machine with no
+        // server installed re-runs the binary search and re-spawns — cheap individually,
+        // but it is a retry loop keyed on user actions, and §24 says a missing server must
+        // be uneventful rather than persistent.
+        if !matches!(self.lsp.state(), LspState::Idle) {
+            return;
+        }
+        let Some(root) = project_root_for(path) else { return };
+        self.start_lsp_at(root, cx);
+    }
+
+    /// Starts a server rooted at `root`, replacing whatever was running.
+    fn start_lsp_at(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.lsp.set_root(Some(root.clone()));
 
         let Some(config) = crate::lsp_session::config_for(&root) else {
-            // `ELLE_LSP_COMMAND=""` — switched off on purpose, so not even a log warning.
+            // Either `ELLE_LSP_COMMAND=""` — switched off on purpose — or the binary is not
+            // installed anywhere this process can see. `config_for` logs the second; both
+            // land here as the same silent state, because from the editor's point of view
+            // they are the same fact: there is no server, and typing must carry on (§24).
             self.lsp.set_state(LspState::Unavailable);
             return;
         };
@@ -3583,14 +3630,22 @@ impl WorkspaceView {
         self.lsp.diagnostics_for(&uri)?.at(offset).map(|d| d.message.clone())
     }
 
-    /// Tells the server about one newly opened file.
+    /// Tells the server about one newly opened file, starting one if this is the first.
     ///
     /// A no-op with no server running, which is the ordinary case and deliberately not
     /// worth a branch at the call site.
-    fn open_on_lsp(&mut self, path: &std::path::Path, text: &str) {
+    fn open_on_lsp(&mut self, path: &std::path::Path, text: &str, cx: &mut Context<Self>) {
         if !crate::lsp_session::handles(path) {
             return;
         }
+        // #125's first cause. `start_lsp` was reachable only from `open_folder`, so a PHP
+        // file opened any other way — ⌘O on the file itself, a jump from the palette, a
+        // window that never had ⌘O run in it — got no server *and no log line*, which is
+        // why the report read as "the popup never opens" rather than "the LSP never
+        // started". Opening a file the server handles is as clear a signal that one is
+        // wanted as opening a folder is.
+        self.start_lsp_for_file(path, cx);
+
         let Some(uri) = crate::lsp_session::uri_for(path) else { return };
         let Some(client) = self.lsp.client_mut() else { return };
 
@@ -3768,6 +3823,43 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
     (items, incomplete)
 }
 
+/// Files that mark the directory containing them as a project root.
+///
+/// `composer.json` is the PHP answer and the one that matters here. `.git` is the general
+/// fallback for a file in a repository that has no manifest — a plain PHP script in a
+/// scripts repo, which is a real case and one where the repository is the right scope.
+///
+/// Order is significance, not precedence: the walk stops at the *nearest* ancestor holding
+/// any of these, so a `composer.json` inside a git repository wins by being closer.
+const ROOT_MARKERS: [&str; 2] = ["composer.json", ".git"];
+
+/// The project root for a file opened without a folder, or `None` if it has no parent.
+///
+/// # Why this walks up rather than taking the parent directory
+///
+/// The obvious answer — hand the server the file's own directory — is wrong in the case
+/// that actually happens. A Laravel model lives in `app/Models`, so opening one would root
+/// the server there: it would index that one directory, resolve none of the framework, and
+/// answer `$this->` with nothing. The user would see a server that started and still knew
+/// nothing, which is harder to diagnose than no server at all.
+///
+/// Walking up to the nearest [`ROOT_MARKERS`] entry gets the answer the user means. The
+/// parent directory remains the fallback for a file that belongs to no project, where
+/// something is still better than refusing to start.
+///
+/// This does not replace opening the folder. The tree is still what gives the workspace a
+/// root for search, git and everything else; this is only about not leaving the server
+/// pointed at a leaf directory.
+fn project_root_for(path: &std::path::Path) -> Option<PathBuf> {
+    let start = path.parent()?;
+    let marked =
+        start.ancestors().find(|dir| ROOT_MARKERS.iter().any(|marker| dir.join(marker).exists()));
+
+    // The parent directory when nothing is marked: a loose file still gets a server, it is
+    // just scoped to where it sits.
+    Some(marked.unwrap_or(start).to_path_buf())
+}
+
 /// The status-bar text for the language server, which is usually nothing at all.
 ///
 /// The rule this encodes is §24's, at the last step before pixels: **not having a language
@@ -3782,8 +3874,26 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
 ///   like nothing happening;
 /// - a failure, but only after the restart budget is spent — "the server you installed
 ///   keeps dying" is something the user cannot learn anywhere else.
-fn lsp_label(lsp: &Lsp) -> String {
+///
+/// # The one exception, added by #125
+///
+/// `Unavailable` stays silent *except* when the file in front of the user is one a server
+/// would handle. The §24 rule is that a missing server is not a problem the user has — and
+/// that is true of a text file, a folder of images, or any of the projects that are not PHP.
+/// It stops being true the moment a `.php` file is open: there, the user is entitled to
+/// expect completion, and silence is what made #125 take a round trip to diagnose. The
+/// report was "the popup never opens", because nothing on screen distinguished "no server
+/// installed" from "server running and returning nothing".
+///
+/// It is still not a complaint. It says what is true, in the cell that already exists, only
+/// while a file it applies to is open — no dialog, no icon, nothing to dismiss.
+///
+/// `php_open` rather than a `&Document`: the caller knows which tab is active and this
+/// function stays testable without one.
+fn lsp_label(lsp: &Lsp, php_open: bool) -> String {
     match lsp.state() {
+        // A file the server would have handled is open and there is no server. Say so.
+        LspState::Unavailable if php_open => "No language server".to_string(),
         // The two silent states, and the reason this function exists.
         LspState::Idle | LspState::Unavailable => String::new(),
         LspState::Starting => "Starting…".to_string(),
@@ -4456,7 +4566,7 @@ impl WorkspaceView {
             })
             .unwrap_or_default();
 
-        let diagnostics = lsp_label(&self.lsp);
+        let diagnostics = lsp_label(&self.lsp, self.active_tab_wants_a_server());
 
         // Like the terminal count, only while the panel is open. A project with no test
         // framework — and one that has simply not run its tests — says nothing here, the
@@ -5139,11 +5249,37 @@ mod lsp_status_tests {
         let mut lsp = Lsp::new();
 
         // Never attempted: no folder open.
-        assert_eq!(lsp_label(&lsp), "");
+        assert_eq!(lsp_label(&lsp, false), "");
 
         // Attempted and the binary was not there.
         lsp.set_state(LspState::Unavailable);
-        assert_eq!(lsp_label(&lsp), "", "a missing server is not the user's problem");
+        assert_eq!(lsp_label(&lsp, false), "", "a missing server is not the user's problem");
+    }
+
+    #[test]
+    fn a_missing_server_is_named_while_a_php_file_is_open() {
+        // #125's third cause, and the narrow exception to the test above. §24's silence is
+        // right for someone who never wanted a PHP server; it is wrong for someone looking
+        // at a PHP file and waiting for a completion popup, which is exactly the state the
+        // report came from. Nothing on screen separated "no server" from "server running
+        // and returning nothing", so the bug was filed against the popup.
+        let mut lsp = Lsp::new();
+        lsp.set_state(LspState::Unavailable);
+
+        assert_eq!(lsp_label(&lsp, true), "No language server");
+    }
+
+    #[test]
+    fn the_exception_does_not_leak_into_the_states_that_are_fine() {
+        // The risk in adding any message here is that it becomes permanent chrome. These
+        // are the states where a PHP file is open and everything is working: they must stay
+        // exactly as silent with the flag set as without it.
+        let mut lsp = Lsp::new();
+
+        assert_eq!(lsp_label(&lsp, true), "", "no attempt yet is not a failure");
+
+        lsp.set_state(LspState::Running);
+        assert_eq!(lsp_label(&lsp, true), "", "a clean file says nothing");
     }
 
     #[test]
@@ -5151,7 +5287,7 @@ mod lsp_status_tests {
         // A clean file is the normal state. "0 problems" is chrome.
         let mut lsp = Lsp::new();
         lsp.set_state(LspState::Running);
-        assert_eq!(lsp_label(&lsp), "");
+        assert_eq!(lsp_label(&lsp, false), "");
     }
 
     #[test]
@@ -5160,7 +5296,7 @@ mod lsp_status_tests {
         // an empty status bar is indistinguishable from a broken one.
         let mut lsp = Lsp::new();
         lsp.set_state(LspState::Starting);
-        assert_eq!(lsp_label(&lsp), "Starting…");
+        assert_eq!(lsp_label(&lsp, false), "Starting…");
     }
 
     #[test]
@@ -5169,7 +5305,7 @@ mod lsp_status_tests {
         // one you have will not stay up", which the user cannot learn anywhere else.
         let mut lsp = Lsp::new();
         lsp.set_state(LspState::Failed("it exited".into()));
-        assert_eq!(lsp_label(&lsp), "LSP unavailable");
+        assert_eq!(lsp_label(&lsp, false), "LSP unavailable");
     }
 
     #[test]
@@ -5194,21 +5330,77 @@ mod lsp_status_tests {
         let text = "a\nb\nc\n";
 
         lsp.set_diagnostics(uri.clone(), &[at(0, DiagnosticSeverity::ERROR)], text);
-        assert_eq!(lsp_label(&lsp), "1 ✕");
+        assert_eq!(lsp_label(&lsp, false), "1 ✕");
 
         lsp.set_diagnostics(
             uri.clone(),
             &[at(0, DiagnosticSeverity::ERROR), at(1, DiagnosticSeverity::WARNING)],
             text,
         );
-        assert_eq!(lsp_label(&lsp), "1 ✕  1 ⚠");
+        assert_eq!(lsp_label(&lsp, false), "1 ✕  1 ⚠");
 
         lsp.set_diagnostics(uri.clone(), &[at(0, DiagnosticSeverity::WARNING)], text);
-        assert_eq!(lsp_label(&lsp), "1 ⚠");
+        assert_eq!(lsp_label(&lsp, false), "1 ⚠");
 
         // And back to silence when the file is fixed.
         lsp.set_diagnostics(uri, &[], text);
-        assert_eq!(lsp_label(&lsp), "");
+        assert_eq!(lsp_label(&lsp, false), "");
+    }
+
+    // --- the root a file opened without a folder gets (#125) ----------------------
+
+    #[test]
+    fn a_file_in_a_project_roots_the_server_at_the_project() {
+        // The case the obvious implementation gets wrong. Rooting the server at the file's
+        // own directory would index `app/Models` alone: the framework would not resolve,
+        // and the server would start and still answer nothing — which is harder to
+        // diagnose than no server, because something visibly happened.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("composer.json"), "{}").unwrap();
+        let models = project.path().join("app/Models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        assert_eq!(project_root_for(&models.join("User.php")), Some(project.path().to_path_buf()));
+    }
+
+    #[test]
+    fn the_nearest_marker_wins_over_the_outer_one() {
+        // A package inside a repository is its own project. Walking to the outermost marker
+        // would hand the server the monorepo and index everything in it.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outer.path().join(".git")).unwrap();
+        let inner = outer.path().join("packages/thing");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(inner.join("composer.json"), "{}").unwrap();
+
+        assert_eq!(project_root_for(&inner.join("src/Thing.php")), Some(inner));
+    }
+
+    #[test]
+    fn a_repository_with_no_manifest_still_roots_at_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let scripts = repo.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+
+        assert_eq!(project_root_for(&scripts.join("import.php")), Some(repo.path().to_path_buf()));
+    }
+
+    #[test]
+    fn a_loose_file_falls_back_to_its_own_directory() {
+        // Nothing to walk up to. A server rooted here is worth more than no server, which
+        // is what #125 reported: the editor started nothing and said nothing.
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            project_root_for(&dir.path().join("scratch.php")),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_parent_gets_no_root() {
+        assert_eq!(project_root_for(std::path::Path::new("/")), None);
     }
 }
 

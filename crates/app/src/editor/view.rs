@@ -11,8 +11,8 @@ use elle_text::Point;
 use gpui::{
     App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
     HighlightStyle as GpuiHighlight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    ScrollStrategy, SharedString, StyledText, TextRun, UniformListScrollHandle, Window, div,
-    prelude::*, px, uniform_list,
+    ScrollStrategy, SharedString, TextRun, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 
 use crate::actions::{
@@ -1524,7 +1524,7 @@ fn indent_guide_columns(text: &str) -> Vec<Range<usize>> {
 /// the space left after `return $x; ` — the one that shows up as a diff hunk nobody meant.
 fn trailing_whitespace_range(line: &str) -> Option<Range<usize>> {
     let trimmed = line.trim_end_matches([' ', '\t']);
-    (!trimmed.is_empty() && trimmed.len() < line.len()).then(|| trimmed.len()..line.len())
+    (!trimmed.is_empty() && trimmed.len() < line.len()).then_some(trimmed.len()..line.len())
 }
 
 /// Adds an underline over `span`, splitting any colour runs it partly covers.
