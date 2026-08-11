@@ -143,10 +143,10 @@ pub struct Document {
     /// delete) and by the renderer; kept sorted by position and never overlapping the
     /// primary or each other, which [`Document::add_selection`] enforces at the door.
     ///
-    /// Stage 1 of #82, and the collapse rule is deliberate: any plain motion funnels
-    /// through [`Document::move_to`], which drops the extras. VS Code moves every caret
-    /// on arrow keys; that is stage 2, a per-cursor rewrite of twenty motion methods,
-    /// and shipping ⌘D-then-type first is most of the value at a tenth of the surface.
+    /// Motions apply per cursor since stage 2 ([`Document::for_each_cursor`]): arrows,
+    /// word and line moves keep the pack, with colliding cursors merging. What still
+    /// collapses is a *placed* cursor — a plain click, a jump — through [`move_to`]'s
+    /// rule, plus Escape, which is the deliberate way out.
     extra_selections: Vec<Selection>,
     /// Column the cursor "wants" during vertical motion, so moving down through a short
     /// line and back out returns to the original column instead of sticking.
@@ -456,8 +456,10 @@ impl Document {
 
     /// Moves the cursor, collapsing or extending the selection.
     pub fn move_to(&mut self, offset: usize, extend: bool) {
-        // Stage-1 collapse rule (#82): a plain motion returns to one cursor. Every arrow,
-        // click and jump funnels through here, so this single line is the whole policy.
+        // The collapse rule (#82): *placing* the cursor — a click, a definition jump, a
+        // palette landing — returns to one. Motions no longer come through here as
+        // collapses; `for_each_cursor` empties the extras before running a motion per
+        // cursor, so this clear is a no-op on that path and the policy for every other.
         self.extra_selections.clear();
         let offset = offset.min(self.buffer.len_bytes());
         if extend {
@@ -471,6 +473,9 @@ impl Document {
     }
 
     pub fn move_horizontal(&mut self, forward: bool, extend: bool) {
+        if self.has_multiple_cursors() {
+            return self.for_each_cursor(|d| d.move_horizontal(forward, extend));
+        }
         let head = self.selection.head;
 
         // Collapsing a selection with an unmodified arrow key goes to its edge, which is
@@ -489,6 +494,9 @@ impl Document {
     }
 
     pub fn move_vertical(&mut self, down: bool, extend: bool) {
+        if self.has_multiple_cursors() {
+            return self.for_each_cursor(|d| d.move_vertical(down, extend));
+        }
         let point = self.buffer.offset_to_point(self.selection.head);
         let goal = self.goal_column.unwrap_or(point.column);
 
@@ -505,6 +513,9 @@ impl Document {
     }
 
     pub fn move_line_end(&mut self, extend: bool) {
+        if self.has_multiple_cursors() {
+            return self.for_each_cursor(|d| d.move_line_end(extend));
+        }
         let row = self.buffer.offset_to_point(self.selection.head).row;
         let column = self.buffer.line_len(row);
         self.move_to(self.buffer.point_to_offset(Point::new(row, column)), extend);
@@ -516,6 +527,9 @@ impl Document {
     /// with a smart home does, and it is the only way to reach column zero on an
     /// indented line without also making the common case (jump to the code) two presses.
     pub fn move_line_home(&mut self, extend: bool) {
+        if self.has_multiple_cursors() {
+            return self.for_each_cursor(|d| d.move_line_home(extend));
+        }
         let row = self.buffer.offset_to_point(self.selection.head).row;
         let line_start = self.buffer.point_to_offset(Point::new(row, 0));
         let indent_end = self.first_non_whitespace(row);
@@ -527,12 +541,18 @@ impl Document {
 
     /// ⌘↑ / ⌘↓: the two ends of the document.
     pub fn move_document_edge(&mut self, end: bool, extend: bool) {
+        if self.has_multiple_cursors() {
+            return self.for_each_cursor(|d| d.move_document_edge(end, extend));
+        }
         self.move_to(if end { self.buffer.len_bytes() } else { 0 }, extend);
         self.goal_column = None;
     }
 
     /// ⌥← / ⌥→, with `extend` for the ⇧ variants.
     pub fn move_word(&mut self, forward: bool, extend: bool) {
+        if self.has_multiple_cursors() {
+            return self.for_each_cursor(|d| d.move_word(forward, extend));
+        }
         let target = if forward {
             self.next_word_boundary(self.selection.head)
         } else {
@@ -662,6 +682,48 @@ impl Document {
     /// Collapses back to the primary cursor. Escape's half of ⌘D.
     pub fn clear_extra_selections(&mut self) {
         self.extra_selections.clear();
+    }
+
+    /// Runs a single-cursor motion once per cursor, keeping all of them (#82, stage 2).
+    ///
+    /// # How a one-cursor method becomes an every-cursor method
+    ///
+    /// Each motion's arithmetic reads `self.selection` — so this swaps every cursor into
+    /// that seat in turn, runs the unchanged motion, and collects where it landed. The
+    /// motion body never learns multiple cursors exist, which is the entire trick: the
+    /// six movement methods gained one guard line each instead of a rewrite.
+    ///
+    /// The extras are emptied first, because the motions funnel through [`move_to`],
+    /// whose stage-1 rule clears extras — with the list already empty the clear is a
+    /// no-op, and the collapse rule stays intact for genuinely single-cursor calls.
+    ///
+    /// Cursors that land on the same spot merge, keeping one — arrow-right at the end of
+    /// two adjacent words herds both cursors to the same boundary, and two carets in one
+    /// place are indistinguishable on screen while typing twice the text.
+    ///
+    /// **Motions only.** An *editing* action routed through here would corrupt: each
+    /// edit shifts the offsets the queued cursors were captured at. Edits go through
+    /// `splice_at`, which was built for exactly that.
+    fn for_each_cursor(&mut self, motion: impl Fn(&mut Self)) {
+        let mut pending = std::mem::take(&mut self.extra_selections);
+        pending.push(self.selection);
+
+        let mut landed: Vec<Selection> = Vec::with_capacity(pending.len());
+        for cursor in pending {
+            self.selection = cursor;
+            motion(self);
+            landed.push(self.selection);
+        }
+
+        // The last seat run was the old primary; it stays primary.
+        let primary = landed.pop().unwrap_or(Selection::at(0));
+        landed.sort_by_key(|selection| selection.range().start);
+        landed.dedup_by_key(|selection| (selection.anchor, selection.head));
+        landed.retain(|selection| {
+            (selection.anchor, selection.head) != (primary.anchor, primary.head)
+        });
+        self.selection = primary;
+        self.extra_selections = landed;
     }
 
     /// Replaces every cursor at once — the column-selection door (#82).
@@ -2722,6 +2784,58 @@ mod tests {
 
         d.move_to(0, false);
         assert!(!d.has_multiple_cursors(), "a plain motion returns to one cursor");
+    }
+
+    #[test]
+    fn arrows_move_every_cursor_and_shift_extends_every_cursor() {
+        // Stage 2: plain motions stopped collapsing. Two cursors, one keystroke, both move.
+        let mut d = doc("aaa bbb\nccc ddd\n");
+        d.set_selections(Selection::at(8), vec![Selection::at(0)]);
+
+        d.move_horizontal(true, false);
+        let heads: Vec<usize> = d.all_selections().iter().map(|s| s.head).collect();
+        assert_eq!(heads, vec![1, 9], "both cursors advanced one character");
+
+        d.move_word(true, true);
+        let ranges: Vec<std::ops::Range<usize>> =
+            d.all_selections().iter().map(|s| s.range()).collect();
+        assert_eq!(ranges, vec![1..3, 9..11], "shift-word extended each from its own spot");
+    }
+
+    #[test]
+    fn cursors_that_land_together_merge() {
+        // Arrow-left from offsets 1 and 2 herds both toward 0; at the wall they collide,
+        // and two carets in one place would type twice the text.
+        let mut d = doc("abc");
+        d.set_selections(Selection::at(2), vec![Selection::at(1)]);
+
+        d.move_horizontal(false, false);
+        assert_eq!(d.all_selections().len(), 2, "still apart after one step");
+        d.move_horizontal(false, false);
+        assert_eq!(d.all_selections().len(), 1, "merged at the left edge");
+
+        // And the case the primary cannot cover for free: two *extras* colliding with
+        // each other while the primary is elsewhere. A first draft of this test only
+        // collided extras into the primary, and deleting the extra-vs-extra dedup line
+        // passed it — the merge rule needs both halves, so both are pinned.
+        let mut d = doc("abcdefgh");
+        d.set_selections(Selection::at(7), vec![Selection::at(1), Selection::at(2)]);
+        d.move_horizontal(false, false);
+        d.move_horizontal(false, false);
+        let heads: Vec<usize> = d.all_selections().iter().map(|s| s.head).collect();
+        assert_eq!(heads, vec![0, 5], "the two extras merged at the wall; the primary is apart");
+    }
+
+    #[test]
+    fn document_edges_collapse_the_pack_by_arithmetic() {
+        // ⌘↑ sends every cursor to offset 0; they all land together and merge to one —
+        // the same outcome VS Code produces, falling out of the merge rule rather than
+        // being special-cased.
+        let mut d = doc("aaa\nbbb\n");
+        d.set_selections(Selection::at(5), vec![Selection::at(1)]);
+        d.move_document_edge(false, false);
+        assert_eq!(d.all_selections().len(), 1);
+        assert_eq!(d.selection.head, 0);
     }
 
     #[test]
