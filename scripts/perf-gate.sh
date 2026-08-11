@@ -60,7 +60,11 @@ BIN=$ROOT/target/release/ellefuanti
 # which is upstream and not ours to fix (#79).
 MEM_LIMIT_MB=95
 CPU_LIMIT_PCT=2
-BIN_LIMIT_MB=17
+# 17 -> 19 with #53: tree-sitter-rust is ~1.3 MB and tree-sitter-md ~0.3 MB, measured
+# from their rlibs — the same "price of the language at all" trade the bash grammar set
+# the precedent for. The gate's job is catching *accidental* growth; a deliberate,
+# attributed cost moves the line and says so here.
+BIN_LIMIT_MB=19
 
 # How long to let the process settle before believing its memory. Measured: footprint is
 # still climbing for the first several seconds after launch, so reading it immediately

@@ -5075,7 +5075,9 @@ impl Render for WorkspaceView {
                     .border_color(theme.border)
                     .text_color(theme.text_muted)
                     .text_size(px(12.0))
-                    .child(SharedString::from(self.title(cx))),
+                    // The app's name, not the folder's — the owner's call, and the tab
+                    // bar plus the tree header already say what is open.
+                    .child("ellefuanti"),
             )
             .child(
                 div()

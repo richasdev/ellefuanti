@@ -55,6 +55,8 @@ tree-sitter-html = "0.23"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-bash = "0.25"
 tree-sitter-yaml = "0.7"
+tree-sitter-rust = "0.24"
+tree-sitter-md = "0.5"
 ignore = "0.4"
 # Find and replace (#80). Not a new dependency in any meaningful sense: `regex` is already
 # compiled for every build via `gpui` (through `gpui_util`) and `tree-sitter`, both direct
