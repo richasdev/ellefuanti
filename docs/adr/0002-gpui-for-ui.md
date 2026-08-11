@@ -86,3 +86,22 @@ We accept churn on upgrades in exchange for years of saved work, and we contain 
 appears in exactly one crate (`crates/app`, see ADR-0004), so a breaking change is a
 bounded refactor of the presentation layer rather than a rewrite. Windows is not currently
 a supported GPUI target, which bounds §1's "prepared for Windows" to the domain layers.
+
+## Resolution of #57: the default build is the release configuration
+
+`cargo build --release --no-default-features` fails on any machine with only the Command
+Line Tools:
+
+```
+xcrun: error: unable to find utility "metal", not a developer tool or in PATH
+```
+
+The Metal shader compiler ships with full Xcode, not the CLT, and this project demands
+Xcode nowhere else. Combined with the measurement above — precompiled shaders changed
+nothing measurable, on cold or warm launches — the precompiled path costs a toolchain and
+buys nothing. It stays in gpui for anyone who has Xcode and wants it; it is not this
+project's release configuration, and `scripts/bundle-macos.sh` no longer suggests it.
+
+**The release build is `cargo build --release -p ellefuanti`, default features.** The
+`runtime_shaders` flag it enables compiles shaders during the startup window phase already
+counted in the budget above.
