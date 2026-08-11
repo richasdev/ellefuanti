@@ -62,6 +62,18 @@ pub fn build(conn: &Connection, root: &Path, cancel: &CancelFlag) -> Result<()> 
                 rusqlite::params![model_id, name, cast],
             )?;
         }
+        for name in &facts.guarded {
+            conn.execute(
+                "INSERT INTO model_columns (model_id, name, type, source) VALUES (?1, ?2, '', 'guarded')",
+                rusqlite::params![model_id, name],
+            )?;
+        }
+        for name in &facts.accessors {
+            conn.execute(
+                "INSERT INTO model_columns (model_id, name, type, source) VALUES (?1, ?2, '', 'accessor')",
+                rusqlite::params![model_id, name],
+            )?;
+        }
         for (name, kind, target) in &facts.relations {
             conn.execute(
                 "INSERT INTO model_relations (model_id, name, kind, target) VALUES (?1, ?2, ?3, ?4)",
@@ -189,7 +201,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("database/migrations")).unwrap();
         std::fs::write(
             dir.path().join("app/Models/User.php"),
-            "<?php\nclass User extends Model {\n  protected $casts = ['is_admin' => 'boolean'];\n  public function posts() { return $this->hasMany(Post::class); }\n  public function scopeActive($query) { return $query; }\n}\n",
+            "<?php\nclass User extends Model {\n  protected $casts = ['is_admin' => 'boolean'];\n  protected $guarded = ['secret'];\n  public function posts() { return $this->hasMany(Post::class); }\n  public function scopeActive($query) { return $query; }\n  public function getFullNameAttribute() { return ''; }\n}\n",
         )
         .unwrap();
         // `$table` deliberately DIFFERENT from the convention (`posts`): the fixture's
@@ -230,9 +242,17 @@ mod tests {
         // $table, so the convention (`users`) attached them: the one guess, made at the
         // one audited seam.
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["id", "name", "created_at", "updated_at", "is_admin"]);
+        assert_eq!(
+            names,
+            ["id", "name", "created_at", "updated_at", "is_admin", "secret", "full_name"]
+        );
         assert_eq!(columns[0].source, "migration");
-        assert_eq!(columns.last().unwrap().source, "cast", "provenance survives storage");
+        let source_of = |name: &str| {
+            columns.iter().find(|c| c.name == name).map(|c| c.source.as_str()).unwrap()
+        };
+        assert_eq!(source_of("is_admin"), "cast", "provenance survives storage");
+        assert_eq!(source_of("secret"), "guarded", "a guard implies the column");
+        assert_eq!(source_of("full_name"), "accessor", "an accessor is a property, not a table column — the badge is the difference");
 
         let relations = relations_for_model(conn, "User").unwrap();
         assert_eq!(relations, [("posts".to_string(), "hasMany".into(), "Post".into())]);
@@ -256,7 +276,7 @@ mod tests {
         build(&conn, dir.path(), &CancelFlag::default()).unwrap();
 
         let columns = columns_for_model(conn, "User").unwrap();
-        assert_eq!(columns.len(), 5, "two builds, one set of rows — the index is a cache");
+        assert_eq!(columns.len(), 7, "two builds, one set of rows — the index is a cache");
         let scopes = scopes_for_model(conn, "User").unwrap();
         assert_eq!(scopes.len(), 1, "scopes ride the same cascade");
     }
