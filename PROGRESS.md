@@ -1,84 +1,92 @@
-# Progress — autonomous loop (2026-08-11)
+# PROGRESS — sessão autónoma (2026-08-11)
 
-Written per the owner's instruction: keep looping through issues by milestone and
-record everything before context runs out. `CONTEXT.md` holds the durable lessons;
-this file is the session ledger.
+Escrito a pedido do dono com o contexto a ~95%. `CONTEXT.md` guarda as lições
+duráveis; isto é o ledger completo da sessão. **Tudo o que está aqui foi merged em
+main e verificado; a app instalada em `~/.local/bin/ellefuanti` e o `.app` em
+`target/` são o build de `7501445`.**
 
-## Merged to main this loop
+## O arco da sessão
 
-| PR | What |
+Começou com "o popup de completion nunca abre" e terminou com o Milestone 3
+destravado. Pelo caminho: 13 PRs merged (#128–#140), ~21 issues fechadas com
+evidência, e o editor passou de sem-LSP-funcional para: completion real
+(Intelephense + rotas + colunas Eloquent com proveniência), navegação completa
+(F12/⌘-click no identificador, refs, símbolos), multi-cursor completo menos
+folding, menu de contexto com operações de ficheiro seguras, painel de settings,
+git stage/unstage/commit-com-hooks, grammars Rust+Markdown, Blade colorido,
+`ellefuanti .` à la `code .`, e o índice Laravel (#21) a alimentar o popup (#22).
+
+## PRs merged, em ordem
+
+| PR | Conteúdo |
 |---|---|
-| #128 | The completion saga: LSP starts (folder/file/Finder), PATH+shebang fixes, doc resync, popup height — closes #123 #125 #126 #127 |
-| #129 | Terminal ⌘-click links; definition lands on the identifier (UTF-16); ⌘-hover underline+hand — closes #70 |
-| #130 | Settings panel (⌘,) + release-config resolution — closes #57 #100 |
-| #131 | Multi-cursor stage 1: ⌘D, type-everywhere, Escape |
-| #132 | ⌥click carets; multi-cursor ⌘C/⌘X; CONTEXT refresh |
-| #133 | ⌥-drag column selection |
-| #134 | Stage 2: motions move every cursor, collisions merge |
-| #135 | Blade/Volt templates stop rendering one-colour (HTML lexer in text regions) |
-| #136 | Tree modified tint+●, themed titlebar |
-| #137 | `ellefuanti .` detaches like `code .`; titlebar strip fixes traffic-light collision |
+| #128 | Saga LSP: arranque (pasta/ficheiro/Finder), PATH+shebang, resync de documento, altura do popup → fecha #123 #125 #126 #127 |
+| #129 | ⌘-click em paths no terminal; definition aterra no identificador (UTF-16); ⌘-hover sublinhado+mãozinha → fecha #70 |
+| #130 | Painel de settings (⌘,) + resolução do release-config → fecha #57 #100 |
+| #131 | Multi-cursor fase 1: ⌘D, escrever em todos, Esc |
+| #132 | ⌥click; ⌘C/⌘X multi; refresh do CONTEXT.md |
+| #133 | Seleção em coluna (⌥-drag, arestas em pixels) |
+| #134 | Fase 2: motions movem o pack; colisões fundem |
+| #135 | Blade/Volt deixa de ser uma cor só (lexer HTML nas regiões text) |
+| #136 | Tint+● de modificados na árvore; titlebar do tema |
+| #137 | `ellefuanti .` desanexa (3 tentativas mortas documentadas); faixa da titlebar |
+| #138 | #53 grammars Rust+MD (gate 17→19MB atribuído) + #64 itens 3–4 (stage/commit-CLI-com-hooks) + ledger |
+| #139 | **#21**: extractors model/migration, schema v2 com proveniência por coluna, build cancelável no open |
+| #140 | **#22 fatia 1**: colunas do model no popup, proveniência no detail |
 
-## Also merged (later in the loop)
+## Issues fechadas com evidência (sem PR dedicado)
 
-- **#138**: #53 grammars (gate 17→19MB, attributed) + #64 items 3–4 (stage/unstage +
-  CLI commit with hooks) + this ledger.
-- **#139**: **#21 first slice** — model/migration extractors, schema v2 with
-  per-column provenance (migration|cast|fillable), declared-$table-wins at one audited
-  seam, wholesale cancellable build fired on folder open. Unblocks #22 → #20.
-  Mutation caught an unfalsifiable fixture (declared name == convention) — the
-  vacuous test wearing data.
-- **#140 (#22 first slice)**: a model's own columns in the completion popup,
-  provenance in the detail (`string · migration` vs `boolean · cast`) — #20's
-  provenance rule paying out at the first consumer. Spelling trap count: **5**.
+#47 #48 #49 #50 #53 #54 #58 #60 #62 #69 #71 #81 #125 — auditorias comentadas em
+cada uma. #112 tem a decisão escrita (verificação em duas camadas: debug_bounds
+para caixas, olhos do dono para tinta) e espera o ack dele.
 
-## Issues closed this loop (with evidence in each)
+## Estado das abertas
 
-#47 #48 #49 #50 #53 #54 #58 #60 #62 #69 #71 #81 #125 — plus #57 #70 #100 #123 #126
-#127 via PR merges. #112 got a written decision (two-layer verification: debug_bounds
-for boxes, owner-eyes for ink) and stays open for the owner's ack.
+- **#21** — fatia 1 merged. Falta: reanálise incremental via grafo de deps,
+  tabelas de rotas/Livewire/Blade, watch de mudanças externas.
+- **#22** — colunas entregues. Falta: relationships como items, contexto
+  `Model::`, colunas dentro de `where('...')`.
+- **#20** — agora tem DUAS fontes vivas para rankear (LSP + colunas). É a próxima
+  peça de design.
+- **#82** — só falta **folding**; o aviso da issue mantém-se (quebra o mapeamento
+  row↔linha do uniform_list, "carefully or not at all").
+- **#64** — itens 1–4 entregues; **item 5 (push/pull/branch/stash) deliberadamente
+  por construir** atrás da nota de perigo.
+- **#65** — a resolução óbvia do conflito ADR-0007 está anotada aqui e não escrita
+  em ADR: **rusqlite já está na árvore e é síncrono; SQLx era a pergunta errada**.
+- **#23** — Artisan via paleta por começar. #83 umbrella. #99 AI chat. #24
+  Livewire (atrás da decisão Blade-tree/ADR-0006). #35 é do dono. #63 deferido.
 
-## Open, with state
+## Postura de verificação
 
-- **#64** — items 1–4 shipped; **item 5 (push/pull/branches/stash) deliberately
-  unbuilt** behind its danger note.
-- **#82** — multi-cursor essentially complete (⌘D/⌥click/column/motions/copy);
-  **folding remains**, and the issue's own warning stands: it breaks the
-  uniform_list row↔line mapping, "worth doing carefully or not at all".
-- **#83/#23** — route palette + navigation + route-name completion shipped earlier;
-  Artisan-through-palette not started.
-- **#21** — first slice merged (#139). Remaining: incremental reanalysis via the
-  dependency graph, routes/Livewire/Blade tables, external-change watch. #22's first slice
-  merged; remaining: relationships, `Model::` context, where('...') strings. #20 (the
-  merge/rank engine) is now the next design-sized piece, with two live sources to merge.
-- **#65** — DB viewer; the ADR-0007 conflict has an obvious resolution nobody has
-  written down: **rusqlite is already in the tree (elle-index) and is synchronous** —
-  SQLx was the wrong question. Needs a decision note + design.
-- **#99** — AI chat; #29/#28/#30/#31/#24–26 — scope items per RISKS #6.
-- **#35** — the owner's two-minute eyes check; steps updated during the sessions.
-- **#63** — Linux, deferred by design.
+~1155 testes, 37 suites (1 PTY flaky sob carga, verde solo — pré-existente).
+Clippy limpo de warnings novos (dois cosméticos entraram com #140: um `if`
+colapsável e um needless-ref em workspace_view — triviais, primeira coisa a
+limpar). Gate de binário: 17.64MB / 19MB. **Toda garantia nova passou por
+mutação**; quatro testes vazios foram apanhados pela mutação e ou reforçados
+(extras-collide, fixture Volt, declared-table-wins) ou apagados com razão
+registada (row-height ink).
 
-## Verification state
+## As armadilhas recorrentes, contadas
 
-~1150 tests, 37 suites green (one PTY test load-flaky under full suite, solo-green —
-pre-existing). Clippy clean of new warnings. Binary 17.64MB under the new 19MB gate.
-Every new guarantee this loop was mutation-verified; three vacuous tests were caught
-by mutation and either strengthened (extras-collide, Volt fixture) or deleted with
-the reason recorded (row-height ink).
+1. **`/var` vs `/private/var`** — **5 aparições** (tabs-no-delete, rename
+   retarget, git stage, e 2× em testes de índice). Regra: dois paths de origens
+   diferentes NUNCA se comparam crus.
+2. **Medição culpada antes do código** — 3+ (histórico #79, harness pty do
+   detach, fixture do Blade). O harness mata mais hipóteses que o código.
+3. **flex_1 em pai não-flex = altura zero** — 3 (popup invisível, near-miss da
+   árvore; 2 testes debug_bounds guardam agora).
+4. **Fixture não-falsificável** = teste vazio vestido de dados (declared-table ==
+   convenção; Blade text vs text_interpolation).
+5. **macOS engole o clique de ativação** em janela de fundo, modificadores
+   incluídos — a causa recorrente de "⌘-click não funciona".
 
-## The recurring traps, counted
+## Para quem continua (humano ou não)
 
-- `/var` vs `/private/var` spelling: **4 appearances** (tabs-on-delete, rename
-  retarget, and now git stage). Assume differing spellings whenever two paths meet.
-- Measurement blamed before code: **3** (perf #79 history, detach pty harness, and
-  the flatten/fixture mismatch in the Blade mutation run).
-- flex_1-in-non-flex-parent zero-height: **3** (popup, tree wrapper near-miss, —
-  guarded by two debug_bounds tests now).
-
-## For whoever continues
-
-Branch `loop/autonomous` is push-ready for a PR. The highest-value next moves, in
-order: **#21** (unblocks two issues and is the milestone), **#82 folding** (careful),
-**#65 decision note**, **Artisan palette** (#23). The app is installed at
-`~/.local/bin/ellefuanti` and detaches like `code .`; debug with
-`ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`.
+Ordem de valor: **#22 restos** (relationships são leitura direta do índice) →
+**#20** (design: rankear LSP vs índice, proveniência já no tipo) → **#82
+folding** (com cuidado) → **#23 Artisan** → **#65** (escrever o ADR rusqlite).
+Debug: `ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`; wire-tap LSP via
+`ELLE_LSP_COMMAND` num script tee; UI automation precisa de Acessibilidade que o
+terminal não tem. O dono testa de verdade e reporta em uma linha — o log
+instrumentado + uma ronda dele vale mais que dez teorias.
