@@ -29,6 +29,7 @@ use crate::completion::{
     CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, CompletionTrigger,
     word_before,
 };
+use crate::context_menu::{self, MenuAction, Overlay, OverlayEvent};
 use crate::editor::{Document, EditorEvent, EditorView, search_project};
 use crate::file_cache;
 use crate::find_bar::{FindBar, FindEvent, Status};
@@ -76,6 +77,11 @@ enum Job {
     QuickOpenIndex,
     RouteIndex,
     ClosePrompt,
+    /// A create, rename or delete started from the tree's context menu (#126).
+    ///
+    /// One slot: these are all started by a click on a modal overlay, so two cannot be in
+    /// flight at once, and a second one superseding the first is the right behaviour anyway.
+    FileOperation,
     /// A find-in-project sweep, and the debounce timer in front of it (#80).
     ///
     /// **One slot for both on purpose.** The timer and the search it starts are the same
@@ -412,6 +418,20 @@ pub struct WorkspaceView {
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
+    /// The file tree's context menu, name prompt or delete confirmation (#126).
+    ///
+    /// One slot for all three because they are steps of one interaction: the menu opens the
+    /// prompt, the prompt replaces it. Two slots would let a stale menu outlive the dialog
+    /// it opened, which is visible as a menu sitting behind a confirmation.
+    overlay: Option<Entity<Overlay>>,
+    /// What the overlay is about — the row that was right-clicked, and what the pending
+    /// action is going to do to it.
+    ///
+    /// Held here rather than inside the overlay because the overlay is replaced between the
+    /// menu and the prompt, and this has to survive that. A path, never a row index: the
+    /// tree is rebuilt by saves and git polls, so an index is a different file by the time
+    /// an await returns (the same reasoning `MenuAction` records).
+    pending: Option<PendingFileAction>,
     /// The find/replace bar (#80). `Some` only while it is open.
     ///
     /// One bar for the window rather than one per tab, which is what VS Code does and
@@ -559,6 +579,8 @@ impl WorkspaceView {
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
+            overlay: None,
+            pending: None,
             find: None,
             search_panel: None,
             search_cancel: None,
@@ -1112,6 +1134,83 @@ impl WorkspaceView {
     pub fn open_folder_for_test(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
         self.tree = FileTree::new(root).ok();
         cx.notify();
+    }
+
+    /// Right-clicks a tree row, through the same handler the row's mouse-down uses.
+    ///
+    /// The position is arbitrary — nothing headless can assert where a menu was drawn (the
+    /// text system is a fake monospace, see `fonts`) — but it goes through the real path so
+    /// what is being tested is the real open, not a reimplementation of it.
+    #[cfg(test)]
+    pub fn right_click_tree_row_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_tree_menu(index, gpui::Point::default(), window, cx);
+    }
+
+    /// The entries the open context menu is offering, or `None` if no menu is open.
+    #[cfg(test)]
+    pub fn menu_actions_for_test(&self, cx: &App) -> Option<Vec<crate::context_menu::MenuAction>> {
+        let overlay = self.overlay.as_ref()?;
+        overlay.read(cx).entries_for_test()
+    }
+
+    /// Picks a menu entry, through the handler the click and the Enter key both use.
+    #[cfg(test)]
+    pub fn pick_menu_action_for_test(
+        &mut self,
+        action: crate::context_menu::MenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_menu_action(action, window, cx);
+    }
+
+    /// Confirms the open name prompt with `name`.
+    #[cfg(test)]
+    pub fn confirm_name_for_test(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_name_confirmed(name.to_string(), window, cx);
+    }
+
+    /// Accepts the open delete confirmation.
+    #[cfg(test)]
+    pub fn confirm_delete_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_delete_confirmed(window, cx);
+    }
+
+    /// Whether any tree overlay is open.
+    #[cfg(test)]
+    pub fn overlay_is_open_for_test(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Dismisses the open overlay, as Escape and a click outside both do.
+    #[cfg(test)]
+    pub fn dismiss_overlay_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_overlay(window, cx);
+    }
+
+    /// The tree's visible row names, for asserting a refresh landed.
+    #[cfg(test)]
+    pub fn tree_names_for_test(&self) -> Vec<String> {
+        self.tree
+            .as_ref()
+            .map(|tree| tree.entries().iter().map(|entry| entry.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// How many tabs are open, for asserting a delete closed the right ones.
+    #[cfg(test)]
+    pub fn tab_count_for_test(&self) -> usize {
+        self.tabs.len()
     }
 
     /// Clicks a result row, through the same handler the row's mouse-down uses.
@@ -3369,6 +3468,279 @@ impl WorkspaceView {
         self.open_path_at(path, Some(point), window, cx);
     }
 
+    // --- the file tree's context menu (#126) ------------------------------------------
+
+    /// Opens the context menu for the tree row at `index`, at the mouse position.
+    ///
+    /// The row is also selected on the way, because a menu that appears next to a row it is
+    /// not visibly about is how people delete the wrong file. Right-click does not open the
+    /// file — that is what left-click is for, and opening a 4 MB file because someone wanted
+    /// to rename it is a surprise with a visible cost.
+    fn open_tree_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = self.tree.as_ref() else { return };
+        let Some(entry) = tree.entries().get(index) else { return };
+
+        let path = entry.path.clone();
+        let is_dir = entry.is_dir();
+
+        self.pending = Some(PendingFileAction { path, is_dir, kind: PendingKind::Menu });
+        self.show_overlay(
+            cx.new(|cx| Overlay::menu(context_menu::actions_for(is_dir), position, cx)),
+            window,
+            cx,
+        );
+    }
+
+    /// Puts an overlay on screen, focuses it, and subscribes to what it reports.
+    ///
+    /// Everything that takes focus dismisses the completion popup first, for the reason
+    /// spelled out at the render root: the popup cannot see focus leave, so an overlay
+    /// opened over it would leave it on screen and unreachable.
+    fn show_overlay(
+        &mut self,
+        overlay: Entity<Overlay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_completion(window, cx);
+
+        cx.subscribe_in(&overlay, window, |this, _overlay, event, window, cx| match event {
+            OverlayEvent::Picked(action) => this.on_menu_action(action.clone(), window, cx),
+            OverlayEvent::Named(name) => this.on_name_confirmed(name.clone(), window, cx),
+            OverlayEvent::Accepted => this.on_delete_confirmed(window, cx),
+            OverlayEvent::Dismissed => this.dismiss_overlay(window, cx),
+        })
+        .detach();
+
+        window.focus(&overlay.read(cx).focus_handle(cx));
+        self.overlay = Some(overlay);
+        cx.notify();
+    }
+
+    /// Closes whatever overlay is open and gives the keyboard back.
+    fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = None;
+        self.pending = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// A menu entry was chosen: either act now, or open the prompt that the action needs.
+    fn on_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else { return };
+        let name = file_name_of(&pending.path);
+
+        match action {
+            // The two that need a name typed first.
+            MenuAction::NewFile | MenuAction::NewDirectory => {
+                let kind = if action == MenuAction::NewFile {
+                    PendingKind::CreateFile
+                } else {
+                    PendingKind::CreateDirectory
+                };
+                let subject = if kind == PendingKind::CreateFile { "file in" } else { "folder in" };
+                self.pending = Some(PendingFileAction { kind, ..pending });
+                self.show_overlay(
+                    cx.new(|cx| Overlay::prompt("New", format!("{subject} {name}"), "", cx)),
+                    window,
+                    cx,
+                );
+            }
+            MenuAction::Rename => {
+                self.pending = Some(PendingFileAction { kind: PendingKind::Rename, ..pending });
+                // Pre-filled with the current name: retyping a long class file to change
+                // one letter is what makes a rename box feel broken.
+                self.show_overlay(
+                    cx.new(|cx| Overlay::prompt("Rename", name.clone(), name, cx)),
+                    window,
+                    cx,
+                );
+            }
+            // The one that cannot be undone, and so the only one that asks.
+            MenuAction::Delete => {
+                self.pending = Some(PendingFileAction { kind: PendingKind::Delete, ..pending });
+                let detail = if pending.is_dir {
+                    "This folder and everything in it will be deleted permanently."
+                } else {
+                    "This file will be deleted permanently."
+                };
+                self.show_overlay(
+                    cx.new(|cx| Overlay::confirm(format!("Delete {name}?"), detail, cx)),
+                    window,
+                    cx,
+                );
+            }
+            // The two that act immediately: neither destroys anything, so neither asks.
+            MenuAction::RevealInFinder => {
+                self.reveal_in_finder(&pending.path, cx);
+                self.dismiss_overlay(window, cx);
+            }
+            MenuAction::CopyPath => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                    pending.path.display().to_string(),
+                ));
+                self.dismiss_overlay(window, cx);
+            }
+        }
+    }
+
+    /// Shows a path in Finder.
+    ///
+    /// ponytail: shells out to `open -R` rather than calling `NSWorkspace`. It is one
+    /// process for an action the user waits on anyway, and it keeps this file free of
+    /// Objective-C bridging for a feature that is not on any hot path. ADR-0004 is not at
+    /// stake — this is the app crate — but `domain_crates_have_no_platform_conditionals` is
+    /// why it could not live in `elle-workspace` even if it wanted to.
+    #[cfg(target_os = "macos")]
+    fn reveal_in_finder(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if let Err(err) = std::process::Command::new("open").arg("-R").arg(path).spawn() {
+            self.status = Some(format!("could not reveal {}: {err}", path.display()).into());
+            cx.notify();
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reveal_in_finder(&mut self, _path: &std::path::Path, _cx: &mut Context<Self>) {}
+
+    /// A name was typed and confirmed. Runs the create or rename it was for.
+    ///
+    /// The file operation is blocking, so it goes to the background executor (ADR-0007) and
+    /// the tree is refreshed on the main thread when it returns.
+    fn on_name_confirmed(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else { return };
+        self.dismiss_overlay(window, cx);
+
+        let path = pending.path.clone();
+        let kind = pending.kind;
+
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let name_for_op = name.clone();
+            let done = cx
+                .background_spawn(async move {
+                    match kind {
+                        PendingKind::CreateFile => {
+                            let target = path.join(name_for_op);
+                            elle_workspace::create_file(&target).map(|()| Some(target))
+                        }
+                        PendingKind::CreateDirectory => {
+                            elle_workspace::create_directory(&path.join(name_for_op)).map(|()| None)
+                        }
+                        // Opening the renamed file would be wrong: the user was already
+                        // looking at whatever they were looking at.
+                        PendingKind::Rename => {
+                            elle_workspace::rename(&path, &name_for_op).map(|_| None)
+                        }
+                        // Unreachable: a delete never goes through the name prompt.
+                        PendingKind::Menu | PendingKind::Delete => Ok(None),
+                    }
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match done {
+                    // A new file is opened, because creating one and then having to find it
+                    // in the tree is the kind of missing half-step that makes a feature feel
+                    // unfinished. A new *folder* is not: there is nothing in it to show.
+                    Ok(created) => {
+                        this.refresh_tree(cx);
+                        if let Some(target) = created {
+                            this.open_path(target, window, cx);
+                        }
+                    }
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::FileOperation, task);
+    }
+
+    /// The delete confirmation was accepted.
+    ///
+    /// The `root` handed to `elle_workspace::delete` is what keeps a recursive delete inside
+    /// the project even if the path in hand is stale — see that function for why a tree path
+    /// is not trusted on its own.
+    fn on_delete_confirmed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else { return };
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        self.dismiss_overlay(window, cx);
+
+        let path = pending.path.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let deleted_path = path.clone();
+            let done = cx
+                .background_spawn(async move { elle_workspace::delete(&deleted_path, &root) })
+                .await;
+
+            this.update(cx, |this, cx| {
+                match done {
+                    Ok(()) => {
+                        // A tab showing a file that no longer exists would save it back into
+                        // being on the next ⌘S, quietly undoing the delete.
+                        this.close_tabs_under(&path, cx);
+                        this.refresh_tree(cx);
+                    }
+                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::FileOperation, task);
+    }
+
+    /// Closes any tab whose file was inside `path`, which may be a file or a directory.
+    ///
+    /// # Why this does not go through `close_tab_at`
+    ///
+    /// That is the ⌘W path, and it prompts "… has unsaved changes. Closing this tab will
+    /// discard them." on a dirty buffer. Asked about a file that has *just been deleted*,
+    /// every part of that dialog is wrong: there is nothing to discard the changes against,
+    /// "Cancel" cannot put the file back, and answering it does not change what is on disk.
+    /// It would also be asked *after* the deletion the user already confirmed, which reads
+    /// as the editor asking twice and doing something different the second time.
+    ///
+    /// So the tabs are removed outright. The user's confirmation to delete the file is the
+    /// consent for losing its buffer — that is what the confirmation said, naming the file
+    /// and the word *permanently*.
+    ///
+    /// The one thing genuinely lost here is unsaved changes to a file the user chose to
+    /// delete. Recovering those would mean offering to save a buffer whose path is gone,
+    /// which is save-as, which is a different question than the one being asked.
+    fn close_tabs_under(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        // Collected first: closing shifts every later index, so deciding and acting in one
+        // pass closes the wrong tabs — the same shift `tab_after_close` exists for.
+        let doomed: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.path.as_deref().is_some_and(|open| is_under(open, path)))
+            .map(|(index, _)| index)
+            .collect();
+
+        // Last first, so each removal cannot shift an index still to come.
+        for index in doomed.into_iter().rev() {
+            self.remove_tab(index, cx);
+        }
+    }
+
+    /// Re-reads the tree after a file operation, keeping the user's expansions.
+    fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = self.tree.as_mut()
+            && let Err(err) = tree.refresh()
+        {
+            self.status = Some(format!("{err:#}").into());
+        }
+        cx.notify();
+    }
+
     // --- language server ------------------------------------------------------------
 
     /// Starts a language server for the open folder, if one is configured.
@@ -3823,6 +4195,85 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
     (items, incomplete)
 }
 
+/// Which step of the context-menu interaction is in flight (#126).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PendingKind {
+    /// The menu is open and nothing has been chosen.
+    Menu,
+    CreateFile,
+    CreateDirectory,
+    Rename,
+    Delete,
+}
+
+/// The row a context menu is about, and what is about to happen to it.
+#[derive(Clone, Debug)]
+struct PendingFileAction {
+    /// The clicked row's path. For a create, the directory to create *inside*.
+    path: PathBuf,
+    is_dir: bool,
+    kind: PendingKind,
+}
+
+/// Whether `path` is `ancestor` or sits inside it.
+///
+/// # Why this is not `path.starts_with(ancestor)`
+///
+/// The two paths reach this comparison from different places and are not spelled the same
+/// way. `FileTree::new` canonicalises its root, so every path the tree hands out is
+/// canonical; a tab's path is whatever opened it, which for quick open is a path built from
+/// an index and for a test is a raw `TempDir` path. On macOS the system temp directory is a
+/// symlink, so those two spellings are `/private/var/…` and `/var/…` — `starts_with` says
+/// no, and a tab on a file that was just deleted stays open.
+///
+/// That tab is the problem this comparison exists for: it holds a buffer whose file is gone,
+/// and the next ⌘S writes it back, quietly undoing the delete the user confirmed.
+///
+/// Canonicalising resolves both spellings to one. It is done on the *deleted* path's
+/// ancestor and on the tab's path, and either may now fail — a deleted file cannot be
+/// canonicalised at all — so both fall back to the literal comparison, which is correct
+/// whenever the two spellings already agree.
+fn is_under(path: &std::path::Path, ancestor: &std::path::Path) -> bool {
+    if path.starts_with(ancestor) {
+        return true;
+    }
+    // `ancestor` has just been deleted, so it cannot be canonicalised directly. Its parent
+    // still exists, which is enough to normalise the prefix.
+    let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+        return false;
+    };
+    let (Ok(real_parent), Ok(real_path)) = (parent.canonicalize(), canonical_prefix(path)) else {
+        return false;
+    };
+    real_path.starts_with(real_parent.join(name))
+}
+
+/// Canonicalises as much of `path` as still exists.
+///
+/// A deleted file's own path cannot be canonicalised, so this resolves the deepest ancestor
+/// that does exist and re-appends the rest. Without it, every comparison against a path that
+/// has just been removed fails at the first step.
+fn canonical_prefix(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    if let Ok(real) = path.canonicalize() {
+        return Ok(real);
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(path.to_path_buf());
+    };
+    Ok(canonical_prefix(parent)?.join(name))
+}
+
+/// The last component of a path, for a message the user reads.
+///
+/// Falls back to the whole path rather than to an empty string: "Delete ?" is worse than a
+/// long question, and a path with no final component is a root, which is worth showing in
+/// full precisely because deleting it would be the most destructive thing on offer.
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// Files that mark the directory containing them as a project root.
 ///
 /// `composer.json` is the PHP answer and the one that matters here. `.git` is the general
@@ -4082,6 +4533,27 @@ impl Render for WorkspaceView {
                     .clone()
                     .map(|popup| div().absolute().top_0().left_0().size_full().child(popup)),
             )
+            // The tree's menu, name prompt and delete confirmation (#126), above everything
+            // else because each is modal: while one is open it is the only thing the user
+            // can answer.
+            //
+            // The wrapper is a full-window absolute box so a child's own `left`/`top` mean
+            // window coordinates — the coordinates the tree row measured, and the same
+            // arrangement the completion popup above relies on. Dismissing on a click
+            // elsewhere is the overlay's own `on_mouse_down_out`, not a handler here; see
+            // `context_menu` for why a handler on this box would eat the entry clicks.
+            .children(self.overlay.clone().map(|overlay| {
+                let centred = overlay.read(cx).is_centred();
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    // A menu draws at the click; a prompt and a confirmation are dialogs
+                    // about the whole window and centre themselves.
+                    .when(centred, |el| el.flex().items_center().justify_center())
+                    .child(overlay)
+            }))
     }
 }
 
@@ -4334,13 +4806,30 @@ impl WorkspaceView {
                                 .active(|el| el.bg(pressed))
                                 .cursor_pointer()
                                 .text_color(if is_dir { text } else { muted })
-                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                .on_mouse_down(MouseButton::Left, {
+                                    let entity = entity.clone();
+                                    move |_ev, window, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            if is_dir {
+                                                this.toggle_tree_entry(index, cx);
+                                            } else {
+                                                this.open_path(path.clone(), window, cx);
+                                            }
+                                        });
+                                    }
+                                })
+                                // #126. The menu opens at the mouse, which is where every
+                                // other file tree puts it and the only position that does
+                                // not require the user to look for it.
+                                //
+                                // `event.position` is in window coordinates, which is what
+                                // the overlay wrapper at the render root expects — it is a
+                                // full-window absolute box precisely so a child's own
+                                // `left`/`top` mean window coordinates (the completion
+                                // popup is positioned the same way).
+                                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                                     entity.update(cx, |this, cx| {
-                                        if is_dir {
-                                            this.toggle_tree_entry(index, cx);
-                                        } else {
-                                            this.open_path(path.clone(), window, cx);
-                                        }
+                                        this.open_tree_menu(index, event.position, window, cx);
                                     });
                                 })
                                 // The disclosure slot. Fixed width whether or not there is
@@ -5401,6 +5890,59 @@ mod lsp_status_tests {
     #[test]
     fn a_path_with_no_parent_gets_no_root() {
         assert_eq!(project_root_for(std::path::Path::new("/")), None);
+    }
+
+    // --- which tabs a delete closes (#126) ----------------------------------------
+
+    #[test]
+    fn a_file_inside_a_deleted_directory_is_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+
+        assert!(is_under(&app.join("User.php"), &app));
+        assert!(is_under(&app, &app), "the deleted path itself counts");
+        assert!(!is_under(&dir.path().join("artisan"), &app), "a sibling must survive");
+    }
+
+    #[test]
+    fn two_spellings_of_the_same_path_still_match() {
+        // The case that let a tab survive its file being deleted. `FileTree` canonicalises
+        // its root, a tab's path is whatever opened it, and on macOS the temp directory is
+        // a symlink — so the same file is `/private/var/…` from one and `/var/…` from the
+        // other, and a plain `starts_with` says they are unrelated.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // Only meaningful where the two actually differ, which is macOS; elsewhere this
+        // degenerates to the plain comparison and still holds.
+        let raw_file = dir.path().join("User.php");
+        std::fs::write(&raw_file, "<?php\n").unwrap();
+
+        assert!(
+            is_under(&raw_file, &canonical),
+            "a tab opened by one spelling must be closed by a delete named in the other"
+        );
+    }
+
+    #[test]
+    fn a_deleted_directory_still_matches_its_open_files() {
+        // `delete` has already run by the time this is asked, so neither the directory nor
+        // the file inside it can be canonicalised. Resolving the deepest ancestor that does
+        // still exist is what keeps the comparison working.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        let file = app.join("User.php");
+        std::fs::write(&file, "<?php\n").unwrap();
+
+        let canonical_app = app.canonicalize().unwrap();
+        std::fs::remove_dir_all(&app).unwrap();
+
+        assert!(
+            is_under(&file, &canonical_app),
+            "a tab must still be recognised as inside a directory that is already gone"
+        );
     }
 }
 

@@ -2218,3 +2218,210 @@ async fn typing_over_an_auto_closed_bracket_closes_the_popup(cx: &mut TestAppCon
 
     draw(cx);
 }
+
+// --- the file tree's context menu (#126) -------------------------------------------
+
+/// A Laravel-shaped folder for the tree tests.
+fn project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
+    std::fs::write(dir.path().join("app/User.php"), "<?php\n").unwrap();
+    std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    dir
+}
+
+/// Right-clicking a row opens a menu about *that* row.
+///
+/// The report #126 came from was "não dá pra apertar click direito" — there was no
+/// right-click handler in the crate at all. This is the assertion that the gesture now
+/// reaches something, and that what it offers depends on what was clicked: a directory
+/// can hold new files, a file cannot.
+#[gpui::test]
+async fn right_clicking_a_directory_offers_more_than_a_file(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        // Directories sort first, so row 0 is `app` and row 1 is `artisan`.
+        workspace.right_click_tree_row_for_test(0, window, cx);
+    });
+
+    let on_dir = workspace.read_with(cx, |workspace, cx| workspace.menu_actions_for_test(cx));
+    let on_dir = on_dir.expect("right-clicking a row must open a menu");
+    assert!(on_dir.contains(&MenuAction::NewFile), "a directory can hold a new file");
+    assert!(on_dir.contains(&MenuAction::Rename));
+    assert!(on_dir.contains(&MenuAction::Delete));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.right_click_tree_row_for_test(1, window, cx);
+    });
+    let on_file = workspace.read_with(cx, |workspace, cx| workspace.menu_actions_for_test(cx));
+    let on_file = on_file.expect("a file row must open a menu too");
+    assert!(!on_file.contains(&MenuAction::NewFile), "a file is not somewhere to create one");
+    assert!(on_file.contains(&MenuAction::Rename), "a file must still be renameable");
+
+    draw(cx);
+}
+
+/// Creating a file writes it, shows it, and opens it.
+#[gpui::test]
+async fn creating_a_file_from_the_menu_writes_it_and_opens_it(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.right_click_tree_row_for_test(0, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::NewFile, window, cx);
+        workspace.confirm_name_for_test("Post.php", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("app/Post.php").exists(), "the file must be on disk");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.overlay_is_open_for_test(), "the prompt must close");
+        assert_eq!(
+            workspace.tab_count_for_test(),
+            1,
+            "a new file opens, so the user is not left hunting for it in the tree"
+        );
+    });
+
+    draw(cx);
+}
+
+/// Renaming moves the file and leaves the old name behind.
+#[gpui::test]
+async fn renaming_from_the_menu_moves_the_file(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        // Row 1 is `artisan`, a file at the root.
+        workspace.right_click_tree_row_for_test(1, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Rename, window, cx);
+        workspace.confirm_name_for_test("artisan.bak", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("artisan.bak").exists());
+    assert!(!dir.path().join("artisan").exists());
+
+    // And the tree shows the new name without the user doing anything, which is the half
+    // that makes the operation feel finished rather than merely performed.
+    workspace.read_with(cx, |workspace, _cx| {
+        let names = workspace.tree_names_for_test();
+        assert!(names.contains(&"artisan.bak".to_string()), "the tree must refresh: {names:?}");
+        assert!(!names.contains(&"artisan".to_string()));
+    });
+
+    draw(cx);
+}
+
+/// Deleting asks first, and only then deletes.
+///
+/// The confirmation is the point: delete is the one action in this editor that cannot be
+/// undone (there is no trash), so picking `Delete` from the menu must *not* delete anything
+/// on its own. A version that deleted on the menu click would pass a test that only checked
+/// the file was gone at the end — so this asserts the file survives the menu step.
+#[gpui::test]
+async fn deleting_asks_before_it_deletes_and_closes_the_tab(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let victim = dir.path().join("artisan");
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(victim.clone()), "#!/usr/bin/env php\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.right_click_tree_row_for_test(1, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Delete, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(victim.exists(), "choosing Delete must only ask; nothing is destroyed yet");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.overlay_is_open_for_test(), "a confirmation must be on screen");
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.confirm_delete_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(!victim.exists(), "confirming must delete");
+    workspace.read_with(cx, |workspace, _cx| {
+        // A tab left open on a deleted file writes it back into existence on the next ⌘S,
+        // quietly undoing the delete.
+        assert_eq!(workspace.tab_count_for_test(), 0, "the tab on the deleted file must close");
+    });
+
+    draw(cx);
+}
+
+/// Dismissing the confirmation leaves the file alone.
+#[gpui::test]
+async fn cancelling_the_confirmation_deletes_nothing(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.right_click_tree_row_for_test(0, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::Delete, window, cx);
+        workspace.dismiss_overlay_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(dir.path().join("app/User.php").exists(), "cancelling must destroy nothing");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.overlay_is_open_for_test());
+    });
+
+    draw(cx);
+}
+
+/// A bad name is refused with a message, and nothing is created.
+#[gpui::test]
+async fn a_name_with_a_slash_is_reported_not_silently_mangled(cx: &mut TestAppContext) {
+    use crate::context_menu::MenuAction;
+
+    install_theme(cx);
+    let dir = project();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.right_click_tree_row_for_test(0, window, cx);
+        workspace.pick_menu_action_for_test(MenuAction::NewFile, window, cx);
+        workspace.confirm_name_for_test("sub/Post.php", window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(!dir.path().join("app/sub").exists(), "a slash must not create a directory");
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.status_for_test().is_some(),
+            "a refused name must say why, not fail silently"
+        );
+    });
+
+    draw(cx);
+}

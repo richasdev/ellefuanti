@@ -2,6 +2,7 @@
 
 mod actions;
 mod completion;
+mod context_menu;
 mod editor;
 mod file_cache;
 mod file_icons;
