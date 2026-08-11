@@ -25,6 +25,7 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 | #148 | #21: rebuild no window focus — o trigger de mudanças externas, mesmo raciocínio dos 3 triggers do git (#64); sem watcher, sem timer                                                             |
 | #149 | #20: ranking — qualidade do match, depois claim do projeto, depois brevidade; estável dentro da banda; query vazia mantém ordem de fontes                                                       |
 | #150 | #20: buffer words sem servidor — invoke a meio da palavra oferece os identificadores do ficheiro (badge `text`); sem palavra digitada, nada (sem sinal, tudo é ruído)                           |
+| #151 | #19: Format Document (⇧⌥F) — resync antes de pedir, aplicar só ao texto perguntado, `apply_edits` = um undo step (splice_at generalizado); batch com overlap rejeitado inteiro                  |
 
 ## Issues fechadas, cada uma com auditoria no fecho
 
@@ -41,9 +42,9 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 ## Estado das milestones
 
 - **M3 Laravel: 0 abertas.** M2 PHP: restam #18 (IME/dead keys — precisa de teclado
-  real e olhos do dono) e #19 (LSP client — substancialmente construído; o que falta
-  definir é o critério de fecho: "substitutable backend" está provado pelo teste de
-  arquitetura que proíbe nomear o Intelephense fora de uma constante).
+  real e olhos do dono) e #19 (formatting entregue em #151; faltam rename, workspace
+  symbols, semantic tokens e code actions — cada um quer a sua decisão de UI, ver o
+  comentário na issue: pode valer declinar semantic tokens de propósito).
 - Fora de milestone continuam #82 (só falta folding, com o aviso do uniform_list),
   #64 item 5 (push/pull atrás da nota de perigo), #65 (ADR rusqlite por escrever),
   #112 (à espera de ack do dono), #35 (checklist humano).
