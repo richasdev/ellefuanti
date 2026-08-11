@@ -134,6 +134,20 @@ pub struct Document {
     pub buffer: Buffer,
     pub syntax: SyntaxTree,
     pub selection: Selection,
+    /// Additional cursors beyond [`selection`](Self::selection), for ⌘D (#82).
+    ///
+    /// The primary stays in its own field on purpose: 51 call sites read
+    /// `self.selection` as "the cursor" — the LSP offset, the completion anchor, the
+    /// status bar — and for all of them the primary *is* the right answer. Extras are
+    /// consulted only by the operations that apply everywhere (typing, backspace,
+    /// delete) and by the renderer; kept sorted by position and never overlapping the
+    /// primary or each other, which [`Document::add_selection`] enforces at the door.
+    ///
+    /// Stage 1 of #82, and the collapse rule is deliberate: any plain motion funnels
+    /// through [`Document::move_to`], which drops the extras. VS Code moves every caret
+    /// on arrow keys; that is stage 2, a per-cursor rewrite of twenty motion methods,
+    /// and shipping ⌘D-then-type first is most of the value at a tenth of the surface.
+    extra_selections: Vec<Selection>,
     /// Column the cursor "wants" during vertical motion, so moving down through a short
     /// line and back out returns to the original column instead of sticking.
     goal_column: Option<usize>,
@@ -155,6 +169,7 @@ impl Document {
             syntax,
             selection: Selection::at(0),
             goal_column: None,
+            extra_selections: Vec::new(),
             trailing_newline,
             search: Search::default(),
         })
@@ -429,6 +444,9 @@ impl Document {
 
     /// Moves the cursor, collapsing or extending the selection.
     pub fn move_to(&mut self, offset: usize, extend: bool) {
+        // Stage-1 collapse rule (#82): a plain motion returns to one cursor. Every arrow,
+        // click and jump funnels through here, so this single line is the whole policy.
+        self.extra_selections.clear();
         let offset = offset.min(self.buffer.len_bytes());
         if extend {
             self.selection.head = offset;
@@ -607,6 +625,180 @@ impl Document {
         }
 
         Some((kind, start, end))
+    }
+
+    // --- multiple cursors (#82, stage 1) -----------------------------------------
+
+    /// Every selection, primary last, sorted by position for the callers that edit.
+    pub fn all_selections(&self) -> Vec<Selection> {
+        let mut all = self.extra_selections.clone();
+        all.push(self.selection);
+        all.sort_by_key(|selection| selection.range().start);
+        all
+    }
+
+    /// The extra cursors' head offsets, for the renderer's caret pass.
+    pub fn extra_selection_heads(&self) -> Vec<usize> {
+        self.extra_selections.iter().map(|selection| selection.head).collect()
+    }
+
+    /// Whether more than one cursor is live — what the renderer and Escape ask.
+    pub fn has_multiple_cursors(&self) -> bool {
+        !self.extra_selections.is_empty()
+    }
+
+    /// Collapses back to the primary cursor. Escape's half of ⌘D.
+    pub fn clear_extra_selections(&mut self) {
+        self.extra_selections.clear();
+    }
+
+    /// ⌘D: selects the word under the cursor, or adds the next occurrence of it.
+    ///
+    /// The two presses are one gesture in every editor that has this: the first names
+    /// *what* to match (the word under the caret, or whatever is already selected), each
+    /// further press adds the next place it occurs, wrapping at the end of the buffer.
+    /// The newest match becomes the primary — it is the one the user is looking at, so it
+    /// is the one the viewport should follow.
+    ///
+    /// Matching is literal bytes, not word-bounded: selecting `name` also finds the
+    /// `name` inside `username`, which is what VS Code does with an explicit selection
+    /// and the simplest honest rule. Nothing is added when the buffer holds no further
+    /// occurrence — ⌘D at saturation is a no-op, not a wrap into duplicates.
+    pub fn select_next_occurrence(&mut self) {
+        if self.selection.is_empty() {
+            // First press: name the needle without adding a cursor.
+            if let Some(span) = self.word_span_at(self.selection.head) {
+                self.selection = Selection { anchor: span.start, head: span.end };
+            }
+            return;
+        }
+
+        let text = self.buffer.text();
+        let needle = text[self.selection.range()].to_string();
+        if needle.is_empty() {
+            return;
+        }
+
+        // Search starts after the *last* selection in buffer order and wraps once; every
+        // existing selection is skipped so saturation terminates.
+        let taken: Vec<std::ops::Range<usize>> =
+            self.all_selections().iter().map(|selection| selection.range()).collect();
+        let last_end = taken.iter().map(|range| range.end).max().unwrap_or(0);
+
+        let found = find_from(&text, &needle, last_end)
+            .or_else(|| find_from(&text, &needle, 0))
+            .filter(|start| !taken.iter().any(|range| range.start == *start));
+
+        if let Some(start) = found {
+            // The old primary joins the extras; the new match leads.
+            self.extra_selections.push(self.selection);
+            self.selection = Selection { anchor: start, head: start + needle.len() };
+            self.extra_selections.sort_by_key(|selection| selection.range().start);
+            self.buffer.break_undo_group();
+        }
+    }
+
+    /// Replaces every selection with `text`, one undo step, all cursors kept.
+    ///
+    /// # Order of application
+    ///
+    /// Descending buffer order, so each replacement leaves every *earlier* selection's
+    /// offsets untouched; the cursors are then rebuilt in one ascending pass, carrying
+    /// the cumulative size delta. Applying ascending and patching as you go is the same
+    /// arithmetic with more places to get it wrong.
+    ///
+    /// One undo group deliberately: ⌘Z after typing through five cursors must restore
+    /// all five sites, not peel them one at a time — the user made one edit.
+    pub fn insert_at_all_cursors(&mut self, text: &str) {
+        if self.extra_selections.is_empty() {
+            self.insert(text);
+            return;
+        }
+
+        let ordered = self.all_selections();
+        let ranges: Vec<std::ops::Range<usize>> =
+            ordered.iter().map(|selection| selection.range()).collect();
+        self.splice_at(&ranges, text);
+    }
+
+    /// Backspace across every cursor: deletes each selection, or one character back.
+    ///
+    /// The same order and rebuild as [`Self::insert_at_all_cursors`]. Indent-aware
+    /// backspace (the tab-stop rule) applies per cursor, exactly as it would alone.
+    pub fn backspace_at_all_cursors(&mut self) {
+        if self.extra_selections.is_empty() {
+            self.backspace();
+            return;
+        }
+
+        let ordered = self.all_selections();
+        // Resolve each cursor's deletion range *before* any edit, in the pre-edit
+        // coordinate space the descending application preserves.
+        let ranges: Vec<std::ops::Range<usize>> = ordered
+            .iter()
+            .map(|selection| {
+                if selection.is_empty() {
+                    let head = selection.head;
+                    if head == 0 {
+                        return 0..0;
+                    }
+                    match self.indent_backspace_target(head) {
+                        Some(target) => target..head,
+                        None => self.prev_char_offset(head)..head,
+                    }
+                } else {
+                    selection.range()
+                }
+            })
+            .collect();
+
+        self.splice_at(&ranges, "");
+    }
+
+    /// Replaces every range with `replacement` as **one** buffer edit — one undo step.
+    ///
+    /// # Why one `replace` over the whole span, not one per range
+    ///
+    /// The documented trap, walked into anyway and caught by this file's own undo test:
+    /// `Edit::extends` coalesces only contiguous typing, so a loop of per-range replaces
+    /// inside a `break_undo_group` sandwich is N undo steps no matter where the breaks
+    /// go — ⌘Z after typing through five cursors peeled one site at a time. The shape
+    /// that works is the one `indent_lines` and replace-all already use: a single
+    /// `replace` spanning first-to-last, with the untouched text between ranges spliced
+    /// back in around each replacement.
+    ///
+    /// `ranges` must be sorted and non-overlapping, which `all_selections` guarantees
+    /// and the debug assertion states.
+    fn splice_at(&mut self, ranges: &[std::ops::Range<usize>], replacement: &str) {
+        debug_assert!(
+            ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "splice ranges must be sorted and disjoint"
+        );
+        let text = self.buffer.text();
+        let span =
+            ranges.first().map(|r| r.start).unwrap_or(0)..ranges.last().map(|r| r.end).unwrap_or(0);
+
+        // The span's new content: replacement at each range, original text in the gaps.
+        let mut combined = String::new();
+        let mut heads: Vec<usize> = Vec::with_capacity(ranges.len());
+        let mut cursor = span.start;
+        for range in ranges {
+            combined.push_str(&text[cursor..range.start]);
+            combined.push_str(replacement);
+            heads.push(span.start + combined.len());
+            cursor = range.end;
+        }
+
+        self.buffer.break_undo_group();
+        self.buffer.replace(span, &combined);
+        self.buffer.break_undo_group();
+
+        let mut rebuilt: Vec<Selection> = heads.into_iter().map(Selection::at).collect();
+        let primary = rebuilt.pop().unwrap_or(Selection::at(0));
+        self.extra_selections = rebuilt;
+        self.selection = primary;
+        self.goal_column = None;
+        self.sync_syntax();
     }
 
     /// The byte span of the *word* under `offset`, or `None` when what is there is not one.
@@ -1476,6 +1668,19 @@ impl Document {
         let char_idx = rope.byte_to_char(offset);
         rope.char_to_byte((char_idx + 1).min(rope.len_chars()))
     }
+}
+
+/// The next occurrence of `needle` at or after `from`, as a byte offset.
+///
+/// Guarded against slicing mid-character: `from` is clamped forward to a boundary,
+/// because the caller derives it from selection ends that always sit on boundaries —
+/// but a helper that would panic if that ever stopped being true is a trap.
+fn find_from(text: &str, needle: &str, from: usize) -> Option<usize> {
+    let mut from = from.min(text.len());
+    while from < text.len() && !text.is_char_boundary(from) {
+        from += 1;
+    }
+    text[from..].find(needle).map(|at| from + at)
 }
 
 #[cfg(test)]
@@ -2379,6 +2584,99 @@ mod tests {
     fn title_falls_back_to_untitled() {
         assert_eq!(Document::new(None, "", false).unwrap().title(), "untitled");
         assert_eq!(doc("").title(), "t.php");
+    }
+
+    // --- multiple cursors (#82, stage 1) ------------------------------------------
+
+    #[test]
+    fn cmd_d_selects_the_word_then_adds_each_occurrence() {
+        let mut d = doc("name = name + name;");
+
+        d.move_to(1, false);
+        d.select_next_occurrence();
+        assert_eq!(d.selection.range(), 0..4, "first press names the needle");
+        assert!(!d.has_multiple_cursors(), "and adds no cursor yet");
+
+        d.select_next_occurrence();
+        assert_eq!(d.selection.range(), 7..11, "second press takes the next occurrence");
+        assert_eq!(d.all_selections().len(), 2);
+
+        d.select_next_occurrence();
+        assert_eq!(d.selection.range(), 14..18);
+        assert_eq!(d.all_selections().len(), 3);
+
+        // Saturation: every occurrence taken, a further press adds nothing — and must
+        // not wrap into duplicating an existing selection.
+        d.select_next_occurrence();
+        assert_eq!(d.all_selections().len(), 3, "no duplicates at saturation");
+    }
+
+    #[test]
+    fn typing_replaces_every_selection_and_undo_restores_all_in_one_step() {
+        let mut d = doc("name = name + name;");
+        d.move_to(1, false);
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+
+        d.insert_at_all_cursors("id");
+        assert_eq!(d.buffer.text(), "id = id + id;", "all three sites replaced");
+        assert_eq!(d.all_selections().len(), 3, "the cursors survive the edit");
+        // Each cursor sits after its own insertion.
+        let heads: Vec<usize> = d.all_selections().iter().map(|selection| selection.head).collect();
+        assert_eq!(heads, vec![2, 7, 12]);
+
+        d.undo();
+        assert_eq!(
+            d.buffer.text(),
+            "name = name + name;",
+            "one ⌘Z restores all sites — the user made one edit"
+        );
+    }
+
+    #[test]
+    fn backspace_at_all_cursors_deletes_one_character_at_each() {
+        let mut d = doc("name = name + name;");
+        d.move_to(1, false);
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+        // Type first so each cursor is a bare caret after its own text.
+        d.insert_at_all_cursors("id");
+        d.backspace_at_all_cursors();
+
+        assert_eq!(d.buffer.text(), "i = i + i;", "one character gone at every cursor");
+        let heads: Vec<usize> = d.all_selections().iter().map(|selection| selection.head).collect();
+        assert_eq!(heads, vec![1, 5, 9]);
+    }
+
+    #[test]
+    fn a_plain_motion_collapses_to_one_cursor() {
+        // The stage-1 rule, and the funnel that enforces it: every arrow and click goes
+        // through move_to.
+        let mut d = doc("name = name;");
+        d.move_to(1, false);
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+        assert!(d.has_multiple_cursors());
+
+        d.move_to(0, false);
+        assert!(!d.has_multiple_cursors(), "a plain motion returns to one cursor");
+    }
+
+    #[test]
+    fn multibyte_needles_survive_the_occurrence_walk() {
+        // `ação` twice: the needle and the offsets both cross multibyte boundaries, and a
+        // byte-sloppy find_from would slice mid-`ç` and panic.
+        let mut d = doc("ação e ação;");
+        d.move_to(1, false);
+        d.select_next_occurrence();
+        assert_eq!(&d.buffer.text()[d.selection.range()], "ação");
+
+        d.select_next_occurrence();
+        assert_eq!(d.all_selections().len(), 2);
+        d.insert_at_all_cursors("x");
+        assert_eq!(d.buffer.text(), "x e x;");
     }
 
     #[test]

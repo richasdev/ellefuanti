@@ -45,7 +45,7 @@ pub struct Line {
     /// it. Zed paints cursors in their own pass with an explicit origin for the same reason
     /// (`EditorElement::paint_cursors`). Inside one element there is no layout to fight —
     /// the caret's x comes from the same shaped line the glyphs came from.
-    caret: Option<(usize, gpui::Hsla)>,
+    carets: Vec<(usize, gpui::Hsla)>,
     /// Forces a fixed advance per glyph. `Some` for the terminal grid, `None` for text.
     cell_width: Option<Pixels>,
     /// Byte offsets to draw a one-pixel indent guide before, and their colour.
@@ -68,7 +68,7 @@ impl Line {
             runs,
             font_size,
             line_height,
-            caret: None,
+            carets: Vec::new(),
             cell_width: None,
             guides: (Vec::new(), gpui::black()),
         }
@@ -96,7 +96,7 @@ impl Line {
         while byte > 0 && !self.text.is_char_boundary(byte) {
             byte -= 1;
         }
-        self.caret = Some((byte, color));
+        self.carets.push((byte, color));
         self
     }
 }
@@ -196,14 +196,16 @@ impl Element for Line {
         // the same shaped line, so the caret lands on a real glyph boundary even on a
         // proportional fallback font — which is the case arithmetic on a column index gets
         // wrong and is why this is measured rather than computed.
-        if let Some((byte, color)) = self.caret {
-            let x = shaped.x_for_index(byte);
+        // A Vec since #82: a row can hold one caret per cursor, and ⌘D routinely puts
+        // several on one line — five occurrences of `name` in a signature are five carets.
+        for (byte, color) in &self.carets {
+            let x = shaped.x_for_index(*byte);
             window.paint_quad(gpui::fill(
                 Bounds::new(
                     gpui::point(bounds.origin.x + x, bounds.origin.y),
                     gpui::size(gpui::px(2.0), self.line_height),
                 ),
-                color,
+                *color,
             ));
         }
     }

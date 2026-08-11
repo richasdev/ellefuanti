@@ -63,6 +63,8 @@ pub struct EditorView {
     /// handed cannot go stale in a way that matters — it is simply the last thing the
     /// server said, and an empty one is the correct rendering when there is no server.
     diagnostics: Vec<(Range<usize>, Severity, SharedString)>,
+    /// True between a left mouse-down on a row and its release: drag-selection (#82).
+    dragging: bool,
     /// The word under a ⌘-hover, underlined as a clickable link (#81's polish).
     ///
     /// Byte range in the buffer. `Some` only while ⌘ is held and the pointer rests on a
@@ -155,6 +157,7 @@ impl EditorView {
             visible_rows: 0..0,
             diagnostics: Vec::new(),
             link_hint: None,
+            dragging: false,
             hover_diagnostic: None,
             text_origin_x: None,
             cursor_row_origin_y: None,
@@ -379,6 +382,17 @@ impl EditorView {
         // auto-closing all replace the plain insert. `insert_with_pairs` reports whether it
         // handled the keystroke rather than deciding here, because what counts as a pair is
         // domain knowledge and `Document` is where that lives.
+        //
+        // With multiple cursors (#82) the pair logic steps aside: auto-closing at five
+        // sites needs per-cursor pair state that stage 1 does not carry, and a `(` that
+        // closes at one cursor and not the others is worse than plain insertion at all.
+        if self.document.has_multiple_cursors() {
+            self.document.insert_at_all_cursors(text);
+            self.restart_blink(cx);
+            cx.emit(EditorEvent::Typed(text.to_string()));
+            cx.notify();
+            return;
+        }
         let plain = !self.document.insert_with_pairs(text);
         if plain {
             self.document.insert(text);
@@ -409,8 +423,38 @@ impl EditorView {
     // keymap. Not worth it at this size.
 
     fn backspace(&mut self, _: &Backspace, _w: &mut Window, cx: &mut Context<Self>) {
-        self.document.backspace();
+        self.document.backspace_at_all_cursors();
         self.after_edit(cx);
+    }
+
+    /// Escape with multiple cursors collapses to one; otherwise the key belongs to
+    /// whoever else wants it (`propagate`), so find-dismissal and friends keep working.
+    fn cancel_multi_cursor(
+        &mut self,
+        _: &crate::actions::Cancel,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document.has_multiple_cursors() {
+            self.document.clear_extra_selections();
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// ⌘D (#82): first press selects the word, each further press adds an occurrence.
+    fn select_next_occurrence(
+        &mut self,
+        _: &crate::actions::SelectNextOccurrence,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.select_next_occurrence();
+        // The newest match is the primary, and it may be off-screen — a ⌘D that adds an
+        // invisible cursor reads as a dead key.
+        self.scroll_cursor_into_view();
+        cx.notify();
     }
 
     fn delete(&mut self, _: &Delete, _w: &mut Window, cx: &mut Context<Self>) {
@@ -790,6 +834,16 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let offset = self.offset_at(event.position.x, row, window, cx);
+
+        // Drag-selection first: while the button is down the mouse is selecting, not
+        // hovering, and a diagnostic card popping open mid-drag would sit on top of the
+        // text being selected. Crossing rows works because every row runs this handler.
+        if self.dragging && event.pressed_button == Some(MouseButton::Left) {
+            self.document.move_to(offset, true);
+            cx.notify();
+            return;
+        }
+
         let fonts = Fonts::get(cx);
         let position = gpui::point(event.position.x, event.position.y + fonts.line_height());
         self.hover_for_offset(offset, row, position, cx);
@@ -890,6 +944,10 @@ impl EditorView {
             1 => {
                 // Shift-click extends the existing selection, matching every other editor.
                 self.document.move_to(offset, event.modifiers.shift);
+                // The most basic gesture there is, missing until a user asked for it in
+                // so many words: press, drag, and the selection follows the mouse. The
+                // move handler extends while this flag holds; release clears it.
+                self.dragging = true;
             }
             2 => self.document.select_word_at(offset),
             3 => self.document.select_line_at(row),
@@ -1002,6 +1060,20 @@ impl Render for EditorView {
             // stopped; scrolling moves the text out from under it, leaving a card pinned
             // over whatever scrolled in. Clearing on wheel is honest: the mouse is now
             // over different bytes, and the next pause re-asks.
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|editor, _ev: &gpui::MouseUpEvent, _w, _cx| {
+                    editor.dragging = false;
+                }),
+            )
+            // Released outside the editor — over the sidebar, past the window edge. The
+            // terminal's drag ends the same two ways for the same reason.
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|editor, _ev: &gpui::MouseUpEvent, _w, _cx| {
+                    editor.dragging = false;
+                }),
+            )
             .on_scroll_wheel(cx.listener(|editor, _event: &gpui::ScrollWheelEvent, _window, cx| {
                 let cleared =
                     editor.hover_diagnostic.take().is_some() | editor.link_hint.take().is_some();
@@ -1025,6 +1097,8 @@ impl Render for EditorView {
             .when(self.link_hint.is_some(), |el| el.cursor_pointer())
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::cancel_multi_cursor))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::tab))
@@ -1159,7 +1233,9 @@ impl EditorView {
 
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
-        let selection = self.document.selection.range();
+        // Every cursor, primary included, for the rows to paint (#82). Head offsets plus
+        // ranges, resolved once per frame rather than per row.
+        let all_selections = self.document.all_selections();
 
         // Once per frame, not once per row: the lookup is a tree descent, and the answer is
         // the same for every visible row. Both offsets are document-wide; `line_runs` clips
@@ -1213,9 +1289,33 @@ impl EditorView {
                     .collect();
 
                 let is_cursor_row = row == cursor.row;
-                let row_selected = !selection.is_empty()
-                    && selection.start < line_end.max(line_start + 1)
-                    && selection.end > line_start;
+                // Each selection's slice of this row, in line-local bytes, for precise
+                // painting (#82). The old full-row tint made a word selection look like a
+                // line selection — and on themes where hover and selected share a value
+                // (one_dark_pro does), ⌘D's first press changed nothing visible at all,
+                // which is exactly how it got reported as dead.
+                let row_selections: Vec<Range<usize>> = all_selections
+                    .iter()
+                    .map(|sel| sel.range())
+                    .filter(|range| {
+                        !range.is_empty() && range.start < line_end && range.end > line_start
+                    })
+                    .map(|range| {
+                        range.start.max(line_start) - line_start
+                            ..range.end.min(line_end) - line_start
+                    })
+                    .collect();
+                let row_selected = !row_selections.is_empty();
+                // Extra carets whose head sits on this row, as columns into the line.
+                // The primary is excluded here — it keeps its existing path below, with
+                // the blink and focus rules that path already carries.
+                let extra_carets: Vec<usize> = self
+                    .document
+                    .extra_selection_heads()
+                    .into_iter()
+                    .filter(|head| *head >= line_start && *head <= line_end)
+                    .map(|head| head - line_start)
+                    .collect();
                 let entity = entity.clone();
 
                 let measuring_entity = entity.clone();
@@ -1284,7 +1384,6 @@ impl EditorView {
                     // is why setting it there alone did not fix the overflow.
                     .line_height(fonts.line_height())
                     .w_full()
-                    .when(row_selected, |el| el.bg(theme.selection))
                     .when(is_cursor_row && !row_selected, |el| el.bg(theme.hover))
                     .child(
                         // Gutter. Right-aligned so digits line up as numbers grow.
@@ -1316,6 +1415,7 @@ impl EditorView {
                                 &spans,
                                 &row_diagnostics,
                                 row_link,
+                                &row_selections,
                                 brackets,
                                 &row_matches,
                                 &theme,
@@ -1325,6 +1425,9 @@ impl EditorView {
                             // As a sibling it was placed by the flex pass and stacked
                             // *below* the text; inside the element it shares the shaped
                             // line the glyphs came from.
+                            let rendered = extra_carets.iter().fold(rendered, |line, column| {
+                                line.with_caret(*column, theme.cursor)
+                            });
                             if is_cursor_row && caret_visible {
                                 rendered.with_caret(cursor.column, theme.cursor)
                             } else {
@@ -1410,13 +1513,14 @@ fn styled_line(
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
     link: Option<Range<usize>>,
+    selections: &[Range<usize>],
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
     fonts: &Fonts,
 ) -> Line {
     let (text, highlights) =
-        line_runs(line, line_start, spans, diagnostics, link, brackets, matches, theme);
+        line_runs(line, line_start, spans, diagnostics, link, selections, brackets, matches, theme);
     // Guides come from the line's own indent, so they are computed here and painted by the
     // element — not folded into the runs above, which is what made them blocks (#108).
     let guides = indent_guide_columns(&text).into_iter().map(|range| range.start).collect();
@@ -1498,6 +1602,7 @@ fn line_runs(
     spans: &[HighlightSpan],
     diagnostics: &[(Range<usize>, Severity)],
     link: Option<Range<usize>>,
+    selections: &[Range<usize>],
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     theme: &Theme,
@@ -1575,6 +1680,18 @@ fn line_runs(
                 wavy: false,
             });
             highlights = merge_underline(highlights, start..end, underline);
+        }
+    }
+
+    // The selection tint, as precise background runs (#82): exactly the selected bytes,
+    // not the whole row. Line-local already — the caller clipped. Before the matches
+    // merge on purpose: a search hit inside a selection keeps its own colour, the same
+    // priority every editor gives it.
+    for range in selections {
+        let start = floor_boundary(&text, range.start.min(text.len()));
+        let end = ceil_boundary(&text, range.end.min(text.len()));
+        if start < end {
+            highlights = merge_background(highlights, start..end, theme.selection);
         }
     }
 
@@ -2104,7 +2221,7 @@ mod tests {
         spans: &[HighlightSpan],
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, None, &[], theme)
+        super::line_runs(line, line_start, spans, &[], None, &[], None, &[], theme)
     }
 
     /// `line_runs` with search matches, spelled out.
@@ -2115,7 +2232,7 @@ mod tests {
         matches: &[(Range<usize>, bool)],
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, &[], None, None, matches, theme)
+        super::line_runs(line, line_start, spans, &[], None, &[], None, matches, theme)
     }
 
     /// Byte ranges carrying a foreground colour.
@@ -2439,6 +2556,7 @@ mod tests {
             &[span(0..4, HighlightStyle::Function)],
             &[],
             None,
+            &[],
             Some((1, 3)),
             &[],
             &theme,
@@ -2457,7 +2575,7 @@ mod tests {
         brackets: Option<(usize, usize)>,
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, &[], &[], None, brackets, &[], theme)
+        super::line_runs(line, line_start, &[], &[], None, &[], brackets, &[], theme)
     }
 
     // --- diagnostics ----------------------------------------------------------------
@@ -2662,7 +2780,7 @@ mod tests {
         diagnostics: &[(Range<usize>, Severity)],
         theme: &Theme,
     ) -> (String, Vec<(Range<usize>, GpuiHighlight)>) {
-        super::line_runs(line, line_start, spans, diagnostics, None, None, &[], theme)
+        super::line_runs(line, line_start, spans, diagnostics, None, &[], None, &[], theme)
     }
 
     // --- search match highlighting (#80) --------------------------------------------
@@ -2829,6 +2947,7 @@ mod tests {
             &[],
             &[(0..3, Severity::Error)],
             None,
+            &[],
             None,
             &[(0..3, false)],
             &theme,
@@ -2839,20 +2958,47 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_tints_exactly_its_own_bytes() {
+        // #82's visibility fix: the old full-row tint made a word selection look like a
+        // line selection, and on themes where hover == selected (one_dark_pro) ⌘D's
+        // first press changed nothing on screen — reported as the feature being dead.
+        let theme = Theme::dark();
+        let (_, runs) = super::line_runs("abcdef", 0, &[], &[], None, &[1..4], None, &[], &theme);
+
+        assert_eq!(backgrounds(&runs, theme.selection), vec![1..4], "the bytes, not the row");
+
+        // A search match inside a selection keeps its own colour — the merge order is the
+        // priority every editor gives the thing being searched for.
+        let (_, runs) =
+            super::line_runs("abcdef", 0, &[], &[], None, &[0..6], None, &[(2..4, false)], &theme);
+        let match_run = runs.iter().find(|(range, _)| *range == (2..4)).expect("match run");
+        assert_eq!(match_run.1.background_color, Some(theme.search_match()));
+    }
+
+    #[test]
     fn the_link_hint_underlines_straight_where_diagnostics_are_wavy() {
         // "Clickable" and "broken" share the underline channel and must not be confusable:
         // straight accent for the ⌘-hover hint, wavy severity colour for a squiggle. If
         // either assertion here starts failing the two have collapsed into one claim.
         let theme = Theme::dark();
 
-        let (_, runs) = super::line_runs("abcdef", 0, &[], &[], Some(1..4), None, &[], &theme);
+        let (_, runs) = super::line_runs("abcdef", 0, &[], &[], Some(1..4), &[], None, &[], &theme);
         let link = runs.iter().find(|(r, _)| *r == (1..4)).expect("the hinted run exists");
         let underline = link.1.underline.expect("the hint underlines");
         assert!(!underline.wavy, "a link hint is straight — wavy claims breakage");
         assert_eq!(underline.color, Some(theme.accent));
 
-        let (_, runs) =
-            super::line_runs("abcdef", 0, &[], &[(1..4, Severity::Error)], None, None, &[], &theme);
+        let (_, runs) = super::line_runs(
+            "abcdef",
+            0,
+            &[],
+            &[(1..4, Severity::Error)],
+            None,
+            &[],
+            None,
+            &[],
+            &theme,
+        );
         let diag = runs.iter().find(|(r, _)| *r == (1..4)).expect("the squiggled run exists");
         assert!(diag.1.underline.expect("diagnostics underline").wavy);
     }
@@ -2906,7 +3052,7 @@ mod tests {
         );
 
         let (_, runs) =
-            super::line_runs("f(1)", 0, &[], &[], None, Some((1, 3)), &[(0..4, true)], &theme);
+            super::line_runs("f(1)", 0, &[], &[], None, &[], Some((1, 3)), &[(0..4, true)], &theme);
 
         assert_eq!(
             backgrounds(&runs, theme.bracket_match()),
