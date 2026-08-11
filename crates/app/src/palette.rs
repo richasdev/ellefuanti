@@ -21,6 +21,11 @@ pub enum PaletteMode {
     /// The project's artisan commands (#23). Confirming types the command into the
     /// terminal; nothing executes out of sight.
     Artisan,
+    /// Symbols across the whole project, from the language server (#19). The server is
+    /// the matcher — every keystroke re-asks it — so this mode does NOT filter locally:
+    /// the server's fuzzy match (camel humps, mid-word) would be second-guessed by a
+    /// subsequence scan and real hits would vanish from the list.
+    WorkspaceSymbols,
     /// The syntax language for the current buffer (#127).
     ///
     /// Not a navigation like the others — it changes the active document rather than
@@ -39,6 +44,7 @@ impl PaletteMode {
             PaletteMode::Symbols => "Go to a symbol…",
             PaletteMode::References => "Go to a usage…",
             PaletteMode::Artisan => "Type an artisan command into the terminal…",
+            PaletteMode::WorkspaceSymbols => "Go to a symbol in the project…",
             PaletteMode::Languages => "Set the language…",
         }
     }
@@ -48,6 +54,9 @@ impl PaletteMode {
 pub enum PaletteEvent {
     /// The id (command id, or file path) that was confirmed.
     Confirmed(String),
+    /// The query changed. Only live-source modes (workspace symbols) act on this; the
+    /// static modes filter what they already have and ignore it.
+    QueryChanged(String),
     Dismissed,
 }
 
@@ -124,7 +133,12 @@ impl Palette {
     /// as the query grows. That is a dependency plus a ranking model, not a one-liner, so it
     /// waits for a project big enough to justify it.
     fn refilter(&mut self) {
-        self.filtered = filter_items(&self.items, &self.query);
+        // Workspace symbols arrive already matched by the server; see the mode's doc.
+        self.filtered = if self.mode == PaletteMode::WorkspaceSymbols {
+            self.items.clone()
+        } else {
+            filter_items(&self.items, &self.query)
+        };
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
     }
 
@@ -154,14 +168,27 @@ impl Palette {
             return;
         }
 
+        self.typed(text, cx);
+    }
+
+    /// The shared tail of a keystroke reaching the query — also the test door, because a
+    /// `KeyDownEvent` cannot be conjured headlessly.
+    fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
         self.query.push_str(text);
         self.refilter();
+        cx.emit(PaletteEvent::QueryChanged(self.query.clone()));
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn type_for_test(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.typed(text, cx);
     }
 
     fn backspace(&mut self, _: &Backspace, _w: &mut Window, cx: &mut Context<Self>) {
         self.query.pop();
         self.refilter();
+        cx.emit(PaletteEvent::QueryChanged(self.query.clone()));
         cx.notify();
     }
 

@@ -1206,3 +1206,28 @@ fn formatting_reaches_the_server_with_options_and_rejects_unopened_documents() {
     assert_eq!(params[0]["options"]["tabSize"], json!(4));
     assert_eq!(params[0]["options"]["insertSpaces"], json!(true));
 }
+
+#[test]
+fn workspace_symbols_reach_the_server_with_the_query() {
+    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+        "workspace/symbol" => Reply::Result(json!([{
+            "name": "UserController",
+            "kind": 5,
+            "location": {
+                "uri": "file:///tmp/app/UserController.php",
+                "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 10}}
+            }
+        }])),
+        _ => Reply::Silence,
+    });
+
+    // No document guard: the question is about the workspace, not an open file, and
+    // demanding an open document would break ⌘T in a window that has none yet.
+    let id = client.request_workspace_symbols("usrctrl").unwrap();
+    let reply: Option<lsp_types::WorkspaceSymbolResponse> =
+        client.await_response(&id, Duration::from_secs(5)).unwrap();
+    assert!(reply.is_some(), "symbols arrive");
+
+    let params = server.params_for("workspace/symbol");
+    assert_eq!(params[0]["query"], json!("usrctrl"), "the typed query is the request");
+}

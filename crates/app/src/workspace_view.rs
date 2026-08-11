@@ -1136,6 +1136,12 @@ impl WorkspaceView {
         self.save(&Save, window, cx);
     }
 
+    /// The open palette entity, for tests that drive its input directly.
+    #[cfg(test)]
+    pub fn palette_for_test(&self) -> Option<Entity<Palette>> {
+        self.palette.clone()
+    }
+
     #[cfg(test)]
     pub fn toggle_palette_for_test(
         &mut self,
@@ -3558,7 +3564,8 @@ impl WorkspaceView {
             | PaletteMode::Routes
             | PaletteMode::Symbols
             | PaletteMode::References
-            | PaletteMode::Artisan => Vec::new(),
+            | PaletteMode::Artisan
+            | PaletteMode::WorkspaceSymbols => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3566,9 +3573,15 @@ impl WorkspaceView {
         // The palette reports outcomes as events rather than calling back into the
         // workspace, so it stays a self-contained widget with no knowledge of what its
         // rows mean. The subscription is dropped with the palette entity.
-        cx.subscribe_in(&palette, window, |this, _palette, event, window, cx| match event {
+        cx.subscribe_in(&palette, window, |this, palette, event, window, cx| match event {
             PaletteEvent::Confirmed(id) => this.confirm_palette(id.clone(), window, cx),
             PaletteEvent::Dismissed => this.dismiss_palette(window, cx),
+            // Only the live-source mode re-asks; static modes already filtered locally.
+            PaletteEvent::QueryChanged(query) => {
+                if palette.read(cx).mode() == PaletteMode::WorkspaceSymbols {
+                    this.load_workspace_symbol_items(palette.clone(), query.clone(), cx);
+                }
+            }
         })
         .detach();
 
@@ -3584,6 +3597,9 @@ impl WorkspaceView {
             // pressed the key, which `toggle_palette` does not know.
             PaletteMode::References => {}
             PaletteMode::Artisan => self.load_artisan_items(palette, cx),
+            PaletteMode::WorkspaceSymbols => {
+                self.load_workspace_symbol_items(palette, String::new(), cx)
+            }
             PaletteMode::Commands | PaletteMode::Languages => {}
         }
 
@@ -4101,6 +4117,54 @@ impl WorkspaceView {
                 Ok(None) => Vec::new(),
                 Err(err) => {
                     tracing::debug!("symbol lookup failed: {err:#}");
+                    Vec::new()
+                }
+            };
+
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.start_query(id, task);
+    }
+
+    /// Fills the workspace-symbols palette from the server, superseding the previous ask.
+    ///
+    /// Called once on open (empty query — some servers answer it with a capped project
+    /// overview, Intelephense answers nothing, and either is a fine starting screen) and
+    /// again on every keystroke. `start_query` cancels the in-flight predecessor, which
+    /// is the whole point: the server is the matcher, so typing fast must drop stale
+    /// asks rather than queue them (#20's rule, applied to #19's search).
+    fn load_workspace_symbol_items(
+        &mut self,
+        palette: Entity<Palette>,
+        query_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.lsp.client_mut() else { return };
+        let id = match client.request_workspace_symbols(&query_text) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for workspace symbols: {err:#}");
+                return;
+            }
+        };
+
+        let query = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let found = Self::poll_query::<elle_lsp::lsp_types::WorkspaceSymbolResponse>(
+                &this, &query, cx,
+            )
+            .await;
+            this.update(cx, |this, _| this.in_flight_query = None).ok();
+
+            let items = match found {
+                Ok(Some(response)) => crate::lsp_session::workspace_symbol_items(&response)
+                    .into_iter()
+                    .map(|(label, path, line)| (label, target_id(&path, line as usize)))
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(err) => {
+                    tracing::debug!("workspace symbol lookup failed: {err:#}");
                     Vec::new()
                 }
             };
@@ -5037,7 +5101,8 @@ impl WorkspaceView {
                 PaletteMode::Files
                 | PaletteMode::Routes
                 | PaletteMode::Symbols
-                | PaletteMode::References,
+                | PaletteMode::References
+                | PaletteMode::WorkspaceSymbols,
             ) => {
                 let (path, target) = split_target_id(&id);
                 // A symbol or a usage is a jump, so Back must return here. A file opened
@@ -5125,6 +5190,9 @@ impl WorkspaceView {
                     Dispatch::Artisan => self.toggle_palette(PaletteMode::Artisan, window, cx),
                     Dispatch::FormatDocument => {
                         self.format_document(&FormatDocument, window, cx)
+                    }
+                    Dispatch::GoToWorkspaceSymbol => {
+                        self.toggle_palette(PaletteMode::WorkspaceSymbols, window, cx)
                     }
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
