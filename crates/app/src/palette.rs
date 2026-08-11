@@ -18,6 +18,9 @@ pub enum PaletteMode {
     Symbols,
     /// Where a symbol is used, from the language server.
     References,
+    /// The project's artisan commands (#23). Confirming types the command into the
+    /// terminal; nothing executes out of sight.
+    Artisan,
     /// The syntax language for the current buffer (#127).
     ///
     /// Not a navigation like the others — it changes the active document rather than
@@ -35,6 +38,7 @@ impl PaletteMode {
             PaletteMode::Routes => "Go to a route…",
             PaletteMode::Symbols => "Go to a symbol…",
             PaletteMode::References => "Go to a usage…",
+            PaletteMode::Artisan => "Type an artisan command into the terminal…",
             PaletteMode::Languages => "Set the language…",
         }
     }

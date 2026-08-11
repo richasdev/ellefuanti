@@ -445,13 +445,16 @@ fn split_command(raw: &str) -> Option<(String, Vec<String>)> {
 /// asking it for its `PATH` (`zsh -lic 'echo $PATH'`) is what a full fix does, and it costs
 /// a subprocess on every folder open plus a hang when someone's rc file blocks on input.
 /// Upgrade to that if a real install turns up outside these three.
-const BINARY_SEARCH_PREFIXES: [&str; 4] = [
+const BINARY_SEARCH_PREFIXES: [&str; 5] = [
     // nvm, and Herd's bundled copy of it. The version component is a glob: `versions/node`
     // holds one directory per installed node, and any of them may own the binary.
     ".nvm/versions/node/*/bin",
     "Library/Application Support/Herd/config/nvm/versions/node/*/bin",
     // Homebrew on Apple silicon lives outside `$HOME`; `resolve_binary` also checks the
     // two absolute prefixes below. These two are the per-user npm targets.
+    // Herd's own bin directory is where its php lives — artisan (#23) resolves php
+    // through this same list.
+    "Library/Application Support/Herd/bin",
     ".local/bin",
     ".npm-global/bin",
 ];
@@ -470,7 +473,7 @@ const ABSOLUTE_SEARCH_PREFIXES: [&str; 3] =
 /// list so this is testable against a `tempfile` directory rather than the real machine —
 /// a test that asserted against the developer's actual `PATH` would pass or fail depending
 /// on who ran it.
-fn resolve_binary(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn resolve_binary(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     if command.contains('/') {
         let path = PathBuf::from(command);
         return is_executable(&path).then_some(path);
@@ -505,7 +508,7 @@ fn is_executable(path: &Path) -> bool {
 /// `PATH` wins because a user who put a server on it chose that one. The fallbacks are for
 /// the case where there is no `PATH` to consult at all (#123), and appending rather than
 /// prepending them means a shell launch behaves exactly as it did before this existed.
-fn search_dirs() -> Vec<PathBuf> {
+pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
