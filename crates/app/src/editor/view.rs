@@ -25,7 +25,7 @@ use crate::actions::{
     ToggleComment, Undo, context,
 };
 use crate::editor::line::Line;
-use crate::editor::state::Document;
+use crate::editor::state::{Document, Selection};
 use crate::fonts::Fonts;
 use crate::lsp_session::Severity;
 use crate::theme::{Metrics, Theme, Themed};
@@ -48,6 +48,15 @@ pub struct HoverDiagnostic {
     pub row: usize,
 }
 
+/// The anchor of an ⌥-drag, held from mouse-down until release.
+struct AltDrag {
+    anchor_x: Pixels,
+    anchor_row: usize,
+    /// The mouse-down offset, applied as a plain ⌥click caret if no drag happens.
+    click_offset: usize,
+    moved: bool,
+}
+
 pub struct EditorView {
     pub document: Document,
     focus_handle: FocusHandle,
@@ -65,6 +74,12 @@ pub struct EditorView {
     diagnostics: Vec<(Range<usize>, Severity, SharedString)>,
     /// True between a left mouse-down on a row and its release: drag-selection (#82).
     dragging: bool,
+    /// An ⌥-drag in progress: the anchor's window-x and row, plus the offset to fall
+    /// back to as a plain ⌥click if the mouse never moves before release.
+    ///
+    /// The pixel x, not a column: each row converts it through its own `offset_at`, so
+    /// the column stays visually straight even where tabs make byte columns lie.
+    alt_drag: Option<AltDrag>,
     /// The word under a ⌘-hover, underlined as a clickable link (#81's polish).
     ///
     /// Byte range in the buffer. `Some` only while ⌘ is held and the pointer rests on a
@@ -158,6 +173,7 @@ impl EditorView {
             diagnostics: Vec::new(),
             link_hint: None,
             dragging: false,
+            alt_drag: None,
             hover_diagnostic: None,
             text_origin_x: None,
             cursor_row_origin_y: None,
@@ -838,6 +854,34 @@ impl EditorView {
     ) {
         let offset = self.offset_at(event.position.x, row, window, cx);
 
+        // Column selection (#82): one selection per row of the ⌥-dragged rectangle, each
+        // spanning the same two window-x edges through its own row's text. The pointer's
+        // row is the primary, so typing after the drag flows from where the user is
+        // looking. A row shorter than the anchor x contributes a caret at its end —
+        // clamping is `offset_at`'s, the same as a click past end-of-line.
+        if let Some(drag) = self.alt_drag.as_mut()
+            && event.pressed_button == Some(MouseButton::Left)
+        {
+            drag.moved = true;
+            // Copied out so the borrow of `alt_drag` ends before `offset_at` needs `self`.
+            let (anchor_x, anchor_row) = (drag.anchor_x, drag.anchor_row);
+
+            let (top, bottom) = (anchor_row.min(row), anchor_row.max(row));
+            let mut selections: Vec<Selection> = Vec::with_capacity(bottom - top + 1);
+            for r in top..=bottom {
+                let start = self.offset_at(anchor_x, r, window, cx);
+                let end = self.offset_at(event.position.x, r, window, cx);
+                selections.push(Selection { anchor: start, head: end });
+            }
+            // The pointer's row leads; it is the last pushed when dragging down and the
+            // first when dragging up.
+            let primary_at = if row >= anchor_row { selections.len() - 1 } else { 0 };
+            let primary = selections.remove(primary_at);
+            self.document.set_selections(primary, selections);
+            cx.notify();
+            return;
+        }
+
         // Drag-selection first: while the button is down the mouse is selecting, not
         // hovering, and a diagnostic card popping open mid-drag would sit on top of the
         // text being selected. Crossing rows works because every row runs this handler.
@@ -943,11 +987,18 @@ impl EditorView {
         // see the `ponytail` note on `Selection`). Rather than half-implement it,
         // shift-double-click here falls through to plain word selection, which is at least
         // not surprising.
-        // ⌥click adds (or removes) a caret (#82). Checked before the ordinary paths:
-        // it is a different gesture, not a variant of placing the cursor.
+        // ⌥ starts either a caret click or a column drag, and which one is not knowable
+        // at mouse-down — so the click is *deferred*: if the mouse moves before release
+        // this becomes a column selection, and if it does not, mouse-up applies the
+        // caret. Committing the caret here and dragging after would leave a stray cursor
+        // at the anchor of every column selection.
         if event.modifiers.alt && event.click_count == 1 {
-            self.document.add_cursor_at(offset);
-            self.restart_blink(cx);
+            self.alt_drag = Some(AltDrag {
+                anchor_x: event.position.x,
+                anchor_row: row,
+                click_offset: offset,
+                moved: false,
+            });
             cx.notify();
             return;
         }
@@ -1074,8 +1125,16 @@ impl Render for EditorView {
             // over different bytes, and the next pause re-asks.
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|editor, _ev: &gpui::MouseUpEvent, _w, _cx| {
+                cx.listener(|editor, _ev: &gpui::MouseUpEvent, _w, cx| {
                     editor.dragging = false;
+                    // A deferred ⌥click that never became a drag lands its caret now.
+                    if let Some(drag) = editor.alt_drag.take()
+                        && !drag.moved
+                    {
+                        editor.document.add_cursor_at(drag.click_offset);
+                        editor.restart_blink(cx);
+                        cx.notify();
+                    }
                 }),
             )
             // Released outside the editor — over the sidebar, past the window edge. The
@@ -1084,6 +1143,9 @@ impl Render for EditorView {
                 gpui::MouseButton::Left,
                 cx.listener(|editor, _ev: &gpui::MouseUpEvent, _w, _cx| {
                     editor.dragging = false;
+                    // Released off the editor: a column drag ends where it was; a
+                    // deferred click aimed at text the pointer has left applies nothing.
+                    editor.alt_drag = None;
                 }),
             )
             .on_scroll_wheel(cx.listener(|editor, _event: &gpui::ScrollWheelEvent, _window, cx| {

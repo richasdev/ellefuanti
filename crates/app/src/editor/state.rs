@@ -664,6 +664,21 @@ impl Document {
         self.extra_selections.clear();
     }
 
+    /// Replaces every cursor at once — the column-selection door (#82).
+    ///
+    /// The primary is the caller's choice (the row under the pointer, for a drag);
+    /// extras are sorted and deduplicated here so no caller can construct the
+    /// overlapping state the editing paths assume away.
+    pub fn set_selections(&mut self, primary: Selection, mut extras: Vec<Selection>) {
+        extras.retain(|extra| extra.range() != primary.range());
+        extras.sort_by_key(|selection| selection.range().start);
+        extras.dedup_by_key(|selection| selection.range().start);
+        self.selection = primary;
+        self.extra_selections = extras;
+        self.goal_column = None;
+        self.buffer.break_undo_group();
+    }
+
     /// ⌥click: adds a caret at `offset`, or removes the one already there.
     ///
     /// The toggle is VS Code's rule and the right one: an accidental extra caret must be
@@ -2707,6 +2722,32 @@ mod tests {
 
         d.move_to(0, false);
         assert!(!d.has_multiple_cursors(), "a plain motion returns to one cursor");
+    }
+
+    #[test]
+    fn set_selections_sorts_dedupes_and_keeps_the_primary() {
+        // The column-drag door. The caller hands rows in drag order; editing assumes
+        // sorted-and-disjoint, so the setter is where that becomes true.
+        let mut d = doc("aa\nbb\ncc\n");
+        let primary = Selection { anchor: 6, head: 7 };
+        d.set_selections(
+            primary,
+            vec![
+                Selection { anchor: 3, head: 4 },
+                Selection { anchor: 0, head: 1 },
+                Selection { anchor: 3, head: 4 }, // duplicate
+                Selection { anchor: 6, head: 7 }, // the primary again
+            ],
+        );
+
+        assert_eq!(d.selection.range(), 6..7, "the primary is the caller's choice");
+        let starts: Vec<usize> =
+            d.all_selections().iter().map(|selection| selection.range().start).collect();
+        assert_eq!(starts, vec![0, 3, 6], "sorted, deduped, primary not doubled");
+
+        // And typing through the column works — the whole point of setting them.
+        d.insert_at_all_cursors("x");
+        assert_eq!(d.buffer.text(), "xa\nxb\nxc\n");
     }
 
     #[test]
