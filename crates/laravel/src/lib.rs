@@ -19,6 +19,7 @@
 //! executor runs it (ADR-0007). No UI dependency (ADR-0004).
 
 mod columns;
+mod composer;
 mod livewire;
 mod logs;
 mod models;
@@ -28,6 +29,7 @@ mod routes;
 mod targets;
 
 pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at, scope_context_at};
+pub use composer::composer_scripts;
 pub use logs::{LogEntry, parse_laravel_log};
 pub use livewire::{
     LivewireFacts, WireTarget, extract_livewire, livewire_class_path, wire_context_at,

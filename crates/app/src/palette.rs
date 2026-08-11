@@ -21,6 +21,9 @@ pub enum PaletteMode {
     /// The project's artisan commands (#23). Confirming types the command into the
     /// terminal; nothing executes out of sight.
     Artisan,
+    /// The project's composer scripts (#26). Confirming TYPES the run-script command
+    /// into the terminal — the #146 rule, like artisan.
+    ComposerScripts,
     /// Local branches (#64). Confirming switches — with the crate-level dirty-tree
     /// refusal as the guard, not a prompt.
     Branches,
@@ -57,6 +60,7 @@ impl PaletteMode {
             PaletteMode::Rename => "New name…",
             PaletteMode::CodeActions => "Apply a fix…",
             PaletteMode::Branches => "Switch to a branch…",
+            PaletteMode::ComposerScripts => "Type a composer script into the terminal…",
             PaletteMode::Languages => "Set the language…",
         }
     }

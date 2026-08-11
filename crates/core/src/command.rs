@@ -182,6 +182,11 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("laravel.logs", "Toggle Log Panel"),
     // #25. These TYPE the compose command into the terminal (#146's rule) — the panel
     // shows state, the terminal runs things, and nothing runs out of sight.
+    // #26. Same typed-into-the-terminal principle as artisan (#146) and docker.
+    Command::new("composer.install", "Composer: Install"),
+    Command::new("composer.update", "Composer: Update"),
+    Command::new("composer.require", "Composer: Require…"),
+    Command::new("composer.script", "Composer: Run Script…"),
     Command::new("docker.up", "Docker: Compose Up"),
     Command::new("docker.stop", "Docker: Compose Stop"),
     Command::new("docker.logs", "Docker: Compose Logs"),

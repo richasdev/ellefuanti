@@ -1651,6 +1651,7 @@ version = "0.1.0"
 dependencies = [
  "elle-syntax",
  "elle-text",
+ "serde_json",
  "tempfile",
  "tree-sitter",
 ]
