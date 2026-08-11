@@ -23,10 +23,21 @@ pub enum ColumnTarget {
     This,
 }
 
-/// A cursor inside the column argument of a query-builder call.
+/// What the literal is expected to name — decided by which method is being called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Argument {
+    /// `where('…')` and friends: a column of the target's table.
+    Column,
+    /// `with('…')` and friends: a relationship method the target declares.
+    Relation,
+}
+
+/// A cursor inside the first-argument literal of a query-builder call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnContext {
     pub target: ColumnTarget,
+    /// Column or relation — the caller offers a different list for each.
+    pub expects: Argument,
     /// The literal's content range — what an accepted completion replaces.
     pub range: std::ops::Range<usize>,
 }
@@ -47,6 +58,20 @@ const COLUMN_METHODS: [&str; 11] = [
     "orderByDesc",
     "pluck",
     "value",
+];
+
+/// The builder methods whose first argument names a *relationship* instead. `with` takes
+/// dotted nested paths (`posts.comments`); only the model's own first segment is knowable
+/// from one class's index rows, which is the piece the completion offers.
+const RELATION_METHODS: [&str; 8] = [
+    "with",
+    "load",
+    "has",
+    "whereHas",
+    "orWhereHas",
+    "doesntHave",
+    "whereDoesntHave",
+    "withCount",
 ];
 
 /// Finds the column context containing `offset`, if the cursor sits inside the first
@@ -76,9 +101,13 @@ pub fn column_context_at(source: &str, offset: usize) -> Option<ColumnContext> {
 fn call_context(call: Node, src: &[u8]) -> Option<ColumnContext> {
     let name = call.child_by_field_name("name")?;
     let method = name.utf8_text(src).ok()?;
-    if !COLUMN_METHODS.contains(&method) {
+    let expects = if COLUMN_METHODS.contains(&method) {
+        Argument::Column
+    } else if RELATION_METHODS.contains(&method) {
+        Argument::Relation
+    } else {
         return None;
-    }
+    };
 
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
@@ -87,7 +116,7 @@ fn call_context(call: Node, src: &[u8]) -> Option<ColumnContext> {
     let (_, range) = literal(first, src)?;
 
     let target = chain_root(call, src)?;
-    Some(ColumnContext { target, range })
+    Some(ColumnContext { target, expects, range })
 }
 
 /// Walks a call chain to its root and reads the class there, if there is one to read.
@@ -196,5 +225,37 @@ mod tests {
     #[test]
     fn an_interpolated_string_is_not_a_plain_literal() {
         assert_eq!(context("<?php User::where(\"{$col|umn}\");"), None);
+    }
+
+    #[test]
+    fn a_with_call_expects_a_relation_not_a_column() {
+        let ctx = context("<?php User::with('po|sts')->get();").expect("a context");
+        assert_eq!(ctx.target, ColumnTarget::Class("User".into()));
+        assert_eq!(ctx.expects, Argument::Relation);
+    }
+
+    #[test]
+    fn where_has_and_with_count_expect_relations_too() {
+        let has = context("<?php User::whereHas('|');").expect("a context");
+        assert_eq!(has.expects, Argument::Relation);
+        let count = context("<?php User::query()->withCount('|');").expect("a context");
+        assert_eq!(count.expects, Argument::Relation);
+        assert_eq!(count.target, ColumnTarget::Class("User".into()));
+    }
+
+    #[test]
+    fn a_where_still_expects_a_column() {
+        let ctx = context("<?php User::where('|');").expect("a context");
+        assert_eq!(ctx.expects, Argument::Column);
+    }
+
+    #[test]
+    fn the_closure_inside_where_has_is_not_the_relation_argument() {
+        // `whereHas('posts', fn ($q) => $q->where('|'))` — the inner where roots at an
+        // untyped `$q`, which is None, not the outer call's relation context.
+        assert_eq!(
+            context("<?php User::whereHas('posts', function ($q) { $q->where('|'); });"),
+            None
+        );
     }
 }
