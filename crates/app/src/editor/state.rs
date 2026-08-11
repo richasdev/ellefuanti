@@ -437,7 +437,19 @@ impl Document {
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        (!self.selection.is_empty()).then(|| self.buffer.slice(self.selection.range()))
+        if !self.has_multiple_cursors() {
+            return (!self.selection.is_empty()).then(|| self.buffer.slice(self.selection.range()));
+        }
+        // Multiple selections copy as one string, newline-joined in buffer order — what
+        // VS Code puts on the clipboard for the same gesture, and the only join that
+        // pastes back readably. Empty carets contribute nothing rather than blank lines.
+        let pieces: Vec<String> = self
+            .all_selections()
+            .iter()
+            .filter(|selection| !selection.is_empty())
+            .map(|selection| self.buffer.slice(selection.range()))
+            .collect();
+        (!pieces.is_empty()).then(|| pieces.join("\n"))
     }
 
     // --- motion ------------------------------------------------------------------
@@ -650,6 +662,39 @@ impl Document {
     /// Collapses back to the primary cursor. Escape's half of ⌘D.
     pub fn clear_extra_selections(&mut self) {
         self.extra_selections.clear();
+    }
+
+    /// ⌥click: adds a caret at `offset`, or removes the one already there.
+    ///
+    /// The toggle is VS Code's rule and the right one: an accidental extra caret must be
+    /// removable by the same gesture that made it, not only by Escape-and-rebuild. The
+    /// clicked position becomes the primary either way — it is where the user is looking.
+    ///
+    /// Clicking a caret away when it is the *last* extra simply collapses to one cursor;
+    /// clicking away the only cursor is refused, because zero cursors is not a state.
+    pub fn add_cursor_at(&mut self, offset: usize) {
+        let offset = offset.min(self.buffer.len_bytes());
+
+        // On an existing caret: remove it (the primary swaps in an extra if needed).
+        if self.selection.is_empty() && self.selection.head == offset {
+            if let Some(next_primary) = self.extra_selections.pop() {
+                self.selection = next_primary;
+            }
+            return;
+        }
+        if let Some(at) =
+            self.extra_selections.iter().position(|sel| sel.is_empty() && sel.head == offset)
+        {
+            self.extra_selections.remove(at);
+            return;
+        }
+
+        // Somewhere new: the old primary joins the extras, the click leads.
+        self.extra_selections.push(self.selection);
+        self.selection = Selection::at(offset);
+        self.extra_selections.sort_by_key(|selection| selection.range().start);
+        self.buffer.break_undo_group();
+        self.goal_column = None;
     }
 
     /// ⌘D: selects the word under the cursor, or adds the next occurrence of it.
@@ -2662,6 +2707,37 @@ mod tests {
 
         d.move_to(0, false);
         assert!(!d.has_multiple_cursors(), "a plain motion returns to one cursor");
+    }
+
+    #[test]
+    fn alt_click_adds_toggles_and_never_reaches_zero_cursors() {
+        let mut d = doc("um dois tres");
+
+        d.add_cursor_at(3);
+        assert_eq!(d.all_selections().len(), 2, "a new position adds a caret");
+        assert_eq!(d.selection.head, 3, "the click leads");
+
+        // The same gesture on an existing caret removes it.
+        d.add_cursor_at(3);
+        assert_eq!(d.all_selections().len(), 1, "clicking a caret away toggles it off");
+
+        // And the only cursor cannot be clicked away — zero cursors is not a state.
+        let head = d.selection.head;
+        d.add_cursor_at(head);
+        assert_eq!(d.all_selections().len(), 1);
+    }
+
+    #[test]
+    fn multi_selection_copy_joins_in_buffer_order() {
+        // ⌘C with three ⌘D selections: one clipboard string, newline-joined, in the order
+        // the text reads — not the order the cursors were added.
+        let mut d = doc("name = name + name;");
+        d.move_to(1, false);
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+        d.select_next_occurrence();
+
+        assert_eq!(d.selected_text().as_deref(), Some("name\nname\nname"));
     }
 
     #[test]

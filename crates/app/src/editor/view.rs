@@ -700,7 +700,10 @@ impl EditorView {
     fn cut(&mut self, _: &Cut, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.document.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.document.insert("");
+            // Through the multi-cursor door, so ⌘X with several selections removes all
+            // of them as one undo step — `insert("")` would collapse to the primary and
+            // leave the other selections' text behind with the clipboard claiming it.
+            self.document.insert_at_all_cursors("");
             self.after_edit(cx);
         }
     }
@@ -940,6 +943,15 @@ impl EditorView {
         // see the `ponytail` note on `Selection`). Rather than half-implement it,
         // shift-double-click here falls through to plain word selection, which is at least
         // not surprising.
+        // ⌥click adds (or removes) a caret (#82). Checked before the ordinary paths:
+        // it is a different gesture, not a variant of placing the cursor.
+        if event.modifiers.alt && event.click_count == 1 {
+            self.document.add_cursor_at(offset);
+            self.restart_blink(cx);
+            cx.notify();
+            return;
+        }
+
         match event.click_count {
             1 => {
                 // Shift-click extends the existing selection, matching every other editor.
@@ -2963,14 +2975,33 @@ mod tests {
         // line selection, and on themes where hover == selected (one_dark_pro) ⌘D's
         // first press changed nothing on screen — reported as the feature being dead.
         let theme = Theme::dark();
-        let (_, runs) = super::line_runs("abcdef", 0, &[], &[], None, &[1..4], None, &[], &theme);
+        let (_, runs) = super::line_runs(
+            "abcdef",
+            0,
+            &[],
+            &[],
+            None,
+            std::slice::from_ref(&(1..4)),
+            None,
+            &[],
+            &theme,
+        );
 
         assert_eq!(backgrounds(&runs, theme.selection), vec![1..4], "the bytes, not the row");
 
         // A search match inside a selection keeps its own colour — the merge order is the
         // priority every editor gives the thing being searched for.
-        let (_, runs) =
-            super::line_runs("abcdef", 0, &[], &[], None, &[0..6], None, &[(2..4, false)], &theme);
+        let (_, runs) = super::line_runs(
+            "abcdef",
+            0,
+            &[],
+            &[],
+            None,
+            std::slice::from_ref(&(0..6)),
+            None,
+            &[(2..4, false)],
+            &theme,
+        );
         let match_run = runs.iter().find(|(range, _)| *range == (2..4)).expect("match run");
         assert_eq!(match_run.1.background_color, Some(theme.search_match()));
     }
