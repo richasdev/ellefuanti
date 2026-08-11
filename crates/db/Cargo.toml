@@ -1,0 +1,12 @@
+[package]
+name = "elle-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+# The same bundled build the index uses (ADR-0008) — one sqlite in the binary, not two.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
