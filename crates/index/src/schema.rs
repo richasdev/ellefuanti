@@ -11,7 +11,7 @@ use rusqlite::Connection;
 /// Forgetting to bump this is the failure mode to watch for. It does not corrupt anything —
 /// the old file is opened against new query code, and the mismatch surfaces as a query
 /// error rather than silently wrong autocomplete.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Every table, created in one transaction.
 ///
@@ -90,6 +90,14 @@ CREATE TABLE model_relations (
     target   TEXT NOT NULL
 );
 CREATE INDEX model_relations_by_model ON model_relations(model_id);
+
+CREATE TABLE model_scopes (
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    -- The *call* name: `scopeActive` is stored as `active`, because the name the user
+    -- types is the one completion answers with.
+    name     TEXT NOT NULL
+);
+CREATE INDEX model_scopes_by_model ON model_scopes(model_id);
 
 -- The dependency graph: "if `from_file` changed, `to_file` may need reanalysis".
 -- Edges are directed and deduplicated; a file importing another twice is one edge.

@@ -119,6 +119,52 @@ fn call_context(call: Node, src: &[u8]) -> Option<ColumnContext> {
     Some(ColumnContext { target, expects, range })
 }
 
+/// Finds a `Class::partial` being typed at `offset`: the class's short name and the
+/// byte range of the partial member name — what an accepted scope completion replaces.
+///
+/// Mid-typing, `User::ac` parses as a `class_constant_access_expression` (often inside
+/// an ERROR node at statement level), and `User::ac()` as a `scoped_call_expression`;
+/// both shapes are the same user intention, so both are contexts. The tree is still the
+/// judge — the same text inside a comment or a string parses as neither.
+pub fn scope_context_at(source: &str, offset: usize) -> Option<(String, std::ops::Range<usize>)> {
+    let buffer = Buffer::new(source);
+    let tree = SyntaxTree::new(Language::Php, &buffer).ok()?;
+    let tree = tree.tree()?;
+    let src = source.as_bytes();
+
+    // The cursor sits at the *end* of the partial word, so look at the byte before it —
+    // `descendant_for_byte_range(offset, offset)` at a word's end lands on the next token.
+    let probe = offset.checked_sub(1)?;
+    let mut node = tree.root_node().descendant_for_byte_range(probe, probe)?;
+    loop {
+        let (scope, member) = match node.kind() {
+            "class_constant_access_expression" => {
+                let mut cursor = node.walk();
+                let names: Vec<Node> = node.named_children(&mut cursor).collect();
+                let [scope, member] = names[..] else { return None };
+                (scope, member)
+            }
+            "scoped_call_expression" => {
+                (node.child_by_field_name("scope")?, node.child_by_field_name("name")?)
+            }
+            _ => {
+                node = node.parent()?;
+                continue;
+            }
+        };
+        if !matches!(scope.kind(), "name" | "qualified_name") {
+            return None;
+        }
+        let range = member.start_byte()..member.end_byte();
+        if !(range.start..=range.end).contains(&offset) {
+            return None;
+        }
+        let written = scope.utf8_text(src).ok()?;
+        let short = written.rsplit('\\').next().unwrap_or(written);
+        return Some((short.to_string(), range));
+    }
+}
+
 /// Walks a call chain to its root and reads the class there, if there is one to read.
 ///
 /// `User::query()->latest()->where(` roots at `User`; `$this->where(` roots at `$this`.
@@ -247,6 +293,44 @@ mod tests {
     fn a_where_still_expects_a_column() {
         let ctx = context("<?php User::where('|');").expect("a context");
         assert_eq!(ctx.expects, Argument::Column);
+    }
+
+    fn scope(fixture: &str) -> Option<(String, std::ops::Range<usize>)> {
+        let (source, offset) = at(fixture);
+        scope_context_at(&source, offset)
+    }
+
+    #[test]
+    fn typing_after_a_static_class_prefix_is_a_scope_context() {
+        let (class, range) = scope("<?php $u = User::ac|;").expect("a context");
+        assert_eq!(class, "User");
+        let (source, _) = at("<?php $u = User::ac|;");
+        assert_eq!(&source[range], "ac");
+    }
+
+    #[test]
+    fn the_bare_statement_form_parses_through_the_error_node() {
+        // `User::ac` alone is an ERROR-wrapped class_constant_access_expression while
+        // being typed; the context must still be found there, because "while being
+        // typed" is the only moment completion exists.
+        let (class, _) = scope("<?php User::ac|").expect("a context");
+        assert_eq!(class, "User");
+    }
+
+    #[test]
+    fn a_qualified_prefix_reports_the_short_name() {
+        let (class, _) = scope("<?php \\App\\Models\\User::po|;").expect("a context");
+        assert_eq!(class, "User");
+    }
+
+    #[test]
+    fn a_commented_prefix_is_not_a_context() {
+        assert_eq!(scope("<?php // User::ac|"), None);
+    }
+
+    #[test]
+    fn a_variable_scope_is_not_a_class() {
+        assert_eq!(scope("<?php $user::ac|;"), None);
     }
 
     #[test]

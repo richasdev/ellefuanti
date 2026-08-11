@@ -3229,3 +3229,75 @@ async fn a_with_call_offers_relationships_not_columns(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Typing `User::ac` offers the model's scopes by call name (#22).
+///
+/// `scopeActive` is *called* as `active()` — Intelephense offers the declared method
+/// name, which is exactly the one the user must not type there. The index stores the
+/// call name and the scanner finds the `Class::partial` shape mid-typing, ERROR node
+/// and all.
+#[gpui::test]
+async fn a_static_prefix_offers_the_models_scopes(cx: &mut TestAppContext) {
+    // Same HOME race as the other index-backed popup tests; same lock.
+    let _home = crate::file_cache::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    std::fs::create_dir_all(dir.path().join("app/Http/Controllers")).unwrap();
+    std::fs::write(
+        dir.path().join("app/Models/User.php"),
+        "<?php\nclass User extends Model {\n    public function scopeActive($query) { return $query; }\n}\n",
+    )
+    .unwrap();
+    let controller_path = dir.path().join("app/Http/Controllers/UserController.php");
+    let controller = "<?php\nclass UserController extends Controller {\n    public function index() { return User::ac; }\n}\n";
+    std::fs::write(&controller_path, controller).unwrap();
+
+    let canonical = dir.path().canonicalize().unwrap();
+    let index_path = crate::file_cache::index_path(&canonical).expect("index path");
+    {
+        let (index, _) = elle_index::Index::open(&index_path).expect("index opens");
+        elle_index::laravel::build(
+            index.connection(),
+            &canonical,
+            &elle_workspace::CancelFlag::default(),
+        )
+        .expect("index builds");
+    }
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(controller_path.clone()), controller, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    draw(cx);
+
+    // The caret at the end of `User::ac` — mid-typing, the only moment that matters.
+    let after = controller.find("User::ac").unwrap() + "User::ac".len();
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    editor.update(cx, |editor, _cx| editor.document.select_range_for_test(after..after));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("popup open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_ref()).collect();
+        assert!(labels.contains(&"active"), "the call name arrives: {labels:?}");
+        let active = items.iter().find(|item| item.label.as_ref() == "active").unwrap();
+        assert!(
+            matches!(active.source, CompletionSource::LaravelScope),
+            "a scope is its own kind of claim"
+        );
+    });
+
+    draw(cx);
+}
