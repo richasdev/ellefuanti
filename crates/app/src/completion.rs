@@ -666,7 +666,33 @@ fn filter_items(items: &[CompletionItem], query: &str) -> Vec<CompletionItem> {
     if query.is_empty() {
         return items.to_vec();
     }
-    items.iter().filter(|item| prefix_match(&item.label, query)).cloned().collect()
+    let mut matched: Vec<CompletionItem> =
+        items.iter().filter(|item| prefix_match(&item.label, query)).cloned().collect();
+    matched.sort_by_key(|item| rank(item, query));
+    matched
+}
+
+/// The rank of one matched item — lower sorts first (#20).
+///
+/// The signal is the query, so match quality leads: an exact match, then the case the
+/// user actually typed, then the folded prefix. Within a quality band a project claim
+/// (column, relation, scope, route) outranks the server's — it is this project's word
+/// about this code, and there are never more than a handful of project rows, so the
+/// server's list sits one band lower rather than buried. Shorter labels last, because a
+/// shorter label completes less. `sort_by_key` is stable, so within a band the sources'
+/// own order — including the server's relevance order — survives.
+fn rank(item: &CompletionItem, query: &str) -> (u8, bool, usize) {
+    let label = item.label.as_ref();
+    let quality = if label == query {
+        0
+    } else if label.eq_ignore_ascii_case(query) {
+        1
+    } else if label.starts_with(query) {
+        2
+    } else {
+        3
+    };
+    (quality, item.source == CompletionSource::Lsp, label.len())
 }
 
 /// Whether `haystack` starts with `needle`, ignoring ASCII case.
@@ -763,6 +789,66 @@ mod tests {
         let matched = filter_items(&all, "");
         assert_eq!(matched[0].label, "zebra", "must not sort");
         assert_eq!(matched[1].label, "alpha");
+    }
+
+    // --- ranking (#20) -----------------------------------------------------------
+    //
+    // The signal is the query; without one (empty query) there is nothing honest to rank
+    // by and source order stands — that case keeps its own test above.
+
+    #[test]
+    fn an_exact_match_outranks_every_prefix() {
+        let all = vec![item("users_count", CompletionSource::Lsp), item("users", CompletionSource::Lsp)];
+        let matched = filter_items(&all, "users");
+        assert_eq!(matched[0].label, "users", "typing the whole word puts it first");
+    }
+
+    #[test]
+    fn a_project_claim_outranks_the_server_at_equal_match_quality() {
+        // Both are exact matches; the column is *this project's* word about *this*
+        // table, which is the sharper claim — and there are never more than a handful
+        // of project items, so the server's list is one row lower, not buried.
+        let all = vec![
+            item("name", CompletionSource::Lsp),
+            item("name", CompletionSource::LaravelColumn),
+        ];
+        let matched = filter_items(&all, "name");
+        assert_eq!(matched[0].source, CompletionSource::LaravelColumn);
+        assert_eq!(matched[1].source, CompletionSource::Lsp);
+    }
+
+    #[test]
+    fn a_case_true_prefix_outranks_a_case_folded_one() {
+        let all = vec![
+            item("STR_PAD_LEFT", CompletionSource::Lsp),
+            item("str_pad", CompletionSource::Lsp),
+        ];
+        let matched = filter_items(&all, "str");
+        assert_eq!(matched[0].label, "str_pad", "the case the user typed wins");
+    }
+
+    #[test]
+    fn a_shorter_label_ranks_first_because_it_completes_less() {
+        let all = vec![
+            item("str_replace", CompletionSource::Lsp),
+            item("strlen", CompletionSource::Lsp),
+        ];
+        let matched = filter_items(&all, "str");
+        assert_eq!(matched[0].label, "strlen");
+    }
+
+    #[test]
+    fn equal_ranks_keep_their_source_order() {
+        // Stability is what keeps the server's own relevance order meaningful within a
+        // rank band — sort_by is stable, and this is the test that notices if the key
+        // ever accidentally includes something that reshuffles equals.
+        let all = vec![
+            item("strlen", CompletionSource::Lsp),
+            item("strtok", CompletionSource::Lsp),
+        ];
+        let matched = filter_items(&all, "str");
+        assert_eq!(matched[0].label, "strlen");
+        assert_eq!(matched[1].label, "strtok");
     }
 
     #[test]
