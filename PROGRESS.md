@@ -30,6 +30,7 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 | #153 | #19: Go to Symbol in Project — paleta ganha modo live-source (QueryChanged re-pede, cancela o anterior); NÃO filtra localmente (o servidor é o matcher; mutação prova) |
 | #154 | #19: Rename Symbol (F2) — paleta ganha modo input-only; WorkspaceEdit aplicado em duas fases, tudo-ou-nada (op de ficheiro/overlap/ilegível aborta antes de tocar um byte); buffers = um undo, fechados = write atómico |
 | #155 | #19: Quick Fix (⌘.) — diagnostics RAW do servidor vão no contexto (raw index-paired com resolved); só entries com edit; decoy-mutation no mapeamento de índice. Sweep de clippy achou DOIS testes sem #[test] que nunca correram |
+| #157 | #24 fatia 1: wire:click/model completion da classe do componente — extractor + resolução view→classe por convenção + scanner de atributo; ADR-0006 amendment (scan-first ratificado pelo loop do dono). Restam: computed/validation/events, dangling-action (discussão RISKS #4), nav PHP⇄Blade |
 | #156 | **#82 FECHADA**: folding por indentação — mapa row↔line puro com prova de inverso exaustiva, conversão UMA vez na fronteira do uniform_list, função partilhada render↔teste (a 1ª versão sobreviveu a uma mutação que partia o render — episódio no commit). Regras: cursor dentro de fold revela; mudança de line count limpa tudo |
 
 ## Issues fechadas, cada uma com auditoria no fecho
