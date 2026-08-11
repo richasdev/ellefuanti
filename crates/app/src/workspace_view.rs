@@ -2845,6 +2845,7 @@ impl WorkspaceView {
 
         self.request_route_completions(popup.clone(), cx);
         self.request_column_completions(popup.clone(), cx);
+        self.request_wire_completions(popup.clone(), cx);
         self.request_lsp_completions(popup, offset, window, cx);
         cx.notify();
     }
@@ -2900,6 +2901,59 @@ impl WorkspaceView {
             crate::completion::popup_height(crate::completion::MAX_VISIBLE_ROWS),
             window.viewport_size(),
         ))
+    }
+
+    /// Offers a Livewire component's actions or properties inside a `wire:` value (#24).
+    ///
+    /// Blade only, and only when the view resolves to a component class by the
+    /// convention (`livewire/user-table.blade.php` → `app/Livewire/UserTable.php`) —
+    /// silence otherwise, because a guessed class is a wrong list wearing a badge. The
+    /// scanner decides which list the attribute wants; offering both would bury the
+    /// three real actions under every property.
+    fn request_wire_completions(&mut self, popup: Entity<CompletionPopup>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(path) = tab.path.clone() else { return };
+        if laravel_dialect(&path) != Some(true) {
+            return;
+        }
+        let editor = tab.editor.clone();
+        let document = &editor.read(cx).document;
+        let text = document.buffer.text();
+        let offset = document.selection.head;
+
+        let Some((target, range)) = elle_laravel::wire_context_at(&text, offset) else { return };
+        // Widen range and query together — both or neither (the route source's rule).
+        if range.start <= offset && range.end <= offset {
+            self.completion_word_start = Some((editor.clone(), range.start));
+            let typed = text[range.start..offset].to_string();
+            popup.update(cx, |popup, cx| popup.set_query(typed, cx));
+        }
+
+        let task = cx.background_spawn(async move {
+            let class_path = elle_laravel::livewire_class_path(&root, &path)?;
+            let source = std::fs::read_to_string(class_path).ok()?;
+            elle_laravel::extract_livewire(&source)
+        });
+        let task = cx.spawn(async move |_this, cx| {
+            let Some(facts) = task.await else { return };
+            let (names, kind) = match target {
+                elle_laravel::WireTarget::Action => (facts.actions, "action"),
+                elle_laravel::WireTarget::Property => (facts.properties, "property"),
+            };
+            let items: Vec<CompletionItem> = names
+                .into_iter()
+                .map(|name| {
+                    CompletionItem::new(name, CompletionSource::Livewire)
+                        .with_detail(Some(format!("{kind} · {}", facts.class)))
+                })
+                .collect();
+            if items.is_empty() {
+                return;
+            }
+            popup.update(cx, |popup, cx| popup.add_items(items, cx)).ok();
+        });
+        self.jobs.start(Job::CompletionColumns, task);
     }
 
     /// Asks Laravel for route names, when the cursor is inside a `route('…')`.

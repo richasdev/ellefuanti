@@ -28,6 +28,8 @@ pub struct Folds {
 }
 
 impl Folds {
+    /// Test-only observer; production reads go through the row map.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.hidden.is_empty()
     }

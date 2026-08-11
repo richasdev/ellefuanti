@@ -35,3 +35,20 @@ component-tag navigation, no slot awareness, no `wire:` attribute structure, no
 Blade-aware folding. Milestone 4's Livewire features (§11) are the trigger, and the
 decision is recorded as a `ponytail:` comment on the `Language::Blade` variant so the
 upgrade path is visible from the code.
+
+## Amendment · 2026-08-12 — the Milestone 4 revisit, resolved as scan-first
+
+The revisit this ADR scheduled has happened (#24). The decision: **extend the scanner
+family, not adopt a grammar yet** — a `wire:` attribute context scanner and a Livewire
+class extractor, the same single-file scan contract as `extract_routes`/`extract_model`,
+which has now paid out five times (routes, models, migrations, column contexts, scopes).
+
+Grounds, over adopting a community tree-sitter-blade grammar now: injections into this
+pipeline are new ground (the highlighter is single-tree per buffer); the PHP
+`highlights.scm` episode showed community grammars can be unable to reproduce what our
+colour tests already pin; and a scan-shaped extractor becomes a consumer of the tree if
+one arrives later — nothing is foreclosed.
+
+**The recorded ceiling**: deep slot awareness and Blade-aware folding stay out of reach
+of scans. If Milestone 4 needs those early, the fallback is the grammar (option A in
+#24's analysis), and this amendment is the marker to revisit *again* at that point.
