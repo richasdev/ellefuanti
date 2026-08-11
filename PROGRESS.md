@@ -19,13 +19,15 @@ this file is the session ledger.
 | #136 | Tree modified tint+●, themed titlebar |
 | #137 | `ellefuanti .` detaches like `code .`; titlebar strip fixes traffic-light collision |
 
-## On branch `loop/autonomous` (pushed, unmerged)
+## Also merged (later in the loop)
 
-- **#53**: Rust + Markdown grammars, curated queries, gate 17→19MB with per-grammar
-  cost attributed in `perf-gate.sh`. Titlebar strip reads "ellefuanti".
-- **#64 items 3–4**: stage/unstage (git2, index-only, no confirm needed) + commit via
-  **CLI** (hooks run; refusal stderr reaches the user; box empties only on success).
-  Tested against real repositories including a refusing pre-commit hook.
+- **#138**: #53 grammars (gate 17→19MB, attributed) + #64 items 3–4 (stage/unstage +
+  CLI commit with hooks) + this ledger.
+- **#139**: **#21 first slice** — model/migration extractors, schema v2 with
+  per-column provenance (migration|cast|fillable), declared-$table-wins at one audited
+  seam, wholesale cancellable build fired on folder open. Unblocks #22 → #20.
+  Mutation caught an unfalsifiable fixture (declared name == convention) — the
+  vacuous test wearing data.
 
 ## Issues closed this loop (with evidence in each)
 
@@ -42,8 +44,10 @@ for boxes, owner-eyes for ink) and stays open for the owner's ack.
   uniform_list row↔line mapping, "worth doing carefully or not at all".
 - **#83/#23** — route palette + navigation + route-name completion shipped earlier;
   Artisan-through-palette not started.
-- **#21 → #22 → #20** — the Milestone-3 keystone chain (SQLite Laravel index →
-  Eloquent completion → merge engine). Not started; biggest open value.
+- **#21** — first slice merged (#139). Remaining: incremental reanalysis via the
+  dependency graph, routes/Livewire/Blade tables, external-change watch. **#22
+  (Eloquent completion from this index) is now unblocked and is the next
+  highest-value implementable.** #20 behind it.
 - **#65** — DB viewer; the ADR-0007 conflict has an obvious resolution nobody has
   written down: **rusqlite is already in the tree (elle-index) and is synchronous** —
   SQLx was the wrong question. Needs a decision note + design.
