@@ -2715,10 +2715,33 @@ impl WorkspaceView {
         // prevent.
         self.cancel_completion_query();
 
+        // The buffer as it is *now*, for the resync below.
+        let text = self.active_editor().map(|editor| editor.read(cx).document.buffer.text());
+
         let Some(client) = self.lsp.client_mut() else {
             popup.update(cx, |popup, cx| popup.mark_loaded(cx));
             return;
         };
+
+        // Resync the document before asking. **Without this the popup can never show
+        // anything in a real session**, and it took a live one to find out: `did_change`
+        // goes to the server on save, not on keystroke (see `document_saved`), so its copy
+        // of the file is the one from open. The user types `$this->`, the request asks
+        // about an offset where the server's copy has no `$this->` — usually pointing into
+        // older text, or past the end of a line — and Intelephense correctly answers an
+        // empty list. `close_if_empty_trigger` then closes a popup that never rendered a
+        // frame, ~1ms after it opened (the measured warm p50 is 1.4ms), which on screen is
+        // indistinguishable from the popup never opening. That is the remaining piece of
+        // #125 after the server itself was fixed to start.
+        //
+        // Full-text rather than incremental, for `document_saved`'s reason: the workspace
+        // sees the buffer after the edit and holds no `Edit`, and PHP files are small.
+        // Cost is one notification per request issued — completion-rate, not typing-rate.
+        if let Some(text) = &text
+            && let Err(err) = client.did_change_full(&uri, text)
+        {
+            tracing::debug!("could not resync before completing: {err:#}");
+        }
 
         let id = match client.request_completion(&uri, offset) {
             Ok(id) => id,

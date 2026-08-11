@@ -39,7 +39,7 @@ fn a_configured_server_starts_and_completes_the_handshake() {
     };
 
     eprintln!("spawning: {}", config.command);
-    let mut client = match elle_lsp::Client::start(&config) {
+    let client = match elle_lsp::Client::start(&config) {
         Ok(client) => client,
         Err(err) => panic!(
             "a resolved server must start. This is the failure a resolution-only test \
@@ -108,4 +108,94 @@ fn search_dirs() -> Vec<PathBuf> {
     }
     dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].iter().map(PathBuf::from));
     dirs
+}
+
+/// The full completion round trip, exactly as the app performs it (#125, final piece).
+///
+/// This is the automated version of the test the owner ran by hand five times: didOpen,
+/// then the pre-request resync `request_lsp_completions` does, then a completion request —
+/// all through `elle_lsp::Client`, the same methods in the same order.
+///
+/// # What is and is not asserted
+///
+/// The bug this hunts took a wire capture to find: without the resync, the server's copy
+/// of the file is the one from `didOpen`, so a completion request about text the user just
+/// typed asks about a position where that text does not exist, and the server correctly
+/// answers nothing. Opening with the final text directly would pass without the resync
+/// working, which is the exact hole the popup fell through — hence open-then-resync below.
+///
+/// Only the *live* position is asserted. During diagnosis, `$this->` written after a
+/// `return` answered **0 items in one file shape and 3 in another** (a first draft of this
+/// test asserted 0 and was refuted by its own first run) — the answer depends on how the
+/// server's parser recovers around the error, which is its business. Asserting either
+/// number would bake a heuristic we do not own into our suite; the empty-answer UX is
+/// covered by `close_if_empty_trigger`'s own tests, which do not need a real server to
+/// decide what to do with an empty list.
+#[test]
+fn completion_round_trips_against_a_real_server() {
+    let dir = project();
+    // `$this->` on the line BEFORE the return: live code, the server must answer.
+    // A second `$this->` after the return: dead code, the server answers empty.
+    let text = "<?php\n\nclass User\n{\n    public string $name;\n    public string $email;\n\n    \
+                public function greet(): string\n    {\n        $this->\n        return $this->name;\n        \
+                $this->\n    }\n}\n";
+    std::fs::write(dir.path().join("app/Models/User.php"), text).unwrap();
+
+    let Some(config) = ellefuanti_config_for(dir.path()) else {
+        eprintln!("SKIPPED: no language server installed on this machine");
+        return;
+    };
+    let mut client = match elle_lsp::Client::start(&config) {
+        Ok(client) => client,
+        Err(err) => panic!("server must start: {err:#}"),
+    };
+
+    let uri: elle_lsp::lsp_types::Uri =
+        format!("file://{}/app/Models/User.php", dir.path().canonicalize().unwrap().display())
+            .parse()
+            .unwrap();
+
+    // The app's order: open with the *original* text, then resync to the edited one — the
+    // flow `request_lsp_completions` performs. Opening with the final text directly would
+    // pass without the resync working, which is the exact hole the popup fell through.
+    let original = text.replace("        $this->\n        return", "        \n        return");
+    client.did_open(uri.clone(), "php", &original).unwrap();
+    client.did_change_full(&uri, text).unwrap();
+
+    let live = text.find("$this->").unwrap() + "$this->".len();
+    let items = complete_at(&mut client, &uri, live);
+    assert!(
+        items.iter().any(|label| label == "name"),
+        "live `$this->` must offer the class's own members, got: {items:?}"
+    );
+    assert!(items.iter().any(|label| label == "greet"), "methods too: {items:?}");
+}
+
+/// Asks and polls, the way `poll_query` does, with a test-sized timeout.
+fn complete_at(
+    client: &mut elle_lsp::Client,
+    uri: &elle_lsp::lsp_types::Uri,
+    offset: usize,
+) -> Vec<String> {
+    use elle_lsp::lsp_types::CompletionResponse;
+
+    let id = client.request_completion(uri, offset).expect("request goes out");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match client.poll_response::<CompletionResponse>(&id) {
+            Ok(Some(Some(response))) => {
+                let items = match response {
+                    CompletionResponse::Array(items) => items,
+                    CompletionResponse::List(list) => list.items,
+                };
+                return items.into_iter().map(|item| item.label).collect();
+            }
+            Ok(Some(None)) => return Vec::new(),
+            Ok(None) => {
+                assert!(std::time::Instant::now() < deadline, "server never answered");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(err) => panic!("completion failed: {err:#}"),
+        }
+    }
 }
