@@ -144,7 +144,7 @@ fn call_reference(call: Node, src: &[u8]) -> Option<Reference> {
 /// the check is that the node has *exactly one* named child and that it spans the quotes —
 /// anything interpolated has more, or leaves a gap. That is the whole honesty rule for this
 /// module: a name we cannot read off the source is not reported at all.
-fn literal(node: Node, src: &[u8]) -> Option<(String, std::ops::Range<usize>)> {
+pub(crate) fn literal(node: Node, src: &[u8]) -> Option<(String, std::ops::Range<usize>)> {
     if !matches!(node.kind(), "string" | "encapsed_string") {
         return None;
     }
