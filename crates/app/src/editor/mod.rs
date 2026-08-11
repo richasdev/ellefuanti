@@ -1,6 +1,7 @@
 //! The editor: document state, and the gpui view that renders it.
 
 mod find;
+pub mod folds;
 pub(crate) mod line;
 mod project_search;
 mod state;

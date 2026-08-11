@@ -95,6 +95,8 @@ actions!(
         FormatDocument,
         RenameSymbol,
         QuickFix,
+        FoldBlock,
+        UnfoldBlock,
         FindReferences,
         NavigateBack,
         NavigateForward,
@@ -196,6 +198,9 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("f2", RenameSymbol, Some(context::WORKSPACE)),
         // ⌘. is VS Code's quick-fix chord and nothing here claims it.
         KeyBinding::new("cmd-.", QuickFix, Some(context::WORKSPACE)),
+        // VS Code's fold chords, on the editor: they act on the buffer under the caret.
+        KeyBinding::new("alt-cmd-[", FoldBlock, Some(context::EDITOR)),
+        KeyBinding::new("alt-cmd-]", UnfoldBlock, Some(context::EDITOR)),
         KeyBinding::new("shift-f12", FindReferences, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-shift-o", GoToSymbol, Some(context::WORKSPACE)),
         // Explicit "complete here". It opened #83's route-name palette until #61; it now
@@ -454,6 +459,8 @@ pub enum Dispatch {
     GoToWorkspaceSymbol,
     RenameSymbol,
     QuickFix,
+    FoldAll,
+    UnfoldAll,
     /// Registered but not wired up yet (a later milestone's command).
     Unhandled,
 }
@@ -493,6 +500,8 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "navigate.workspace_symbol" => Dispatch::GoToWorkspaceSymbol,
         "editor.rename" => Dispatch::RenameSymbol,
         "editor.quick_fix" => Dispatch::QuickFix,
+        "editor.fold_all" => Dispatch::FoldAll,
+        "editor.unfold_all" => Dispatch::UnfoldAll,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.
         _ => Dispatch::Unhandled,
     }

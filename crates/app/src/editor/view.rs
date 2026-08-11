@@ -17,6 +17,7 @@ use gpui::{
 
 use crate::actions::{
     Backspace, Copy, Cut, Delete, DeleteLine, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
+    FoldBlock, UnfoldBlock,
     DeleteWordRight, DuplicateLineDown, DuplicateLineUp, Indent, MoveDocumentEnd,
     MoveDocumentStart, MoveDown, MoveLeft, MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp,
     MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent,
@@ -105,6 +106,10 @@ pub struct EditorView {
     /// a panel is added, resized or collapsed, so it is measured from the laid-out element
     /// instead. `None` until the first prepaint, which is before any click can arrive.
     text_origin_x: Option<Pixels>,
+    /// Which lines are folded away (#82). View state, not document state: two views of
+    /// one document (a future split) fold independently, and no fold survives in a file
+    /// on disk.
+    folds: crate::editor::folds::Folds,
     /// Window y of the cursor's row, measured at prepaint (#61).
     ///
     /// The completion popup anchors to it. Measured rather than computed from the row index
@@ -176,6 +181,7 @@ impl EditorView {
             alt_drag: None,
             hover_diagnostic: None,
             text_origin_x: None,
+            folds: crate::editor::folds::Folds::default(),
             cursor_row_origin_y: None,
             caret_visible: true,
             blink: None,
@@ -342,9 +348,90 @@ impl EditorView {
     ///
     /// Falls back to the old unconditional scroll before the first frame, when
     /// `visible_rows` is still empty and there is no viewport to reason about.
+    /// Folds the block containing the cursor (#82, ⌥⌘[).
+    ///
+    /// The cursor cannot be left inside the fold — the render pass would reveal it
+    /// again next frame (its safety rule) — so it moves to the end of the header, which
+    /// is where VS Code leaves it and where typing visibly continues.
+    pub fn fold_block_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let text = self.document.buffer.text();
+        let cursor = self.document.cursor_point();
+        let Some((header, body)) = crate::editor::folds::enclosing_block(&text, cursor.row)
+        else {
+            return;
+        };
+        self.folds.fold(body, self.document.buffer.len_lines());
+        if self.folds.is_hidden(cursor.row) {
+            let offset = self
+                .document
+                .buffer
+                .point_to_offset(Point::new(header, self.document.buffer.line_len(header)));
+            self.document.move_to(offset, false);
+        }
+        cx.notify();
+    }
+
+    /// Unfolds the fold whose header is the cursor's line (#82, ⌥⌘]).
+    pub fn unfold_at_cursor(&mut self, cx: &mut Context<Self>) {
+        if self.folds.unfold_at_header(self.document.cursor_point().row) {
+            cx.notify();
+        }
+    }
+
+    /// Folds every top-level block (#82). The cursor's own block is revealed again if
+    /// the sweep hid it — same rule as everywhere: no invisible caret.
+    pub fn fold_all(&mut self, cx: &mut Context<Self>) {
+        let text = self.document.buffer.text();
+        let lines = self.document.buffer.len_lines();
+        for body in crate::editor::folds::top_level_blocks(&text) {
+            self.folds.fold(body, lines);
+        }
+        let cursor = self.document.cursor_point().row;
+        if self.folds.is_hidden(cursor) {
+            self.folds.unfold_containing(cursor);
+        }
+        cx.notify();
+    }
+
+    pub fn unfold_all(&mut self, cx: &mut Context<Self>) {
+        self.folds.clear();
+        cx.notify();
+    }
+
+    fn on_fold_block(&mut self, _: &FoldBlock, _w: &mut Window, cx: &mut Context<Self>) {
+        self.fold_block_at_cursor(cx);
+    }
+
+    fn on_unfold_block(&mut self, _: &UnfoldBlock, _w: &mut Window, cx: &mut Context<Self>) {
+        self.unfold_at_cursor(cx);
+    }
+
+    /// The buffer line a list row shows — the fold conversion, shared by the render
+    /// callback and the tests so they cannot diverge.
+    fn row_line_index(&self, row: usize) -> usize {
+        self.folds.line_of_row(row, self.document.buffer.len_lines())
+    }
+
+    /// The visible rows' buffer lines, for tests — through `row_line_index`, the same
+    /// function the render callback uses.
+    #[cfg(test)]
+    pub fn visible_lines_for_test(&self) -> Vec<usize> {
+        let lines = self.document.buffer.len_lines();
+        (0..self.folds.visible_count(lines)).map(|row| self.row_line_index(row)).collect()
+    }
+
     fn scroll_cursor_into_view(&mut self) {
-        let row = self.document.cursor_point().row;
-        let last_row = self.document.buffer.len_lines().saturating_sub(1);
+        let line = self.document.cursor_point().row;
+        // A cursor inside a fold reveals it before scrolling — the render pass enforces
+        // the same rule, but scrolling runs first and needs a row to aim at now.
+        if self.folds.is_hidden(line) {
+            self.folds.unfold_containing(line);
+        }
+        let Some(row) = self.folds.row_of_line(line) else { return };
+        let last_row = self
+            .folds
+            .visible_count(self.document.buffer.len_lines())
+            .saturating_sub(1);
 
         if let Some((item, strategy)) = autoscroll_fit(row, &self.visible_rows, last_row) {
             self.scroll.scroll_to_item(item, strategy);
@@ -1091,8 +1178,18 @@ impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
-        let row_count = self.document.buffer.len_lines();
+        let buffer_lines = self.document.buffer.len_lines();
+        // Folding's two safety rules, enforced at the one funnel every change flows
+        // through. An edit that changed the line count invalidates every fold (the
+        // ranges name lines that moved); a cursor that lands inside a fold reveals it —
+        // a caret the user cannot see is an edit about to land somewhere invisible,
+        // which is exactly the corruption the issue warned about.
+        self.folds.invalidate(buffer_lines);
         let cursor = self.document.cursor_point();
+        if self.folds.is_hidden(cursor.row) {
+            self.folds.unfold_containing(cursor.row);
+        }
+        let row_count = self.folds.visible_count(buffer_lines);
 
         self.observe_window_focus(window, cx);
 
@@ -1171,6 +1268,8 @@ impl Render for EditorView {
             .when(self.link_hint.is_some(), |el| el.cursor_pointer())
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::on_fold_block))
+            .on_action(cx.listener(Self::on_unfold_block))
             .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::cancel_multi_cursor))
             .on_action(cx.listener(Self::delete))
@@ -1341,8 +1440,17 @@ impl EditorView {
 
         range
             .map(|row| {
-                let line = self.document.buffer.line(row);
-                let line_start = self.document.buffer.point_to_offset(Point::new(row, 0));
+                // THE fold conversion: this row shows this buffer line, and everything
+                // below — content, gutter number, mouse handlers — is built from the
+                // line. `offset_at` and every consumer beneath it never see a folded
+                // row at all (see `editor/folds.rs` module doc). One shared function
+                // with `visible_lines_for_test`, so the test exercises the same code
+                // the render callback runs — a private copy here is how the first
+                // version survived a mutation that broke the render path.
+                let line_index = self.row_line_index(row);
+                let line = self.document.buffer.line(line_index);
+                let line_start =
+                    self.document.buffer.point_to_offset(Point::new(line_index, 0));
                 let line_end = line_start + line.len();
 
                 // Sliced per row rather than passed whole: `line_runs` would otherwise
@@ -1362,7 +1470,7 @@ impl EditorView {
                     .cloned()
                     .collect();
 
-                let is_cursor_row = row == cursor.row;
+                let is_cursor_row = line_index == cursor.row;
                 // Each selection's slice of this row, in line-local bytes, for precise
                 // painting (#82). The old full-row tint made a word selection look like a
                 // line selection — and on themes where hover and selected share a value
@@ -1394,6 +1502,7 @@ impl EditorView {
 
                 let measuring_entity = entity.clone();
                 let cursor_row = cursor.row;
+                let handler_line = line_index;
 
                 div()
                     // The click handler needs the window x where the text starts, and only
@@ -1412,7 +1521,7 @@ impl EditorView {
                                 // adding those up from constants is the bug `text_origin_x`
                                 // exists because someone already wrote. Only the cursor row
                                 // is recorded — it is the only one anything anchors to.
-                                if row == cursor_row {
+                                if handler_line == cursor_row {
                                     editor.cursor_row_origin_y = Some(text.origin.y);
                                 }
                             });
@@ -1424,7 +1533,7 @@ impl EditorView {
                         move |event, window, cx| {
                             let event = event.clone();
                             entity.update(cx, |editor, cx| {
-                                editor.on_row_mouse_down(&event, row, window, cx);
+                                editor.on_row_mouse_down(&event, handler_line, window, cx);
                             });
                         }
                     })
@@ -1437,7 +1546,7 @@ impl EditorView {
                         move |event, window, cx| {
                             let event = event.clone();
                             entity.update(cx, |editor, cx| {
-                                editor.on_row_mouse_move(&event, row, window, cx);
+                                editor.on_row_mouse_move(&event, handler_line, window, cx);
                             });
                         }
                     })
@@ -1445,7 +1554,9 @@ impl EditorView {
                         let entity = entity.clone();
                         move |entered, _window, cx| {
                             if !entered {
-                                entity.update(cx, |editor, cx| editor.on_row_hover_out(row, cx));
+                                entity.update(cx, |editor, cx| {
+                                    editor.on_row_hover_out(handler_line, cx)
+                                });
                             }
                         }
                     })
@@ -1468,7 +1579,10 @@ impl EditorView {
                             .justify_end()
                             .pr_3()
                             .text_color(if is_cursor_row { theme.text } else { theme.text_muted })
-                            .child(SharedString::from((row + 1).to_string())),
+                            // The buffer line's own number — after a fold, rows are not
+                            // consecutive and pretending they are would misnumber every
+                            // line below the fold.
+                            .child(SharedString::from((line_index + 1).to_string())),
                     )
                     .child(
                         // `relative` so the caret's absolute position is resolved against
@@ -1517,9 +1631,17 @@ impl EditorView {
     /// Byte range covered by a row range, for a single batched highlight query.
     fn visible_byte_range(&self, rows: &Range<usize>) -> Range<usize> {
         let buffer = &self.document.buffer;
-        let start = buffer.point_to_offset(Point::new(rows.start, 0));
-        let last_row = rows.end.saturating_sub(1).min(buffer.len_lines().saturating_sub(1));
-        let end = buffer.point_to_offset(Point::new(last_row, buffer.line_len(last_row)));
+        // List rows, converted to buffer lines through the fold map. The band spans
+        // hidden lines in between — highlights computed for them are clipped away per
+        // row, which costs a few spans and cannot mis-colour anything.
+        let first_line = self.folds.line_of_row(rows.start, buffer.len_lines());
+        let start = buffer.point_to_offset(Point::new(first_line, 0));
+        let last_row = rows.end.saturating_sub(1);
+        let last_line = self
+            .folds
+            .line_of_row(last_row, buffer.len_lines())
+            .min(buffer.len_lines().saturating_sub(1));
+        let end = buffer.point_to_offset(Point::new(last_line, buffer.line_len(last_line)));
         start..end.max(start)
     }
 }

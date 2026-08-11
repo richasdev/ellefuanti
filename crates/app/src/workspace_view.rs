@@ -5494,6 +5494,16 @@ impl WorkspaceView {
                     }
                     Dispatch::RenameSymbol => self.rename_symbol(&RenameSymbol, window, cx),
                     Dispatch::QuickFix => self.quick_fix(&QuickFix, window, cx),
+                    Dispatch::FoldAll => {
+                        if let Some(editor) = self.active_editor().cloned() {
+                            editor.update(cx, |editor, cx| editor.fold_all(cx));
+                        }
+                    }
+                    Dispatch::UnfoldAll => {
+                        if let Some(editor) = self.active_editor().cloned() {
+                            editor.update(cx, |editor, cx| editor.unfold_all(cx));
+                        }
+                    }
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
