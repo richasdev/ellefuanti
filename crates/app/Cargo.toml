@@ -36,6 +36,7 @@ elle-workspace.workspace = true
 elle-laravel.workspace = true
 elle-git.workspace = true
 elle-index.workspace = true
+elle-db.workspace = true
 elle-lsp.workspace = true
 elle-settings.workspace = true
 elle-terminal.workspace = true
@@ -57,6 +58,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 # gpui's own test harness, which can open a window and run a full layout/paint pass with no
 # display attached. That is the only way a machine can check that a view renders at all
 # rather than merely that its inputs were computed correctly (issue #35).

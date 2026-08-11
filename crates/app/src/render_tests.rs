@@ -3368,6 +3368,56 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     draw(cx);
 }
 
+/// The Database panel reads the project's sqlite schema when shown (#65).
+///
+/// What this pins: showing the panel is what loads (the baseline assert says the state
+/// starts empty), the read resolves through `.env`, and the tables come back in stable
+/// order. The stronger claim — that the REAL folder-open path never touches the
+/// database — is not provable from here: `open_folder_for_test` deliberately stops at
+/// the tree (the #125 seam), so "never at startup" rests on `adopt_tree` having exactly
+/// two `load_db_schema` call sites (activity click, focus-with-panel-up), which is a
+/// review property, stated here so nobody mistakes this test for proving it.
+#[gpui::test]
+async fn the_database_panel_reads_the_schema_on_entry(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    let db = dir.path().join("database/database.sqlite");
+    rusqlite_fixture(&db);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.db_schema_for_test().is_none(),
+            "the state starts empty — showing the panel is what loads"
+        );
+    });
+
+    workspace.update(cx, |workspace, cx| workspace.show_database_panel_for_test(cx));
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        let tables = workspace.db_schema_for_test().expect("loaded").expect("read ok");
+        assert_eq!(tables, ["posts", "users"], "alphabetical, from the real file");
+    });
+
+    draw(cx);
+}
+
+/// Writes a two-table sqlite fixture — a user database, not an index.
+fn rusqlite_fixture(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+         CREATE TABLE posts (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
+}
+
 /// Inside `wire:click="…"` the component's actions arrive; `wire:model` its properties (#24).
 ///
 /// The class resolves by convention from the view path; the scanner decides which list

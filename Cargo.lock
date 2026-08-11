@@ -1608,6 +1608,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "elle-git"
 version = "0.1.0"
 dependencies = [
@@ -1734,6 +1743,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "elle-core",
+ "elle-db",
  "elle-git",
  "elle-index",
  "elle-laravel",
@@ -1748,6 +1758,7 @@ dependencies = [
  "gpui",
  "libc",
  "regex",
+ "rusqlite",
  "smol",
  "tempfile",
  "tracing",

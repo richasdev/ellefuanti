@@ -58,6 +58,7 @@ enum Sidebar {
     Explorer,
     Search,
     Git,
+    Database,
 }
 
 /// An open tab.
@@ -78,6 +79,9 @@ enum Job {
     Save,
     QuickOpenIndex,
     RouteIndex,
+    /// Reading the project database's schema for the sidebar (#65). Its own slot:
+    /// clicking Database twice must supersede, not race.
+    DbSchema,
     /// Asking the project's artisan for its command list (#23). Its own slot: the palette
     /// that consumes it may be swapped to another mode while artisan is still answering,
     /// and the swap must cancel the ask rather than race it.
@@ -529,6 +533,10 @@ pub struct WorkspaceView {
     pending_rename: Option<(elle_lsp::lsp_types::Uri, usize)>,
     /// The edits behind the open quick-fix palette, index-paired with its rows.
     pending_code_actions: Vec<elle_lsp::lsp_types::WorkspaceEdit>,
+    /// The schema panel's state (#65): `None` before the first load, then the tables or
+    /// the honest failure line. Kept across sidebar switches like git's panel — a
+    /// re-read is a refocus or a re-click, not every switch.
+    db_schema: Option<std::result::Result<Vec<elle_db::TableInfo>, String>>,
     /// The source control panel (#64), and whether it is the visible sidebar.
     ///
     /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
@@ -630,6 +638,7 @@ impl WorkspaceView {
             in_flight_query: None,
             pending_rename: None,
             pending_code_actions: Vec::new(),
+            db_schema: None,
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -834,6 +843,11 @@ impl WorkspaceView {
         self.refresh_git_status(cx);
         if let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) {
             rebuild_laravel_index(root, cx);
+        }
+        // A migration ran in the terminal: same to-notice-you-must-look reasoning, but
+        // only while the panel is actually up — a hidden panel refreshing is idle cost.
+        if self.sidebar == Sidebar::Database {
+            self.load_db_schema(cx);
         }
     }
 
@@ -1154,6 +1168,25 @@ impl WorkspaceView {
         _cx: &mut Context<Self>,
     ) {
         self.pending_code_actions = edits;
+    }
+
+    /// The activity-bar Database click, through the real load path.
+    #[cfg(test)]
+    pub fn show_database_panel_for_test(&mut self, cx: &mut Context<Self>) {
+        self.load_db_schema(cx);
+        self.sidebar = Sidebar::Database;
+        cx.notify();
+    }
+
+    /// What the schema panel would render: table names, or the failure line.
+    #[cfg(test)]
+    pub fn db_schema_for_test(&self) -> Option<std::result::Result<Vec<String>, String>> {
+        self.db_schema.as_ref().map(|result| {
+            result
+                .as_ref()
+                .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
+                .map_err(|message| message.clone())
+        })
     }
 
     /// The rename applier, for tests — a real `WorkspaceEdit` needs a live server.
@@ -6136,7 +6169,7 @@ const ACTIVITY_PANELS: [(&str, Option<Sidebar>); 7] = [
     ("Search", Some(Sidebar::Search)),
     ("Git", Some(Sidebar::Git)),
     ("Laravel", None),
-    ("Database", None),
+    ("Database", Some(Sidebar::Database)),
     ("Docker", None),
     ("Tests", None),
 ];
@@ -6214,6 +6247,12 @@ impl WorkspaceView {
                                     } else if this.sidebar == Sidebar::Search {
                                         this.cancel_project_search();
                                     }
+                                    // The database panel loads on entry, never at
+                                    // startup (#65): a down or absent database must
+                                    // cost nothing until someone asks to look at it.
+                                    if target == Sidebar::Database {
+                                        this.load_db_schema(cx);
+                                    }
                                     this.sidebar = target;
                                     cx.notify();
                                 });
@@ -6240,6 +6279,66 @@ impl WorkspaceView {
             ))
     }
 
+    /// Reads the project database's schema on the background pool, superseding.
+    fn load_db_schema(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let Some(path) = elle_db::env_database(&root) else {
+                        // Which of the reasons applies is knowable and said: the message
+                        // names the two honest cases without echoing any credential.
+                        return Err("No sqlite database found (.env names another driver, \
+                                    or the file does not exist)"
+                            .to_string());
+                    };
+                    elle_db::sqlite_schema(&path).map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.db_schema = Some(result);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::DbSchema, task);
+    }
+
+    /// The schema browser's rows (#65): tables, their columns, types and the two
+    /// shape markers. Text markers, not colour — `pk` and `?` survive every theme.
+    fn render_db_panel(&self, theme: &Theme) -> gpui::Div {
+        let body = div().flex_1().flex().flex_col().overflow_hidden().px_3().py_2().gap_1();
+        match &self.db_schema {
+            None => body.child(
+                div().text_color(theme.text_muted).child("Reading the database schema…"),
+            ),
+            Some(Err(message)) => {
+                body.child(div().text_color(theme.text_muted).child(SharedString::from(message.clone())))
+            }
+            Some(Ok(tables)) if tables.is_empty() => {
+                body.child(div().text_color(theme.text_muted).child("The database has no tables"))
+            }
+            Some(Ok(tables)) => body.children(tables.iter().map(|table| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div().text_color(theme.text).child(SharedString::from(table.name.clone())),
+                    )
+                    .children(table.columns.iter().map(|column| {
+                        let mut label = format!("  {}  {}", column.name, column.column_type);
+                        if column.primary_key {
+                            label.push_str("  pk");
+                        }
+                        if column.nullable {
+                            label.push_str("  ?");
+                        }
+                        div().text_color(theme.text_muted).child(SharedString::from(label))
+                    }))
+            })),
+        }
+    }
+
     /// The sidebar: the file tree, source control, or find-in-project.
     ///
     /// One sidebar with several possible contents rather than stacked columns, which is
@@ -6255,6 +6354,7 @@ impl WorkspaceView {
                 .unwrap_or_else(|| "NO FOLDER OPEN".to_string()),
             Sidebar::Git => "SOURCE CONTROL".to_string(),
             Sidebar::Search => "SEARCH".to_string(),
+            Sidebar::Database => "DATABASE".to_string(),
         };
 
         div()
@@ -6299,6 +6399,7 @@ impl WorkspaceView {
                     Some(panel) => panel.into_any_element(),
                     None => div().into_any_element(),
                 },
+                Sidebar::Database => self.render_db_panel(theme).into_any_element(),
                 Sidebar::Explorer => match self.tree.as_ref() {
                     // Wrapped so the empty space *below* the rows is right-clickable: that
                     // opens the root menu, which is the only way to create at the top
