@@ -26,6 +26,10 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 | #149 | #20: ranking — qualidade do match, depois claim do projeto, depois brevidade; estável dentro da banda; query vazia mantém ordem de fontes                                                       |
 | #150 | #20: buffer words sem servidor — invoke a meio da palavra oferece os identificadores do ficheiro (badge `text`); sem palavra digitada, nada (sem sinal, tudo é ruído)                           |
 | #151 | #19: Format Document (⇧⌥F) — resync antes de pedir, aplicar só ao texto perguntado, `apply_edits` = um undo step (splice_at generalizado); batch com overlap rejeitado inteiro                  |
+| #152 | #65: ADR-0010 — drivers bloqueantes, rusqlite primeiro (Laravel default é sqlite desde v11: fatia 1 sem dependências novas), SQLx rejeitado com fundamentos que sobrevivem a drivers futuros |
+| #153 | #19: Go to Symbol in Project — paleta ganha modo live-source (QueryChanged re-pede, cancela o anterior); NÃO filtra localmente (o servidor é o matcher; mutação prova) |
+| #154 | #19: Rename Symbol (F2) — paleta ganha modo input-only; WorkspaceEdit aplicado em duas fases, tudo-ou-nada (op de ficheiro/overlap/ilegível aborta antes de tocar um byte); buffers = um undo, fechados = write atómico |
+| #155 | #19: Quick Fix (⌘.) — diagnostics RAW do servidor vão no contexto (raw index-paired com resolved); só entries com edit; decoy-mutation no mapeamento de índice. Sweep de clippy achou DOIS testes sem #[test] que nunca correram |
 
 ## Issues fechadas, cada uma com auditoria no fecho
 
@@ -41,10 +45,15 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 
 ## Estado das milestones
 
-- **M3 Laravel: 0 abertas.** M2 PHP: restam #18 (IME/dead keys — precisa de teclado
-  real e olhos do dono) e #19 (formatting entregue em #151; faltam rename, workspace
-  symbols, semantic tokens e code actions — cada um quer a sua decisão de UI, ver o
-  comentário na issue: pode valer declinar semantic tokens de propósito).
+- **M3 Laravel: 0 abertas. M2 PHP: resta só #18** (IME/dead keys — teclado real, dono).
+  **#19 e #20 fechados com auditoria**; semantic tokens declinado deliberadamente (o
+  fundamento está no fecho do #19: segunda fonte de verdade de cor, que desaparece
+  quando o servidor morre). Signature help tem client sem UI — trabalho #61-shaped.
+- **ADR-0010 escrito e merged** (#65 destravado): rusqlite primeiro, SQLx rejeitado.
+- **O gate de clippy esteve cego ao formato do rtk** a sessão toda — o sweep no #155
+  apanhou dois testes reais sem `#[test]` (deleting_a_word, highlights_operators) que
+  NUNCA correram. Gate correto: `grep -cE "warning|error"` sobre o agregado, ou
+  `rtk proxy cargo clippy` para output cru.
 - Fora de milestone continuam #82 (só falta folding, com o aviso do uniform_list),
   #64 item 5 (push/pull atrás da nota de perigo), #65 (ADR rusqlite por escrever),
   #112 (à espera de ack do dono), #35 (checklist humano).
