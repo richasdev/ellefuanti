@@ -30,6 +30,7 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 | #153 | #19: Go to Symbol in Project — paleta ganha modo live-source (QueryChanged re-pede, cancela o anterior); NÃO filtra localmente (o servidor é o matcher; mutação prova) |
 | #154 | #19: Rename Symbol (F2) — paleta ganha modo input-only; WorkspaceEdit aplicado em duas fases, tudo-ou-nada (op de ficheiro/overlap/ilegível aborta antes de tocar um byte); buffers = um undo, fechados = write atómico |
 | #155 | #19: Quick Fix (⌘.) — diagnostics RAW do servidor vão no contexto (raw index-paired com resolved); só entries com edit; decoy-mutation no mapeamento de índice. Sweep de clippy achou DOIS testes sem #[test] que nunca correram |
+| #156 | **#82 FECHADA**: folding por indentação — mapa row↔line puro com prova de inverso exaustiva, conversão UMA vez na fronteira do uniform_list, função partilhada render↔teste (a 1ª versão sobreviveu a uma mutação que partia o render — episódio no commit). Regras: cursor dentro de fold revela; mudança de line count limpa tudo |
 
 ## Issues fechadas, cada uma com auditoria no fecho
 
@@ -54,9 +55,9 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
   apanhou dois testes reais sem `#[test]` (deleting_a_word, highlights_operators) que
   NUNCA correram. Gate correto: `grep -cE "warning|error"` sobre o agregado, ou
   `rtk proxy cargo clippy` para output cru.
-- Fora de milestone continuam #82 (só falta folding, com o aviso do uniform_list),
-  #64 item 5 (push/pull atrás da nota de perigo), #65 (ADR rusqlite por escrever),
-  #112 (à espera de ack do dono), #35 (checklist humano).
+- Fora de milestone: **#82 FECHADA** (#156). Continuam #64 item 5 (push/pull atrás
+  da nota de perigo), #65 (ADR feito; viewer por construir), #112 (ack do dono),
+  #35 (checklist de 7 olhares postado — destrava #9–#15).
 
 ## Lições novas desta ronda (as que custaram)
 
@@ -78,9 +79,11 @@ fechada** (Milestone 2). Dez PRs, #141–#150.
 
 ## Para quem continua
 
-Ordem de valor sugerida: **#82 folding** (o resto do multi-cursor está feito; cuidado
-com o mapeamento row↔linha do uniform_list) → **#19 critério de fecho + auditoria** →
-**#65 escrever o ADR rusqlite** (a resolução está anotada no ledger anterior) →
-**#24 decisão ADR-0006 Blade tree** (destrava Livewire e as tabelas restantes do
-índice). #18 e #35 precisam do dono. Debug: `ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`;
-wire-tap LSP via `ELLE_LSP_COMMAND` num script tee.
+Feitos nesta terceira ronda: #82, #19, #20 fechados; ADR-0010; M1 auditada com
+checklist no #35. Ordem de valor a seguir: **#24 decisão ADR-0006 Blade tree**
+(destrava Livewire + tabelas do índice; é uma decisão de arquitetura, não código) →
+**#65 fatia 1 do DB viewer** (rusqlite, sqlite default, ADR-0010 governa) →
+**#64 item 5** (push/pull — a máquina de confirmação existe desde #126) → chevrons
+de fold no gutter (visual, precisa de #35-olhos). #18 e o checklist do #35 precisam
+do dono. Debug: `ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`; wire-tap LSP via
+`ELLE_LSP_COMMAND` num script tee.
