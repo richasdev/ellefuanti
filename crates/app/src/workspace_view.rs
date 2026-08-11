@@ -810,9 +810,28 @@ impl WorkspaceView {
         }
         self.window_activation = Some(cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                this.refresh_git_status(cx);
+                this.window_became_active(cx);
             }
         }));
+    }
+
+    /// Everything that refreshes when the user comes back to the window: git status
+    /// (#64) and the Laravel index (#21). Both exist for the same reason — the changes
+    /// made *outside* this editor (a commit in the terminal, an `artisan make:model`)
+    /// have no other event to ride, and to notice staleness you must first look at the
+    /// window, which is this event.
+    fn window_became_active(&mut self, cx: &mut Context<Self>) {
+        self.refresh_git_status(cx);
+        if let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) {
+            rebuild_laravel_index(root, cx);
+        }
+    }
+
+    /// The focus trigger through the real handler, for tests — headless windows never
+    /// see a real activation event.
+    #[cfg(test)]
+    pub fn window_became_active_for_test(&mut self, cx: &mut Context<Self>) {
+        self.window_became_active(cx);
     }
 
     /// Cancels an in-flight status walk. Same shape as `cancel_quick_open_walk`.
