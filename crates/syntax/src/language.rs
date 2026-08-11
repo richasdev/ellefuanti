@@ -45,6 +45,10 @@ pub enum Language {
     /// also what makes `.env` free rather than a fifth grammar, which is part of why the
     /// reuse above is worth doing rather than merely clever.
     Shell,
+    /// `.rs` — this editor's own source, and the first thing anyone opens to poke at it.
+    Rust,
+    /// `.md` — READMEs, and half the files in any project's docs/.
+    Markdown,
     /// Recognised extension with no grammar wired up yet: renders as plain text.
     PlainText,
 }
@@ -62,6 +66,8 @@ impl Language {
             Language::Toml => "TOML",
             Language::Yaml => "YAML",
             Language::Shell => "Shell",
+            Language::Rust => "Rust",
+            Language::Markdown => "Markdown",
             Language::PlainText => "Plain Text",
         }
     }
@@ -81,6 +87,8 @@ impl Language {
             Language::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
             Language::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
             Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
+            Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            Language::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
             Language::PlainText => None,
         }
     }
@@ -110,6 +118,8 @@ impl Language {
             Language::Toml => Some(include_str!("../queries/toml.scm")),
             Language::Yaml => Some(include_str!("../queries/yaml.scm")),
             Language::Shell => Some(include_str!("../queries/bash.scm")),
+            Language::Rust => Some(include_str!("../queries/rust.scm")),
+            Language::Markdown => Some(include_str!("../queries/markdown.scm")),
             Language::Php | Language::Blade | Language::PlainText => None,
         }
     }
@@ -149,13 +159,18 @@ impl Language {
     /// comment it is stripped before the response is sent.
     pub fn line_comment(&self) -> Option<&'static str> {
         match self {
-            Language::Php | Language::JavaScript | Language::TypeScript => Some("//"),
+            Language::Php | Language::JavaScript | Language::TypeScript | Language::Rust => {
+                Some("//")
+            }
             Language::Toml | Language::Yaml | Language::Shell => Some("#"),
             // CSS has only `/* */`, HTML only `<!-- -->`, and Blade's `{{-- --}}` is a
             // block form too. They comment through `block_comment` instead.
             Language::Css | Language::Html | Language::Blade => None,
             // See the doc comment: JSON genuinely has no comment syntax.
             Language::Json => None,
+            // Markdown's comment is HTML's, through `block_comment` — valid in every
+            // renderer and what ⌘/ should insert.
+            Language::Markdown => None,
             Language::PlainText => None,
         }
     }
@@ -169,6 +184,8 @@ impl Language {
         match self {
             Language::Css => Some(("/*", "*/")),
             Language::Html => Some(("<!--", "-->")),
+            // Valid in every Markdown renderer, and the only comment the format has.
+            Language::Markdown => Some(("<!--", "-->")),
             Language::Blade => Some(("{{--", "--}}")),
             // PHP and JS have `/* */` too, but they have `//`, so the line form wins.
             // Listing them here would never be reached and would only invite the reader to
@@ -187,7 +204,7 @@ impl Language {
 /// [`Language::name`] is what keeps it complete: an exhaustive match, so a new variant
 /// is a compile error pointing at the function, and the length assertion in
 /// `the_list_covers_every_language` catches the half the compiler cannot.
-pub const ALL_LANGUAGES: [Language; 11] = [
+pub const ALL_LANGUAGES: [Language; 13] = [
     Language::Php,
     Language::Blade,
     Language::Json,
@@ -198,6 +215,8 @@ pub const ALL_LANGUAGES: [Language; 11] = [
     Language::Toml,
     Language::Yaml,
     Language::Shell,
+    Language::Rust,
+    Language::Markdown,
     Language::PlainText,
 ];
 
@@ -236,6 +255,9 @@ pub fn language_for_path(path: &Path) -> Language {
 
     match name.rsplit_once('.').map(|(_, ext)| ext) {
         Some("php" | "phtml") => Language::Php,
+        Some("rs") => Language::Rust,
+        // `.markdown` is the long form the spec allows and nobody types.
+        Some("md" | "markdown") => Language::Markdown,
         // `.jsonc` and `.json5` are deliberately absent: the JSON grammar rejects the
         // comments and trailing commas that are the entire reason those extensions
         // exist, so they would parse as errors rather than fall back to plain text.
@@ -274,7 +296,7 @@ mod tests {
         assert_eq!(language_for_path(&PathBuf::from("a/show.blade.php")), Language::Blade);
         assert_eq!(language_for_path(&PathBuf::from("a/User.php")), Language::Php);
         assert_eq!(language_for_path(&PathBuf::from("a/old.phtml")), Language::Php);
-        assert_eq!(language_for_path(&PathBuf::from("README.md")), Language::PlainText);
+        assert_eq!(language_for_path(&PathBuf::from("README.md")), Language::Markdown);
         assert_eq!(language_for_path(&PathBuf::from("Makefile")), Language::PlainText);
     }
 
@@ -348,9 +370,7 @@ mod tests {
             "phpunit.xml",    // the HTML grammar hard-codes HTML's void and raw-text elements
             "Dockerfile",     // tree-sitter-dockerfile is 0.2.0 and unmaintained
             "Dockerfile.prod",
-            "README.md",
             "schema.sql",
-            "main.rs",
         ] {
             assert_eq!(language_for_path(&PathBuf::from(name)), Language::PlainText, "{name}");
         }
@@ -362,7 +382,7 @@ mod tests {
         // never named. What it cannot catch is a new variant missing from ALL_LANGUAGES,
         // which would silently shrink the coverage of every test that iterates it —
         // including the viewport-cost one, which is the expensive property to lose.
-        assert_eq!(ALL_LANGUAGES.len(), 11, "a new Language needs adding to ALL_LANGUAGES");
+        assert_eq!(ALL_LANGUAGES.len(), 13, "a new Language needs adding to ALL_LANGUAGES");
         for (i, a) in ALL_LANGUAGES.iter().enumerate() {
             assert!(!ALL_LANGUAGES[i + 1..].contains(a), "{} is listed twice", a.name());
         }

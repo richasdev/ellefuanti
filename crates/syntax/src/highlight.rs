@@ -1247,6 +1247,44 @@ mod tests {
     }
 
     #[test]
+    fn rust_colours_its_own_source() {
+        // The dogfood language (#53): this editor's own files are the first thing anyone
+        // opens to poke at it.
+        let src = "// c\nfn main() {\n    let mut x: usize = 42;\n    #[derive(Debug)]\n    println!(\"oi\");\n}\n";
+        let spans = spans_of(Language::Rust, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Comment).contains(&"// c"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"fn"));
+        assert!(styled(src, &spans, HighlightStyle::Keyword).contains(&"mut"));
+        assert!(styled(src, &spans, HighlightStyle::Function).contains(&"main"));
+        assert!(styled(src, &spans, HighlightStyle::Type).contains(&"usize"));
+        assert!(styled(src, &spans, HighlightStyle::Number).contains(&"42"));
+        assert!(styled(src, &spans, HighlightStyle::String).contains(&"\"oi\""));
+        assert!(
+            styled(src, &spans, HighlightStyle::Attribute).iter().any(|s| s.contains("derive")),
+            "attributes colour"
+        );
+    }
+
+    #[test]
+    fn markdown_headings_code_and_structure_colour_and_prose_stays_plain() {
+        let src = "# Title\n\nplain words\n\n- item\n\n```\ncode here\n```\n\n> quote\n";
+        let spans = spans_of(Language::Markdown, src);
+
+        assert!(styled(src, &spans, HighlightStyle::Keyword).iter().any(|s| s.contains("# Title")));
+        assert!(
+            styled(src, &spans, HighlightStyle::String).iter().any(|s| s.contains("code here"))
+        );
+        assert!(styled(src, &spans, HighlightStyle::Comment).iter().any(|s| s.contains("quote")));
+        // Prose is not code, and colouring it would make the whole file loud — the same
+        // rule the HTML query pins for text content.
+        assert!(
+            !spans.iter().any(|span| src[span.range.clone()].contains("plain words")),
+            "prose stays plain: {spans:?}"
+        );
+    }
+
+    #[test]
     fn css_separates_selectors_properties_and_values() {
         let src = "/* c */\n@media screen {\n  .cls a:hover { color: #fff; margin: 10px; }\n}\n";
         let spans = spans_of(Language::Css, src);
