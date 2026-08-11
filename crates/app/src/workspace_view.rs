@@ -424,6 +424,19 @@ pub struct WorkspaceView {
     /// prompt, the prompt replaces it. Two slots would let a stale menu outlive the dialog
     /// it opened, which is visible as a menu sitting behind a confirmation.
     overlay: Option<Entity<Overlay>>,
+    /// The buffer version last sent to the language server, per open file (#59's follow-up).
+    ///
+    /// What keeps diagnostics honest between saves: `poll_lsp` compares each PHP tab's
+    /// buffer version against this on every tick and resyncs the ones that moved, which
+    /// gives per-keystroke sync a free 250ms debounce — the timer already existed. Without
+    /// it, squiggles describe the buffer as it was at the last save (or the last completion
+    /// request, since #125's resync), and a squiggle over code the user has since fixed
+    /// reads as the editor being wrong about working code.
+    ///
+    /// Cleared when a server starts: a fresh server was just told everything via
+    /// `sync_open_documents`, and stale entries from the previous server would suppress the
+    /// first resync of every file.
+    lsp_synced: std::collections::HashMap<PathBuf, elle_text::Version>,
     /// What the overlay is about — the row that was right-clicked, and what the pending
     /// action is going to do to it.
     ///
@@ -581,6 +594,7 @@ impl WorkspaceView {
             palette: None,
             overlay: None,
             pending: None,
+            lsp_synced: std::collections::HashMap::new(),
             find: None,
             search_panel: None,
             search_cancel: None,
@@ -3955,6 +3969,8 @@ impl WorkspaceView {
 
     /// Starts a server rooted at `root`, replacing whatever was running.
     fn start_lsp_at(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // A new server knows nothing; the sync ledger must not claim otherwise.
+        self.lsp_synced.clear();
         self.lsp.set_root(Some(root.clone()));
 
         let Some(config) = crate::lsp_session::config_for(&root) else {
@@ -4027,6 +4043,10 @@ impl WorkspaceView {
                 let Some(events) = this.lsp.client_mut().map(|client| client.drain_events()) else {
                     return false;
                 };
+                // Before applying, so a resync issued now produces diagnostics one tick
+                // from now rather than two. Riding this timer is what gives per-keystroke
+                // sync a 250ms debounce without a debouncer: the tick was already paid for.
+                this.sync_changed_documents(cx);
                 this.apply_lsp_events(events, cx)
             });
 
@@ -4148,7 +4168,12 @@ impl WorkspaceView {
                 .and_then(crate::lsp_session::uri_for)
                 .and_then(|uri| self.lsp.diagnostics_for(&uri))
                 .map(|file| {
-                    file.items.iter().map(|d| (d.range.clone(), d.severity)).collect::<Vec<_>>()
+                    file.items
+                        .iter()
+                        .map(|d| {
+                            (d.range.clone(), d.severity, SharedString::from(d.message.clone()))
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
 
@@ -4163,9 +4188,64 @@ impl WorkspaceView {
     fn cursor_diagnostic(&self, cx: &App) -> Option<String> {
         let tab = self.tabs.get(self.active_tab)?;
         let uri = crate::lsp_session::uri_for(tab.path.as_deref()?)?;
-        let offset = tab.editor.read(cx).document.selection.head;
+        let document = &tab.editor.read(cx).document;
+        let offset = document.selection.head;
 
-        self.lsp.diagnostics_for(&uri)?.at(offset).map(|d| d.message.clone())
+        let diagnostics = self.lsp.diagnostics_for(&uri)?;
+        if let Some(exact) = diagnostics.at(offset) {
+            return Some(exact.message.clone());
+        }
+
+        // Nothing under the cursor itself: fall back to the cursor's *line*. Requiring the
+        // cursor to land inside the squiggle's exact bytes made the message effectively
+        // undiscoverable — the owner asked for "the reason for the error" while the reason
+        // was already wired to a place their cursor never quite reached. Clicking anywhere
+        // on a marked line is the gesture people actually make.
+        let row = document.buffer.offset_to_point(offset).row;
+        let start = document.buffer.point_to_offset(elle_text::Point { row, column: 0 });
+        let end = start + document.buffer.line_len(row);
+        diagnostics.on_line(start..end).map(|d| d.message.clone())
+    }
+
+    /// Resyncs every open PHP buffer the server's copy has fallen behind.
+    ///
+    /// Called from `poll_lsp`'s tick. Sends nothing for a buffer whose version is already
+    /// in the ledger — typing pauses, the tick keeps firing, and an unchanged file must
+    /// cost nothing. Full-text for `document_saved`'s reasons: no `Edit` in hand here, and
+    /// PHP files are small.
+    ///
+    /// Every tab rather than only the active one, deliberately: replace-in-project and a
+    /// future format-on-save can touch buffers that are not in front of the user, and a
+    /// rule with an exception ("active only, except…") is how one door falls behind.
+    fn sync_changed_documents(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<(PathBuf, String, elle_text::Version)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let path = tab.path.as_deref()?;
+                if !crate::lsp_session::handles(path) {
+                    return None;
+                }
+                let buffer = &tab.editor.read(cx).document.buffer;
+                let version = buffer.version();
+                if self.lsp_synced.get(path) == Some(&version) {
+                    return None;
+                }
+                Some((path.to_path_buf(), buffer.text(), version))
+            })
+            .collect();
+
+        for (path, text, version) in pending {
+            let Some(uri) = crate::lsp_session::uri_for(&path) else { continue };
+            let Some(client) = self.lsp.client_mut() else { return };
+            if let Err(err) = client.did_change_full(&uri, &text) {
+                tracing::debug!("could not resync {}: {err:#}", path.display());
+                continue;
+            }
+            // Recorded only after a successful send, so a failed one is retried next tick
+            // rather than silently never.
+            self.lsp_synced.insert(path, version);
+        }
     }
 
     /// Tells the server about one newly opened file, starting one if this is the first.
@@ -4715,6 +4795,36 @@ impl Render for WorkspaceView {
                     .clone()
                     .map(|popup| div().absolute().top_0().left_0().size_full().child(popup)),
             )
+            // The diagnostic hover card (#59): the message, at the mouse, one line below the
+            // squiggle it is about. The editor computes it (only it can turn a mouse position
+            // into a byte offset); this renders it, because the card sits at window
+            // coordinates over every panel — the same split the completion popup uses.
+            //
+            // Read directly from the active editor per frame rather than mirrored into
+            // workspace state: a mirror is a second copy that can go stale, and this is
+            // exactly the kind of derived value render passes exist to derive.
+            .children(self.active_editor().and_then(|editor| {
+                let hover = editor.read(cx).hover_diagnostic.clone()?;
+                Some(
+                    div().absolute().top_0().left_0().size_full().child(
+                        div()
+                            .absolute()
+                            .left(hover.position.x)
+                            .top(hover.position.y)
+                            .max_w(px(480.0))
+                            .px_2()
+                            .py_1()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(px(4.0))
+                            .shadow_lg()
+                            .text_color(theme.text)
+                            .text_size(Fonts::get(cx).ui_size)
+                            .child(hover.message),
+                    ),
+                )
+            }))
             // The tree's menu, name prompt and delete confirmation (#126), above everything
             // else because each is modal: while one is open it is the only thing the user
             // can answer.

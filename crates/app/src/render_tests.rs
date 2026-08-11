@@ -2595,3 +2595,76 @@ async fn the_completion_list_occupies_real_height(cx: &mut TestAppContext) {
     );
     assert!(bounds.size.width > px(0.), "and it must have width: {bounds:?}");
 }
+
+/// Hovering a squiggle produces a card with the server's message; leaving clears it.
+///
+/// What the status-bar affordance kept failing at in live testing: the reason for an error
+/// was reachable only with the *text cursor* inside the squiggle's bytes, which nobody
+/// discovers. The card follows the mouse, which is the gesture every comparable editor
+/// taught people. This test drives the same handlers the mouse events call.
+#[gpui::test]
+async fn hovering_a_diagnostic_shows_its_message_and_leaving_hides_it(cx: &mut TestAppContext) {
+    use elle_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    // Absolute, because it has to survive the `uri_for` round trip: publishing keys the
+    // diagnostics by URI, and a relative path has none.
+    let path = std::path::PathBuf::from("/srv/app/User.php");
+    workspace.update_in(cx, |workspace, window, cx| {
+        let document =
+            Document::new(Some(path.clone()), "<?php\n$x = $undefined;\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        // Line 1, chars 5..15: `$undefined`.
+        workspace.publish_diagnostics_for_test(
+            &path,
+            &[Diagnostic {
+                range: Range {
+                    start: Position { line: 1, character: 5 },
+                    end: Position { line: 1, character: 15 },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Undefined variable '$undefined'.".into(),
+                ..Default::default()
+            }],
+            cx,
+        );
+    });
+    draw(cx);
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a tab is open");
+
+    // Driven at the offset level: the pixel conversion is the click tests' business, and
+    // the fake text system's advances are fiction anyway (`fonts.rs`). Byte 14 sits inside
+    // `$undefined` (bytes 11..21 of this fixture).
+    editor.update(cx, |editor, cx| {
+        editor.hover_at_for_test(14, 1, cx);
+    });
+    editor.read_with(cx, |editor, _cx| {
+        let hover = editor.hover_diagnostic.as_ref().expect("hovering the squiggle makes a card");
+        assert_eq!(hover.message.as_ref(), "Undefined variable '$undefined'.");
+        assert_eq!(hover.row, 1);
+    });
+
+    // Same row, byte 7 — off the squiggle. The card must go.
+    editor.update(cx, |editor, cx| {
+        editor.hover_at_for_test(7, 1, cx);
+    });
+    editor.read_with(cx, |editor, _cx| {
+        assert!(editor.hover_diagnostic.is_none(), "off the squiggle, no card");
+    });
+
+    // Back on, then the mouse leaves the row entirely.
+    editor.update(cx, |editor, cx| {
+        editor.hover_at_for_test(14, 1, cx);
+    });
+    editor.update(cx, |editor, cx| editor.hover_out_for_test(1, cx));
+    editor.read_with(cx, |editor, _cx| {
+        assert!(editor.hover_diagnostic.is_none(), "leaving the row clears the card");
+    });
+
+    draw(cx);
+}

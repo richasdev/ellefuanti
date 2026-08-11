@@ -118,6 +118,17 @@ impl FileDiagnostics {
             .min_by_key(|d| d.range.end - d.range.start)
     }
 
+    /// The first diagnostic overlapping a byte range — the cursor's line, in practice.
+    ///
+    /// The line-level fallback behind the status bar's message. `at` answers "what is under
+    /// the cursor"; this answers "what is wrong on this line", which is the question a
+    /// click on a marked line is actually asking. First rather than innermost: a line with
+    /// two problems shows one of them, and showing *a* reason beats a rule for choosing
+    /// between reasons nobody has needed yet.
+    pub fn on_line(&self, line: std::ops::Range<usize>) -> Option<&ResolvedDiagnostic> {
+        self.items.iter().find(|d| d.range.start < line.end && line.start <= d.range.end)
+    }
+
     /// Counts by severity, for the status bar: `(errors, warnings)`.
     ///
     /// Hints and information are counted as neither. They are advisory, and a status bar
@@ -844,6 +855,23 @@ mod tests {
         // lighting a template up red end to end. ADR-0006 keeps Blade away from the PHP
         // parser; this keeps it away from the PHP server for the same reason.
         assert!(!handles(Path::new("/srv/resources/views/home.blade.php")));
+    }
+
+    #[test]
+    fn a_diagnostic_is_found_from_anywhere_on_its_line() {
+        // The discoverability fix: the exact-span lookup made the reason invisible unless
+        // the cursor landed inside the squiggle's own bytes. Clicking anywhere on the
+        // marked line is what people do, so that is what must work.
+        let mut lsp = Lsp::new();
+        let text = "<?php\n$x = $undefined;\n";
+        lsp.set_diagnostics(uri(), &[diagnostic(1, 5, 15, DiagnosticSeverity::ERROR)], text);
+        let file = lsp.diagnostics_for(&uri()).unwrap();
+
+        // Line 1 spans bytes 6..22. Column 0 is nowhere near the squiggle at 11..21.
+        let line = 6..22;
+        assert!(file.on_line(line.clone()).is_some(), "anywhere on the line finds it");
+        // And the neighbouring line must not.
+        assert!(file.on_line(0..5).is_none(), "a clean line stays clean");
     }
 
     // --- restart bounding --------------------------------------------------------
