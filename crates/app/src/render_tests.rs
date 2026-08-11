@@ -3368,6 +3368,60 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     draw(cx);
 }
 
+/// Inside `wire:click="…"` the component's actions arrive; `wire:model` its properties (#24).
+///
+/// The class resolves by convention from the view path; the scanner decides which list
+/// the attribute wants. The negative is real: `sortBy` (an action) must not appear in
+/// the `wire:model` list, and `search` (a property) not in `wire:click`'s.
+#[gpui::test]
+async fn a_wire_attribute_offers_the_components_surface(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Livewire")).unwrap();
+    std::fs::create_dir_all(dir.path().join("resources/views/livewire")).unwrap();
+    std::fs::write(
+        dir.path().join("app/Livewire/UserTable.php"),
+        "<?php\nnamespace App\\Livewire;\nuse Livewire\\Component;\nclass UserTable extends Component {\n    public string $search = '';\n    public function render() {}\n    public function sortBy($c) {}\n}\n",
+    )
+    .unwrap();
+    let view_path = dir.path().join("resources/views/livewire/user-table.blade.php");
+    let view = "<div>\n    <button wire:click=\"\">Sort</button>\n</div>\n";
+    std::fs::write(&view_path, view).unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(view_path.clone()), view, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    draw(cx);
+
+    let inside = view.find("wire:click=\"").unwrap() + "wire:click=\"".len();
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    editor.update(cx, |editor, _cx| editor.document.select_range_for_test(inside..inside));
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.complete_for_test(window, cx));
+    cx.run_until_parked();
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("popup open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_ref()).collect();
+        assert!(labels.contains(&"sortBy"), "the action arrives: {labels:?}");
+        assert!(!labels.contains(&"search"), "a property is not a click target: {labels:?}");
+        assert!(!labels.contains(&"render"), "lifecycle stays the framework's: {labels:?}");
+        let sort = items.iter().find(|item| item.label.as_ref() == "sortBy").unwrap();
+        assert!(matches!(sort.source, CompletionSource::Livewire));
+        assert_eq!(sort.detail.as_ref().map(|d| d.as_ref()), Some("action · UserTable"));
+    });
+
+    draw(cx);
+}
+
 /// Folding hides a block's body from the row map and the safety rules hold (#82).
 ///
 /// The row↔line map is the piece the issue warned corrupts edits if wrong; rows here

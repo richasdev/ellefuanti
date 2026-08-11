@@ -55,6 +55,11 @@ pub enum CompletionSource {
     /// model declares `scopeActive`. The one list where the declared method name — the
     /// thing the server offers — is exactly what the user must not type.
     LaravelScope,
+    /// A Livewire wire target read from the component's class by scan (#24): an action
+    /// for `wire:click`, a property for `wire:model`. The detail says which and from
+    /// which class — a trait-provided member is invisible to the scan, and the badge is
+    /// what keeps the incomplete list honest.
+    Livewire,
     /// A word that occurs in the current buffer (#20) — the weakest claim there is,
     /// offered only when no language server is running, so an uninstalled Intelephense
     /// degrades to "the words of this file" rather than to nothing.
@@ -78,6 +83,7 @@ impl CompletionSource {
             CompletionSource::LaravelColumn => "column",
             CompletionSource::LaravelRelation => "relation",
             CompletionSource::LaravelScope => "scope",
+            CompletionSource::Livewire => "wire",
             CompletionSource::Buffer => "text",
         }
     }
@@ -97,6 +103,7 @@ impl CompletionSource {
             CompletionSource::LaravelColumn => theme.accent,
             CompletionSource::LaravelRelation => theme.accent,
             CompletionSource::LaravelScope => theme.accent,
+            CompletionSource::Livewire => theme.accent,
             // The quiet colour: buffer words are filler, not project facts.
             CompletionSource::Buffer => theme.text_muted,
         }
