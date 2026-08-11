@@ -2930,6 +2930,9 @@ async fn the_theme_picker_cycles_and_applies(cx: &mut TestAppContext) {
 /// scoped to where it holds, which is the routes source's rule inherited.
 #[gpui::test]
 async fn a_model_offers_its_columns_with_provenance(cx: &mut TestAppContext) {
+    // `index_path` derives from HOME, and this test reads it on a background task while
+    // the `file_cache` tests may be *setting* HOME — hold their lock for the duration.
+    let _home = crate::file_cache::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     install_theme(cx);
     let dir = project();
     std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
@@ -2995,6 +2998,75 @@ async fn a_model_offers_its_columns_with_provenance(cx: &mut TestAppContext) {
         assert!(
             items.iter().any(|item| matches!(item.source, CompletionSource::LaravelColumn)),
             "the source is modelled, not inferred"
+        );
+    });
+
+    draw(cx);
+}
+
+/// Editing a model also offers its relationships, kind and target in the detail (#22).
+///
+/// Same door as columns — the index already stores `(method, kind, target)`; this test
+/// pins that they reach the popup as items in their own right, with their own source, so
+/// a `posts` from a `hasMany` cannot masquerade as a column named `posts`.
+#[gpui::test]
+async fn a_model_offers_its_relationships_with_kind_and_target(cx: &mut TestAppContext) {
+    // Same HOME race as the columns test above; same lock.
+    let _home = crate::file_cache::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    let model_path = dir.path().join("app/Models/User.php");
+    std::fs::write(
+        &model_path,
+        "<?php\nclass User extends Model {\n    public function posts() { return $this->hasMany(Post::class); }\n}\n",
+    )
+    .unwrap();
+
+    // Canonical root, as ever — the /var-vs-/private/var trap (fifth appearance is in
+    // the sibling test's comment; this test inherits the lesson, not the price).
+    let canonical = dir.path().canonicalize().unwrap();
+    let index_path = crate::file_cache::index_path(&canonical).expect("index path");
+    {
+        let (index, _) = elle_index::Index::open(&index_path).expect("index opens");
+        elle_index::laravel::build(
+            index.connection(),
+            &canonical,
+            &elle_workspace::CancelFlag::default(),
+        )
+        .expect("index builds");
+    }
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let text = std::fs::read_to_string(&model_path).unwrap();
+        let document = Document::new(Some(model_path.clone()), &text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+    draw(cx);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.complete_for_test(window, cx);
+    });
+    cx.run_until_parked();
+
+    let popup = workspace
+        .read_with(cx, |workspace, _cx| workspace.completion_for_test())
+        .expect("popup open");
+    popup.read_with(cx, |popup, _cx| {
+        let items = popup.visible_items();
+        let posts = items
+            .iter()
+            .find(|item| item.label.as_ref() == "posts")
+            .expect("the relationship arrives as an item");
+        assert_eq!(
+            posts.detail.as_ref().map(|d| d.as_ref()),
+            Some("hasMany · Post"),
+            "kind and target are the detail — what the method body actually says"
+        );
+        assert!(
+            matches!(posts.source, CompletionSource::LaravelRelation),
+            "a relationship is its own kind of claim, not a column"
         );
     });
 

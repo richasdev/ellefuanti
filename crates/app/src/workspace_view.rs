@@ -2932,12 +2932,15 @@ impl WorkspaceView {
         let task = cx.background_spawn(async move {
             let path = crate::file_cache::index_path(&root)?;
             let (index, _) = elle_index::Index::open(&path).ok()?;
-            elle_index::laravel::columns_for_model(index.connection(), &class).ok()
+            let conn = index.connection();
+            let columns = elle_index::laravel::columns_for_model(conn, &class).ok()?;
+            let relations = elle_index::laravel::relations_for_model(conn, &class).ok()?;
+            Some((columns, relations))
         });
 
         let task = cx.spawn(async move |_this, cx| {
-            let Some(columns) = task.await else { return };
-            let items: Vec<CompletionItem> = columns
+            let Some((columns, relations)) = task.await else { return };
+            let mut items: Vec<CompletionItem> = columns
                 .into_iter()
                 .map(|column| {
                     let detail = if column.column_type.is_empty() {
@@ -2949,6 +2952,13 @@ impl WorkspaceView {
                         .with_detail(Some(detail))
                 })
                 .collect();
+            // Relationships after columns: both are index facts, but a column is data on
+            // every row while a relationship is one method — and the detail says what the
+            // method body claims (`hasMany · Post`), which is a scan's word, not a proof.
+            items.extend(relations.into_iter().map(|(name, kind, target)| {
+                CompletionItem::new(name, CompletionSource::LaravelRelation)
+                    .with_detail(Some(format!("{kind} · {target}")))
+            }));
             if items.is_empty() {
                 return;
             }
