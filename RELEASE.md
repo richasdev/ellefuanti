@@ -1,0 +1,232 @@
+# RELEASE — como cortar uma versão, e tudo o que já correu mal
+
+Este ficheiro existe porque **cada release desde a v0.1.0 partiu de uma maneira nova**, e
+nenhuma das falhas foi detetada pelo CI: todas passaram nos testes e chegaram ao utilizador
+partidas. O que se segue é o checklist, e a seguir o registo de cada falha com a causa raiz —
+porque um checklist sem o "porquê" é uma lista que alguém há de encurtar.
+
+**A regra que resume tudo:** um release verde no CI não é um release verificado. O CI compila
+e testa; não descarrega o `.dmg`, não o monta, não o abre. As três coisas que partiram a
+instalação — prerelease, assinatura, cópia — são todas invisíveis a `cargo test`.
+
+---
+
+## Checklist
+
+### Antes de taggar
+
+- [ ] `git checkout main && git pull` — a tag sai do main, nunca de uma branch.
+- [ ] `cargo test --workspace` verde. **Ler o número**, não só o "ok": uma suite que deixou
+      de compilar desaparece silenciosamente da contagem.
+- [ ] `cargo clippy --workspace` sem avisos novos. Cuidado: o output do `rtk` agrega e pode
+      esconder avisos — em caso de dúvida, `rtk proxy cargo clippy` para output cru.
+- [ ] `cargo fmt --all --check` limpo.
+- [ ] **Binário dentro do gate**: `cargo build --release` e comparar com `BIN_LIMIT_MB` em
+      `scripts/perf-gate.sh`. Está em **18.69 MB de 19 MB (98.4%)** — qualquer dependência
+      nova é uma decisão de release, não de implementação.
+- [ ] CHANGELOG com uma secção `## [x.y.z] — data` (não deixar em `[Unreleased]`).
+- [ ] `version` em `Cargo.toml` bumpado, e `cargo check` corrido depois para o `Cargo.lock`
+      apanhar o novo número.
+
+### Taggar
+
+```sh
+git tag -a vX.Y.Z -m "vX.Y.Z — resumo"
+git push origin vX.Y.Z
+```
+
+O workflow `release.yml` dispara em `refs/tags/v*`: corre os testes, compila com
+`--no-default-features` (shaders precompilados, precisa de Xcode completo no runner),
+empacota o `.zip` e publica o release.
+
+### Depois de o CI publicar
+
+**1. `latest` aponta para a tag nova.** Se responder uma antiga, é o bug do prerelease (§1):
+
+```sh
+gh api repos/richasdev/ellefuanti/releases/latest -q .tag_name
+```
+
+**2. Construir e anexar o `.dmg`** — o CI só produz o `.zip`:
+
+```sh
+cargo build --release
+scripts/bundle-macos.sh
+scripts/dmg-macos.sh
+gh release upload vX.Y.Z target/ellefuanti-vX.Y.Z-macos.dmg
+```
+
+**3. Verificar a assinatura do bundle** — o passo que faltou em três releases:
+
+```sh
+codesign -dv --verbose=2 target/ellefuanti.app 2>&1 | grep -E "Info.plist|Sealed"
+# Tem de dizer:  Info.plist entries=N   e   Sealed Resources version=2
+# "Info.plist=not bound" ou "Sealed Resources=none" = bundle malformado,
+# e o macOS vai chamar-lhe "damaged".
+
+codesign --verify --deep --strict target/ellefuanti.app   # exit 0
+```
+
+**4. Verificar que a assinatura sobreviveu ao `.dmg`** (o `cp -R` come o `_CodeSignature`):
+
+```sh
+hdiutil attach target/ellefuanti-vX.Y.Z-macos.dmg -nobrowse -quiet
+ls "/Volumes/ellefuanti X.Y.Z/ellefuanti.app/Contents/"   # tem de listar _CodeSignature/
+hdiutil detach "/Volumes/ellefuanti X.Y.Z" -quiet
+```
+
+**5. Teste do utilizador real** — descarregar do GitHub _com quarentena_ e ver o veredito:
+
+```sh
+cd /tmp && curl -sL -o t.dmg \
+  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-vX.Y.Z-macos.dmg
+xattr -w com.apple.quarantine "0083;00000000;Safari;" t.dmg
+hdiutil attach t.dmg -nobrowse -quiet
+ditto "/Volumes/ellefuanti X.Y.Z/ellefuanti.app" /tmp/t.app
+hdiutil detach "/Volumes/ellefuanti X.Y.Z" -quiet
+spctl -a -vvv -t exec /tmp/t.app
+```
+
+**`rejected` sozinho é o resultado correto** — é o veredito normal de um app sem certificado,
+e produz o diálogo "desenvolvedor não identificado" com opção de abrir. Qualquer outra
+mensagem (sobretudo _"code has no resources but signature indicates they must be present"_)
+significa bundle partido.
+
+**6. Últimos dois olhares:**
+
+```sh
+# `defaults read` exige caminho ABSOLUTO — com caminho relativo diz
+# "domain/default pair does not exist", que parece plist em falta e não é.
+/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+  target/ellefuanti.app/Contents/Info.plist          # a versão certa
+ls target/ellefuanti.app/Contents/Resources/themes/ | wc -l   # 8 temas
+```
+
+### Deprecations — verificar de release em release
+
+- [ ] `cargo build 2>&1 | grep -i deprecat` — nenhum aviso de API deprecada nosso.
+- [ ] `cargo report future-incompatibilities` — hoje acusa `block v0.1.6` e
+      `proc-macro-error2 v2.0.1`, ambos **transitivos via gpui**, nada que possamos corrigir
+      aqui. Se aparecer um terceiro, verificar se é nosso antes de ignorar.
+- [ ] Actions do workflow com major pinado (`actions/checkout@v4`,
+      `softprops/action-gh-release@v2`) — um major novo é uma mudança deliberada, nunca
+      automática.
+- [ ] Modelos de IA em `crates/settings/src/file.rs` (`ai.chat_model`,
+      `ai.completion_model`): os defaults apontam para modelos que existem hoje. Modelo
+      retirado = 404 no primeiro pedido do utilizador.
+- [ ] `rust-toolchain.toml` — subir o pin é um commit próprio, para os lints novos
+      chegarem como mudança revisível e não como build vermelho de outra pessoa.
+
+---
+
+## O registo: cada falha, e porque nenhuma foi apanhada
+
+### 1. Todos os releases eram "prerelease" — o download servia a v0.1.0
+
+**Sintoma.** Um utilizador que clicasse em Download no README recebia a **v0.1.0**, com
+três versões já publicadas. E o auto-update — construído na v0.2.1 — nunca disparou para
+ninguém.
+
+**Causa raiz.** O `release.yml` publicava com `prerelease: true`, decidido na v0.1.0 com
+justificação legítima (rendering não verificado, issue #35) e **nunca revisto**. O GitHub
+exclui prereleases ao resolver `releases/latest` — que é exatamente a URL do botão do README
+_e_ a que o updater in-app consulta.
+
+**Porque não foi apanhado.** O release publicava com sucesso; o `.dmg` estava lá; a página
+da tag estava correta. Só olhando para `/releases/latest` — coisa que ninguém fazia — é que
+aparecia. O bug estava numa linha de YAML que passou em todas as revisões por estar
+comentada com uma razão que já não valia.
+
+**Correção.** `prerelease: false` + `make_latest: true` (PR #214), e a v0.3.0 promovida à
+mão. **Lição: uma flag com uma justificação temporal precisa de data de validade escrita ao
+lado.**
+
+### 2. O macOS dizia "is damaged" — e não era o que o README dizia
+
+**Sintoma.** Toda instalação nova: _"ellefuanti is damaged and can't be opened."_ O README
+mandava correr `xattr -dr com.apple.quarantine`, o que "resolvia" e mascarou o problema real
+durante três releases.
+
+**Causa raiz.** O linker do Rust deixa o executável com uma assinatura ad-hoc mínima
+(`linker-signed`) que cobre **só o binário**: `Info.plist=not bound`, `Sealed Resources=none`.
+Um bundle nesse estado, com flag de quarentena, não é "não assinado" — é **malformado**, e a
+mensagem que o macOS escolhe para malformado é literalmente "danificado". O `xattr` funcionava
+porque, sem quarentena, o Gatekeeper nem chega a avaliar a assinatura.
+
+**Porque não foi apanhado.** Quem desenvolve corre `cargo run` (sem bundle) ou copia o `.app`
+localmente (sem quarentena). A quarentena só existe no que **desce da internet** — condição
+que nenhum teste reproduzia.
+
+**Correção.** `scripts/bundle-macos.sh` assina o bundle inteiro com `codesign --sign -` **em
+último lugar**, depois de todos os recursos estarem no sítio (assinar sela os recursos; copiar
+alguma coisa depois invalida o selo). PR #215.
+
+### 3. O `.dmg` comia a assinatura — pior que não assinar
+
+**Sintoma.** Já com a correção do §2, o download continuava partido, agora com outra
+mensagem: _"code has no resources but signature indicates they must be present."_
+
+**Causa raiz.** `scripts/dmg-macos.sh` copiava o `.app` com `cp -R`, e **o `cp` não leva o
+diretório `_CodeSignature/`**. O app chegava assinado-mas-sem-selo — um estado pior que não
+assinado, porque a assinatura promete recursos selados que não estão lá.
+
+**Porque não foi apanhado.** Só aparece depois do round-trip completo: assinar → `.dmg` →
+montar → copiar. Verificar o `.app` acabado de construir dava verde.
+
+**Correção.** `ditto` em vez de `cp -R` — é a cópia da Apple, feita para preservar bundles
+(assinatura, xattrs, resource forks). PR #215. Depois disto o veredito passou de erro de
+bundle malformado para `rejected` simples, que é o correto para app sem certificado.
+
+### 4. O `Info.plist` mentia a versão em todos os builds
+
+**Sintoma.** "Get Info" no Finder dizia **0.1.0** num app v0.2.1.
+
+**Causa raiz.** `assets/macos/Info.plist` tinha `0.1.0` hardcoded e o script copiava-o tal e
+qual. O `Cargo.toml` era a fonte de verdade só para o binário.
+
+**Correção.** O script carimba a versão com `PlistBuddy` a partir do `Cargo.toml`. PR #203.
+
+### 5. Um teste flaky bloqueou o release da v0.2.1 — duas vezes
+
+**Sintoma.** O CI da tag falhou duas vezes seguidas em
+`a_cancelled_run_stops_the_child_rather_than_waiting_for_it`, com 30s cravados.
+
+**Causa raiz.** O cancelamento matava só o filho direto (`sh`); o neto (`sleep`, e na vida
+real `pest`/`php`) sobrevivia e **segurava os pipes de stdout/stderr abertos**, mantendo a
+thread leitora bloqueada. Localmente o SIGKILL ganhava a corrida contra o fork do shell; num
+runner carregado, perdia sempre.
+
+**Correção.** O processo nasce no seu próprio process group e o cancel mata o grupo inteiro
+(`kill(-pid, SIGKILL)`). PR #201. **Lição: um teste que só falha em máquina carregada
+costuma ser um bug real de concorrência, não flakiness.**
+
+### 6. `cargo fmt --check` vermelho há muito, e o perf-gate a falhar por carga
+
+**Sintoma.** CI vermelho em 28 ficheiros de formatação, e o perf-gate a sair com código 2 num
+runner com load 20.
+
+**Causa raiz.** Dois problemas distintos com o mesmo efeito. O gate de formatação nunca tinha
+sido corrido em conjunto; e o `perf-gate.sh` usa exit 2 para dizer _"não consigo medir"_ (load
+alto contamina memória e tempo), que o workflow tratava como regressão.
+
+**Correção.** Árvore formatada, e o workflow passou a tratar exit 2 como neutro — uma medição
+que não aconteceu não é prova de regressão. Regressão real (exit 1) continua a falhar o build.
+PR #202.
+
+---
+
+## O que continua por resolver
+
+**Assinatura real.** Tudo acima remove a acusação falsa de "danificado", mas **não** remove o
+aviso do Gatekeeper: para isso é preciso certificado Apple Developer (US$ 99/ano) e
+notarização. Enquanto não houver, o README ensina `xattr` — e agora o clique-direito → Abrir
+também funciona, coisa que com o bundle malformado não era fiável.
+
+**O `.dmg` é manual.** O CI produz só o `.zip`; o `.dmg` — que é o que o README recomenda — é
+construído e anexado à mão a cada release. Automatizá-lo no workflow eliminaria o passo mais
+fácil de esquecer.
+
+**Universal binary.** O build é `arm64` puro. Um Mac Intel não corre isto.
+
+**Binário a 98.4% do gate** (18.69 de 19 MB). A próxima dependência não cabe sem decisão
+explícita.

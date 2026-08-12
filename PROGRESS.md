@@ -1,107 +1,101 @@
-# PROGRESS — sessão autónoma (2026-08-11, segunda ronda)
+# PROGRESS — estado atual (2026-08-12)
 
-Continuação do ledger anterior (o arco #128–#140 está no histórico git deste ficheiro).
-Tudo abaixo está **merged em main e verificado**; a suite fecha em **1200 testes, 37
-suites** (o PTY flaky pré-existente mantém-se verde solo), clippy limpo, binário
-17.81MB / 19MB.
+**v0.3.0 lançada e a servir como `latest`.** Suite em **1369 testes, 41 suites**, clippy
+limpo, binário **18.69 MB de 19 MB (98.4% do gate)**. Ledger das rondas anteriores no
+histórico git deste ficheiro.
 
-## Fim do loop (2026-08-12): o mapa do que resta
+> Para cortar uma versão — e para o registo de tudo o que já partiu num release —
+> ver **[RELEASE.md](RELEASE.md)**. Não é opcional: cada release desde a v0.1.0 partiu de
+> uma forma nova, e **nenhuma foi apanhada pelo CI**.
 
-O loop /loop fechou **#24, #25, #26, M5 inteira** nesta cauda, além de tudo acima.
-Estado final das milestones: **M3 ✓, M5 ✓; M2 = só #18 (teclado real, dono); M4 ✓
-(fechada com auditoria); M6 = #30 Xdebug (scoping postado: a decisão real é
-DBGp-nativo vs DAP+bridge); M7 = #28 plugins (recomendação subprocess+IPC à espera
-de 👍) e #29 AI (3 decisões do dono listadas na issue); M8 = #31 browser (colide com
-o gate de binário — spike de medição primeiro); 0.1.0 = checklist de 7 olhares no
-#35 destrava as oito.** Nada do que resta é completável autonomamente numa iteração:
-é do dono, ou é decisão dele, ou é projeto multi-sessão com o scoping já postado.
+## Onde está o projeto
 
-## O arco desta ronda
+Três versões saíram no mesmo dia, cada uma com um arco próprio:
 
-Pedido: loop pelas issues das milestones — atacar, fechar com evidência, seguir.
-Resultado: **Milestone 3 (Laravel) fechada por inteiro** (#21, #22, #23) e **#20
-fechada** (Milestone 2). Dez PRs, #141–#150.
+| Versão    | O que trouxe                                                                          |
+| --------- | ------------------------------------------------------------------------------------- |
+| **0.1.0** | Editor, LSP, Laravel/Livewire, painéis Git/DB/Docker/Composer/testes                  |
+| **0.2.0** | Drag & drop, auto-refresh da árvore, ficheiro ativo na árvore, fim do limite de 64 MB |
+| **0.2.1** | Auto-update in-app (verifica, instala, reinicia)                                      |
+| **0.3.0** | Chat IA + ghost text, smart typing PHP, zen/fullscreen, 8 temas, settings com secções |
 
-## PRs merged, em ordem
+**Issues #29 (AI autocomplete) e #99 (AI chat) fechadas** — eram as duas maiores por fechar
+fora das milestones originais.
 
-| PR   | Conteúdo                                                                                                                                                                                        |
-| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| #141 | #22: relationships como items do popup (`hasMany · Post`, variante própria); fix da race de HOME entre testes de file_cache e popup-índice (o teste do #140 passava por sorte de escalonamento) |
-| #142 | #22: colunas dentro de `where('…')` e dez amigos — `column_context_at` tree-based, chain-walk até à classe, `$user->` honesto (nada)                                                            |
-| #143 | #22: relationships dentro de `with`/`whereHas`/etc — `expects: Argument` decide qual lista; a outra seria resposta errada com badge confiante                                                   |
-| #144 | #22: scopes por nome de chamada (`scopeActive`→`active`) após `Model::` — schema v3 (`model_scopes`), scanner atravessa o ERROR node do meio-da-digitação                                       |
-| #145 | #22: accessors (ambos os estilos → `full_name`) e `$guarded` como colunas-por-implicação; sem mudança de schema (source é TEXT)                                                                 |
-| #146 | #23: paleta "Artisan Command…" — lista do _próprio_ artisan (`list --raw`), confirmar **digita** `php artisan <nome> ` no terminal sem newline; nada executa fora da vista                      |
-| #147 | #21: rebuild do índice no save de model/migration (`is_under` canonicalizado — 6ª aparição da armadilha /var, desta vez prevenida)                                                              |
-| #148 | #21: rebuild no window focus — o trigger de mudanças externas, mesmo raciocínio dos 3 triggers do git (#64); sem watcher, sem timer                                                             |
-| #149 | #20: ranking — qualidade do match, depois claim do projeto, depois brevidade; estável dentro da banda; query vazia mantém ordem de fontes                                                       |
-| #150 | #20: buffer words sem servidor — invoke a meio da palavra oferece os identificadores do ficheiro (badge `text`); sem palavra digitada, nada (sem sinal, tudo é ruído)                           |
-| #151 | #19: Format Document (⇧⌥F) — resync antes de pedir, aplicar só ao texto perguntado, `apply_edits` = um undo step (splice_at generalizado); batch com overlap rejeitado inteiro                  |
-| #152 | #65: ADR-0010 — drivers bloqueantes, rusqlite primeiro (Laravel default é sqlite desde v11: fatia 1 sem dependências novas), SQLx rejeitado com fundamentos que sobrevivem a drivers futuros |
-| #153 | #19: Go to Symbol in Project — paleta ganha modo live-source (QueryChanged re-pede, cancela o anterior); NÃO filtra localmente (o servidor é o matcher; mutação prova) |
-| #154 | #19: Rename Symbol (F2) — paleta ganha modo input-only; WorkspaceEdit aplicado em duas fases, tudo-ou-nada (op de ficheiro/overlap/ilegível aborta antes de tocar um byte); buffers = um undo, fechados = write atómico |
-| #155 | #19: Quick Fix (⌘.) — diagnostics RAW do servidor vão no contexto (raw index-paired com resolved); só entries com edit; decoy-mutation no mapeamento de índice. Sweep de clippy achou DOIS testes sem #[test] que nunca correram |
-| #163 | #26 Composer: install/update/require/run-script digitados (porta #146 agora UMA função partilhada artisan/docker/composer). Trap nova: ordem do map do serde_json é FEATURE FLAG sob unificação do cargo — ordens DIFERENTES em builds diferentes; só um sort explícito sobrevive ao workspace |
-| #162 | **#25 e M5 FECHADAS**: painel Docker (deteção + serviços via 2 chamadas plain-line merged puro; daemon down = as palavras dele; Up/Stop/Logs DIGITAM no terminal — regra #146). Auditoria por folha no fecho do #25 |
-| #161 | #25 log panel: entries estruturadas (nível/timestamp/msg sem cauda JSON), click aterra no throw site (primeiro frame REAL — o #0 é [internal]; bug first-vs-last paren apanhado pelo teste). Viewer não tail: newest por nome, refresh no focus. Binário 18.21MB/19MB |
-| #160 | #64 item 5 metade segura: fetch/push/switch via CLI (credenciais do git do user); push SEM flag de force (o argumento não existe = garantia estrutural); switch recusa dirty tree inteiro, mais estrito que o git de propósito, mutação prova. Stash fica atrás da nota de perigo |
-| #159 | #65 fatia 1: elle-db + painel Database vivo — schema browser read-only (flag no driver, DROP provado a falhar), .env sem nunca ler DB_PASSWORD, never-at-startup. ATENÇÃO: binário 18.15MB/19MB (95.5% do gate) |
-| #158 | #24 fatia 2: navegação Blade→PHP em wire values — ⌘click em wire:click="sortBy(1)" aterra na declaração; resolve() ganha o current-file (primeiro kind cujo alvo depende de onde se clicou); membro invisível ao scan abre o ficheiro SEM linha (RISKS #4) |
-| #157 | #24 fatia 1: wire:click/model completion da classe do componente — extractor + resolução view→classe por convenção + scanner de atributo; ADR-0006 amendment (scan-first ratificado pelo loop do dono). Restam: computed/validation/events, dangling-action (discussão RISKS #4), nav PHP⇄Blade |
-| #156 | **#82 FECHADA**: folding por indentação — mapa row↔line puro com prova de inverso exaustiva, conversão UMA vez na fronteira do uniform_list, função partilhada render↔teste (a 1ª versão sobreviveu a uma mutação que partia o render — episódio no commit). Regras: cursor dentro de fold revela; mudança de line count limpa tudo |
+## O arco da v0.3.0
 
-## Issues fechadas, cada uma com auditoria no fecho
+Sete entregas, executadas em sequência, cada uma com spec → branch → PR → merge:
 
-- **#22 Eloquent intelligence** — superfície declarada completa; gaps registados:
-  setter-only mutators, segundo segmento de `with('a.b')`, `User::` sem letra ainda.
-- **#23 Routes + Artisan** — indexação de rotas era do #46; Artisan agora; GUIs
-  opcionais e tabela de rotas adiadas com razão escrita (viva-e-nunca-stale).
-- **#21 Índice SQLite** — construído, consumido, fresco (3 triggers, sem timer).
-  Incremental pass adiado: otimizar sem perfil é proibido pelas convenções; a tabela
-  `dependencies` está pronta para quando um projeto real o medir como lento.
-- **#20 Merged completion** — fontes reais, proveniência no tipo desde #118, ranking,
-  cancelamento; pipeline local warm p50 1.4ms contra o alvo de 50ms.
+| PR   | Entrega                                                                                                                                                                                                       |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #204 | Smart typing PHP: aspas auto-fecham **em código** (a árvore sintática protege `don't` em prosa), `=` vira `=>` dentro de array literal, `>` seguinte engolido                                                 |
+| #205 | Fullscreen (⌃⌘F, delega à plataforma) e Zen (⌘K Z, esconde chrome + centra com padding fracionário; session-only para nunca reabrir preso)                                                                    |
+| #206 | 8 temas: Dracula, Nord, Catppuccin Mocha/Latte, Gruvbox, Tokyo Night, Solarized Dark/Light — como disk themes, com o `bundle-macos.sh` a copiá-los para `Contents/Resources/themes`                           |
+| #207 | Settings com secções (Editor/Aparência) e picker de tema em grelha com 4 swatches por tema; `preview()` vive em `theme.rs` porque construir `Theme` é monopólio desse módulo (teste de arquitetura #48 impõe) |
+| #208 | Camada de provider IA: 3 providers × 2 formatos de wire, transporte via `curl` do sistema (zero crates novas contra o gate), chaves no Keychain, **denylist sem override**                                    |
+| #210 | Painel de chat IA (⌘⇧A): streaming com repaint agregado a 50ms (gate #93), cancel mata o filho, chips de contexto explícitos, code blocks com copiar                                                          |
+| #211 | Ghost text: primeira linha inline + overlay para as seguintes, Tab aceita como um undo step, debounce 400ms, uma única request em voo                                                                         |
 
-## Estado das milestones
+**#210 e #211 foram feitos por dois agentes em paralelo**, cada um em worktree isolada; o do
+ghost text caiu a meio (máquina adormeceu) e foi retomado do ponto exato. O merge do ghost
+text sobre o chat panel foi limpo.
 
-- **M3 Laravel: 0 abertas. M2 PHP: resta só #18** (IME/dead keys — teclado real, dono).
-  **#19 e #20 fechados com auditoria**; semantic tokens declinado deliberadamente (o
-  fundamento está no fecho do #19: segunda fonte de verdade de cor, que desaparece
-  quando o servidor morre). Signature help tem client sem UI — trabalho #61-shaped.
-- **ADR-0010 escrito e merged** (#65 destravado): rusqlite primeiro, SQLx rejeitado.
-- **O gate de clippy esteve cego ao formato do rtk** a sessão toda — o sweep no #155
-  apanhou dois testes reais sem `#[test]` (deleting_a_word, highlights_operators) que
-  NUNCA correram. Gate correto: `grep -cE "warning|error"` sobre o agregado, ou
-  `rtk proxy cargo clippy` para output cru.
-- Fora de milestone: **#82 FECHADA** (#156). Continuam #64 item 5 (push/pull atrás
-  da nota de perigo), #65 (ADR feito; viewer por construir), #112 (ack do dono),
-  #35 (checklist de 7 olhares postado — destrava #9–#15).
+## Correções de release desta ronda
 
-## Lições novas desta ronda (as que custaram)
+Quatro PRs que não são features — são a instalação a funcionar. **Detalhe completo em
+[RELEASE.md](RELEASE.md)**, resumo:
 
-1. **`git checkout -- ficheiro` durante mutation-testing destrói trabalho untracked/
-   unstaged.** Aconteceu duas vezes (scanner de scopes reescrito). Regra: `git add`
-   ANTES de cada mutação sed/python; reverter por edit, não por checkout.
-2. **A race de HOME** — testes que resolvem `index_path` (derivado de HOME) num task
-   de background correm contra `with_home` de outros testes. `HOME_LOCK` é agora
-   pub(crate) a nível de ficheiro; qualquer teste novo que toque no índice via popup
-   segura-o a sessão inteira. O teste do #140 passava por sorte.
-3. **Fonte sem sinal é ruído com badge** — a decisão do #150 (buffer words só com
-   prefixo digitado) resolveu simultaneamente o UX e cinco testes de layout que
-   teriam de mentir. Quando um fix de testes e um fix de design coincidem, é o design.
-4. **tree-sitter dá contexto a meio da digitação** — `User::ac` parseia como
-   `class_constant_access_expression` dentro de um ERROR node; `descendant_for_byte_range`
-   no fim de palavra aterra no token SEGUINTE (sonda offset-1). Ver `scope_context_at`.
-5. **`php artisan list --raw`** evita JSON (e a dependência serde_json no app crate).
-   O caminho Herd (`~/Library/Application Support/Herd/bin`) juntou-se aos prefixos.
+| PR   | O que estava partido                                                                                                                        |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| #201 | Cancelamento de testes matava só o filho direto; o neto segurava os pipes → "cancel" de 30s                                                 |
+| #202 | `cargo fmt --check` vermelho em 28 ficheiros; perf-gate a falhar o build por load do runner                                                 |
+| #214 | Todos os releases marcados `prerelease` → `releases/latest` servia a **v0.1.0**, e o auto-update nunca disparou                             |
+| #215 | Bundle malformado (`Info.plist` não vinculado, recursos não selados) → macOS dizia "damaged"; e `cp -R` no `.dmg` comia o `_CodeSignature/` |
+
+## Arquitetura — o que mudou
+
+- **`crates/app/src/ai.rs`** — camada de provider, pura e testável sem rede: `resolve_auth`,
+  `chat_body`, `curl_args`, `parse_sse` (dois wires), `deny_reason`. Tudo o que toca rede
+  está atrás de um `curl` filho, o que também dá cancelamento grátis (matar = cancelar).
+- **`crates/app/src/ai_chat.rs`** e **`crates/app/src/editor/ghost.rs`** — as duas
+  superfícies de IA, ambas consumindo `ai.rs` sem duplicar nada.
+- **15 crates** (eram 10 no README antigo): entraram `git`, `db`, `docker`, `test-runner`,
+  `theme`.
+- **`docs/RISKS.md` ganhou a entrada #9** (egress de dados) que a issue #99 exigia — a regra
+  vivia só no corpo da issue, a uma issue fechada de ser esquecida.
+
+## Lições desta ronda (as que custaram)
+
+1. **Um release verde no CI não é um release verificado.** As três falhas que partiram a
+   instalação — prerelease, assinatura, cópia — são todas invisíveis a `cargo test`. O único
+   teste que as apanha é descarregar do GitHub com quarentena e correr `spctl`.
+2. **Uma flag com justificação temporal precisa de data de validade escrita ao lado.** O
+   `prerelease: true` tinha razão legítima na v0.1.0 e sobreviveu a três releases porque a
+   razão estava no comentário mas a validade não.
+3. **`cp -R` não é `ditto`.** Para bundles assinados, `cp` produz um estado _pior_ que não
+   assinar: promete recursos selados que não existem.
+4. **Um teste que só falha em máquina carregada costuma ser bug de concorrência real.** O
+   flaky do test-runner era um process group em falta, não escalonamento azarado.
+5. **Agentes paralelos em worktrees funcionam** para trabalho grande e independente — desde
+   que cada um tenha fronteiras de ficheiros explícitas no prompt (dizer a um "não toques em
+   `settings_panel.rs`" evitou o único conflito possível).
 
 ## Para quem continua
 
-Feitos nesta terceira ronda: #82, #19, #20 fechados; ADR-0010; M1 auditada com
-checklist no #35. Ordem de valor a seguir: **#24 decisão ADR-0006 Blade tree**
-(destrava Livewire + tabelas do índice; é uma decisão de arquitetura, não código) →
-**#65 fatia 1 do DB viewer** (rusqlite, sqlite default, ADR-0010 governa) →
-**#64 item 5** (push/pull — a máquina de confirmação existe desde #126) → chevrons
-de fold no gutter (visual, precisa de #35-olhos). #18 e o checklist do #35 precisam
-do dono. Debug: `ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`; wire-tap LSP via
-`ELLE_LSP_COMMAND` num script tee.
+**Por fechar, em ordem de valor:**
+
+1. **Assinatura real + notarização** — US$ 99/ano; é o que remove o aviso do Gatekeeper de
+   vez e torna o README uma linha em vez de três. Tudo o resto na instalação já está feito.
+2. **`.dmg` no CI** — hoje é construído e anexado à mão a cada release; é o passo mais fácil
+   de esquecer e o que o README recomenda.
+3. **Universal binary** — o build é `arm64` puro, um Mac Intel não corre.
+4. **#30 Xdebug** (decisão por tomar: DBGp nativo vs DAP+bridge), **#28 plugins**
+   (recomendação subprocess+IPC à espera de 👍), **#31 browser embutido** (colide com o gate
+   de binário — spike de medição primeiro), **#18 IME/dead keys** (precisa de teclado real),
+   **#112** (ack do dono).
+
+**Atenção ao binário:** 18.69 de 19 MB. A próxima dependência não cabe sem uma decisão
+explícita — foi por isso que a camada de IA usa o `curl` do sistema em vez de um cliente HTTP.
+
+Debug: `ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`; wire-tap do LSP via `ELLE_LSP_COMMAND`
+apontado a um script com `tee`.
