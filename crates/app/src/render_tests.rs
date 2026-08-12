@@ -4141,3 +4141,45 @@ async fn opening_a_db_table_shows_its_rows(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// The Git: Log palette shows the commit graph, newest first (#64).
+#[gpui::test]
+async fn the_git_log_palette_shows_the_graph(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let run = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@t"]);
+    run(&["config", "user.name", "t"]);
+    std::fs::write(dir.path().join("a.php"), "<?php\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "first commit"]);
+    std::fs::write(dir.path().join("b.php"), "<?php\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "second commit"]);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.toggle_palette_for_test(crate::palette::PaletteMode::GitLog, window, cx);
+    });
+    cx.run_until_parked();
+
+    let labels = workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
+    assert!(labels.len() >= 2, "both commits listed: {labels:?}");
+    assert!(labels[0].contains("second commit"), "newest first: {labels:?}");
+    assert!(labels[0].contains('*'), "the graph column is there: {labels:?}");
+
+    draw(cx);
+}
