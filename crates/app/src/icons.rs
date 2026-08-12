@@ -92,6 +92,9 @@ pub const ICONS: &[Icon] = icons![
     // seven: `ACTIVITY_ICONS` is a *prefix slice* of this list, so anything inserted
     // before `ACTIVITY_ICON_COUNT` would shift every panel's glyph one place.
     "sparkle",
+    // Editor gutter. At the end for the same reason `sparkle` is: `ACTIVITY_ICONS` is a
+    // prefix slice, so the only safe place to add is after everything.
+    "lightbulb",
 ];
 
 /// How many of [`ICONS`] belong to the activity bar, from the front.
@@ -121,6 +124,9 @@ pub const REVEAL_FILE: &str = "icons/reveal-file.svg";
 pub const COLLAPSE_ALL: &str = "icons/collapse-all.svg";
 /// The titlebar's AI chat button (#99 follow-up: the panel was keyboard-only).
 pub const SPARKLE: &str = "icons/sparkle.svg";
+/// The gutter's quick-fix bulb, on a line that has a diagnostic. ⌘. already did this and
+/// was invisible — a chord nobody can see is a feature nobody has.
+pub const LIGHTBULB: &str = "icons/lightbulb.svg";
 
 /// The icon for a file, chosen from its name.
 ///
@@ -335,6 +341,8 @@ mod tests {
             EXPAND_ALL,
             COLLAPSE_ALL,
             REVEAL_FILE,
+            SPARKLE,
+            LIGHTBULB,
         ];
 
         for name in [

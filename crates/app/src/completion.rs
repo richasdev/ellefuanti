@@ -124,13 +124,33 @@ pub struct CompletionItem {
     /// The server's own extra line — a type, a signature, a namespace. `None` for sources
     /// that have nothing further to say, which is not the same as an empty string.
     pub detail: Option<SharedString>,
+    /// Edits elsewhere in the file that this completion also requires — in practice the
+    /// `use App\Models\User;` line that makes the accepted `User` resolve.
+    ///
+    /// **The server sends these already.** Intelephense fills `additionalTextEdits` on
+    /// every completion for an unimported class; the field simply had nowhere to go, so
+    /// accepting `User` wrote the identifier and dropped the import on the floor. This is
+    /// the whole of auto-import: carry what was always in the reply.
+    ///
+    /// Kept in LSP coordinates deliberately. Converting here would need the document's
+    /// text, which the popup does not have and must not acquire — the conversion belongs
+    /// where the `Document` is in hand, at accept time, using the same `LineIndex` path
+    /// Format Document and Rename Symbol already use. Empty for every non-LSP source,
+    /// which have no second edit to make.
+    pub additional_edits: Vec<elle_lsp::lsp_types::TextEdit>,
 }
 
 impl CompletionItem {
     /// An item whose label is also what gets typed.
     pub fn new(label: impl Into<SharedString>, source: CompletionSource) -> Self {
         let label = label.into();
-        Self { insert: label.to_string(), label, source, detail: None }
+        Self {
+            insert: label.to_string(),
+            label,
+            source,
+            detail: None,
+            additional_edits: Vec::new(),
+        }
     }
 
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
@@ -143,6 +163,19 @@ impl CompletionItem {
     /// An item whose insertion differs from its label.
     pub fn with_insert(mut self, insert: String) -> Self {
         self.insert = insert;
+        self
+    }
+
+    /// The server's `additionalTextEdits` — the import line, carried through untouched.
+    ///
+    /// `None` and `Some(vec![])` are the same thing here: a server that has nothing to add
+    /// says so either way, and the accept path branches on emptiness rather than on which
+    /// spelling of "nothing" arrived.
+    pub fn with_additional_edits(
+        mut self,
+        edits: Option<Vec<elle_lsp::lsp_types::TextEdit>>,
+    ) -> Self {
+        self.additional_edits = edits.unwrap_or_default();
         self
     }
 }

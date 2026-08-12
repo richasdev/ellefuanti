@@ -930,7 +930,30 @@ impl Document {
     /// Order in the input is meaningless (LSP leaves it unspecified — only the ranges
     /// are the truth), so the edits are sorted here; overlapping edits are a protocol
     /// violation and the whole batch is dropped rather than half-applied.
-    pub fn apply_edits(&mut self, mut edits: Vec<(std::ops::Range<usize>, String)>) {
+    pub fn apply_edits(&mut self, edits: Vec<(std::ops::Range<usize>, String)>) {
+        // `None` keeps the historic landing: the same offset clamped into the new text,
+        // which is right for formatting because nothing was "just typed" to land after.
+        self.apply_edits_landing_after(edits, None);
+    }
+
+    /// [`Self::apply_edits`], but the cursor lands at the **end of the edit that replaced
+    /// `land_after`** rather than at its old offset.
+    ///
+    /// Auto-import (#61 follow-up) is why this exists. Accepting `User` from the popup is
+    /// two edits at once — the identifier at the cursor *and* the `use App\Models\User;`
+    /// the server sent in `additionalTextEdits` — and they have to be one undo step, so
+    /// they go through one batch. But the import is inserted *above* the cursor, so it
+    /// grows the text before it and the "same offset" rule of `apply_edits` would leave
+    /// the caret that many bytes short of the identifier it just accepted.
+    ///
+    /// The caller names the range it cares about instead of trying to predict the shift,
+    /// because the shift depends on every other edit in the batch and only this function
+    /// has seen them all.
+    pub fn apply_edits_landing_after(
+        &mut self,
+        mut edits: Vec<(std::ops::Range<usize>, String)>,
+        land_after: Option<std::ops::Range<usize>>,
+    ) {
         if edits.is_empty() {
             return;
         }
@@ -938,6 +961,23 @@ impl Document {
         if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
             return;
         }
+
+        // Where the named range ends once every earlier edit has resized the text before
+        // it. Computed against the *sorted* batch, so it is the real post-edit offset and
+        // not an assumption about which edit came first off the wire.
+        let landing = land_after.and_then(|target| {
+            let mut drift: isize = 0;
+            for (range, new_text) in &edits {
+                if *range == target {
+                    return Some((range.start as isize + drift) as usize + new_text.len());
+                }
+                // Only edits strictly before the target move it.
+                if range.end <= target.start {
+                    drift += new_text.len() as isize - (range.end - range.start) as isize;
+                }
+            }
+            None
+        });
 
         let text = self.buffer.text();
         let span = edits.first().map(|(r, _)| r.start).unwrap_or(0)
@@ -957,9 +997,10 @@ impl Document {
 
         // Formatting moves text under the cursor; the least surprising landing is the
         // same offset clamped into the new document — snapped back to a char boundary,
-        // because the old offset may now point into the middle of a codepoint.
+        // because the old offset may now point into the middle of a codepoint. A caller
+        // that named a range gets the end of that range's replacement instead.
         let after = self.buffer.text();
-        let mut head = self.selection.head.min(after.len());
+        let mut head = landing.unwrap_or(self.selection.head).min(after.len());
         while head > 0 && !after.is_char_boundary(head) {
             head -= 1;
         }
@@ -2470,6 +2511,60 @@ mod tests {
         let mut d = doc("abcdef");
         d.apply_edits(vec![(4..5, "E".to_string()), (1..2, "B".to_string())]);
         assert_eq!(d.buffer.text(), "aBcdEf");
+    }
+
+    #[test]
+    fn an_import_inserted_above_the_cursor_still_lands_the_caret_after_the_word() {
+        // The auto-import shape, and the exact offset trap it carries: the `use` line goes
+        // in *above* the identifier, so every byte below it moves down. Landing the caret
+        // at its old offset would leave it short by the length of the import — inside the
+        // word the user just accepted, which is where the next keystroke would go.
+        let mut d = doc("<?php\nnamespace App;\n\n$u = new Us;\n");
+        let text = d.buffer.text();
+        let word = text.find("Us;").unwrap();
+        let main = word..word + 2;
+        let import_at = text.find("\n\n$u").unwrap() + 1;
+        let import = "\nuse App\\Models\\User;\n";
+
+        d.apply_edits_landing_after(
+            vec![(main.clone(), "User".to_string()), (import_at..import_at, import.to_string())],
+            Some(main),
+        );
+
+        assert_eq!(
+            d.buffer.text(),
+            "<?php\nnamespace App;\n\nuse App\\Models\\User;\n\n$u = new User;\n"
+        );
+        let after = d.buffer.text();
+        assert_eq!(
+            &after[..d.selection.head],
+            "<?php\nnamespace App;\n\nuse App\\Models\\User;\n\n$u = new User",
+            "the caret sits just past the accepted word, not short of it by the import"
+        );
+
+        // And the whole thing is one ⌘Z, not one per edit — an import the user has to undo
+        // separately from the word that needed it is two edits pretending to be one.
+        d.undo();
+        assert_eq!(d.buffer.text(), "<?php\nnamespace App;\n\n$u = new Us;\n");
+    }
+
+    #[test]
+    fn a_completion_with_no_import_lands_exactly_where_a_plain_insert_would() {
+        // The common case. Auto-import must be invisible when there is nothing to import.
+        let mut d = doc("$u = new Us;");
+        d.apply_edits_landing_after(vec![(9..11, "User".to_string())], Some(9..11));
+        assert_eq!(d.buffer.text(), "$u = new User;");
+        assert_eq!(d.selection.head, 13, "just past the `r`");
+    }
+
+    #[test]
+    fn formatting_keeps_the_old_landing_rule() {
+        // The regression guard for the split: `apply_edits` names no range, so it must
+        // still clamp the cursor to its old offset the way #19's formatting relies on.
+        let mut d = doc("<?php\nif($x){\nreturn;\n}\n");
+        d.move_to(3, false);
+        d.apply_edits(vec![(8..8, " ".to_string())]);
+        assert_eq!(d.selection.head, 3, "an unnamed batch does not move the caret");
     }
 
     #[test]
