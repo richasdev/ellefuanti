@@ -2197,8 +2197,10 @@ impl WorkspaceView {
         self.dismiss_completion(window, cx);
         match self.terminal.take() {
             Some(_) => {
-                // Focus returns to the workspace, or the editor keymap stays dead.
-                window.focus(&self.focus_handle);
+                // Focus returns to the editor the eye is now on, or the keymap stays dead —
+                // the same rule the palette and every overlay follow (#171/#172). Parking it
+                // on the workspace root left the next keystroke reaching nothing.
+                self.focus_editor_or_workspace(window, cx);
             }
             None => {
                 let terminal = cx.new(TerminalView::new);
@@ -2256,7 +2258,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match self.tests.take() {
-            Some(_) => window.focus(&self.focus_handle),
+            // Focus follows the eye back to the editor, not the workspace root — closing the
+            // panel must not leave the keyboard dead (#171/#172's rule for every dismiss).
+            Some(_) => self.focus_editor_or_workspace(window, cx),
             None => {
                 self.tests = Some(self.new_test_panel(cx));
             }
@@ -3744,7 +3748,10 @@ impl WorkspaceView {
         // stays one click away inside it, and keeps its own palette command — the panel
         // must not become a wall between the user and their file.
         if self.settings_panel.take().is_some() {
-            window.focus(&self.focus_handle);
+            // Same destination as the panel's click-away close (#172): the editor, not the
+            // workspace root. Closing by re-pressing ⌘, used to strand the keyboard here
+            // while the click-away path did not — one panel, two exits, two behaviours.
+            self.focus_editor_or_workspace(window, cx);
             cx.notify();
             return;
         }
@@ -3754,7 +3761,9 @@ impl WorkspaceView {
         cx.subscribe_in(&panel, window, |this, _panel, event, window, cx| match event {
             SettingsPanelEvent::Dismissed => {
                 this.settings_panel = None;
-                window.focus(&this.focus_handle);
+                // Esc / Cancel inside the panel lands focus back on the editor too — the
+                // click-away path already did, and the two must not disagree (#172).
+                this.focus_editor_or_workspace(window, cx);
                 cx.notify();
             }
             SettingsPanelEvent::OpenJson => {
@@ -5632,14 +5641,15 @@ impl WorkspaceView {
         self.jobs.cancel(Job::QuickOpenIndex);
     }
 
-    fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A walk still running is now pure waste — nothing will consume its results.
-        self.cancel_quick_open_walk();
-        self.palette = None;
-        // Focus goes back to the *editor* when one is open, not just the workspace: after
-        // the language menu closes the owner reported the keyboard felt dead, because a
-        // workspace with no editor focus does not forward typing or the reopen chord to
-        // where the eye is. The workspace handle is the fallback for a window with no tab.
+    /// Puts focus back on the editor when a tab is open, and on the workspace root otherwise.
+    ///
+    /// The one move #171/#172 made the rule for every overlay dismiss: after the language
+    /// menu closed the owner reported the keyboard felt dead, because a workspace with no
+    /// editor focus forwards neither typing nor the reopen chord to where the eye is. Closing
+    /// a bottom panel (terminal, tests) and the settings dialog leaves the eye on the editor
+    /// just the same, so they route here rather than parking focus on the root. The workspace
+    /// handle is the fallback for a window with no tab.
+    fn focus_editor_or_workspace(&self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_editor() {
             Some(editor) => {
                 let handle = editor.read(cx).focus_handle(cx);
@@ -5647,6 +5657,13 @@ impl WorkspaceView {
             }
             None => window.focus(&self.focus_handle),
         }
+    }
+
+    fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A walk still running is now pure waste — nothing will consume its results.
+        self.cancel_quick_open_walk();
+        self.palette = None;
+        self.focus_editor_or_workspace(window, cx);
         cx.notify();
     }
 
