@@ -4365,3 +4365,44 @@ async fn palette_click_on_a_stale_row_is_ignored_not_a_panic(cx: &mut TestAppCon
     assert!(confirmed.borrow().is_empty(), "a stale click confirms nothing");
     drop(subscription);
 }
+
+/// Schema tables start collapsed and toggle their columns; a click also opens the rows (#65).
+#[gpui::test]
+async fn schema_tables_collapse_and_a_click_opens_the_rows(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    let db = dir.path().join("database/database.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);").unwrap();
+    drop(conn);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.db_expanded_for_test("users"), "collapsed by default — clean list");
+    });
+
+    // Click expands the columns AND opens the rows.
+    workspace.update(cx, |workspace, cx| workspace.toggle_db_table_for_test("users", cx));
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.db_expanded_for_test("users"), "expanded after the click");
+        let (name, _) = workspace.db_table_for_test().expect("rows opened too");
+        assert_eq!(name, "users");
+    });
+
+    // A second click collapses the columns but leaves the rows.
+    workspace.update(cx, |workspace, cx| workspace.toggle_db_table_for_test("users", cx));
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.db_expanded_for_test("users"), "collapsed again");
+        assert!(workspace.db_table_for_test().is_some(), "but the rows stay open");
+    });
+
+    draw(cx);
+}
