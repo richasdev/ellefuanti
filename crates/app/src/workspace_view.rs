@@ -7134,7 +7134,10 @@ impl WorkspaceView {
                 .background_spawn(async move {
                     let path =
                         elle_db::env_database(&root).ok_or_else(|| "no sqlite database".to_string())?;
-                    elle_db::insert_empty_row(&path, &table)
+                    // No values from the caller: insert_row seeds NOT NULL columns with
+                    // an empty string so a blank add-row never trips a constraint (the
+                    // owner's courses.name error). The user then edits the cells.
+                    elle_db::insert_row(&path, &table, &[])
                         .map_err(|err| format!("{err:#}"))
                         .map(|_rowid| table)
                 })
