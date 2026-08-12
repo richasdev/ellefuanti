@@ -55,6 +55,9 @@ anyhow.workspace = true
 # costs nothing when no run is happening.
 smol.workspace = true
 notify.workspace = true
+# Reads GitHub's releases/latest response for the self-updater. Already compiled for
+# every build through the settings crate — declaring it here adds nothing new.
+serde_json.workspace = true
 regex.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

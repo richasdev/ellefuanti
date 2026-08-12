@@ -106,6 +106,9 @@ enum Job {
     LogRead,
     /// Asking docker compose for its services (#25). Own slot, same reasoning.
     DockerPs,
+    /// The self-updater's download-and-swap pipeline. Its own slot so opening a file
+    /// mid-download cannot cancel an update half-way through replacing the app.
+    UpdateInstall,
     /// Asking the project's artisan for its command list (#23). Its own slot: the palette
     /// that consumes it may be swapped to another mode while artisan is still answering,
     /// and the swap must cancel the ask rather than race it.
@@ -514,6 +517,10 @@ pub struct WorkspaceView {
     /// Scrolls the tab strip so the active tab is visible — activating a tab from the
     /// tree or palette with twenty open otherwise selects it off-screen (owner request).
     tab_scroll: gpui::ScrollHandle,
+    /// Where the self-updater is in its lifecycle; the status bar renders from this.
+    update_state: crate::update::UpdateState,
+    /// The periodic release check, held so it lives exactly as long as the workspace.
+    update_check: Option<gpui::Task<()>>,
     /// Keeps the FS watcher and its debounce task alive so the tree follows Finder,
     /// terminals and the app's own file operations without a manual refresh (owner
     /// request). The sender is held for tests, which have no real FSEvents to fire.
@@ -725,6 +732,8 @@ impl WorkspaceView {
             tree: None,
             tree_scroll: gpui::UniformListScrollHandle::new(),
             tab_scroll: gpui::ScrollHandle::new(),
+            update_state: crate::update::UpdateState::default(),
+            update_check: None,
             tree_watcher: None,
             tabs: Vec::new(),
             active_tab: 0,
@@ -5664,6 +5673,179 @@ impl WorkspaceView {
         self.tree_watcher = Some((watcher, tx, task));
     }
 
+    // --- self-update (owner request) ------------------------------------------------
+
+    /// Starts the periodic release check, once — from `render` like the activation
+    /// observer, because that is the established "after the window exists" hook.
+    ///
+    /// The transport is `curl`, which every macOS ships: an HTTP crate for one GET
+    /// every six hours is exactly the dependency this codebase keeps refusing. A
+    /// failed check (offline, rate-limited, GitHub down) is silence, not a toast —
+    /// the user did not ask a question, so there is no answer to owe them. Guarded
+    /// out of tests entirely: 600 render tests each spawning a network process is a
+    /// flake factory.
+    fn start_update_check(&mut self, cx: &mut Context<Self>) {
+        if self.update_check.is_some() || cfg!(test) {
+            return;
+        }
+        let timer_executor = cx.background_executor().clone();
+        self.update_check = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let output = cx
+                    .background_spawn(async {
+                        smol::process::Command::new("curl")
+                            .args(["-fsSL", crate::update::RELEASES_API])
+                            .output()
+                            .await
+                    })
+                    .await;
+                let available = output
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .and_then(|body| crate::update::parse_latest_release(&body))
+                    .filter(|release| {
+                        crate::update::newer_than_current(release, env!("CARGO_PKG_VERSION"))
+                    });
+                if let Some(available) = available {
+                    let alive = this.update(cx, |this, cx| {
+                        // Only ever move forward from an offer: a re-check must not
+                        // clobber an install in flight or a finished one.
+                        if matches!(
+                            this.update_state,
+                            crate::update::UpdateState::Idle
+                                | crate::update::UpdateState::Available(_)
+                        ) {
+                            this.update_state =
+                                crate::update::UpdateState::Available(available);
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+                timer_executor.timer(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        }));
+    }
+
+    /// The status-bar cell was clicked while an update was on offer.
+    ///
+    /// The full install only makes sense for the installed app: a `cargo run` or a
+    /// Gatekeeper-translocated copy is not at `/Applications/ellefuanti.app`, and
+    /// swapping that path out from under a build that is not running from it updates
+    /// nothing the user is looking at. Those cases — and a release with no dmg asset —
+    /// open the release page instead, which is the notify-only behaviour.
+    fn update_clicked(&mut self, cx: &mut Context<Self>) {
+        match self.update_state.clone() {
+            crate::update::UpdateState::Available(release) => {
+                let installed = std::env::current_exe()
+                    .map(|exe| exe.starts_with("/Applications/ellefuanti.app"))
+                    .unwrap_or(false);
+                match release.dmg_url.clone() {
+                    Some(dmg_url) if installed => {
+                        self.start_update_install(release, dmg_url, cx);
+                    }
+                    _ => {
+                        let _ = std::process::Command::new("open")
+                            .arg(&release.html_url)
+                            .spawn();
+                    }
+                }
+            }
+            crate::update::UpdateState::ReadyToRestart => self.restart_into_update(cx),
+            _ => {}
+        }
+    }
+
+    /// Downloads the dmg and swaps `/Applications/ellefuanti.app` for its contents.
+    ///
+    /// One `sh -euc` script rather than N spawned steps: `-e` is the error handling —
+    /// first failing tool aborts the rest, so a half-mounted image never gets copied
+    /// from. The swap order (`rm` old, `mv` staged) is safe for the running app because
+    /// macOS keeps the open binary's inode alive until exit. The `xattr -dr` at the end
+    /// is the same quarantine clearing the README tells users to do by hand — done by
+    /// the copy of the app they already chose to trust.
+    fn start_update_install(
+        &mut self,
+        release: crate::update::Available,
+        dmg_url: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_state = crate::update::UpdateState::Downloading;
+        cx.notify();
+
+        let script = format!(
+            r#"set -eu
+STAGE="$(mktemp -d)"
+trap 'hdiutil detach "$STAGE/mnt" >/dev/null 2>&1 || true; rm -rf "$STAGE"' EXIT
+curl -fsSL -o "$STAGE/update.dmg" "{dmg_url}"
+mkdir "$STAGE/mnt"
+hdiutil attach -nobrowse -readonly -mountpoint "$STAGE/mnt" "$STAGE/update.dmg" >/dev/null
+rm -rf "/Applications/ellefuanti.app.update"
+cp -R "$STAGE/mnt/ellefuanti.app" "/Applications/ellefuanti.app.update"
+hdiutil detach "$STAGE/mnt" >/dev/null
+rm -rf "/Applications/ellefuanti.app"
+mv "/Applications/ellefuanti.app.update" "/Applications/ellefuanti.app"
+xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
+"#
+        );
+        let task = cx.spawn(async move |this, cx| {
+            let output = cx
+                .background_spawn(async move {
+                    smol::process::Command::new("sh").args(["-c", &script]).output().await
+                })
+                .await;
+            let result = match output {
+                Ok(output) if output.status.success() => Ok(()),
+                Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                Err(err) => Err(err.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.update_state = crate::update::UpdateState::ReadyToRestart,
+                    Err(err) => {
+                        // Back to the offer, not to Idle: the cell stays retryable
+                        // instead of vanishing until the next six-hour check.
+                        this.status = Some(format!("Update failed: {err}").into());
+                        this.update_state = crate::update::UpdateState::Available(release);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        // Its own slot: dropping the workspace drops the task; the shell script's trap
+        // cleans the temp dir either way.
+        self.jobs.start(Job::UpdateInstall, task);
+    }
+
+    /// "Restart to update": relaunch the installed app and quit this process. The
+    /// `sleep 1` gives this process time to exit so `open -n` does not just focus the
+    /// dying instance.
+    fn restart_into_update(&mut self, cx: &mut Context<Self>) {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "sleep 1; open -n /Applications/ellefuanti.app"])
+            .spawn();
+        cx.quit();
+    }
+
+    #[cfg(test)]
+    pub fn set_update_state_for_test(
+        &mut self,
+        state: crate::update::UpdateState,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_state = state;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn update_label_for_test(&self) -> Option<String> {
+        self.update_state.status_label()
+    }
+
     /// Simulates one FS event, since a headless test has no FSEvents to fire. Goes
     /// through the real channel, debounce and refresh path.
     #[cfg(test)]
@@ -6736,6 +6918,7 @@ impl Render for WorkspaceView {
         // Registers once and then costs one `is_none` per frame. See
         // `observe_window_focus` for why here and not in `new`.
         self.observe_window_focus(window, cx);
+        self.start_update_check(cx);
 
         // Re-apply the find query to whichever document is active (#80).
         //
@@ -8644,6 +8827,25 @@ impl WorkspaceView {
                     .when(self.status.is_some(), |el| el.text_color(theme.accent))
                     .child(message),
             )
+            // The updater's cell: absent until there is something to do, accent-coloured
+            // because it is the one cell that asks for a click (owner request — the
+            // "restart to update" every reference IDE shows).
+            .when_some(self.update_state.status_label(), |el, label| {
+                let entity = cx.entity();
+                el.child(
+                    div()
+                        .id("status-update")
+                        .px_1()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .hover(|el| el.bg(theme.hover))
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            entity.update(cx, |this, cx| this.update_clicked(cx));
+                        })
+                        .child(SharedString::from(label)),
+                )
+            })
             .child(SharedString::from(diagnostics))
             .child(SharedString::from(tests))
             .child(SharedString::from(terminals))
