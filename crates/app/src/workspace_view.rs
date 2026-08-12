@@ -6403,6 +6403,12 @@ impl Render for WorkspaceView {
 /// guards the icons and leaves the array the renderer actually zips unguarded. Renaming a
 /// panel here would have kept the test green while every glyph shifted one place. There is
 /// one list now, and the test reads it.
+/// A fixed cell width for the database grid (#65). Fixed, not content-sized: a wide
+/// text column (a `resume`, a JSON blob) would otherwise steal the whole pane and push
+/// every other column off screen — the owner's report. Overflow clips and the grid
+/// scrolls horizontally, the TablePlus/Excel behaviour.
+const DB_CELL_WIDTH: gpui::Pixels = px(180.0);
+
 /// Rows per page in the database table view (#65) — a screenful, not a SELECT * on a
 /// production table (the #65 rule). Paging beyond the first is the next slice.
 const DB_PAGE_SIZE: u64 = 200;
@@ -6693,50 +6699,99 @@ impl WorkspaceView {
         let Some((name, result)) = &self.db_table else {
             return div();
         };
-        let grid = div().size_full().flex().flex_col().overflow_hidden().px_3().py_2();
-        match result {
-            Err(message) => grid.child(
+        let outer = div().size_full().flex().flex_col().overflow_hidden();
+        let Ok(page) = result else {
+            let Err(message) = result else { unreachable!() };
+            return outer.px_3().py_2().child(
                 div().text_color(theme.text_muted).child(SharedString::from(message.clone())),
-            ),
-            Ok(page) => {
-                let header = format!(
-                    "{}  —  {} row(s){}",
-                    name,
-                    page.total,
-                    if page.total > DB_PAGE_SIZE { ", showing first page" } else { "" }
-                );
-                grid.child(
-                    div()
-                        .h(Metrics::TAB_HEIGHT)
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(header)),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .gap_4()
-                        .text_color(theme.text)
-                        .children(page.columns.iter().map(|c| {
-                            div().min_w(px(120.0)).child(SharedString::from(c.clone()))
-                        })),
-                )
-                .child(div().flex_1().flex().flex_col().overflow_hidden().children(
-                    page.rows.iter().map(|row| {
+            );
+        };
+
+        let header = format!(
+            "{}  —  {} row(s){}",
+            name,
+            page.total,
+            if page.total > DB_PAGE_SIZE { ", showing first page" } else { "" }
+        );
+
+        // A real grid, not a list: every cell is a fixed-width box that clips its text
+        // (no wrap — the `resume` column was pushing every other column off screen), rows
+        // are one line tall, and the whole grid scrolls horizontally when the columns
+        // sum wider than the pane. This is the TablePlus/Excel shape the owner asked for.
+        let row_height = px(24.0);
+        let cell = move |text: &str, header: bool, striped: bool| {
+            let mut el = div()
+                .w(DB_CELL_WIDTH)
+                .h(row_height)
+                .flex_none()
+                .px_2()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .border_r_1()
+                .border_color(theme.border)
+                .child(SharedString::from(text.to_string()));
+            if header {
+                el = el.bg(theme.panel).text_color(theme.text);
+            } else {
+                el = el.text_color(theme.text_muted);
+                if striped {
+                    el = el.bg(theme.hover);
+                }
+            }
+            el
+        };
+
+        // The header row and the data rows share one horizontally scrolling column, so a
+        // scroll moves both together — a header that stayed put while the rows slid would
+        // mislabel every value.
+        let scroll = div()
+            .id("db-grid-scroll")
+            .flex_1()
+            .overflow_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_full()
+                    // Header row: sticky look via the panel background, a bottom border to
+                    // divide it from the data.
+                    .child(
                         div()
                             .flex()
-                            .gap_4()
-                            .text_color(theme.text_muted)
-                            .children(row.iter().map(|value| {
-                                div().min_w(px(120.0)).child(SharedString::from(value.clone()))
-                            }))
-                    }),
-                ))
-            }
-        }
+                            .flex_none()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .children(
+                                page.columns.iter().map(|c| cell(c, true, false)),
+                            ),
+                    )
+                    .children(page.rows.iter().enumerate().map(|(index, row)| {
+                        div()
+                            .flex()
+                            .flex_none()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .children(
+                                row.iter().map(move |value| cell(value, false, index % 2 == 1)),
+                            )
+                    })),
+            );
+
+        outer
+            .child(
+                div()
+                    .h(Metrics::TAB_HEIGHT)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(header)),
+            )
+            .child(scroll)
     }
 
     /// Reads the project database's schema on the background pool, superseding.
