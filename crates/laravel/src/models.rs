@@ -75,8 +75,20 @@ pub fn extract_model(source: &str) -> Option<ModelFacts> {
     let mut facts = ModelFacts { class, ..Default::default() };
 
     facts.table = quoted_after(source, "$table");
+    // Fillable, two shapes: the `$fillable` property and Laravel's PHP-8
+    // `#[Fillable([...])]` attribute. The attribute wins when present — a model uses one
+    // or the other, and a project on the attribute has no `$fillable` to find.
     facts.fillable = quoted_list_after(source, "$fillable");
+    if facts.fillable.is_empty() {
+        facts.fillable = quoted_list_after(source, "#[Fillable(");
+    }
+    // Casts, two shapes: the `$casts` property and Laravel 11's `casts(): array` method.
+    // The method returns an array literal, so the same pair scanner reads it — anchored
+    // on `function casts` so a `$casts` elsewhere is not double-counted.
     facts.casts = pair_list_after(source, "$casts");
+    if facts.casts.is_empty() {
+        facts.casts = pair_list_after(source, "function casts");
+    }
     facts.guarded = quoted_list_after(source, "$guarded");
 
     // Relationship methods: `function posts() { return $this->hasMany(Post::class); }`.
@@ -280,7 +292,13 @@ fn pair_list_after(source: &str, property: &str) -> Vec<(String, String)> {
     body.split(',')
         .filter_map(|pair| {
             let (key, value) = pair.split_once("=>")?;
-            Some((quoted_at(key.trim())?, quoted_at(value.trim())?))
+            let key = quoted_at(key.trim())?;
+            // The value is usually quoted (`'datetime'`) but Laravel 11 casts an enum
+            // with `'status' => PostStatus::class` — a bare expression. Take the quoted
+            // form when there is one, else the trimmed token as written, so an enum cast
+            // is not silently dropped.
+            let value = quoted_at(value.trim()).unwrap_or_else(|| value.trim().to_string());
+            (!value.is_empty()).then_some((key, value))
         })
         .collect()
 }
@@ -335,6 +353,30 @@ class User extends Authenticatable
     }
 
     #[test]
+    fn the_modern_casts_method_and_fillable_attribute_are_read() {
+        // Laravel 11's `casts(): array` method instead of `$casts`, and the PHP-8
+        // `#[Fillable([...])]` attribute instead of `$fillable`. Real richas-blog shapes.
+        let src = "<?php
+class Post extends Model {
+  #[Fillable(['title', 'slug'])]
+  protected function casts(): array {
+    return ['status' => PostStatus::class, 'created_at' => 'datetime'];
+  }
+}
+";
+        let facts = extract_model(src).expect("a model");
+        assert_eq!(facts.fillable, ["title", "slug"], "the #[Fillable] attribute is read");
+        assert_eq!(
+            facts.casts,
+            [
+                ("status".to_string(), "PostStatus::class".into()),
+                ("created_at".into(), "datetime".into())
+            ],
+            "the casts() method's array is read like $casts was"
+        );
+    }
+
+    #[test]
     fn accessors_are_reported_as_the_attribute_they_expose() {
         // Both accessor styles expose `$user->full_name`; the property name is the item.
         let old_style = "<?php\nclass User extends Model {\n  public function getFullNameAttribute() { return ''; }\n  public function getAttribute($key) { return parent::getAttribute($key); }\n}\n";
@@ -345,6 +387,27 @@ class User extends Authenticatable
         let new_style = "<?php\nclass User extends Model {\n  protected function fullName(): Attribute { return Attribute::make(get: fn () => ''); }\n  protected function plainHelper(): string { return ''; }\n}\n";
         let facts = extract_model(new_style).expect("a model");
         assert_eq!(facts.accessors, ["full_name"]);
+    }
+
+    #[test]
+    fn a_real_richas_blog_model_reads_end_to_end() {
+        // The exact modern shapes from richas-blog's Post.php: #[Fillable] attribute,
+        // casts() method with an enum ::class cast, and an imageUrl(): Attribute accessor.
+        let src = "<?php
+class Post extends Model {
+  #[Fillable(['title', 'content', 'slug'])]
+  protected function casts(): array {
+    return ['status' => PostStatus::class, 'created_at' => 'datetime'];
+  }
+  protected function imageUrl(): Attribute {
+    return Attribute::get(fn () => null);
+  }
+}
+";
+        let facts = extract_model(src).expect("a model");
+        assert_eq!(facts.fillable, ["title", "content", "slug"]);
+        assert!(facts.casts.iter().any(|(k, v)| k == "status" && v == "PostStatus::class"));
+        assert!(facts.accessors.contains(&"image_url".to_string()), "imageUrl -> image_url");
     }
 
     #[test]
