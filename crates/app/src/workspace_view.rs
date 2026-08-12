@@ -249,11 +249,14 @@ const MAX_HISTORY: usize = 50;
 /// query is finished, and making them wait would be the control ignoring an explicit act.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// How long the editor waits after the last keystroke before autosaving (#25). VS
-/// Code's `afterDelay` default is 1000ms; matching it means the file is on disk a second
-/// after you stop typing, which is what "auto save" means to someone coming from there —
-/// the window-blur trigger alone left the owner thinking it did nothing.
-const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(1000);
+/// How long the editor waits after the last keystroke before autosaving (#25).
+///
+/// The owner wanted "a cada alteração já salva" — effectively immediate. A short 150ms
+/// debounce is imperceptible yet still groups a fast burst of keystrokes into one write
+/// rather than one write per character (which on a large file is real disk churn and a
+/// git-status refresh per key). So it *feels* like save-on-change without hammering the
+/// disk. The window-blur save stays as the backstop for leaving mid-burst.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Where the cursor has been, so Back and Forward can retrace it.
 ///
