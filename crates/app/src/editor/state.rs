@@ -1540,6 +1540,53 @@ impl Document {
         None
     }
 
+    /// Whether the byte offset sits inside a comment or string, per the parse tree.
+    ///
+    /// The gate that lets quotes auto-close in *code* while leaving prose alone: `don't`
+    /// in a comment or a string must never become `don''t`, and the tree already knows
+    /// which one the cursor is in. No tree (plain text, broken parse) answers `true` —
+    /// prose is exactly where auto-closing quotes does damage, so the conservative
+    /// reading is the safe one.
+    fn in_comment_or_string(&self, at: usize) -> bool {
+        let Some(tree) = self.syntax.tree() else { return true };
+        let Some(node) = tree.root_node().descendant_for_byte_range(at, at) else {
+            return true;
+        };
+        let mut current = Some(node);
+        while let Some(n) = current {
+            let kind = n.kind();
+            if kind.contains("comment") || kind.contains("string") || kind.contains("heredoc") {
+                return true;
+            }
+            current = n.parent();
+        }
+        false
+    }
+
+    /// Whether the offset sits inside a PHP array literal — and not inside a nested
+    /// call's argument list, where `=` is an assignment again.
+    ///
+    /// Walking up from the cursor, the first structural ancestor decides: an
+    /// `array_creation_expression` means `['name' |]`, where `=` can only sensibly mean
+    /// `=>`; hitting an argument list or parentheses first means `['a' => foo($x |)]`,
+    /// where it cannot.
+    fn in_array_literal(&self, at: usize) -> bool {
+        let Some(tree) = self.syntax.tree() else { return false };
+        let Some(node) = tree.root_node().descendant_for_byte_range(at, at) else {
+            return false;
+        };
+        let mut current = Some(node);
+        while let Some(n) = current {
+            match n.kind() {
+                "array_creation_expression" => return true,
+                "arguments" | "parenthesized_expression" | "formal_parameters" => return false,
+                _ => {}
+            }
+            current = n.parent();
+        }
+        false
+    }
+
     /// Inserts typed text, auto-closing brackets and typing over a closer.
     ///
     /// Three behaviours, all of which every editor has and none of which the user thinks
@@ -1554,10 +1601,11 @@ impl Document {
     ///
     /// Returns false when none applied, so the caller falls back to a plain insert.
     ///
-    /// Bare quotes deliberately do **not** auto-close: `it's` and `don't` are the common
-    /// case in comments and strings, and an editor that turns them into `it''s` is worse
-    /// than one with no auto-close at all. Quotes still *wrap* a selection, which is the
-    /// half users actually reach for.
+    /// Quotes auto-close **in code only**: the parse tree vetoes comments, strings, and
+    /// grammarless files, so `it's` and `don't` in prose stay untouched — the reason the
+    /// old rule was "never". Two PHP-specific smart keys ride along (owner request):
+    /// `=` inside an array literal completes to ` => `, and the `>` typed right after is
+    /// swallowed.
     pub fn insert_with_pairs(&mut self, text: &str) -> bool {
         let mut chars = text.chars();
         let (Some(ch), None) = (chars.next(), chars.next()) else {
@@ -1589,14 +1637,74 @@ impl Document {
         let head = self.selection.head;
         let next = self.buffer.slice(head..self.next_char_offset(head));
 
-        // 2. Type over a closer this editor just inserted. Restricted to closers so typing
-        //    `(` in front of an existing `(` still opens a new pair.
+        // 2. Type over a closer this editor just inserted. Closing brackets always;
+        //    quotes only when the very next character is the same quote — stepping past
+        //    is what makes `['name']` typed in full come out with two quotes, not four.
         if Self::PAIRS.iter().any(|&(o, c)| c == ch && o != c) && next == ch.to_string() {
             self.move_to(self.next_char_offset(head), false);
             return true;
         }
+        if (ch == '\'' || ch == '"') && next == ch.to_string() {
+            self.move_to(self.next_char_offset(head), false);
+            return true;
+        }
 
-        // 3. Auto-close. Openers only — see the doc comment on quotes.
+        // PHP array smart keys (owner request, the PhpStorm behaviours):
+        // `=` inside an array literal completes to ` => ` — `['name' =` is only ever the
+        // start of an arrow — and a `>` typed right after is swallowed so the habit of
+        // typing `=>` in full does not produce `=>>`.
+        if ch == '=' && self.in_array_literal(head) {
+            let before = self.buffer.slice(head.saturating_sub(32)..head);
+            let prev_non_space = before.chars().rev().find(|c| !c.is_whitespace());
+            let after_key = matches!(prev_non_space, Some('\'' | '"' | ']' | ')'))
+                || prev_non_space.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if after_key {
+                let lead = if before.chars().next_back().is_some_and(char::is_whitespace) {
+                    ""
+                } else {
+                    " "
+                };
+                self.buffer.break_undo_group();
+                let edit = self.buffer.replace(head..head, &format!("{lead}=> "));
+                self.selection = Selection::at(edit.new_range().end);
+                self.goal_column = None;
+                self.buffer.break_undo_group();
+                self.sync_syntax();
+                return true;
+            }
+        }
+        if ch == '>' && self.in_array_literal(head) {
+            let before = self.buffer.slice(head.saturating_sub(3)..head);
+            if before.ends_with("=> ") || before.ends_with("=>") {
+                return true; // swallowed — the arrow is already there
+            }
+        }
+
+        // 3. Auto-close quotes, in code only. The old rule was "never", because `don't`
+        //    in prose must not become `don''t` — the parse tree now draws that line
+        //    exactly: inside comments and strings (and in files with no grammar at all,
+        //    which is what prose is) nothing changes; in code, `['` gets its partner.
+        //    Word-adjacency still vetoes, same as brackets.
+        if ch == '\'' || ch == '"' {
+            let prev = self.buffer.slice(self.prev_char_offset(head)..head);
+            let prev_ok = prev
+                .chars()
+                .next_back()
+                .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != ch);
+            let next_ok = next.chars().next().is_none_or(|n| !n.is_alphanumeric() && n != '_');
+            if prev_ok && next_ok && !self.in_comment_or_string(head) {
+                self.buffer.break_undo_group();
+                let edit = self.buffer.replace(head..head, &format!("{ch}{ch}"));
+                self.selection = Selection::at(edit.new_range().start + ch.len_utf8());
+                self.goal_column = None;
+                self.buffer.break_undo_group();
+                self.sync_syntax();
+                return true;
+            }
+            return false;
+        }
+
+        // 4. Auto-close brackets. Openers only.
         if let Some(&(_, close)) = Self::PAIRS.iter().find(|&&(o, c)| o == ch && o != c) {
             // Not in front of a word: `(` typed before `foo` means the user is wrapping by
             // hand, and a `)` landing between `(` and `foo` is in the way.
@@ -3321,16 +3429,95 @@ $ação = 1;
     }
 
     #[test]
-    fn quotes_wrap_a_selection_but_do_not_auto_close_on_their_own() {
-        // The apostrophe rule: `don't` in a comment must stay `don't`. Auto-closing a bare
-        // quote is worse than having no auto-close at all.
-        let mut d = doc("");
-        assert!(!d.insert_with_pairs("'"), "a bare quote is just a quote");
-
+    fn quotes_wrap_a_selection_and_auto_close_in_code() {
         let mut d = doc("hello");
         d.select_all();
-        assert!(d.insert_with_pairs("'"), "but it still wraps a selection");
+        assert!(d.insert_with_pairs("'"), "quotes wrap a selection");
         assert_eq!(d.buffer.text(), "'hello'");
+
+        // In code — here, an expression position in PHP — a quote closes itself.
+        let mut d = doc("<?php\n$a = ;\n");
+        d.move_to(d.buffer.text().find(';').unwrap(), false);
+        assert!(d.insert_with_pairs("'"), "a quote in code auto-closes");
+        assert_eq!(d.buffer.text(), "<?php\n$a = '';\n");
+    }
+
+    #[test]
+    fn quotes_do_not_auto_close_in_prose() {
+        // The apostrophe rule survives the new behaviour: `don't` in a comment or in a
+        // grammarless file must stay `don't` — the parse tree is what draws the line.
+        let mut d = doc("<?php\n// don\n");
+        d.move_to(d.buffer.text().find("don").unwrap() + 3, false);
+        assert!(!d.insert_with_pairs("'"), "a comment is prose");
+
+        let mut d = Document::new(Some(PathBuf::from("notes.txt")), "don", false).unwrap();
+        d.move_to(3, false);
+        assert!(!d.insert_with_pairs("'"), "no grammar is prose too");
+
+        // Inside a string: typing a *different* quote must not pair either.
+        let mut d = doc("<?php\n$a = \"it\";\n");
+        d.move_to(d.buffer.text().find("it").unwrap() + 2, false);
+        assert!(!d.insert_with_pairs("'"), "inside a string is prose");
+    }
+
+    #[test]
+    fn a_quote_next_to_a_word_stays_bare() {
+        // `$a = it` + `'` — adjacency vetoes, same as brackets before a word.
+        let mut d = doc("<?php\n$a = it;\n");
+        d.move_to(d.buffer.text().find(';').unwrap(), false);
+        assert!(!d.insert_with_pairs("'"));
+    }
+
+    #[test]
+    fn typing_the_closing_quote_types_over_it() {
+        let mut d = doc("<?php\n$a = ;\n");
+        d.move_to(d.buffer.text().find(';').unwrap(), false);
+        d.insert_with_pairs("'");
+        assert!(d.insert_with_pairs("'"), "the second quote steps past");
+        assert_eq!(d.buffer.text(), "<?php\n$a = '';\n", "still two quotes, not four");
+    }
+
+    // --- PHP array smart keys ----------------------------------------------------------
+
+    #[test]
+    fn equals_inside_an_array_becomes_an_arrow() {
+        // `['name' =` is only ever the start of `=>` — the PhpStorm behaviour the owner
+        // asked for, with the spacing of the example: `['name' => 'Ricardo']`.
+        let mut d = doc("<?php\n$a = ['name'];\n");
+        d.move_to(d.buffer.text().find("']").unwrap() + 1, false);
+        assert!(d.insert_with_pairs("="));
+        assert_eq!(d.buffer.text(), "<?php\n$a = ['name' => ];\n");
+
+        // With the space already typed, no double space.
+        let mut d = doc("<?php\n$a = ['name' ];\n");
+        d.move_to(d.buffer.text().find(" ]").unwrap() + 1, false);
+        assert!(d.insert_with_pairs("="));
+        assert_eq!(d.buffer.text(), "<?php\n$a = ['name' => ];\n");
+    }
+
+    #[test]
+    fn a_greater_than_right_after_the_arrow_is_swallowed() {
+        // The habit of typing `=>` in full must not produce `=>>`.
+        let mut d = doc("<?php\n$a = ['name'];\n");
+        d.move_to(d.buffer.text().find("']").unwrap() + 1, false);
+        d.insert_with_pairs("=");
+        assert!(d.insert_with_pairs(">"), "swallowed");
+        assert_eq!(d.buffer.text(), "<?php\n$a = ['name' => ];\n", "no second >");
+    }
+
+    #[test]
+    fn equals_outside_an_array_is_just_equals() {
+        let mut d = doc("<?php\n$a ;\n");
+        d.move_to(d.buffer.text().find(';').unwrap(), false);
+        assert!(!d.insert_with_pairs("="), "assignment is not an arrow");
+    }
+
+    #[test]
+    fn equals_inside_a_nested_call_is_not_an_arrow() {
+        // `['k' => f($x )]` — inside the call's arguments `=` is an assignment again.
+        let mut d = doc("<?php\n$a = ['k' => f($x )];\n");
+        d.move_to(d.buffer.text().find(" )").unwrap() + 1, false);
+        assert!(!d.insert_with_pairs("="));
     }
 
     #[test]
