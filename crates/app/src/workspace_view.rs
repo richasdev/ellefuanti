@@ -1228,6 +1228,21 @@ impl WorkspaceView {
         }
     }
 
+    /// The database header's "expand all": every table shows its columns — the bulk
+    /// counterpart of clicking each name (#65), mirroring the explorer's pair.
+    fn expand_all_db(&mut self, cx: &mut Context<Self>) {
+        if let Some(Ok(tables)) = self.db_schema.as_ref() {
+            self.db_expanded = tables.iter().map(|table| table.name.clone()).collect();
+            cx.notify();
+        }
+    }
+
+    /// Back to the clean list of table names.
+    fn collapse_all_db(&mut self, cx: &mut Context<Self>) {
+        self.db_expanded.clear();
+        cx.notify();
+    }
+
     // --- file opening ------------------------------------------------------------
 
     /// The active tab's editor handle, for render tests that need to inspect it.
@@ -1380,6 +1395,16 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn db_expanded_for_test(&self, table: &str) -> bool {
         self.db_expanded.contains(table)
+    }
+
+    #[cfg(test)]
+    pub fn expand_all_db_for_test(&mut self, cx: &mut Context<Self>) {
+        self.expand_all_db(cx);
+    }
+
+    #[cfg(test)]
+    pub fn collapse_all_db_for_test(&mut self, cx: &mut Context<Self>) {
+        self.collapse_all_db(cx);
     }
 
     #[cfg(test)]
@@ -7703,6 +7728,13 @@ impl WorkspaceView {
                     .when(
                         self.sidebar == Sidebar::Explorer && self.tree.is_some(),
                         |el| el.child(self.render_explorer_header_buttons(theme, cx)),
+                    )
+                    // The same pair for the schema panel: there is only something to fold
+                    // once tables actually loaded.
+                    .when(
+                        self.sidebar == Sidebar::Database
+                            && matches!(&self.db_schema, Some(Ok(tables)) if !tables.is_empty()),
+                        |el| el.child(self.render_db_header_buttons(theme, cx)),
                     ),
             )
             .child(match self.sidebar {
@@ -7854,6 +7886,50 @@ impl WorkspaceView {
             .items_center()
             .gap_1()
             .child(reveal)
+            .child(button(icons::EXPAND_ALL, "Expand All", true))
+            .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
+    }
+
+    /// The database header's expand-all / collapse-all pair — the explorer's buttons
+    /// (above) pointed at the schema's expanded-tables set instead of the tree. Same
+    /// glyphs, same tooltips, so the two panels read as one system.
+    fn render_db_header_buttons(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let muted = theme.text_muted;
+        let hover = theme.hover;
+        let pressed = theme.pressed;
+
+        let button = move |icon: &'static str, label: &'static str, expand: bool| {
+            let entity = entity.clone();
+            div()
+                .id(label)
+                .size(px(22.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|el| el.bg(hover))
+                .active(|el| el.bg(pressed))
+                .tooltip(crate::tooltip::Tooltip::text(label))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        if expand {
+                            this.expand_all_db(cx);
+                        } else {
+                            this.collapse_all_db(cx);
+                        }
+                    });
+                })
+                .child(svg().path(icon).size(px(16.0)).text_color(muted))
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
             .child(button(icons::EXPAND_ALL, "Expand All", true))
             .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
     }

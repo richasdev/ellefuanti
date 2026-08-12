@@ -3524,6 +3524,38 @@ fn rusqlite_fixture(path: &std::path::Path) {
     .unwrap();
 }
 
+/// The database header's expand-all opens every table's columns at once; collapse-all
+/// returns to the clean list — the explorer's pair, pointed at the schema.
+#[gpui::test]
+async fn db_expand_all_and_collapse_all_drive_every_table(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    rusqlite_fixture(&dir.path().join("database/database.sqlite"));
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+    workspace.update(cx, |workspace, cx| workspace.show_database_panel_for_test(cx));
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| workspace.expand_all_db_for_test(cx));
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.db_expanded_for_test("users"), "expand-all opens users");
+        assert!(workspace.db_expanded_for_test("posts"), "expand-all opens posts");
+    });
+
+    workspace.update(cx, |workspace, cx| workspace.collapse_all_db_for_test(cx));
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.db_expanded_for_test("users"), "collapse-all closes users");
+        assert!(!workspace.db_expanded_for_test("posts"), "collapse-all closes posts");
+    });
+
+    draw(cx);
+}
+
 /// Inside `wire:click="…"` the component's actions arrive; `wire:model` its properties (#24).
 ///
 /// The class resolves by convention from the view path; the scanner decides which list
