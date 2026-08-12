@@ -22,7 +22,13 @@ command -v hdiutil >/dev/null || { echo "hdiutil not found; macOS only" >&2; exi
 # Applications symlink, nothing else.
 rm -rf "$STAGING" "$DMG"
 mkdir -p "$STAGING"
-cp -R "$APP" "$STAGING/"
+
+# `ditto`, not `cp -R`: cp does not carry a bundle's `_CodeSignature/` directory across,
+# and a signed .app that arrives without its seal is *worse* than an unsigned one —
+# `spctl` reports "code has no resources but signature indicates they must be present"
+# and macOS shows the app as damaged. ditto is Apple's own bundle-preserving copy and
+# keeps the signature, extended attributes and resource forks intact.
+ditto "$APP" "$STAGING/$(basename "$APP")"
 ln -s /Applications "$STAGING/Applications"
 
 # UDZO is the compressed read-only format every macOS opens; the volume name is what the
