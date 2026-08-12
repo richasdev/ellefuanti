@@ -80,6 +80,9 @@ enum Job {
     Save,
     QuickOpenIndex,
     RouteIndex,
+    /// The autosave debounce timer (#25). Its own slot so each keystroke supersedes the
+    /// pending save — the file is written once the user pauses, not on every key.
+    AutosaveDebounce,
     /// Reading the project database's schema for the sidebar (#65). Its own slot:
     /// clicking Database twice must supersede, not race.
     DbSchema,
@@ -245,6 +248,12 @@ const MAX_HISTORY: usize = 50;
 /// Return and the three option toggles skip it entirely — those are statements that the
 /// query is finished, and making them wait would be the control ignoring an explicit act.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How long the editor waits after the last keystroke before autosaving (#25). VS
+/// Code's `afterDelay` default is 1000ms; matching it means the file is on disk a second
+/// after you stop typing, which is what "auto save" means to someone coming from there —
+/// the window-blur trigger alone left the owner thinking it did nothing.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(1000);
 
 /// Where the cursor has been, so Back and Forward can retrace it.
 ///
@@ -2990,10 +2999,27 @@ impl WorkspaceView {
         // keeps a single letter from opening a hundred-row list on every keystroke.
         let declared = self.is_completion_trigger(text)
             || self.should_open_on_word_char(text, cx);
+        self.schedule_autosave(cx);
         if !Self::should_open_on_trigger(self.completion.is_some(), declared) {
             return;
         }
         self.open_completion(CompletionTrigger::Character, window, cx);
+    }
+
+    /// Arms (or re-arms) the autosave debounce — a save one second after the last
+    /// keystroke, when autosave is on. Each call supersedes the pending timer through the
+    /// job slot, so typing continuously never saves mid-word; pausing does. This is the
+    /// trigger the owner expected (VS Code's afterDelay); the window-blur save stays as a
+    /// backstop for when you leave without pausing.
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        if !crate::settings::current(cx).autosave() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AUTOSAVE_DEBOUNCE).await;
+            this.update(cx, |this, cx| this.autosave_dirty_tabs(cx)).ok();
+        });
+        self.jobs.start(Job::AutosaveDebounce, task);
     }
 
     /// Whether typing `text` (one keystroke) should open the popup as an
@@ -3624,6 +3650,9 @@ impl WorkspaceView {
     fn completion_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor().cloned() else { return };
         let landed_as_typed = editor.update(cx, |editor, cx| editor.insert_typed(text, cx));
+        // Typing with the popup open still edits the buffer, so it must re-arm autosave
+        // too — otherwise a whole completion-driven edit session never triggers a save.
+        self.schedule_autosave(cx);
 
         // The keystroke did something other than insert its own character — typed over an
         // auto-inserted closer, or opened a pair and wrote two. Mirroring it into the filter
