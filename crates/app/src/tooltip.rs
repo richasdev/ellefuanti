@@ -24,6 +24,12 @@ impl Tooltip {
         let text = text.into();
         move |_window, cx| cx.new(|_cx| Tooltip { text: text.clone() }).into()
     }
+
+    /// The same one-line card as a plain view — `on_drag` wants an `Entity<impl Render>`
+    /// to float under the pointer, and this label is exactly that shape already.
+    pub fn new(text: impl Into<SharedString>) -> Self {
+        Tooltip { text: text.into() }
+    }
 }
 
 /// The label an activity-bar icon shows: its name, or the name plus the honest

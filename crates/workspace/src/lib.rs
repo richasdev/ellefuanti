@@ -12,6 +12,6 @@ mod fs;
 pub use file_index::{CancelFlag, IndexedFile, MAX_INDEXED_FILES, index_files};
 pub use file_tree::{Entry, EntryKind, FileTree};
 pub use fs::{
-    ReadFile, create_directory, create_file, delete, read_file, rename, validate_file_name,
-    write_file,
+    ReadFile, create_directory, create_file, delete, move_entry, read_file, rename,
+    validate_file_name, write_file,
 };

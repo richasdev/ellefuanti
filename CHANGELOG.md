@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-08-12
+
+### Added
+
+- Drag & drop: files/folders from Finder open in the app (a folder becomes the project);
+  tree entries move between folders by drag, with open tabs following the move; tabs
+  reorder by drag, and the active file stays active wherever its tab lands.
+- Database panel: expand-all / collapse-all buttons on the header, the explorer's pair
+  pointed at the schema's tables.
+- Explorer: the active file's row carries a persistent highlight, so the tree always
+  answers "which file am I in".
+- Tab strip: activating a tab (tree click, palette, go-to-definition) scrolls it into
+  view instead of selecting it off-screen.
+- File tree auto-refresh: an FS watcher (FSEvents via `notify`) follows Finder, terminal
+  and in-app creations/deletions/renames — no manual refresh, `.git` churn filtered,
+  events debounced 300 ms.
+
+### Changed
+
+- The 64 MB file-size open limit is gone: any file opens (a multi-GB file loads fully
+  into memory, by explicit owner choice).
+
 ## [0.1.0] — 2026-08-12
 
 First release. A working native IDE for PHP, Laravel, Livewire and Blade — GPU-accelerated,

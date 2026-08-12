@@ -69,6 +69,21 @@ struct Tab {
     editor: Entity<EditorView>,
 }
 
+/// What a tree row's drag carries: enough to move the entry when it lands on a
+/// directory. A plain value, not an entity — gpui clones it into the drag state.
+#[derive(Clone)]
+struct DraggedTreeEntry {
+    path: PathBuf,
+}
+
+/// What a tab's drag carries: its index at drag start, resolved against the tabs vec
+/// at drop. Stale-index safety is the drop handler's bounds check, not a lookup — the
+/// strip cannot reorder itself mid-drag.
+#[derive(Clone, Copy)]
+struct DraggedTab {
+    index: usize,
+}
+
 /// The kinds of background work the workspace runs, one slot each.
 ///
 /// The slot is the unit of cancellation: starting a second folder load supersedes the
@@ -496,6 +511,14 @@ pub struct WorkspaceView {
     tree: Option<FileTree>,
     /// Scrolls the file tree so a revealed file is on screen (the mira button, #71 cousin).
     tree_scroll: gpui::UniformListScrollHandle,
+    /// Scrolls the tab strip so the active tab is visible — activating a tab from the
+    /// tree or palette with twenty open otherwise selects it off-screen (owner request).
+    tab_scroll: gpui::ScrollHandle,
+    /// Keeps the FS watcher and its debounce task alive so the tree follows Finder,
+    /// terminals and the app's own file operations without a manual refresh (owner
+    /// request). The sender is held for tests, which have no real FSEvents to fire.
+    /// Dropping the tuple (a new root, or shutdown) un-watches and ends the task.
+    tree_watcher: Option<(notify::RecommendedWatcher, smol::channel::Sender<()>, gpui::Task<()>)>,
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
@@ -701,6 +724,8 @@ impl WorkspaceView {
             registry,
             tree: None,
             tree_scroll: gpui::UniformListScrollHandle::new(),
+            tab_scroll: gpui::ScrollHandle::new(),
+            tree_watcher: None,
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
@@ -799,8 +824,10 @@ impl WorkspaceView {
     /// server and the other one quietly not — which is the shape of #125, where `start_lsp`
     /// had exactly one caller and nobody noticed.
     fn adopt_tree(&mut self, tree: FileTree, cx: &mut Context<Self>) {
+        let root = tree.root().to_path_buf();
         self.tree = Some(tree);
         self.status = None;
+        self.start_tree_watcher(root, cx);
         // A run belongs to the project it was started in. Its results name files in the old
         // tree and its `--filter` names the old suite, so carrying either into a new project
         // would show verdicts about code the user is no longer looking at. The panel goes
@@ -1228,6 +1255,41 @@ impl WorkspaceView {
         }
     }
 
+    /// Scrolls the tab strip so the active tab is on screen. Called after every
+    /// `active_tab` assignment — activation and visibility are one gesture; a tab
+    /// selected off-screen looks like nothing happened.
+    fn scroll_active_tab_into_view(&self) {
+        self.tab_scroll.scroll_to_item(self.active_tab);
+    }
+
+    /// A tab dragged from `from` lands in slot `to`; the file the user was in stays
+    /// active wherever its tab went (`active_after_reorder`'s contract, tested there).
+    fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = active_after_reorder(self.active_tab, from, to);
+        self.scroll_active_tab_into_view();
+        cx.notify();
+    }
+
+    /// The database header's "expand all": every table shows its columns — the bulk
+    /// counterpart of clicking each name (#65), mirroring the explorer's pair.
+    fn expand_all_db(&mut self, cx: &mut Context<Self>) {
+        if let Some(Ok(tables)) = self.db_schema.as_ref() {
+            self.db_expanded = tables.iter().map(|table| table.name.clone()).collect();
+            cx.notify();
+        }
+    }
+
+    /// Back to the clean list of table names.
+    fn collapse_all_db(&mut self, cx: &mut Context<Self>) {
+        self.db_expanded.clear();
+        cx.notify();
+    }
+
     // --- file opening ------------------------------------------------------------
 
     /// The active tab's editor handle, for render tests that need to inspect it.
@@ -1380,6 +1442,16 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn db_expanded_for_test(&self, table: &str) -> bool {
         self.db_expanded.contains(table)
+    }
+
+    #[cfg(test)]
+    pub fn expand_all_db_for_test(&mut self, cx: &mut Context<Self>) {
+        self.expand_all_db(cx);
+    }
+
+    #[cfg(test)]
+    pub fn collapse_all_db_for_test(&mut self, cx: &mut Context<Self>) {
+        self.collapse_all_db(cx);
     }
 
     #[cfg(test)]
@@ -1922,6 +1994,7 @@ impl WorkspaceView {
         window.focus(&editor.read(cx).focus_handle(cx));
         self.tabs.push(Tab { path, editor });
         self.active_tab = self.tabs.len() - 1;
+        self.scroll_active_tab_into_view();
         cx.notify();
     }
 
@@ -2018,6 +2091,7 @@ impl WorkspaceView {
     ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
+            self.scroll_active_tab_into_view();
             self.clear_hover_cards(cx);
             // A file already open still has to move: "go to definition" on something in the
             // current file is the common case, and leaving the cursor where it was would
@@ -2061,6 +2135,7 @@ impl WorkspaceView {
                                 window.focus(&editor.read(cx).focus_handle(cx));
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
+                                this.scroll_active_tab_into_view();
                                 this.status = None;
                                 this.open_on_lsp(&path, &text, cx);
                             }
@@ -2099,6 +2174,7 @@ impl WorkspaceView {
                 window.focus(&editor.read(cx).focus_handle(cx));
                 self.tabs.push(Tab { path: None, editor });
                 self.active_tab = self.tabs.len() - 1;
+                self.scroll_active_tab_into_view();
                 self.status = None;
             }
             // Plain text needs no grammar, so this is unreachable in practice — but it is a
@@ -2375,6 +2451,7 @@ impl WorkspaceView {
             self.close_on_lsp(path);
         }
         self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
+        self.scroll_active_tab_into_view();
         self.clear_hover_cards(cx);
         cx.notify();
     }
@@ -5386,6 +5463,54 @@ impl WorkspaceView {
         }
     }
 
+    /// A tree row was dropped on a directory (or the empty space, meaning the root).
+    ///
+    /// Synchronous, unlike delete: a rename within one filesystem is a metadata operation
+    /// at human-drag speed, and `move_entry` carries the refusals (own subtree, existing
+    /// name, outside the root) that make it safe to call with whatever was dropped.
+    /// The moved file's open tabs follow via the rename machinery above — same operation
+    /// as far as a buffer is concerned.
+    fn drop_tree_entry(&mut self, source: PathBuf, dest_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else {
+            return;
+        };
+        match elle_workspace::move_entry(&source, &dest_dir, &root) {
+            Ok(dest) if dest == source => {} // dropped where it already lives
+            Ok(dest) => {
+                self.retarget_tabs(&source, &dest, cx);
+                self.refresh_tree(cx);
+            }
+            Err(err) => {
+                self.status = Some(format!("{err:#}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Files dragged in from Finder (owner request): a folder becomes the open project,
+    /// a file becomes a tab. Both doors already exist — this is only a third handle on
+    /// them, which is what keeps a dropped folder and ⌘O indistinguishable afterwards.
+    fn external_drop(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for path in paths {
+            if path.is_dir() {
+                match FileTree::new(path.clone()) {
+                    Ok(tree) => self.adopt_tree(tree, cx),
+                    Err(err) => {
+                        self.status = Some(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                }
+            } else {
+                self.open_path(path.clone(), window, cx);
+            }
+        }
+    }
+
     /// The delete confirmation was accepted.
     ///
     /// The `root` handed to `elle_workspace::delete` is what keeps a recursive delete inside
@@ -5478,6 +5603,86 @@ impl WorkspaceView {
             self.status = Some(format!("{err:#}").into());
         }
         cx.notify();
+    }
+
+    /// Watches the root so the tree follows Finder, terminals and `mkdir` without a
+    /// manual refresh (owner request).
+    ///
+    /// The watcher's callback runs on notify's own thread, where touching an `Entity`
+    /// is not allowed, so it only pokes a channel — the same marshalling shape as the
+    /// test runner's event stream. A foreground task debounces 300 ms on gpui's
+    /// executor (test-controllable time, like the search debounce) and drains the
+    /// burst, so a `composer install` that touches a thousand paths costs a handful of
+    /// refreshes rather than a thousand.
+    ///
+    /// `.git` churn is filtered at the callback: every `git status` the git panel runs
+    /// rewrites index files, and refreshing the tree for those would make the watcher
+    /// its own noisiest client. Watcher setup failure is non-fatal — the tree just
+    /// stays manual-refresh, which is what it was before this existed.
+    fn start_tree_watcher(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        use notify::Watcher as _;
+
+        self.tree_watcher = None; // a replaced root un-watches before re-watching
+        let (tx, rx) = smol::channel::unbounded::<()>();
+        let git_dir = root.join(".git");
+        let callback_tx = tx.clone();
+        let mut watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let Ok(event) = event else { return };
+                if !event.paths.is_empty() && event.paths.iter().all(|p| p.starts_with(&git_dir))
+                {
+                    return;
+                }
+                // A full channel cannot happen (unbounded); a closed one means the
+                // workspace moved on, and the watcher is about to be dropped with it.
+                let _ = callback_tx.try_send(());
+            }) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    eprintln!("ellefuanti: tree watcher unavailable ({err}); refresh stays manual");
+                    return;
+                }
+            };
+        if let Err(err) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
+            eprintln!(
+                "ellefuanti: cannot watch {} ({err}); refresh stays manual",
+                root.display()
+            );
+            return;
+        }
+
+        let timer_executor = cx.background_executor().clone();
+        let task = cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_ok() {
+                timer_executor.timer(std::time::Duration::from_millis(300)).await;
+                while rx.try_recv().is_ok() {} // coalesce the burst into one refresh
+                if this.update(cx, |this, cx| this.refresh_tree(cx)).is_err() {
+                    break; // the workspace is gone; so is the point
+                }
+            }
+        });
+        self.tree_watcher = Some((watcher, tx, task));
+    }
+
+    /// Simulates one FS event, since a headless test has no FSEvents to fire. Goes
+    /// through the real channel, debounce and refresh path.
+    #[cfg(test)]
+    pub fn poke_tree_watcher_for_test(&self) -> bool {
+        match self.tree_watcher.as_ref() {
+            Some((_, tx, _)) => tx.try_send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Starts the real watcher, which `open_folder_for_test` deliberately does not:
+    /// most tests want a root, not an FSEvents stream per test.
+    #[cfg(test)]
+    pub fn start_tree_watcher_for_test(
+        &mut self,
+        root: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_tree_watcher(root, cx);
     }
 
     /// Sets the syntax language for the active tab (#127).
@@ -6487,6 +6692,23 @@ fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
     active.min(remaining.saturating_sub(1))
 }
 
+/// Which tab is active after the one at `from` is dragged to `to` — the strip's reorder.
+///
+/// The identity rule: the *file* the user was in stays active, wherever its tab lands.
+/// Moving the active tab means the active index follows it; dragging another tab across
+/// the active one shifts it by one, the same slide `active_after_close` handles.
+fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
+    if active == from {
+        to
+    } else if from < active && to >= active {
+        active - 1
+    } else if from > active && to <= active {
+        active + 1
+    } else {
+        active
+    }
+}
+
 /// Recovers the `&'static str` id for a title the palette returned.
 ///
 /// `CommandId` holds a `&'static str` so the registry costs no allocation; the palette
@@ -6575,6 +6797,12 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
             .on_action(cx.listener(|this, _: &ResetFontSize, _w, cx| this.zoom(None, cx)))
+            // Finder drops land on the whole window: a file opens, a folder becomes the
+            // project. Registered here rather than on a target strip because there is no
+            // wrong place to drop a file onto an editor.
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                this.external_drop(paths.paths(), window, cx);
+            }))
             .relative()
             .size_full()
             .flex()
@@ -7703,6 +7931,13 @@ impl WorkspaceView {
                     .when(
                         self.sidebar == Sidebar::Explorer && self.tree.is_some(),
                         |el| el.child(self.render_explorer_header_buttons(theme, cx)),
+                    )
+                    // The same pair for the schema panel: there is only something to fold
+                    // once tables actually loaded.
+                    .when(
+                        self.sidebar == Sidebar::Database
+                            && matches!(&self.db_schema, Some(Ok(tables)) if !tables.is_empty()),
+                        |el| el.child(self.render_db_header_buttons(theme, cx)),
                     ),
             )
             .child(match self.sidebar {
@@ -7741,6 +7976,8 @@ impl WorkspaceView {
                     // belonging to nothing.
                     Some(tree) if !tree.is_empty() => {
                         let entity = cx.entity();
+                        let drop_entity = entity.clone();
+                        let root = tree.root().to_path_buf();
                         div()
                             // A flex column, not a block: the rows list sizes itself with
                             // `flex_1`, which in a non-flex parent is the exact zero-height
@@ -7751,6 +7988,18 @@ impl WorkspaceView {
                             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                                 entity.update(cx, |this, cx| {
                                     this.open_tree_root_menu(event.position, window, cx);
+                                });
+                            })
+                            // The space below the rows means "the root": dropping there
+                            // moves the entry to the top level, the same way the
+                            // right-click there creates at the top level (#126).
+                            .on_drop(move |dragged: &DraggedTreeEntry, _window, cx| {
+                                drop_entity.update(cx, |this, cx| {
+                                    this.drop_tree_entry(
+                                        dragged.path.clone(),
+                                        root.clone(),
+                                        cx,
+                                    );
                                 });
                             })
                             .child(self.render_tree_rows(tree.len(), theme, cx))
@@ -7858,6 +8107,50 @@ impl WorkspaceView {
             .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
     }
 
+    /// The database header's expand-all / collapse-all pair — the explorer's buttons
+    /// (above) pointed at the schema's expanded-tables set instead of the tree. Same
+    /// glyphs, same tooltips, so the two panels read as one system.
+    fn render_db_header_buttons(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let muted = theme.text_muted;
+        let hover = theme.hover;
+        let pressed = theme.pressed;
+
+        let button = move |icon: &'static str, label: &'static str, expand: bool| {
+            let entity = entity.clone();
+            div()
+                .id(label)
+                .size(px(22.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|el| el.bg(hover))
+                .active(|el| el.bg(pressed))
+                .tooltip(crate::tooltip::Tooltip::text(label))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        if expand {
+                            this.expand_all_db(cx);
+                        } else {
+                            this.collapse_all_db(cx);
+                        }
+                    });
+                })
+                .child(svg().path(icon).size(px(16.0)).text_color(muted))
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(button(icons::EXPAND_ALL, "Expand All", true))
+            .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
+    }
+
     fn render_tree_rows(
         &self,
         count: usize,
@@ -7878,10 +8171,17 @@ impl WorkspaceView {
         let modified: std::collections::HashSet<PathBuf> =
             self.git.read(cx).state().files().iter().map(|file| file.path.clone()).collect();
 
+        let selection = theme.selection;
         let tree_scroll = self.tree_scroll.clone();
         uniform_list("file-tree", count, move |range, _window, cx| {
             entity.update(cx, |this, _cx| {
                 let Some(tree) = this.tree.as_ref() else { return Vec::new() };
+                // The active tab's file gets a persistent row tint — "which file am I
+                // in" answered by the tree itself (owner request). Read here, not
+                // captured outside: the closure re-runs per frame and the active tab
+                // changes under it.
+                let active_path =
+                    this.tabs.get(this.active_tab).and_then(|tab| tab.path.clone());
 
                 range
                     .filter_map(|index| {
@@ -7902,6 +8202,7 @@ impl WorkspaceView {
                             icons::for_file(&entry.name)
                         };
                         let is_modified = modified.contains(&path);
+                        let is_active = active_path.as_deref() == Some(path.as_path());
 
                         Some(
                             div()
@@ -7914,10 +8215,46 @@ impl WorkspaceView {
                                 .pl(px(8.0 + entry.depth as f32 * 12.0))
                                 .hover(|el| el.bg(hover))
                                 .active(|el| el.bg(pressed))
+                                // Every row can be picked up; the label under the pointer
+                                // is the entry's name (the tooltip card, repurposed —
+                                // gpui only wants some `Render` to float).
+                                .on_drag(
+                                    DraggedTreeEntry { path: path.clone() },
+                                    |dragged, _offset, _window, cx| {
+                                        let name = dragged
+                                            .path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default();
+                                        cx.new(|_| crate::tooltip::Tooltip::new(name))
+                                    },
+                                )
+                                // Only directories receive: dropping a file on a file has
+                                // no meaning this tree wants to invent. The tint says
+                                // "this folder will take it" before the mouse commits.
+                                .when(is_dir, |el| {
+                                    let drop_entity = entity.clone();
+                                    let dest = path.clone();
+                                    el.drag_over::<DraggedTreeEntry>(move |style, _, _, _| {
+                                        style.bg(selection)
+                                    })
+                                    .on_drop(move |dragged: &DraggedTreeEntry, _window, cx| {
+                                        drop_entity.update(cx, |this, cx| {
+                                            this.drop_tree_entry(
+                                                dragged.path.clone(),
+                                                dest.clone(),
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                })
+                                // Persistent, unlike hover: the tint follows the active
+                                // tab so the tree always answers "which file am I in".
+                                .when(is_active, |el| el.bg(selection))
                                 .cursor_pointer()
                                 .text_color(if modified.contains(&path) {
                                     modified_color
-                                } else if is_dir {
+                                } else if is_dir || is_active {
                                     text
                                 } else {
                                     muted
@@ -8060,6 +8397,9 @@ impl WorkspaceView {
             // is a plain flex container and many tabs either squeeze below legibility or
             // overflow off the window edge with no way to reach them — the report.
             .id("tab-strip")
+            // The handle is what `scroll_active_tab_into_view` drives; tracking gives
+            // it the children's bounds so `scroll_to_item` can aim at a tab.
+            .track_scroll(&self.tab_scroll)
             .h(Metrics::TAB_HEIGHT)
             .flex_none()
             .flex()
@@ -8085,9 +8425,28 @@ impl WorkspaceView {
                 let (icon, icon_color) = icons::for_file(&title);
                 let entity = entity.clone();
                 let close_entity = entity.clone();
+                let drop_entity = entity.clone();
+                let drag_title = title.clone();
+                let accent = theme.accent;
 
                 div()
                     .id(("tab", index))
+                    // Tabs reorder by drag (owner request). The dragged value is the
+                    // index at pick-up; the strip cannot reorder under an open drag, so
+                    // resolving it at drop is safe with a bounds check.
+                    .on_drag(DraggedTab { index }, move |_dragged, _offset, _window, cx| {
+                        cx.new(|_| crate::tooltip::Tooltip::new(drag_title.clone()))
+                    })
+                    // The accent border says "it lands here" — dropping on a tab puts
+                    // the dragged one in its place.
+                    .drag_over::<DraggedTab>(move |style, _, _, _| {
+                        style.border_l_2().border_color(accent)
+                    })
+                    .on_drop(move |dragged: &DraggedTab, _window, cx| {
+                        drop_entity.update(cx, |this, cx| {
+                            this.reorder_tab(dragged.index, index, cx);
+                        });
+                    })
                     .flex()
                     // `flex_none` is the other half of the scroll fix: in a plain flex row
                     // the tabs shrink to share the width, which is the "squeeze" — with many
@@ -8118,6 +8477,7 @@ impl WorkspaceView {
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                         entity.update(cx, |this, cx| {
                             this.active_tab = index;
+                            this.scroll_active_tab_into_view();
                             this.clear_hover_cards(cx);
                             cx.notify();
                         });
@@ -8957,6 +9317,19 @@ mod tests {
         assert_eq!(active_after_close(2, 2, 2), 1);
         // Closing the only tab leaves nothing; index 0 is what an empty tab bar renders as.
         assert_eq!(active_after_close(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn reordering_tabs_keeps_the_same_file_active() {
+        // Dragging the active tab: the selection follows it to where it lands.
+        assert_eq!(active_after_reorder(1, 1, 3), 3);
+        assert_eq!(active_after_reorder(3, 3, 0), 0);
+        // Dragging another tab across the active one shifts it by one slot.
+        assert_eq!(active_after_reorder(2, 0, 3), 1, "left-of-active dragged past it");
+        assert_eq!(active_after_reorder(1, 3, 0), 2, "right-of-active dragged before it");
+        // A drag that never crosses the active tab leaves it alone.
+        assert_eq!(active_after_reorder(0, 1, 2), 0);
+        assert_eq!(active_after_reorder(3, 1, 2), 3);
     }
 
     #[test]

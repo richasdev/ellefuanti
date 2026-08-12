@@ -2278,6 +2278,44 @@ fn project() -> tempfile::TempDir {
     dir
 }
 
+/// A filesystem change refreshes the tree by itself — no manual refresh (owner request).
+///
+/// The event is fired through the watcher's own channel rather than by waiting on real
+/// FSEvents: the debounce and refresh path is what this test owns; delivery from the OS
+/// to the callback is notify's contract. Time is advanced, not slept — the debounce
+/// timer runs on gpui's executor exactly so a test controls it (the search pattern).
+#[gpui::test]
+async fn the_tree_refreshes_itself_when_the_filesystem_changes(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.start_tree_watcher_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    std::fs::create_dir(dir.path().join("nova")).unwrap();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            !workspace.tree_names_for_test().contains(&"nova".to_string()),
+            "not yet — nothing has refreshed"
+        );
+        assert!(workspace.poke_tree_watcher_for_test(), "the watcher is running");
+    });
+
+    cx.executor().advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.tree_names_for_test().contains(&"nova".to_string()),
+            "the new folder appeared without a manual refresh"
+        );
+    });
+
+    draw(cx);
+}
+
 /// Right-clicking a row opens a menu about *that* row.
 ///
 /// The report #126 came from was "não dá pra apertar click direito" — there was no
@@ -3522,6 +3560,38 @@ fn rusqlite_fixture(path: &std::path::Path) {
          CREATE TABLE posts (id INTEGER PRIMARY KEY);",
     )
     .unwrap();
+}
+
+/// The database header's expand-all opens every table's columns at once; collapse-all
+/// returns to the clean list — the explorer's pair, pointed at the schema.
+#[gpui::test]
+async fn db_expand_all_and_collapse_all_drive_every_table(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    rusqlite_fixture(&dir.path().join("database/database.sqlite"));
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+    });
+    workspace.update(cx, |workspace, cx| workspace.show_database_panel_for_test(cx));
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| workspace.expand_all_db_for_test(cx));
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.db_expanded_for_test("users"), "expand-all opens users");
+        assert!(workspace.db_expanded_for_test("posts"), "expand-all opens posts");
+    });
+
+    workspace.update(cx, |workspace, cx| workspace.collapse_all_db_for_test(cx));
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.db_expanded_for_test("users"), "collapse-all closes users");
+        assert!(!workspace.db_expanded_for_test("posts"), "collapse-all closes posts");
+    });
+
+    draw(cx);
 }
 
 /// Inside `wire:click="…"` the component's actions arrive; `wire:model` its properties (#24).

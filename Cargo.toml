@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/uemuradev/ellefuanti"
@@ -62,6 +62,9 @@ tree-sitter-yaml = "0.7"
 tree-sitter-rust = "0.24"
 tree-sitter-md = "0.5"
 ignore = "0.4"
+# Tree auto-refresh: FSEvents on macOS. The alternative was a poll timer, which burns
+# wakeups to be 2 s late; the platform watcher is the standard tool and costs nothing idle.
+notify = "8"
 # Find and replace (#80). Not a new dependency in any meaningful sense: `regex` is already
 # compiled for every build via `gpui` (through `gpui_util`) and `tree-sitter`, both direct
 # dependencies of `crates/app`, so declaring it costs zero build time and adds nothing to
@@ -74,7 +77,6 @@ alacritty_terminal = "0.26"
 lsp-types = "0.97"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-notify = "8"
 
 anyhow = "1"
 thiserror = "2"
