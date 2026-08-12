@@ -565,6 +565,9 @@ pub struct WorkspaceView {
     /// selected file: not a tab (nothing to edit or close), just a read-only view that
     /// shows while a table is picked and vanishes when the sidebar leaves Database.
     db_table: Option<(String, std::result::Result<elle_db::TablePage, String>)>,
+    /// The cell being edited in the DB grid (#65): `(row index, column index, buffer)`.
+    /// One cell at a time — click to edit, Enter to write it by rowid, Esc to cancel.
+    db_editing: Option<(usize, usize, String)>,
     /// The source control panel (#64), and whether it is the visible sidebar.
     ///
     /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
@@ -670,6 +673,7 @@ impl WorkspaceView {
             db_schema: None,
             docker_services: None,
             db_table: None,
+            db_editing: None,
             db_expanded: std::collections::HashSet::new(),
             git,
             sidebar: Sidebar::default(),
@@ -1242,6 +1246,26 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.open_db_table(table.to_string(), cx);
+    }
+
+    #[cfg(test)]
+    pub fn db_edit_flow_for_test(
+        &mut self,
+        row: usize,
+        col: usize,
+        typed: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_db_edit(row, col, window, cx);
+        // Replace the seeded value — "set this cell to `typed`".
+        if let Some((_, _, buffer)) = &mut self.db_editing {
+            buffer.clear();
+        }
+        for ch in typed.chars() {
+            self.db_edit_typed(&ch.to_string(), cx);
+        }
+        self.db_edit_commit(cx);
     }
 
     #[cfg(test)]
@@ -6955,14 +6979,96 @@ impl WorkspaceView {
     }
 
     /// Opens a table's first page of rows in the editor area (#65).
+    /// Starts editing a DB cell — the buffer seeds from its current text (#65).
+    fn begin_db_edit(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, Ok(page))) = &self.db_table else { return };
+        // Only an editable row (one with a rowid) can be edited; a WITHOUT ROWID table's
+        // rows have no key and stay read-only.
+        if page.rowids.get(row).copied().flatten().is_none() {
+            self.status = Some("This table has no rowid — its cells are read-only".into());
+            cx.notify();
+            return;
+        }
+        let seed = page.rows.get(row).and_then(|r| r.get(col)).cloned().unwrap_or_default();
+        // A NULL cell edits from empty, not the literal word.
+        let seed = if seed == "NULL" { String::new() } else { seed };
+        self.db_editing = Some((row, col, seed));
+        // The grid takes the keyboard so the typed characters reach the cell buffer.
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// A character typed into the cell editor.
+    fn db_edit_typed(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some((_, _, buffer)) = &mut self.db_editing {
+            buffer.push_str(text);
+            cx.notify();
+        }
+    }
+
+    fn db_edit_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, _, buffer)) = &mut self.db_editing {
+            buffer.pop();
+            cx.notify();
+        }
+    }
+
+    fn db_edit_cancel(&mut self, cx: &mut Context<Self>) {
+        if self.db_editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Commits the cell edit by rowid via `update_cell`, then re-reads the page (#65).
+    ///
+    /// The write is guarded in the crate (rowid-addressed, name-validated, one row). An
+    /// empty buffer writes an empty string; the user who wants a real NULL types `NULL`,
+    /// mirroring how the grid shows one.
+    fn db_edit_commit(&mut self, cx: &mut Context<Self>) {
+        let Some((row, col, buffer)) = self.db_editing.take() else { return };
+        let Some((table, Ok(page))) = &self.db_table else { return };
+        let (Some(rowid), Some(column)) =
+            (page.rowids.get(row).copied().flatten(), page.columns.get(col).cloned())
+        else {
+            return;
+        };
+        let table = table.clone();
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move {
+                    let path =
+                        elle_db::env_database(&root).ok_or_else(|| "no sqlite database".to_string())?;
+                    elle_db::update_cell(&path, &table, &column, rowid, &buffer)
+                        .map_err(|err| format!("{err:#}"))
+                        .map(|()| table)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(table) => this.open_db_table(table, cx), // re-read to show the write
+                    Err(message) => {
+                        this.status = Some(format!("update failed: {message}").into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        });
+        self.jobs.start(Job::DbSchema, task);
+    }
+
     fn open_db_table(&mut self, table: String, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
         // Show the header immediately (selected state), fill the rows when the read lands.
         self.db_table = Some((table.clone(), Ok(elle_db::TablePage {
             columns: Vec::new(),
             rows: Vec::new(),
+            rowids: Vec::new(),
             total: 0,
         })));
+        self.db_editing = None;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let page = cx
@@ -6991,11 +7097,39 @@ impl WorkspaceView {
     }
 
     /// The table-rows grid for the editor area — headers, then rows, NULL distinct.
-    fn render_db_table_view(&self, theme: &Theme) -> gpui::Div {
+    fn render_db_table_view(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let self_entity_for_cells = cx.entity();
+        // Key handling for the cell editor: only meaningful while a cell is open. Bound
+        // on the grid's own div so the editor keymap does not swallow the keystrokes.
+        let editing = self.db_editing.is_some();
         let Some((name, result)) = &self.db_table else {
             return div();
         };
-        let outer = div().size_full().flex().flex_col().overflow_hidden();
+        let key_entity = self_entity_for_cells.clone();
+        let mut outer = div().size_full().flex().flex_col().overflow_hidden();
+        if editing {
+            // While a cell is open the grid takes the keyboard: printable keys extend the
+            // buffer, Backspace trims it, Enter writes it by rowid, Escape cancels. Bound
+            // here rather than through the editor keymap so the two do not fight.
+            outer = outer
+                .track_focus(&self.focus_handle)
+                .on_key_down(move |event, _window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    key_entity.update(cx, |this, cx| match key {
+                        "enter" => this.db_edit_commit(cx),
+                        "escape" => this.db_edit_cancel(cx),
+                        "backspace" => this.db_edit_backspace(cx),
+                        _ => {
+                            if let Some(text) = event.keystroke.key_char.as_deref()
+                                && !text.is_empty()
+                                && !text.chars().all(|c| c.is_control())
+                            {
+                                this.db_edit_typed(text, cx);
+                            }
+                        }
+                    });
+                });
+        }
         let Ok(page) = result else {
             let Err(message) = result else { unreachable!() };
             return outer.px_3().py_2().child(
@@ -7064,15 +7198,60 @@ impl WorkspaceView {
                                 page.columns.iter().map(|c| cell(c, true, false)),
                             ),
                     )
-                    .children(page.rows.iter().enumerate().map(|(index, row)| {
+                    .children(page.rows.iter().enumerate().map(|(row_index, row)| {
+                        let editing = self.db_editing.as_ref();
+                        let self_entity_for_cells = self_entity_for_cells.clone();
                         div()
                             .flex()
                             .flex_none()
                             .border_b_1()
                             .border_color(theme.border)
-                            .children(
-                                row.iter().map(move |value| cell(value, false, index % 2 == 1)),
-                            )
+                            .children(row.iter().enumerate().map(move |(col_index, value)| {
+                                // The cell in edit shows its buffer with a caret; every
+                                // other cell is the read-only clipped text, clickable to
+                                // start editing it.
+                                if let Some((r, c, buffer)) = editing
+                                    && *r == row_index
+                                    && *c == col_index
+                                {
+                                    div()
+                                        .w(DB_CELL_WIDTH)
+                                        .h(row_height)
+                                        .flex_none()
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .border_1()
+                                        .border_color(theme.accent)
+                                        .bg(theme.background)
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(buffer.clone()))
+                                        .child(
+                                            div().w(px(2.0)).h(px(16.0)).bg(theme.cursor),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    let entity = self_entity_for_cells.clone();
+                                    cell(value, false, row_index % 2 == 1)
+                                        .id(gpui::ElementId::Name(
+                                            format!("db-cell-{row_index}-{col_index}").into(),
+                                        ))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, cx| {
+                                                entity.update(cx, |this, cx| {
+                                                    this.begin_db_edit(
+                                                        row_index, col_index, window, cx,
+                                                    )
+                                                });
+                                            },
+                                        )
+                                        .into_any_element()
+                                }
+                            }))
                     })),
             );
 
@@ -7748,7 +7927,7 @@ impl WorkspaceView {
             (Some((file, renderer)), _, _) => {
                 render_diff(&file, renderer, theme, cx).into_any_element()
             }
-            (None, Some(_), _) => self.render_db_table_view(theme).into_any_element(),
+            (None, Some(_), _) => self.render_db_table_view(theme, cx).into_any_element(),
             (None, None, Some(editor)) => editor.clone().into_any_element(),
             (None, None, None) => div()
                 .size_full()

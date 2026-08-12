@@ -4459,3 +4459,37 @@ async fn schema_tables_collapse_and_a_click_opens_the_rows(cx: &mut TestAppConte
 
     draw(cx);
 }
+
+/// Editing a DB cell writes it to disk by rowid and re-reads the page (#65).
+#[gpui::test]
+async fn editing_a_db_cell_writes_it_to_the_database(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    let db = dir.path().join("database/database.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+                        INSERT INTO users (name) VALUES ('old');").unwrap();
+    drop(conn);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.open_db_table_for_test("users", cx);
+    });
+    cx.run_until_parked();
+
+    // Edit the name cell (row 0, col 1) to "new" (the flow replaces the seeded value).
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.db_edit_flow_for_test(0, 1, "new", window, cx);
+    });
+    cx.run_until_parked();
+
+    // The database itself has the new value.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let name: String = conn.query_row("SELECT name FROM users WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(name, "new", "the edit reached the database, keyed by rowid");
+
+    draw(cx);
+}

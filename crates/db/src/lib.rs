@@ -135,6 +135,10 @@ pub struct TablePage {
     /// Rows of display text. NULL is rendered as the word `NULL`, which a text grid can
     /// show distinctly from the empty string — the difference matters in a database.
     pub rows: Vec<Vec<String>>,
+    /// Each row's sqlite `rowid`, index-paired with `rows` — the stable key an edit
+    /// updates by. A WITHOUT ROWID table has no rowid; its rows carry `None` and
+    /// `update_cell` refuses them rather than guessing a key.
+    pub rowids: Vec<Option<i64>>,
     /// Total rows in the table, for "1–50 of 1 204" pagination labels.
     pub total: u64,
 }
@@ -163,14 +167,29 @@ pub fn table_page(path: &Path, table: &str, offset: u64, limit: u64) -> Result<T
         conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| row.get(0))?;
 
     let columns: Vec<String> = known.columns.iter().map(|column| column.name.clone()).collect();
-    let mut statement = conn.prepare(&format!(
-        "SELECT * FROM \"{table}\" ORDER BY rowid LIMIT ?1 OFFSET ?2"
-    ))?;
-    let column_count = statement.column_count();
+    // Select the rowid alongside the columns so an edit has a stable key. `rowid` is a
+    // hidden column on an ordinary table; on a WITHOUT ROWID table the alias fails, and
+    // the query falls back to one without it, leaving `rowids` all `None` (uneditable).
+    let with_rowid = format!("SELECT rowid, * FROM \"{table}\" ORDER BY rowid LIMIT ?1 OFFSET ?2");
+    let without_rowid = format!("SELECT * FROM \"{table}\" ORDER BY rowid LIMIT ?1 OFFSET ?2");
+    let (mut statement, has_rowid) = match conn.prepare(&with_rowid) {
+        Ok(stmt) => (stmt, true),
+        Err(_) => (conn.prepare(&without_rowid)?, false),
+    };
+    let total_cols = statement.column_count();
+    // With the rowid prefix, column 0 is the rowid and the data starts at 1.
+    let first_data = if has_rowid { 1 } else { 0 };
+    let mut rowids: Vec<Option<i64>> = Vec::new();
+    let column_count = total_cols;
     let rows = statement
         .query_map(rusqlite::params![limit, offset], |row| {
-            let mut out = Vec::with_capacity(column_count);
-            for index in 0..column_count {
+            if has_rowid {
+                rowids.push(row.get::<_, i64>(0).ok());
+            } else {
+                rowids.push(None);
+            }
+            let mut out = Vec::with_capacity(column_count - first_data);
+            for index in first_data..column_count {
                 // Every affinity as display text, at the driver: the grid shows text,
                 // and pushing the conversion down here keeps sqlite's own formatting
                 // (integers without a float's `.0`, blobs as a length tag).
@@ -189,7 +208,51 @@ pub fn table_page(path: &Path, table: &str, offset: u64, limit: u64) -> Result<T
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    Ok(TablePage { columns, rows, total })
+    Ok(TablePage { columns, rows, rowids, total })
+}
+
+/// Updates one cell by rowid, opening the database read-WRITE for this one statement.
+///
+/// The only write in the crate, and every guard #65 asks for is here: the table name is
+/// validated against the schema (no crafted name reaches SQL), the column name likewise,
+/// the row is addressed by its `rowid` (so exactly one row changes — a wide UPDATE is
+/// impossible by construction, there is no WHERE the caller controls), and the value is
+/// bound as a parameter. An empty rowid (WITHOUT ROWID table) is refused. The literal
+/// text `NULL` writes a real NULL, mirroring how the grid renders one.
+pub fn update_cell(
+    path: &Path,
+    table: &str,
+    column: &str,
+    rowid: i64,
+    value: &str,
+) -> Result<()> {
+    let schema = sqlite_schema(path)?;
+    let known = schema
+        .iter()
+        .find(|info| info.name == table)
+        .with_context(|| format!("{table} is not a table of this database"))?;
+    if !known.columns.iter().any(|c| c.name == column) {
+        bail!("{column} is not a column of {table}");
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .with_context(|| format!("opening {} for write", path.display()))?;
+
+    // The column name cannot be a bound parameter, so it is quoted; it was just validated
+    // against the schema, so it is a real identifier, not attacker input.
+    let sql = format!("UPDATE \"{table}\" SET \"{column}\" = ?1 WHERE rowid = ?2");
+    let changed = if value == "NULL" {
+        conn.execute(&sql, rusqlite::params![rusqlite::types::Null, rowid])?
+    } else {
+        conn.execute(&sql, rusqlite::params![value, rowid])?
+    };
+    if changed != 1 {
+        bail!("the row was not found (it may have been deleted); {changed} rows changed");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -325,6 +388,42 @@ mod page_tests {
         let page = table_page(&db, "users", 2, 2).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0][0], "3");
+    }
+
+    #[test]
+    fn a_page_carries_a_rowid_per_row_for_editing() {
+        let (_dir, db) = seeded();
+        let page = table_page(&db, "users", 0, 10).unwrap();
+        assert_eq!(page.rowids.len(), page.rows.len(), "one rowid per row");
+        assert!(page.rowids.iter().all(|r| r.is_some()), "an ordinary table has rowids");
+    }
+
+    #[test]
+    fn update_cell_changes_exactly_one_row_by_rowid() {
+        let (_dir, db) = seeded();
+        let page = table_page(&db, "users", 0, 10).unwrap();
+        let rowid = page.rowids[1].unwrap(); // the NULL-email row
+
+        update_cell(&db, "users", "email", rowid, "new@x").unwrap();
+        let after = table_page(&db, "users", 0, 10).unwrap();
+        assert_eq!(after.rows[1][1], "new@x", "the cell changed");
+        assert_eq!(after.rows[0][1], "a@x", "and only that row");
+
+        // The literal NULL writes a real NULL back.
+        update_cell(&db, "users", "email", rowid, "NULL").unwrap();
+        assert_eq!(table_page(&db, "users", 0, 10).unwrap().rows[1][1], "NULL");
+    }
+
+    #[test]
+    fn update_cell_refuses_a_bad_table_or_column_and_is_read_only_write_scoped() {
+        let (_dir, db) = seeded();
+        // A crafted table or column name never reaches SQL — validated first.
+        assert!(update_cell(&db, "users\"; DROP TABLE users; --", "email", 1, "x").is_err());
+        assert!(update_cell(&db, "users", "email\"; --", 1, "x").is_err());
+        // The table survives, proving no injected statement ran.
+        assert_eq!(table_page(&db, "users", 0, 10).unwrap().total, 3);
+        // A rowid that does not exist changes nothing and says so.
+        assert!(update_cell(&db, "users", "email", 9999, "x").is_err());
     }
 
     #[test]
