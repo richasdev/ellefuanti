@@ -496,6 +496,9 @@ pub struct WorkspaceView {
     tree: Option<FileTree>,
     /// Scrolls the file tree so a revealed file is on screen (the mira button, #71 cousin).
     tree_scroll: gpui::UniformListScrollHandle,
+    /// Scrolls the tab strip so the active tab is visible — activating a tab from the
+    /// tree or palette with twenty open otherwise selects it off-screen (owner request).
+    tab_scroll: gpui::ScrollHandle,
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
@@ -701,6 +704,7 @@ impl WorkspaceView {
             registry,
             tree: None,
             tree_scroll: gpui::UniformListScrollHandle::new(),
+            tab_scroll: gpui::ScrollHandle::new(),
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
@@ -1226,6 +1230,13 @@ impl WorkspaceView {
             }
             cx.notify();
         }
+    }
+
+    /// Scrolls the tab strip so the active tab is on screen. Called after every
+    /// `active_tab` assignment — activation and visibility are one gesture; a tab
+    /// selected off-screen looks like nothing happened.
+    fn scroll_active_tab_into_view(&self) {
+        self.tab_scroll.scroll_to_item(self.active_tab);
     }
 
     /// The database header's "expand all": every table shows its columns — the bulk
@@ -1947,6 +1958,7 @@ impl WorkspaceView {
         window.focus(&editor.read(cx).focus_handle(cx));
         self.tabs.push(Tab { path, editor });
         self.active_tab = self.tabs.len() - 1;
+        self.scroll_active_tab_into_view();
         cx.notify();
     }
 
@@ -2043,6 +2055,7 @@ impl WorkspaceView {
     ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path.as_ref() == Some(&path)) {
             self.active_tab = index;
+            self.scroll_active_tab_into_view();
             self.clear_hover_cards(cx);
             // A file already open still has to move: "go to definition" on something in the
             // current file is the common case, and leaving the cursor where it was would
@@ -2086,6 +2099,7 @@ impl WorkspaceView {
                                 window.focus(&editor.read(cx).focus_handle(cx));
                                 this.tabs.push(Tab { path: Some(path.clone()), editor });
                                 this.active_tab = this.tabs.len() - 1;
+                                this.scroll_active_tab_into_view();
                                 this.status = None;
                                 this.open_on_lsp(&path, &text, cx);
                             }
@@ -2124,6 +2138,7 @@ impl WorkspaceView {
                 window.focus(&editor.read(cx).focus_handle(cx));
                 self.tabs.push(Tab { path: None, editor });
                 self.active_tab = self.tabs.len() - 1;
+                self.scroll_active_tab_into_view();
                 self.status = None;
             }
             // Plain text needs no grammar, so this is unreachable in practice — but it is a
@@ -2400,6 +2415,7 @@ impl WorkspaceView {
             self.close_on_lsp(path);
         }
         self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
+        self.scroll_active_tab_into_view();
         self.clear_hover_cards(cx);
         cx.notify();
     }
@@ -8147,6 +8163,9 @@ impl WorkspaceView {
             // is a plain flex container and many tabs either squeeze below legibility or
             // overflow off the window edge with no way to reach them — the report.
             .id("tab-strip")
+            // The handle is what `scroll_active_tab_into_view` drives; tracking gives
+            // it the children's bounds so `scroll_to_item` can aim at a tab.
+            .track_scroll(&self.tab_scroll)
             .h(Metrics::TAB_HEIGHT)
             .flex_none()
             .flex()
@@ -8205,6 +8224,7 @@ impl WorkspaceView {
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                         entity.update(cx, |this, cx| {
                             this.active_tab = index;
+                            this.scroll_active_tab_into_view();
                             this.clear_hover_cards(cx);
                             cx.notify();
                         });
