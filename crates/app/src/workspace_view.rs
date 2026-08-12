@@ -843,6 +843,11 @@ impl WorkspaceView {
         self.window_activation = Some(cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.window_became_active(cx);
+            } else {
+                // The blur half: autosave (#25 follow-up from the owner's first rename
+                // session). Leaving the window is the moment work silently sitting in
+                // a buffer starts to rot — and the moment every reference IDE saves.
+                this.autosave_dirty_tabs(cx);
             }
         }));
     }
@@ -874,6 +879,12 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn window_became_active_for_test(&mut self, cx: &mut Context<Self>) {
         self.window_became_active(cx);
+    }
+
+    /// The blur half — what autosave rides.
+    #[cfg(test)]
+    pub fn window_lost_focus_for_test(&mut self, cx: &mut Context<Self>) {
+        self.autosave_dirty_tabs(cx);
     }
 
     /// Cancels an in-flight status walk. Same shape as `cancel_quick_open_walk`.
@@ -1871,6 +1882,74 @@ impl WorkspaceView {
             Err(err) => self.status = Some(format!("{err:#}").into()),
         }
         cx.notify();
+    }
+
+    /// Saves every dirty tab that has a path, silently — the autosave pass.
+    ///
+    /// One background task writes them all: the per-tab `save` shares a superseding
+    /// job slot, which for N tabs would keep only the last write's continuation. A
+    /// pathless scratch buffer is skipped — autosave must never open a dialog.
+    /// Failures land on the status line with the path; successes are silent.
+    fn autosave_dirty_tabs(&mut self, cx: &mut Context<Self>) {
+        if !crate::settings::current(cx).autosave() {
+            return;
+        }
+        let dirty: Vec<(std::path::PathBuf, Entity<EditorView>, String, elle_text::Version)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let path = tab.path.clone()?;
+                let editor = tab.editor.clone();
+                if !editor.read(cx).document.buffer.is_dirty() {
+                    return None;
+                }
+                let snapshot = editor.read(cx).document.snapshot_for_save();
+                Some((path, editor, snapshot.text, snapshot.version))
+            })
+            .collect();
+        if dirty.is_empty() {
+            return;
+        }
+
+        let writes: Vec<(std::path::PathBuf, String)> =
+            dirty.iter().map(|(path, _, text, _)| (path.clone(), text.clone())).collect();
+        let task = cx.spawn(async move |this, cx| {
+            let outcomes = cx
+                .background_spawn(async move {
+                    writes
+                        .into_iter()
+                        .map(|(path, text)| {
+                            let result = write_file(&path, &text);
+                            (path, text, result)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                for ((path, text, result), (_, editor, _, version)) in
+                    outcomes.into_iter().zip(dirty)
+                {
+                    match result {
+                        Ok(()) => {
+                            this.notify_lsp_of_change(&path, &text);
+                            editor.update(cx, |editor, _| {
+                                editor.document.buffer.mark_saved_at(version)
+                            });
+                        }
+                        Err(err) => {
+                            this.status =
+                                Some(format!("autosave failed: {}: {err:#}", path.display()).into());
+                        }
+                    }
+                }
+                this.refresh_git_status(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        // Detached rather than slotted: a second blur while writes are in flight must
+        // not cancel the first continuation and strand written files marked dirty.
+        task.detach();
     }
 
     // --- saving ------------------------------------------------------------------
@@ -4191,8 +4270,18 @@ impl WorkspaceView {
     /// because the cursor may move under the overlay.
     fn rename_symbol(&mut self, _: &RenameSymbol, window: &mut Window, cx: &mut Context<Self>) {
         let Some((uri, offset)) = self.navigation_origin(cx) else { return };
-        if self.lsp.client_mut().is_none() {
-            return;
+        match self.lsp.client_mut() {
+            None => return,
+            Some(client) if !client.capabilities().rename => {
+                // Said BEFORE the prompt opens: F2 into a prompt whose Enter can only
+                // ever do nothing reads as a broken feature. Intelephense without a
+                // licence key is the common way to land here, and the server's own
+                // capability answer is the honest thing to relay.
+                self.status = Some("The language server does not offer rename".into());
+                cx.notify();
+                return;
+            }
+            Some(_) => {}
         }
         let Some(editor) = self.active_editor().cloned() else { return };
         let (word, span) = {
@@ -4245,8 +4334,12 @@ impl WorkspaceView {
             this.update(cx, |this, cx| {
                 this.in_flight_query = None;
                 match reply {
-                    // The server declining (null) is not an error (RISKS #4).
-                    None => this.status = None,
+                    // The user acted (F2, a name, Enter), so a null reply gets words —
+                    // the ⌥⌘I rule; silence here read as "rename is broken" in the
+                    // owner's first real use.
+                    None => {
+                        this.status = Some("The server offered no rename here".into());
+                    }
                     Some(edit) => match this.apply_workspace_edit(edit, cx) {
                         Ok(files) => {
                             this.status = Some(format!("Renamed in {files} file(s)").into());
@@ -4335,6 +4428,7 @@ impl WorkspaceView {
         // fails mid-way is reported, which is the one residual risk of writing files at
         // all — recorded rather than hidden.
         let files = plan.len();
+        let mut wrote_disk = false;
         for planned in plan {
             match planned {
                 Planned::Buffer(editor, byte_edits, path, _old_text) => {
@@ -4349,9 +4443,19 @@ impl WorkspaceView {
                 Planned::Disk(path, new_text) => {
                     write_file(&path, &new_text)
                         .with_context(|| format!("could not write {}", path.display()))?;
+                    wrote_disk = true;
                 }
             }
         }
+        // Disk writes changed the working tree; the panel must not wait for a focus
+        // round-trip to notice (the owner's report: "nem vai pro source control").
+        if wrote_disk {
+            self.refresh_git_status(cx);
+        }
+        // And the buffers the edit touched save themselves (when autosave is on), so
+        // the rename reaches disk and the git panel in one gesture — the report was
+        // exactly this gap.
+        self.autosave_dirty_tabs(cx);
         cx.notify();
         Ok(files)
     }

@@ -75,6 +75,10 @@ pub struct Capabilities {
     pub references: bool,
     pub document_symbols: bool,
     pub signature_help: bool,
+    /// Whether the server offers rename at all. Checked BEFORE the prompt opens (#19
+    /// follow-up): Intelephense without a licence key does not, and a prompt whose
+    /// Enter can only ever do nothing reads as a broken feature, not a missing one.
+    pub rename: bool,
     /// Characters that should trigger completion, straight from the server.
     ///
     /// Read from the server rather than hardcoded as `["$", "-", ">", ":"]` — those are
@@ -119,6 +123,7 @@ impl Capabilities {
             references: capabilities.references_provider.is_some(),
             document_symbols: capabilities.document_symbol_provider.is_some(),
             signature_help: capabilities.signature_help_provider.is_some(),
+            rename: capabilities.rename_provider.is_some(),
             completion_triggers,
             signature_help_triggers,
             raw: capabilities,

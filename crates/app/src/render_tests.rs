@@ -4064,3 +4064,45 @@ async fn the_composer_script_palette_lists_and_types(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Losing window focus saves every dirty tab that has a path — autosave (#25 follow-up).
+///
+/// The default is ON (the settings crate's doc records why); a pathless scratch buffer
+/// is skipped because autosave must never open a dialog.
+#[gpui::test]
+async fn losing_focus_autosaves_dirty_tabs(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let path = dir.path().join("a.php");
+    std::fs::write(&path, "<?php\n$old = 1;\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::new(Some(path.clone()), &text, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("a file is open");
+    editor.update(cx, |editor, _cx| {
+        let len = editor.document.buffer.len_bytes();
+        editor.document.buffer.replace(0..len, "<?php\n$new = 2;\n");
+        assert!(editor.document.buffer.is_dirty());
+    });
+
+    workspace.update(cx, |workspace, cx| workspace.window_lost_focus_for_test(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "<?php\n$new = 2;\n",
+        "the blur wrote the buffer to disk"
+    );
+    editor.read_with(cx, |editor, _cx| {
+        assert!(!editor.document.buffer.is_dirty(), "and the dot cleared");
+    });
+
+    draw(cx);
+}
