@@ -6448,6 +6448,13 @@ impl WorkspaceView {
                         .items_center()
                         .justify_center()
                         .rounded_md()
+                        // The icon is a glyph with no label, so hovering said nothing —
+                        // the owner's report. A disabled panel's tooltip names it too and
+                        // adds "(coming soon)", which is the honest reason it does not
+                        // respond to a click.
+                        .tooltip(crate::tooltip::Tooltip::text(
+                            crate::tooltip::activity_label(name, enabled),
+                        ))
                         .when(enabled, |el| {
                             el.cursor_pointer()
                                 .hover(|el| el.bg(theme.hover))

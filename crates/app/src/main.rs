@@ -24,6 +24,7 @@ mod settings_panel;
 mod terminal_view;
 mod test_view;
 mod theme;
+mod tooltip;
 mod themes;
 mod workspace_view;
 
