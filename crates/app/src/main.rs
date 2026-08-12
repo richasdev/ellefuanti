@@ -1,6 +1,7 @@
 //! ellefuanti — a native IDE for PHP, Laravel, Livewire and Blade.
 
 mod actions;
+mod ai;
 mod artisan;
 mod completion;
 mod context_menu;

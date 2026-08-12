@@ -296,6 +296,82 @@ impl Settings {
         self.document.insert(FONT_FAMILY_KEY.to_string(), Value::String(family.to_string()));
     }
 
+    // --- AI (#29/#99). All off by default — nothing talks to a provider until the
+    // user turns it on, which is the issues' non-negotiable. Keys are NOT here: the
+    // settings file is plain JSON and API keys live in the macOS Keychain.
+
+    /// Which AI backend: `"anthropic"`, `"ant"` (CLI login), or `"custom"` (base URL).
+    pub fn ai_provider(&self) -> &str {
+        self.string_or("ai.provider", "anthropic")
+    }
+
+    pub fn set_ai_provider(&mut self, provider: &str) {
+        self.document.insert("ai.provider".to_string(), Value::String(provider.to_string()));
+    }
+
+    /// The OpenAI-compatible base URL for the custom provider (e.g. a local Ollama).
+    pub fn ai_base_url(&self) -> &str {
+        self.string_or("ai.base_url", "")
+    }
+
+    pub fn ai_chat_model(&self) -> &str {
+        self.string_or("ai.chat_model", "claude-opus-5")
+    }
+
+    pub fn ai_completion_model(&self) -> &str {
+        self.string_or("ai.completion_model", "claude-haiku-4-5")
+    }
+
+    /// The chat panel's master switch. Off by default (#99).
+    pub fn ai_chat_enabled(&self) -> bool {
+        self.bool_or("ai.chat", false)
+    }
+
+    pub fn set_ai_chat_enabled(&mut self, enabled: bool) {
+        self.document.insert("ai.chat".to_string(), Value::Bool(enabled));
+    }
+
+    /// Ghost-text autocomplete's own switch, separate on purpose (#29). Off by default.
+    pub fn ai_autocomplete_enabled(&self) -> bool {
+        self.bool_or("ai.autocomplete", false)
+    }
+
+    pub fn set_ai_autocomplete_enabled(&mut self, enabled: bool) {
+        self.document.insert("ai.autocomplete".to_string(), Value::Bool(enabled));
+    }
+
+    /// A string key with a default, warning (not failing) on a wrong type — the same
+    /// one-bad-key-does-not-cost-the-file rule every reader here follows.
+    fn string_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
+        match self.document.get(key) {
+            Some(Value::String(value)) => value,
+            Some(other) => {
+                tracing::warn!(
+                    key,
+                    found = type_name(other),
+                    "settings: expected a string, using the default"
+                );
+                default
+            }
+            None => default,
+        }
+    }
+
+    fn bool_or(&self, key: &str, default: bool) -> bool {
+        match self.document.get(key) {
+            Some(Value::Bool(value)) => *value,
+            Some(other) => {
+                tracing::warn!(
+                    key,
+                    found = type_name(other),
+                    "settings: expected a bool, using the default"
+                );
+                default
+            }
+            None => default,
+        }
+    }
+
     /// Writes the autosave flag (#25 follow-up: a toggle in the panel).
     pub fn set_autosave(&mut self, enabled: bool) {
         self.document.insert("autosave".to_string(), Value::Bool(enabled));

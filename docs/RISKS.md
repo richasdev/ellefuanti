@@ -165,3 +165,27 @@ outside `crates/app`, and no absolute macOS paths anywhere.
 
 **Honest statement of position:** the domain layers will port cleanly; the UI ports when
 GPUI does. That is a bet on GPUI's roadmap, and it is the same bet ADR-0002 already makes.
+
+---
+
+## 9. AI features could exfiltrate exactly what an IDE is trusted with
+
+**Likelihood: high if unguarded. Impact: severe.**
+
+A Laravel project root is a pile of secrets — `.env` with database passwords, SSH keys,
+service-account JSON, the sqlite database itself — and #29/#99 add features whose whole
+job is sending project text to a remote model. The failure mode is not malice, it is
+convenience: a "send whole project" button, an autocomplete that silently ships the
+open buffer, a chat that attaches files nobody looked at.
+
+**Mitigation, enforced in `crates/app/src/ai.rs`.** Everything is off by default; the
+user picks the provider and supplies the key; context is attached explicitly per item
+and is visible and revocable in the UI; and a name-based denylist (`.env*`, SSH keys,
+`*.pem`/`*.key`, sqlite databases, `*credential*`/`*secret*`/`*token*`, `auth.json`,
+`.npmrc`) refuses attachment with **no override**. API keys live in the macOS Keychain,
+never in the plain-JSON settings file. The local-Ollama path exists precisely so the
+feature can be used with nothing leaving the machine at all.
+
+**Honest statement of position:** a denylist is a heuristic, not a guarantee — a secret
+in an innocently-named file will pass it. The real line of defence is that nothing is
+ever sent implicitly; the denylist only catches the user's own slips.
