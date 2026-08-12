@@ -189,7 +189,18 @@ const VIEW_DIRECTIVES: [&str; 4] = ["include", "extends", "component", "each"];
 ///
 /// Scanner, not parser, per ADR-0006 and the module docs. It reads the buffer directly, so
 /// unlike a second tree it cannot desync from the highlighter's view of the same file.
+///
+/// The four passes below slice `source` by this byte `offset` directly (`source[..offset]`,
+/// and ranges built from it). A byte index that falls *inside* a multi-byte character is a
+/// panic on any of those slices — and a Blade template is exactly where that offset arrives:
+/// these files are full of accented prose (`função`, `José`) and the pixel-to-offset
+/// hit-test (`EditorView::offset_at`) can land a ⌘click one byte inside a `ç`. A crash there
+/// aborts the whole navigation, so the *symptom* is go-to-definition doing nothing at all in
+/// a `.blade.php` file. Snapping down to the character the click is on — its own start byte —
+/// is both panic-safe and the honest reading of "the cursor is on this glyph". The PHP side
+/// needs none of this: it hands the offset to tree-sitter, which takes any byte range.
 fn blade_reference_at(source: &str, offset: usize) -> Option<Reference> {
+    let offset = char_boundary_at_or_below(source, offset);
     component_at(source, offset)
         .or_else(|| wire_at(source, offset))
         .or_else(|| directive_at(source, offset))
@@ -199,6 +210,20 @@ fn blade_reference_at(source: &str, offset: usize) -> Option<Reference> {
         // and the failure is a ⌘click that navigates from a commented line rather than a
         // wrong destination.
         .or_else(|| helper_call_at(source, offset))
+}
+
+/// The largest char boundary `<= offset`, clamped into `source`.
+///
+/// `is_char_boundary` is true at `0` and at `source.len()`, so the loop always terminates —
+/// a byte that is not a boundary is by definition preceded by one within the same character
+/// (a UTF-8 code point is at most four bytes). An offset already on a boundary, which is the
+/// overwhelmingly common case, returns after a single check.
+fn char_boundary_at_or_below(source: &str, offset: usize) -> usize {
+    let mut offset = offset.min(source.len());
+    while !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 /// The value of a `wire:` attribute under the cursor, as a navigable reference (#24).
@@ -508,5 +533,37 @@ mod tests {
     fn clicking_ordinary_blade_text_reports_nothing() {
         let src = "<div>Hello, {{ $name }}</div>\n";
         assert_eq!(reference_at(src, at(src, "Hello"), true), None);
+    }
+
+    /// The bug this fixes: a Blade file is full of accented prose, and the editor's
+    /// pixel-to-offset hit-test can land a ⌘click one byte *inside* a multi-byte character.
+    /// The scanner slices `source` by that byte offset, so a non-boundary offset used to
+    /// panic — and a panic in `go_to_laravel_target` is go-to-definition doing nothing at
+    /// all. Every byte offset over a template with accents (`função`, an emoji) must return
+    /// an answer, never crash.
+    #[test]
+    fn a_non_boundary_offset_over_accented_blade_does_not_panic() {
+        // `função` and `⚡` are multi-byte; the `route(...)` gives the scan something real to
+        // find, so this exercises the resolving path, not just the early returns.
+        let src = "⚡ A função <a href=\"{{ route('users.show') }}\">José</a>\n";
+        for offset in 0..=src.len() {
+            // What the editor cannot do but a hit-test bug can: probe a byte that may sit
+            // inside a character. The contract is "no panic", so any answer is acceptable.
+            let _ = reference_at(src, offset, true);
+        }
+
+        // And a boundary click on the literal still resolves, so the clamp did not blunt it.
+        let found = reference_at(src, at(src, "users.show"), true).expect("the route");
+        assert_eq!(found.name, "users.show");
+    }
+
+    #[test]
+    fn char_boundary_at_or_below_snaps_down_and_leaves_boundaries_alone() {
+        let src = "a£b"; // `£` is two bytes: 'a'=0, '£'=1..3, 'b'=3.
+        assert_eq!(char_boundary_at_or_below(src, 0), 0);
+        assert_eq!(char_boundary_at_or_below(src, 1), 1, "a boundary is returned as-is");
+        assert_eq!(char_boundary_at_or_below(src, 2), 1, "mid-`£` snaps down to its start");
+        assert_eq!(char_boundary_at_or_below(src, 3), 3);
+        assert_eq!(char_boundary_at_or_below(src, 99), src.len(), "past the end clamps to len");
     }
 }
