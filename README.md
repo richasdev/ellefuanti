@@ -13,23 +13,30 @@ Written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
 
 ## Install
 
-Download the latest `.app` from [Releases](https://github.com/richasdev/ellefuanti/releases/latest),
-or grab it from the terminal:
+Download the **`.dmg`** from [Releases](https://github.com/richasdev/ellefuanti/releases/latest),
+open it, and drag `ellefuanti.app` onto the Applications folder.
+
+Because the build is unsigned, macOS quarantines it on download and the first launch says
+the app **"is damaged"**. It is not — clear the quarantine flag once:
 
 ```sh
-# Download and unzip the latest macOS build
-curl -L -o ellefuanti.zip \
-  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-v0.1.0-macos.zip
-unzip ellefuanti.zip
-
-# The build is unsigned, so macOS quarantines it on download and says the app "is
-# damaged". It is not — strip the quarantine attribute and it opens:
-xattr -dr com.apple.quarantine ellefuanti.app
-
-# Move it into place and launch
-mv ellefuanti.app /Applications/
+xattr -dr com.apple.quarantine /Applications/ellefuanti.app
 open /Applications/ellefuanti.app
 ```
+
+Or do the whole thing from the terminal:
+
+```sh
+curl -L -o ellefuanti.dmg \
+  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-v0.1.0-macos.dmg
+hdiutil attach ellefuanti.dmg
+cp -R "/Volumes/ellefuanti 0.1.0/ellefuanti.app" /Applications/
+hdiutil detach "/Volumes/ellefuanti 0.1.0"
+xattr -dr com.apple.quarantine /Applications/ellefuanti.app   # clears the "damaged" flag
+open /Applications/ellefuanti.app
+```
+
+A `.zip` of the bare `.app` is also attached to the release if you prefer it.
 
 **Why "damaged"?** The build is not code-signed with an Apple Developer certificate, so
 Gatekeeper flags the downloaded bundle. The `xattr -dr com.apple.quarantine` command above
