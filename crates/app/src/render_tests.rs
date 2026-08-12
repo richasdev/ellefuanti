@@ -4528,3 +4528,40 @@ async fn adding_a_db_row_inserts_it_into_the_database(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// The reveal button expands the tree to the active file and switches to Explorer (#71 cousin).
+#[gpui::test]
+async fn revealing_the_active_file_expands_the_tree_to_it(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
+    let deep = dir.path().join("app/Models/User.php");
+    std::fs::write(&deep, "<?php\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        let document = Document::new(Some(deep.clone()), "<?php\n", true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+    });
+
+    // Before reveal, the deep file is not in the flat tree (its folders are collapsed).
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            !workspace.tree_entry_paths_for_test().iter().any(|p| p.ends_with("User.php")),
+            "the file is hidden inside collapsed folders"
+        );
+    });
+
+    workspace.update(cx, |workspace, cx| workspace.reveal_active_file_for_test(cx));
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.tree_entry_paths_for_test().iter().any(|p| p.ends_with("User.php")),
+            "reveal expanded app/ and app/Models/ so the file is now a visible row"
+        );
+    });
+
+    draw(cx);
+}

@@ -494,6 +494,8 @@ pub struct WorkspaceView {
     focus_handle: FocusHandle,
     registry: Arc<CommandRegistry>,
     tree: Option<FileTree>,
+    /// Scrolls the file tree so a revealed file is on screen (the mira button, #71 cousin).
+    tree_scroll: gpui::UniformListScrollHandle,
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
@@ -698,6 +700,7 @@ impl WorkspaceView {
             focus_handle: cx.focus_handle(),
             registry,
             tree: None,
+            tree_scroll: gpui::UniformListScrollHandle::new(),
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
@@ -1195,6 +1198,24 @@ impl WorkspaceView {
             }
             cx.notify();
         }
+    }
+
+    /// Reveals the active file in the tree — the "mira" button (owner request).
+    ///
+    /// Expands the file's ancestor folders and scrolls it into view, switching the
+    /// sidebar to Explorer so there is a tree to reveal it in. Does nothing without an
+    /// open file with a path (a scratch buffer has none), which is the honest no-op.
+    fn reveal_active_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()) else {
+            return;
+        };
+        self.sidebar = Sidebar::Explorer;
+        let Some(row) = self.tree.as_mut().and_then(|tree| tree.reveal(&path)) else {
+            cx.notify();
+            return;
+        };
+        self.tree_scroll.scroll_to_item(row, gpui::ScrollStrategy::Center);
+        cx.notify();
     }
 
     /// The explorer header's "collapse all" button.
@@ -1740,6 +1761,16 @@ impl WorkspaceView {
     }
 
     /// The active tab's path, for asserting which file a jump opened.
+    #[cfg(test)]
+    pub fn reveal_active_file_for_test(&mut self, cx: &mut Context<Self>) {
+        self.reveal_active_file(cx);
+    }
+
+    #[cfg(test)]
+    pub fn tree_entry_paths_for_test(&self) -> Vec<PathBuf> {
+        self.tree.as_ref().map(|t| t.entries().iter().map(|e| e.path.clone()).collect()).unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub fn active_tab_path_for_test(&self) -> Option<PathBuf> {
         self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone())
@@ -7797,11 +7828,32 @@ impl WorkspaceView {
                 .child(svg().path(icon).size(px(16.0)).text_color(muted))
         };
 
+        // The reveal (mira) button is a separate handler, so it is its own element rather
+        // than a third arm of the expand/collapse closure.
+        let reveal_entity = cx.entity();
+        let reveal = div()
+            .id("reveal-file")
+            .size(px(22.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|el| el.bg(hover))
+            .active(|el| el.bg(pressed))
+            .tooltip(crate::tooltip::Tooltip::text("Reveal active file in tree"))
+            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                reveal_entity.update(cx, |this, cx| this.reveal_active_file(cx));
+            })
+            .child(svg().path(icons::REVEAL_FILE).size(px(16.0)).text_color(muted));
+
         div()
             .flex()
             .flex_none()
             .items_center()
             .gap_1()
+            .child(reveal)
             .child(button(icons::EXPAND_ALL, "Expand All", true))
             .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
     }
@@ -7826,6 +7878,7 @@ impl WorkspaceView {
         let modified: std::collections::HashSet<PathBuf> =
             self.git.read(cx).state().files().iter().map(|file| file.path.clone()).collect();
 
+        let tree_scroll = self.tree_scroll.clone();
         uniform_list("file-tree", count, move |range, _window, cx| {
             entity.update(cx, |this, _cx| {
                 let Some(tree) = this.tree.as_ref() else { return Vec::new() };
@@ -7987,6 +8040,7 @@ impl WorkspaceView {
                     .collect()
             })
         })
+        .track_scroll(tree_scroll)
         .flex_1()
         // Recorded bounds for `the_file_tree_occupies_real_height`: this list rides
         // `flex_1`, which resolves to zero height the moment an ancestor stops being a
