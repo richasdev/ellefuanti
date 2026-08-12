@@ -1,13 +1,50 @@
 //! The command palette and quick open, which are the same overlay over different lists.
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, ScrollStrategy,
-    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels,
+    ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 
 use crate::actions::{Backspace, Cancel, Confirm, SelectNext, SelectPrev, context};
 use crate::fonts::Fonts;
 use crate::theme::Themed;
+
+/// The height of one palette row. Must match the `.h(...)` the row is painted with below —
+/// the list's total height is `count` of these, and a mismatch would leave a partial row or
+/// dead space at the bottom.
+const ROW_HEIGHT: Pixels = px(32.0);
+
+/// The input row's fixed height, matched to the `.h(...)` on the input div below.
+const INPUT_HEIGHT: Pixels = px(38.0);
+
+/// The most rows the list shows before it scrolls. Twelve keeps the panel near VS Code's
+/// command-palette footprint: 12 × 32 + 38 input ≈ 422px, just inside the 440px cap.
+const MAX_VISIBLE_ROWS: usize = 12;
+
+/// The fewest rows' worth of height the list area reserves even when the current filter
+/// yields fewer. Without a floor a one- or two-hit list would be a thin strip; VS Code keeps
+/// a comfortable list area open regardless. Four rows is that comfortable minimum.
+const MIN_VISIBLE_ROWS: usize = 4;
+
+/// The list area's height for `count` rows.
+///
+/// This is the whole fix for the "palette renders as a sliver" report. The list was a
+/// `uniform_list().flex_1()` inside a panel whose only vertical constraint was `max_h` —
+/// no `h`. `flex_1` is flex-basis 0, so it *contributes no content height*, and a
+/// content-sized parent has no free space to grow it into: the list resolved to zero pixels
+/// and the whole panel collapsed to just the input row (CONTEXT.md's "flex_1 em pai
+/// não-flex = altura zero"). The completion popup hit the identical bug (#112) and fixed it
+/// the same way — an explicit height, never `flex_1` — so this mirrors `completion::popup_height`.
+///
+/// Clamped between a floor (a short list still shows a real area) and `MAX_VISIBLE_ROWS`
+/// (past which the `uniform_list` scrolls). Never zero, so the empty/"No matches" state —
+/// which renders its own div, not the list — is not what this governs; that path keeps its
+/// own padding.
+fn list_height(count: usize) -> Pixels {
+    let rows = count.clamp(MIN_VISIBLE_ROWS, MAX_VISIBLE_ROWS);
+    ROW_HEIGHT * rows
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
@@ -348,6 +385,11 @@ impl Render for Palette {
             .on_action(cx.listener(Self::cancel))
             .mt(px(90.0))
             .w(px(560.0))
+            // `max_h`, not `h`: the panel is as tall as its content (input + list) up to this
+            // cap. The list below now carries a *concrete* height, so "content" is a real
+            // number and the panel no longer collapses to just the input row. The backdrop
+            // aligns this to the cross-axis start (`items_start`) so its own default
+            // `align-items: stretch` does not pull the panel to full window height.
             .max_h(px(440.0))
             .flex()
             .flex_col()
@@ -363,7 +405,8 @@ impl Render for Palette {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(38.0))
+                    .flex_none()
+                    .h(INPUT_HEIGHT)
                     .px_3()
                     .border_b_1()
                     .border_color(theme.border)
@@ -414,7 +457,7 @@ impl Render for Palette {
                                         .id(("palette-row", index))
                                         .flex()
                                         .items_center()
-                                        .h(px(32.0))
+                                        .h(ROW_HEIGHT)
                                         .px_3()
                                         .mx_1()
                                         .rounded_md()
@@ -450,7 +493,14 @@ impl Render for Palette {
                     })
                 })
                 .track_scroll(self.scroll.clone())
-                .flex_1()
+                // An explicit height, never `flex_1`. `flex_1` is flex-basis 0 — it
+                // contributes no content height — and the panel above is content-sized
+                // (`max_h`, no `h`), so the two resolved to a zero-pixel list and a panel
+                // collapsed to the input row alone: the "sliver" the owner saw. This is the
+                // same trap and the same fix as `completion::popup_height` (#112); see
+                // `list_height`. `max_h` on the panel still caps the total, and the
+                // `uniform_list` scrolls once the rows exceed `MAX_VISIBLE_ROWS`.
+                .h(list_height(count))
                 .py_1()
                 .into_any_element()
             })
@@ -486,6 +536,39 @@ fn subsequence(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_height_never_collapses_and_is_capped() {
+        // The regression guard for the "sliver" report: whatever the row count, the list
+        // reserves a real height. A short list floors at MIN_VISIBLE_ROWS so a one-hit
+        // palette is still a comfortable box, and a huge list caps at MAX_VISIBLE_ROWS so
+        // the panel stays inside its `max_h` and the `uniform_list` scrolls past that.
+        assert_eq!(list_height(0), ROW_HEIGHT * MIN_VISIBLE_ROWS, "empty floors, never zero");
+        assert_eq!(list_height(1), ROW_HEIGHT * MIN_VISIBLE_ROWS, "one hit still shows a real area");
+        assert_eq!(list_height(MIN_VISIBLE_ROWS), ROW_HEIGHT * MIN_VISIBLE_ROWS);
+        // Between the floor and the cap the list is exactly the rows it holds — no dead space.
+        let mid = MIN_VISIBLE_ROWS + 2;
+        assert_eq!(list_height(mid), ROW_HEIGHT * mid);
+        assert_eq!(list_height(MAX_VISIBLE_ROWS), ROW_HEIGHT * MAX_VISIBLE_ROWS);
+        assert_eq!(
+            list_height(10_000),
+            ROW_HEIGHT * MAX_VISIBLE_ROWS,
+            "a huge list caps so the panel scrolls rather than growing past max_h"
+        );
+    }
+
+    #[test]
+    fn the_panel_at_full_list_fits_inside_its_height_cap() {
+        // The panel is `max_h(440)`; its content is the input row plus the list at its
+        // tallest. If that sum exceeded the cap the bottom rows would be clipped, so the
+        // constants are checked to add up rather than trusted to.
+        let content = INPUT_HEIGHT + list_height(MAX_VISIBLE_ROWS);
+        assert!(
+            content <= px(440.0),
+            "input {INPUT_HEIGHT:?} + list {:?} = {content:?} must fit the 440px cap",
+            list_height(MAX_VISIBLE_ROWS),
+        );
+    }
 
     #[test]
     fn subsequence_matches_scattered_characters() {

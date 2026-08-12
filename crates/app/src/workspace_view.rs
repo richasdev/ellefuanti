@@ -6364,6 +6364,11 @@ impl Render for WorkspaceView {
                     .size_full()
                     .flex()
                     .justify_center()
+                    // Cross-axis start, not the flex default of `stretch`: the panel is
+                    // content-sized (`max_h`, no `h`), and stretch would override that and
+                    // pull it to the full window height. `justify_center` still centres it
+                    // horizontally; `items_start` keeps its own `mt(90)` as the top offset.
+                    .items_start()
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                         entity.update(cx, |this, cx| this.dismiss_palette(window, cx));
                     })
@@ -7417,17 +7422,25 @@ impl WorkspaceView {
         let active = self.active_tab;
 
         div()
+            // `id` + `overflow_x_scroll` is what gives the strip a horizontal scroll: the
+            // scroll methods live on `InteractiveElement`, which a div only becomes with an
+            // id (the same shape the db grid uses at `db-grid-scroll`). Without this the row
+            // is a plain flex container and many tabs either squeeze below legibility or
+            // overflow off the window edge with no way to reach them — the report.
+            .id("tab-strip")
             .h(Metrics::TAB_HEIGHT)
             .flex_none()
             .flex()
             .items_center()
+            .overflow_x_scroll()
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
             // Clearance for the macOS traffic lights: the titlebar is transparent (the
             // owner's screenshot was a white system strip over a dark theme), so this row
             // is the top of the window and the buttons overlay its left edge. 78px is
-            // the standard close/min/zoom footprint with breathing room.
+            // the standard close/min/zoom footprint with breathing room. This is padding,
+            // not a flex child, so the scroll container never shrinks it away.
             .pl(px(78.0))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let dirty = tab.editor.read(cx).is_dirty();
@@ -7444,6 +7457,16 @@ impl WorkspaceView {
                 div()
                     .id(("tab", index))
                     .flex()
+                    // `flex_none` is the other half of the scroll fix: in a plain flex row
+                    // the tabs shrink to share the width, which is the "squeeze" — with many
+                    // open, every tab loses its label before the strip ever overflows. Fixed
+                    // basis instead: each tab keeps a legible size and the strip scrolls once
+                    // they no longer fit. A min-width floors short names (`a.php`) so a tab is
+                    // always big enough to click; the label truncates below so a long name
+                    // does not run a single tab off the screen.
+                    .flex_none()
+                    .min_w(px(120.0))
+                    .max_w(px(240.0))
                     .items_center()
                     .gap_2()
                     .h_full()
@@ -7494,7 +7517,19 @@ impl WorkspaceView {
                                 .when_some(icon_color, |el, c| el.text_color(rgb(c))),
                         ),
                     )
-                    .child(SharedString::from(title))
+                    // The name takes the space between the icon and the close slot, and
+                    // truncates rather than widening the tab: `max_w` above only caps the tab
+                    // if the label yields, so this is what keeps a long file name inside it
+                    // (`whitespace_nowrap` + ellipsis, the tab-strip counterpart of the db
+                    // grid cell's clamp).
+                    .child(
+                        div()
+                            .flex_1()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(SharedString::from(title)),
+                    )
                     .child(
                         // One slot for both the dirty marker and the close button, so the
                         // tab width never shifts as the pointer crosses it. A dirty tab
