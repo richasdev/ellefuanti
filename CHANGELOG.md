@@ -5,10 +5,17 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-08-12
 
 ### Added
 
+- AI chat panel (#99): a right-side panel (⌘⇧A) with streaming replies, cancel, and
+  code blocks with copy. Context is explicit chips — Selection and Current file, off by
+  default, denylist enforced — and nothing is ever sent implicitly. Off by default;
+  provider configured in Settings → AI, key in the macOS Keychain.
+- AI ghost-text autocomplete (#29): dim inline suggestions at the cursor, Tab accepts,
+  Escape dismisses, typing discards. 400 ms debounce, one in-flight request, context is
+  a window of the current file only. Own toggle, off by default.
 - PHP smart typing: quotes auto-close in code (the parse tree keeps `don't` in comments,
   strings and prose untouched), and `=` inside an array literal completes to `=>` with
   the follow-up `>` swallowed — the PhpStorm behaviours.
