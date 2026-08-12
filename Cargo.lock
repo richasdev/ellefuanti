@@ -1770,6 +1770,7 @@ dependencies = [
  "notify",
  "regex",
  "rusqlite",
+ "serde_json",
  "smol",
  "tempfile",
  "tracing",
