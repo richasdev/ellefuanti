@@ -1132,6 +1132,31 @@ impl WorkspaceView {
         }
     }
 
+    /// The explorer header's "expand all" button.
+    ///
+    /// `expand_all` walks and reads the whole project, which is why it is a button and not
+    /// something on any hot path (see the method's own note). Runs inline rather than on the
+    /// background pool because it follows a deliberate click at human speed — the same
+    /// choice `toggle` makes for a single directory, scaled up.
+    fn expand_all_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = self.tree.as_mut() {
+            if let Err(err) = tree.expand_all() {
+                self.status = Some(format!("{err:#}").into());
+            }
+            cx.notify();
+        }
+    }
+
+    /// The explorer header's "collapse all" button.
+    fn collapse_all_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = self.tree.as_mut() {
+            if let Err(err) = tree.collapse_all() {
+                self.status = Some(format!("{err:#}").into());
+            }
+            cx.notify();
+        }
+    }
+
     // --- file opening ------------------------------------------------------------
 
     /// The active tab's editor handle, for render tests that need to inspect it.
@@ -7498,7 +7523,18 @@ impl WorkspaceView {
                     .items_center()
                     .px_3()
                     .text_color(theme.text_muted)
-                    .child(SharedString::from(header)),
+                    // The name takes the room it needs and yields the rest: `flex_1` +
+                    // `min_w_0` + `truncate` so a long folder name is clipped rather than
+                    // shoving the buttons off the panel's right edge.
+                    .child(div().flex_1().min_w_0().truncate().child(SharedString::from(header)))
+                    // The expand-all / collapse-all pair, on the right of the header the
+                    // way VS Code puts them — but only for the Explorer with a folder open,
+                    // because there is no tree to fold otherwise. Search's and Git's headers
+                    // stay a plain label.
+                    .when(
+                        self.sidebar == Sidebar::Explorer && self.tree.is_some(),
+                        |el| el.child(self.render_explorer_header_buttons(theme, cx)),
+                    ),
             )
             .child(match self.sidebar {
                 // The panel is its own entity, so switching away and back does not
@@ -7576,6 +7612,60 @@ impl WorkspaceView {
                         .into_any_element(),
                 },
             })
+    }
+
+    /// The explorer header's expand-all / collapse-all buttons.
+    ///
+    /// Two glyph buttons, no labels, so each carries a tooltip the way the activity-bar
+    /// icons do — a bare glyph on hover said nothing there and would say nothing here. The
+    /// colour is set on the `svg()` itself because gpui fills an SVG's alpha mask from
+    /// `style.text.color` on that element and does not inherit it from this row (the trap
+    /// the tree, tab and activity-bar icons all document).
+    fn render_explorer_header_buttons(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity();
+        let muted = theme.text_muted;
+        let hover = theme.hover;
+        let pressed = theme.pressed;
+
+        // (icon, tooltip, whether it expands). One closure builds both buttons so their
+        // hit target, hover and press treatment cannot drift apart.
+        let button = move |icon: &'static str, label: &'static str, expand: bool| {
+            let entity = entity.clone();
+            div()
+                .id(label)
+                .size(px(22.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|el| el.bg(hover))
+                .active(|el| el.bg(pressed))
+                .tooltip(crate::tooltip::Tooltip::text(label))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        if expand {
+                            this.expand_all_tree(cx);
+                        } else {
+                            this.collapse_all_tree(cx);
+                        }
+                    });
+                })
+                .child(svg().path(icon).size(px(16.0)).text_color(muted))
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(button(icons::EXPAND_ALL, "Expand All", true))
+            .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
     }
 
     fn render_tree_rows(

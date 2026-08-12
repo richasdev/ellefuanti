@@ -183,6 +183,48 @@ impl FileTree {
         Ok(())
     }
 
+    /// Collapses every directory, leaving only the top level — the explorer's "collapse
+    /// all" button.
+    ///
+    /// Re-reading the root rather than walking and collapsing each open directory: the
+    /// result is defined as "what `new` shows", and one read produces exactly that with no
+    /// chance of a stray descendant surviving. `show_hidden` is preserved because the read
+    /// goes through the same filter every other read does.
+    pub fn collapse_all(&mut self) -> Result<()> {
+        self.entries = self.read_dir(&self.root.clone(), 0)?;
+        Ok(())
+    }
+
+    /// Expands every directory in the tree — the explorer's "expand all" button.
+    ///
+    /// The tree is lazy, so this has to *realise* the whole thing: walk the flat list from
+    /// the top and open each directory that is still closed. Opening one splices its
+    /// children in immediately after it, so continuing forward from the same index reaches
+    /// those children in turn — a breadth-then-depth sweep that terminates because every
+    /// splice lands strictly after the cursor and each directory is opened at most once.
+    ///
+    /// # Cost
+    ///
+    /// This is the one operation here that reads the entire project rather than one level:
+    /// on a repository with a committed `vendor/` and `show_hidden` on, that is every
+    /// directory in it. That is acceptable for an *explicit* button press the way it would
+    /// not be for something on the typing path — the user asked for the whole tree, and the
+    /// `.gitignore`/hidden filter keeps the common case (dependencies ignored) bounded to
+    /// the project's own source. A directory that becomes unreadable mid-walk is left
+    /// collapsed rather than failing the whole expansion, the same fault-isolation rule
+    /// `refresh` follows (§24).
+    pub fn expand_all(&mut self) -> Result<()> {
+        let mut index = 0;
+        while index < self.entries.len() {
+            let entry = &self.entries[index];
+            if entry.is_dir() && !entry.expanded {
+                let _ = self.toggle(index);
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
     /// Reads one directory level, filtered and sorted for display.
     fn read_dir(&self, dir: &Path, depth: usize) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
@@ -356,6 +398,81 @@ mod tests {
         tree.toggle(0).unwrap();
         assert_eq!(tree.len(), before);
         assert!(!tree.entries()[0].expanded);
+    }
+
+    // --- expand-all / collapse-all, the explorer header buttons ---------------------
+
+    #[test]
+    fn collapse_all_returns_the_tree_to_the_root() {
+        // The cheap direction: forget every expansion and re-read the top level. What is
+        // left is exactly what `FileTree::new` produced, so the assertion is that the two
+        // agree.
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        let root_only: Vec<String> =
+            tree.entries().iter().map(|e| e.name.clone()).collect();
+
+        let app = tree.entries().iter().position(|e| e.name == "app").unwrap();
+        tree.toggle(app).unwrap();
+        let models = tree.entries().iter().position(|e| e.name == "Models").unwrap();
+        tree.toggle(models).unwrap();
+        assert!(tree.len() > root_only.len(), "the tree must actually be expanded first");
+
+        tree.collapse_all().unwrap();
+
+        let after: Vec<String> = tree.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(after, root_only, "collapse-all must leave only the top level");
+        assert!(tree.entries().iter().all(|e| !e.expanded), "nothing may stay expanded");
+    }
+
+    #[test]
+    fn expand_all_realises_every_directory_in_the_tree() {
+        // The lazy tree shows none of the nested files until a folder is opened. Expand-all
+        // walks and opens every directory, so a file three levels down is visible without a
+        // single click.
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        assert!(tree.entries().iter().all(|e| e.name != "User.php"), "nested, so hidden at first");
+
+        tree.expand_all().unwrap();
+
+        assert!(tree.entries().iter().any(|e| e.name == "User.php"), "the nested file must appear");
+        // Every directory that is shown must itself be open — that is what "expand all"
+        // means, and a half-open tree would be worse than the lazy one.
+        assert!(
+            tree.entries().iter().filter(|e| e.is_dir()).all(|e| e.expanded),
+            "every directory must end expanded"
+        );
+    }
+
+    #[test]
+    fn expand_all_then_collapse_all_round_trips() {
+        // The two buttons are inverses: expanding everything and then collapsing must land
+        // back on exactly the top level, not some leftover partial expansion.
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        let root_only: Vec<String> = tree.entries().iter().map(|e| e.name.clone()).collect();
+
+        tree.expand_all().unwrap();
+        tree.collapse_all().unwrap();
+
+        let after: Vec<String> = tree.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(after, root_only);
+    }
+
+    #[test]
+    fn expand_all_respects_show_hidden() {
+        // Expand-all must not smuggle in ignored directories the tree is hiding: the walk
+        // goes through the same per-level filter as every other read, so `vendor/` stays
+        // out while it is ignored and comes in once hidden files are shown.
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        tree.expand_all().unwrap();
+        assert!(tree.entries().iter().all(|e| e.name != "vendor"), "vendor is ignored");
+
+        tree.set_show_hidden(true).unwrap();
+        tree.expand_all().unwrap();
+        assert!(tree.entries().iter().any(|e| e.name == "vendor"), "now shown, so expanded too");
     }
 
     #[test]
