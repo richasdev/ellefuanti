@@ -4870,7 +4870,13 @@ impl WorkspaceView {
     fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = None;
         self.pending = None;
-        window.focus(&self.focus_handle);
+        match self.active_editor() {
+            Some(editor) => {
+                let handle = editor.read(cx).focus_handle(cx);
+                window.focus(&handle);
+            }
+            None => window.focus(&self.focus_handle),
+        }
         cx.notify();
     }
 
@@ -6383,7 +6389,9 @@ impl Render for WorkspaceView {
             // The settings panel (#100): centred like the palette, modal like the tree's
             // overlays. Dismiss-on-click-outside is the panel's own `on_mouse_down_out`.
             .children(self.settings_panel.clone().map(|panel| {
+                let entity = cx.entity();
                 div()
+                    .id("settings-backdrop")
                     .absolute()
                     .top_0()
                     .left_0()
@@ -6391,7 +6399,29 @@ impl Render for WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(panel)
+                    // Click-away closes, like every overlay. ⌘, toggles it too, and Esc
+                    // inside it — three ways out, none of them a trap.
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.settings_panel = None;
+                            match this.active_editor() {
+                                Some(editor) => {
+                                    let handle = editor.read(cx).focus_handle(cx);
+                                    window.focus(&handle);
+                                }
+                                None => window.focus(&this.focus_handle),
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .id("settings-panel")
+                            .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                cx.stop_propagation()
+                            })
+                            .child(panel),
+                    )
             }))
             // The tree's menu, name prompt and delete confirmation (#126), above everything
             // else because each is modal: while one is open it is the only thing the user
@@ -6404,15 +6434,31 @@ impl Render for WorkspaceView {
             // `context_menu` for why a handler on this box would eat the entry clicks.
             .children(self.overlay.clone().map(|overlay| {
                 let centred = overlay.read(cx).is_centred();
+                let entity = cx.entity();
                 div()
+                    .id("overlay-backdrop")
                     .absolute()
                     .top_0()
                     .left_0()
                     .size_full()
+                    // Clicking anywhere off the menu/dialog closes it — the every-overlay
+                    // dismissal the owner expected. A confirmation still requires its
+                    // explicit Cancel/Confirm for the *action*, but the click-away simply
+                    // closes it, which is the safe reading (nothing destructive fires).
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        entity.update(cx, |this, cx| this.dismiss_overlay(window, cx));
+                    })
                     // A menu draws at the click; a prompt and a confirmation are dialogs
                     // about the whole window and centre themselves.
                     .when(centred, |el| el.flex().items_center().justify_center())
-                    .child(overlay)
+                    .child(
+                        div()
+                            .id("overlay-panel")
+                            .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                cx.stop_propagation()
+                            })
+                            .child(overlay),
+                    )
             }))
     }
 }
