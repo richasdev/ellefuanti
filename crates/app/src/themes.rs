@@ -119,6 +119,19 @@ pub fn load(cx: &mut App) {
 ///
 /// Built-ins first, then disk themes (#58), which is precedence order — the same list the
 /// palette offers, so the two ways of choosing a theme cannot disagree about what exists.
+/// Four swatch colours for a theme name — background, accent, string, keyword — for the
+/// settings panel's picker (#100 follow-up). Enough to tell palettes apart at a glance
+/// without applying them; `None` for a name that no longer resolves.
+pub fn preview(name: &str, cx: &App) -> Option<[gpui::Hsla; 4]> {
+    if let Some(variant) = ThemeVariant::ALL.iter().find(|v| v.name() == name) {
+        return Some(variant.preview());
+    }
+    let disk = cx.try_global::<DiskThemes>()?;
+    let file = disk.get(name)?;
+    let color = |key: &str| file.color(key).map(|rgb| gpui::rgb(rgb).into());
+    Some([color("background")?, color("accent")?, color("string")?, color("keyword")?])
+}
+
 pub fn selectable_names(cx: &App) -> Vec<String> {
     let mut names: Vec<String> =
         crate::theme::ThemeVariant::ALL.iter().map(|variant| variant.name().to_string()).collect();
