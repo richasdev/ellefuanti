@@ -793,7 +793,16 @@ pub fn buffer_words(text: &str, typed: &str) -> Vec<String> {
 /// answers with the whole set for that position; the prefix is applied on our side, which is
 /// also what makes filtering-as-you-type work without a second request per keystroke.
 pub fn word_before(text: &str, offset: usize) -> &str {
-    let offset = offset.min(text.len());
+    // Snap to a char boundary at or below the offset. The cursor offset comes from a
+    // pixel hit-test (`closest_index_for_x`) which can land *inside* a multi-byte
+    // character — and this codebase is full of accented Portuguese. Slicing `&str` at a
+    // non-boundary byte panics, and this runs on every keystroke through the
+    // autocomplete-on-typing path (#180), so an accented buffer crashed continuously.
+    // Same class of bug as the Blade #184 fix, in the shared completion prefix.
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
     // Walk back over identifier characters. `$` is deliberately excluded: it starts a PHP
     // variable and the server's own labels include it, so treating it as part of the prefix
     // would make `$us` fail to match `$user`. It is left to the caller's request position.
@@ -809,6 +818,20 @@ pub fn word_before(text: &str, offset: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_before_never_panics_on_a_mid_codepoint_offset() {
+        // The crash the owner hit: an accented buffer (`função`) with a pixel-derived
+        // offset landing inside a multi-byte char. Sweeping every byte offset must not
+        // panic and must return a str slice on a boundary.
+        let text = "<?php
+$função = ação();
+";
+        for offset in 0..=text.len() {
+            let word = word_before(text, offset); // must not panic at any byte
+            assert!(text.contains(word) || word.is_empty());
+        }
+    }
 
     fn item(label: &str, source: CompletionSource) -> CompletionItem {
         CompletionItem::new(label.to_string(), source)
