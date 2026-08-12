@@ -15,13 +15,6 @@ pub struct ReadFile {
     pub trailing_newline: bool,
 }
 
-/// Files above this size are refused rather than loaded.
-///
-/// ponytail: a hard limit, not a streaming/virtualised large-file mode. Refusing with a
-/// clear message beats freezing the UI on a 2 GB log. Raise it — or implement
-/// memory-mapped viewing — when someone actually needs to open such a file.
-pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-
 /// Reads a UTF-8 text file.
 ///
 /// Rejects binary files (NUL byte in the first 8 KiB, the same heuristic git uses) so
@@ -32,15 +25,8 @@ pub fn read_file(path: &Path) -> Result<ReadFile> {
     if meta.is_dir() {
         bail!("{} is a directory", path.display());
     }
-    if meta.len() > MAX_FILE_BYTES {
-        bail!(
-            "{} is {:.1} MB; the limit is {} MB",
-            path.display(),
-            meta.len() as f64 / 1_048_576.0,
-            MAX_FILE_BYTES / 1_048_576
-        );
-    }
-
+    // No size ceiling: the owner asked for any file to open, accepting that a
+    // multi-GB file loads fully into memory and can stall the UI while it does.
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes[..bytes.len().min(8192)].contains(&0) {
         bail!("{} looks like a binary file", path.display());
