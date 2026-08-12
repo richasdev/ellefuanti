@@ -73,6 +73,10 @@ actions!(
         CloseTerminal,
         SplitTerminal,
         ToggleTheme,
+        // Fullscreen and Zen (owner request). Fullscreen defers to the platform;
+        // Zen hides the chrome around the editor and is this app's own state.
+        ToggleFullscreen,
+        ToggleZen,
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
@@ -187,6 +191,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some(context::WORKSPACE)),
         // ⌘, is the macOS convention for preferences, and the menu item shows it.
         KeyBinding::new("cmd-,", OpenSettings, Some(context::WORKSPACE)),
+        // ⌃⌘F is the macOS-wide fullscreen chord; ⌘K Z is VS Code's zen chord, chosen
+        // so the muscle memory transfers.
+        KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-k z", ToggleZen, Some(context::WORKSPACE)),
         // #82 stage 1: ⌘D grows a cursor per occurrence; Escape (the editor's existing
         // Cancel) collapses back to one.
         KeyBinding::new("cmd-d", SelectNextOccurrence, Some(context::EDITOR)),
@@ -456,6 +464,8 @@ pub enum Dispatch {
     NewTerminal,
     ToggleTerminal,
     ToggleTheme,
+    ToggleFullscreen,
+    ToggleZen,
     ToggleHiddenFiles,
     OpenSettings,
     Find,
@@ -509,6 +519,8 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "terminal.new" => Dispatch::NewTerminal,
         "terminal.toggle" => Dispatch::ToggleTerminal,
         "theme.toggle" => Dispatch::ToggleTheme,
+        "view.fullscreen" => Dispatch::ToggleFullscreen,
+        "view.zen" => Dispatch::ToggleZen,
         "workspace.toggle_hidden_files" => Dispatch::ToggleHiddenFiles,
         "workspace.open_settings" => Dispatch::OpenSettings,
         "editor.find" => Dispatch::Find,
