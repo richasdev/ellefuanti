@@ -5,14 +5,43 @@ generic editor that happens to support them.
 
 Written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
 
-> **Status: preparing 0.1.0.** The editor foundation is built — rope buffer, incremental
-> parsing, highlighting, file tree, tabs, palette, quick open, multi-session terminal, and a
-> generic LSP client. 258 tests, clippy clean.
->
-> **The UI has not been visually verified** ([#35](https://github.com/richasdev/ellefuanti/issues/35)),
-> and that is the main thing standing between this and a release. See
-> [CHANGELOG.md](CHANGELOG.md) for the honest limitations list and
-> [docs/MILESTONE-1.md](docs/MILESTONE-1.md) for what works.
+> **Status: v0.1.0 released.** A working editor for PHP, Laravel, Livewire and Blade —
+> editor, LSP intelligence, Eloquent/route/Livewire awareness, and Git / Database / Docker /
+> Composer / test panels. Verified in daily use on a real Laravel project. 1300+ tests,
+> clippy clean. See [CHANGELOG.md](CHANGELOG.md) and
+> [the latest release](https://github.com/richasdev/ellefuanti/releases/latest).
+
+## Install
+
+Download the latest `.app` from [Releases](https://github.com/richasdev/ellefuanti/releases/latest),
+or grab it from the terminal:
+
+```sh
+# Download and unzip the latest macOS build
+curl -L -o ellefuanti.zip \
+  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-v0.1.0-macos.zip
+unzip ellefuanti.zip
+
+# The build is unsigned, so macOS quarantines it on download and says the app "is
+# damaged". It is not — strip the quarantine attribute and it opens:
+xattr -dr com.apple.quarantine ellefuanti.app
+
+# Move it into place and launch
+mv ellefuanti.app /Applications/
+open /Applications/ellefuanti.app
+```
+
+**Why "damaged"?** The build is not code-signed with an Apple Developer certificate, so
+Gatekeeper flags the downloaded bundle. The `xattr -dr com.apple.quarantine` command above
+removes the download flag; alternatively, right-click the app → **Open** the first time and
+confirm. Signing/notarization is on the roadmap.
+
+**PHP language features** need a language server on your `PATH` (or under a common installer
+prefix like Herd/nvm) — install [Intelephense](https://intelephense.com/):
+
+```sh
+npm install -g intelephense
+```
 
 ## Why
 
