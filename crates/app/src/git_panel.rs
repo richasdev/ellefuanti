@@ -38,8 +38,8 @@ use elle_git::{DiffFile, FileStatus, LineKind, RepoStatus, Status};
 use elle_syntax::{Language, SyntaxTree, language_for_path};
 use elle_text::Buffer;
 use gpui::{
-    App, Context, EventEmitter, MouseButton, SharedString, StyledText, Window, div, prelude::*, px,
-    uniform_list,
+    App, Context, EventEmitter, FocusHandle, Focusable, MouseButton, SharedString, StyledText,
+    Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::fonts::Fonts;
@@ -122,6 +122,11 @@ impl PanelState {
 
 pub struct GitPanel {
     state: PanelState,
+    /// The panel's place in the window's focus path. Without this the commit box was a
+    /// drawing of an input: `on_key_down` was wired but gpui dispatches key events along
+    /// the focus path only, so every keystroke went to the editor and the box never
+    /// heard one. Clicking the box focuses this handle; the root div tracks it.
+    focus_handle: FocusHandle,
     /// The commit box's text. Plain keystroke capture, the palette's pattern — a full
     /// text-input widget for a one-line message would be the framework this repo keeps
     /// declining to build.
@@ -136,9 +141,10 @@ pub struct GitPanel {
 impl EventEmitter<GitEvent> for GitPanel {}
 
 impl GitPanel {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             state: PanelState::default(),
+            focus_handle: cx.focus_handle(),
             diff: None,
             selected: None,
             commit_message: String::new(),
@@ -166,25 +172,57 @@ impl GitPanel {
             return;
         }
         match keystroke.key.as_str() {
-            "backspace" => {
-                self.commit_message.pop();
-                cx.notify();
-            }
-            "enter" => {
-                let staged_anything = self.state.files().iter().any(|file| file.staged);
-                if !self.commit_message.trim().is_empty() && staged_anything {
-                    cx.emit(GitEvent::CommitRequested { message: self.commit_message.clone() });
-                }
-            }
+            "backspace" => self.backspace(cx),
+            "enter" => self.commit_if_ready(cx),
             _ => {
                 let Some(text) = keystroke.key_char.as_deref() else { return };
                 if text.is_empty() || text.chars().all(|c| c.is_control()) {
                     return;
                 }
-                self.commit_message.push_str(text);
-                cx.notify();
+                self.typed(text, cx);
             }
         }
+    }
+
+    /// The shared tail of a keystroke reaching the message — also the test door, because
+    /// a `KeyDownEvent` cannot be conjured headlessly (the palette's `typed` reasoning).
+    fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.commit_message.push_str(text);
+        cx.notify();
+    }
+
+    fn backspace(&mut self, cx: &mut Context<Self>) {
+        self.commit_message.pop();
+        cx.notify();
+    }
+
+    /// Enter's tail: commit only with a non-blank message *and* something staged —
+    /// otherwise Enter is a no-op, not a commit of nothing.
+    fn commit_if_ready(&mut self, cx: &mut Context<Self>) {
+        let staged_anything = self.state.files().iter().any(|file| file.staged);
+        if !self.commit_message.trim().is_empty() && staged_anything {
+            cx.emit(GitEvent::CommitRequested { message: self.commit_message.clone() });
+        }
+    }
+
+    #[cfg(test)]
+    pub fn type_for_test(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.typed(text, cx);
+    }
+
+    #[cfg(test)]
+    pub fn backspace_for_test(&mut self, cx: &mut Context<Self>) {
+        self.backspace(cx);
+    }
+
+    #[cfg(test)]
+    pub fn commit_for_test(&mut self, cx: &mut Context<Self>) {
+        self.commit_if_ready(cx);
+    }
+
+    #[cfg(test)]
+    pub fn commit_message_for_test(&self) -> &str {
+        &self.commit_message
     }
 
     /// The commit box (#64 item 4): message line, button, both live only when a
@@ -195,12 +233,14 @@ impl GitPanel {
         }
         let staged_anything = self.state.files().iter().any(|file| file.staged);
         let has_message = !self.commit_message.trim().is_empty();
-        let shown = if self.commit_message.is_empty() {
+        let message_is_placeholder = self.commit_message.is_empty();
+        let shown = if message_is_placeholder {
             SharedString::from("Commit message…")
         } else {
             SharedString::from(self.commit_message.clone())
         };
         let entity = cx.entity();
+        let focus = self.focus_handle.clone();
 
         Some(
             div()
@@ -213,14 +253,43 @@ impl GitPanel {
                 .border_color(theme.border)
                 .child(
                     div()
+                        .id("git-commit-message")
+                        .flex()
+                        .items_center()
                         .px_2()
                         .py_1()
                         .rounded(px(4.0))
                         .bg(theme.background)
                         .border_1()
                         .border_color(theme.border)
-                        .when(self.commit_message.is_empty(), |el| el.text_color(theme.text_muted))
-                        .child(shown),
+                        .cursor_text()
+                        // Clicking the box is how it becomes an input: keystrokes only
+                        // dispatch along the focus path, so without this focus the box
+                        // could render forever and never hear a key.
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, _cx| {
+                            window.focus(&focus);
+                        })
+                        .when(message_is_placeholder, |el| el.text_color(theme.text_muted))
+                        // The caret sits BEFORE placeholder text and after typed text —
+                        // the box reads as an input either way, the palette's shape
+                        // (#164). Solid, not blinking, for the palette's reason: a
+                        // steady bar says "type here" without buying a timer.
+                        .when(message_is_placeholder, |el| {
+                            el.child(
+                                div().w(px(2.0)).h(px(16.0)).mr_1().flex_none().bg(theme.cursor),
+                            )
+                        })
+                        .child(shown)
+                        .when(!message_is_placeholder, |el| {
+                            el.child(
+                                div()
+                                    .w(px(2.0))
+                                    .h(px(16.0))
+                                    .ml(px(1.0))
+                                    .flex_none()
+                                    .bg(theme.cursor),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -320,6 +389,12 @@ fn status_color(status: Status, theme: &Theme) -> gpui::Hsla {
     }
 }
 
+impl Focusable for GitPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for GitPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Cloned rather than borrowed: `render_rows` needs `&mut Context`, and holding a
@@ -331,6 +406,10 @@ impl Render for GitPanel {
             .flex()
             .flex_col()
             .size_full()
+            // Without this the `on_key_down` below is decoration: key events dispatch
+            // along the focus path only, and a div that never participates in focus is
+            // never on it. This was the whole commit-box bug.
+            .track_focus(&self.focus_handle(cx))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_header(&theme))
             .child(self.render_rows(&theme, cx))
