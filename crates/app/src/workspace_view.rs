@@ -22,7 +22,8 @@ use crate::actions::{
     FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol, PushToRemote,
     IncreaseFontSize, QuickFix, RenameSymbol,
     NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
-    RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
+    RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch,
+    ToggleCommandPalette,
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
     dispatch_for,
 };
@@ -391,6 +392,53 @@ fn split_target_id(id: &str) -> (PathBuf, Option<Point>) {
         }
         _ => (PathBuf::from(id), None),
     }
+}
+
+/// Cleans a git error for the one-line status bar.
+///
+/// git's CLI writes multi-line stderr, and `anyhow`'s `{err:#}` flattens a chain into
+/// `outer: inner: innermost` — either way the raw string is a paragraph where the status bar
+/// has one line. The owner asked for these "formatted better"; the shape that helps is: show
+/// the *first meaningful* line, and drop git's own `error:`/`fatal:` prefix noise, which
+/// repeats what the user already knows (they ran a git action) and buries the actual sentence
+/// behind a category label.
+///
+/// What is deliberately **kept**: everything after the first meaningful line's prefix, in
+/// full. A pre-commit/pre-push hook's rejection and a remote's `! [rejected]` reason are the
+/// message the user needs to act on — those are FOR them, the same reason `run_git_write`
+/// surfaces hook stderr verbatim. This trims labels, never content.
+fn clean_git_error(raw: &str) -> String {
+    // The first line that says something. git prints blank lines and bare `hint:`/`warning:`
+    // scaffolding around the real reason; the first line carrying an actual message is the
+    // one to show. Fall back to the whole trimmed string if nothing stands out.
+    let first_meaningful = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("error")
+                && !line.eq_ignore_ascii_case("fatal")
+        })
+        .unwrap_or_else(|| raw.trim());
+
+    // Strip a single leading category label. `fatal:` and `error:` name a severity the status
+    // bar already implies; stripping one leaves the sentence. Only one is stripped, so a
+    // message that legitimately contains "error: " later in its text keeps it.
+    let cleaned = strip_git_prefix(first_meaningful);
+
+    // Empty only if the whole error was blank lines and bare labels — then the raw string,
+    // trimmed, is still better than an empty status.
+    if cleaned.is_empty() { raw.trim().to_string() } else { cleaned.to_string() }
+}
+
+/// Drops one leading `fatal:`/`error:`/`git:` label and the space after it, case-insensitively.
+fn strip_git_prefix(line: &str) -> &str {
+    for prefix in ["fatal:", "error:", "git:"] {
+        if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return line[prefix.len()..].trim_start();
+        }
+    }
+    line
 }
 
 /// One in-flight [`Task`] per [`Job`].
@@ -1059,7 +1107,9 @@ impl WorkspaceView {
                             this.status = Some(format!("✓ {summary}  ·  ⇧⌥P to push").into());
                         }
                     }
-                    Err(err) => this.status = Some(format!("{err:#}").into()),
+                    Err(err) => {
+                        this.status = Some(clean_git_error(&format!("{err:#}")).into())
+                    }
                 }
                 this.refresh_git_status(cx);
                 cx.notify();
@@ -4278,6 +4328,20 @@ impl WorkspaceView {
         );
     }
 
+    /// Opens the branch palette (the panel's Branch button, and `git.switch_branch`).
+    ///
+    /// A thin action so the git panel's pointer button and the command palette's keyboard
+    /// entry land on the *same* `toggle_palette(Branches)` — the switch logic itself stays in
+    /// one place, `elle_git::switch_branch`, reached only when a branch is confirmed.
+    fn switch_branch(&mut self, _: &SwitchBranch, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette(PaletteMode::Branches, window, cx);
+    }
+
+    /// Opens the git log palette (the panel's History button, and `git.log`).
+    fn show_git_log(&mut self, _: &ShowGitLog, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette(PaletteMode::GitLog, window, cx);
+    }
+
     /// Formats the whole document through the language server (#19, ⇧⌥F).
     ///
     /// Silent with no server, like every navigation command (§24). The buffer is
@@ -6404,6 +6468,8 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::format_document))
             .on_action(cx.listener(Self::push_to_remote))
+            .on_action(cx.listener(Self::switch_branch))
+            .on_action(cx.listener(Self::show_git_log))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::quick_fix))
             .on_action(cx.listener(Self::find_references))
@@ -6931,7 +6997,7 @@ impl WorkspaceView {
                         let message = message.trim();
                         if message.is_empty() { "Done".to_string() } else { message.to_string() }
                     }
-                    Err(err) => format!("git: {err}"),
+                    Err(err) => clean_git_error(&format!("{err:#}")),
                 }
                 .into());
                 this.refresh_git_status(cx);
@@ -7856,6 +7922,56 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn a_fatal_prefix_is_dropped_from_a_git_error() {
+        // The status bar already implies "this is a git failure"; the `fatal:` label just
+        // pushes the actual sentence right. What is left is the reason, in full.
+        assert_eq!(
+            clean_git_error("fatal: not a git repository"),
+            "not a git repository"
+        );
+        assert_eq!(clean_git_error("error: pathspec 'x' did not match"), "pathspec 'x' did not match");
+    }
+
+    #[test]
+    fn only_the_first_meaningful_line_is_shown() {
+        // git stderr is a paragraph; the status bar is one line. The first line that carries
+        // a message wins, and blank/bare-label lines ahead of it are skipped.
+        let raw = "\nfatal: unable to access 'https://…': Could not resolve host\nhint: check your network";
+        assert_eq!(clean_git_error(raw), "unable to access 'https://…': Could not resolve host");
+    }
+
+    #[test]
+    fn a_hook_rejection_is_kept_intact() {
+        // A pre-commit hook's message is FOR the user — the whole point of surfacing it. Only
+        // the leading label is trimmed; the hook's own words survive untouched.
+        let raw = "error: failed to push some refs\nremote: rejected by pre-receive hook: run the linter first";
+        // First meaningful line is the summary; its label is dropped, its content kept.
+        assert_eq!(clean_git_error(raw), "failed to push some refs");
+    }
+
+    #[test]
+    fn a_message_with_no_prefix_survives_unchanged() {
+        assert_eq!(clean_git_error("Everything up-to-date"), "Everything up-to-date");
+    }
+
+    #[test]
+    fn a_later_error_word_in_the_sentence_is_not_stripped() {
+        // Only ONE leading label comes off. A message that mentions "error:" further along
+        // keeps it — stripping every occurrence would eat real content.
+        assert_eq!(
+            clean_git_error("fatal: the commit hook printed error: bad config"),
+            "the commit hook printed error: bad config"
+        );
+    }
+
+    #[test]
+    fn an_all_label_error_falls_back_to_the_raw_text() {
+        // Degenerate input (only blank lines and bare labels) still yields something rather
+        // than an empty status bar.
+        assert_eq!(clean_git_error("fatal\n\nerror"), "fatal\n\nerror");
+    }
 
     #[test]
     fn autocomplete_opens_on_a_word_char_only_past_the_prefix_floor() {

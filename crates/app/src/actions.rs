@@ -94,6 +94,13 @@ actions!(
         GoToDefinition,
         FormatDocument,
         PushToRemote,
+        // Git panel toolbar (#64 follow-up). `PushToRemote` already exists (⇧⌥P); these two
+        // give the panel's Branch and History buttons an action to fire so they reuse the
+        // exact `toggle_palette` paths the palette commands do, rather than reimplementing
+        // branch-switch or log. Keyboard-unbound: the palette and its commands are the
+        // keyboard route, the buttons are the pointer route to the same handlers.
+        SwitchBranch,
+        ShowGitLog,
         RenameSymbol,
         QuickFix,
         FoldBlock,
