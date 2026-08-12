@@ -705,9 +705,11 @@ impl Render for AiChatPanel {
             .on_action(cx.listener(Self::cancel))
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(380.0))
-            .h_full()
+            // Fills the wrapper the workspace sizes, rather than declaring its own
+            // width: since the owner's resize request the width lives on the workspace
+            // and is dragged by a divider, and two owners of one number is how a panel
+            // ends up ignoring the handle that is supposed to size it.
+            .size_full()
             .overflow_hidden()
             .bg(theme.panel)
             .border_l_1()

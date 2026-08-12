@@ -119,7 +119,19 @@ pub struct Metrics;
 
 impl Metrics {
     pub const ACTIVITY_BAR_WIDTH: Pixels = px(44.0);
+    /// The sidebar's width *on first launch*. Since the owner's resize request it is a
+    /// starting point rather than the width: `WorkspaceView` owns the live value and the
+    /// divider drags it.
     pub const SIDEBAR_WIDTH: Pixels = px(240.0);
+    /// Same, for the AI chat panel (#99 shipped it fixed at this width).
+    pub const AI_CHAT_WIDTH: Pixels = px(380.0);
+    /// What a panel may not be dragged below or above.
+    ///
+    /// A floor because a panel dragged to nothing is a panel the user cannot get back —
+    /// the divider goes with it. A ceiling because the editor is the point of the window;
+    /// a sidebar that can eat it is a layout bug waiting for a bug report.
+    pub const PANEL_MIN_WIDTH: Pixels = px(160.0);
+    pub const PANEL_MAX_WIDTH: Pixels = px(720.0);
     pub const TAB_HEIGHT: Pixels = px(32.0);
     pub const STATUS_HEIGHT: Pixels = px(24.0);
     pub const ROW_HEIGHT: Pixels = px(22.0);
