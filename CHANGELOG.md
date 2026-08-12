@@ -5,6 +5,24 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- PHP smart typing: quotes auto-close in code (the parse tree keeps `don't` in comments,
+  strings and prose untouched), and `=` inside an array literal completes to `=>` with
+  the follow-up `>` swallowed — the PhpStorm behaviours.
+- Fullscreen (⌃⌘F, native) and Zen mode (⌘K Z): chrome hidden, editor centred; both in
+  the View menu and the command palette.
+- Eight shipped themes: Dracula, Nord, Catppuccin Mocha and Latte, Gruvbox Dark, Tokyo
+  Night, Solarized Dark and Light — bundled into the .app and picked visually.
+- Settings panel sections (Editor / Appearance) with a swatch-grid theme picker.
+- AI provider layer (#29/#99 groundwork): Anthropic API key (macOS Keychain), `ant` CLI
+  login, or any OpenAI-compatible base URL (OpenAI, OpenRouter, local Ollama). Transport
+  is the system `curl`; a no-override denylist refuses `.env`, keys, PEMs, databases and
+  credential-named files as context. Everything off by default; `docs/RISKS.md` gains
+  the data-egress entry.
+
 ## [0.2.1] — 2026-08-12
 
 ### Added
