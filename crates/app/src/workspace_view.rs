@@ -499,6 +499,11 @@ pub struct WorkspaceView {
     /// Scrolls the tab strip so the active tab is visible — activating a tab from the
     /// tree or palette with twenty open otherwise selects it off-screen (owner request).
     tab_scroll: gpui::ScrollHandle,
+    /// Keeps the FS watcher and its debounce task alive so the tree follows Finder,
+    /// terminals and the app's own file operations without a manual refresh (owner
+    /// request). The sender is held for tests, which have no real FSEvents to fire.
+    /// Dropping the tuple (a new root, or shutdown) un-watches and ends the task.
+    tree_watcher: Option<(notify::RecommendedWatcher, smol::channel::Sender<()>, gpui::Task<()>)>,
     tabs: Vec<Tab>,
     active_tab: usize,
     palette: Option<Entity<Palette>>,
@@ -705,6 +710,7 @@ impl WorkspaceView {
             tree: None,
             tree_scroll: gpui::UniformListScrollHandle::new(),
             tab_scroll: gpui::ScrollHandle::new(),
+            tree_watcher: None,
             tabs: Vec::new(),
             active_tab: 0,
             palette: None,
@@ -803,8 +809,10 @@ impl WorkspaceView {
     /// server and the other one quietly not — which is the shape of #125, where `start_lsp`
     /// had exactly one caller and nobody noticed.
     fn adopt_tree(&mut self, tree: FileTree, cx: &mut Context<Self>) {
+        let root = tree.root().to_path_buf();
         self.tree = Some(tree);
         self.status = None;
+        self.start_tree_watcher(root, cx);
         // A run belongs to the project it was started in. Its results name files in the old
         // tree and its `--filter` names the old suite, so carrying either into a new project
         // would show verdicts about code the user is no longer looking at. The panel goes
@@ -5519,6 +5527,86 @@ impl WorkspaceView {
             self.status = Some(format!("{err:#}").into());
         }
         cx.notify();
+    }
+
+    /// Watches the root so the tree follows Finder, terminals and `mkdir` without a
+    /// manual refresh (owner request).
+    ///
+    /// The watcher's callback runs on notify's own thread, where touching an `Entity`
+    /// is not allowed, so it only pokes a channel — the same marshalling shape as the
+    /// test runner's event stream. A foreground task debounces 300 ms on gpui's
+    /// executor (test-controllable time, like the search debounce) and drains the
+    /// burst, so a `composer install` that touches a thousand paths costs a handful of
+    /// refreshes rather than a thousand.
+    ///
+    /// `.git` churn is filtered at the callback: every `git status` the git panel runs
+    /// rewrites index files, and refreshing the tree for those would make the watcher
+    /// its own noisiest client. Watcher setup failure is non-fatal — the tree just
+    /// stays manual-refresh, which is what it was before this existed.
+    fn start_tree_watcher(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        use notify::Watcher as _;
+
+        self.tree_watcher = None; // a replaced root un-watches before re-watching
+        let (tx, rx) = smol::channel::unbounded::<()>();
+        let git_dir = root.join(".git");
+        let callback_tx = tx.clone();
+        let mut watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let Ok(event) = event else { return };
+                if !event.paths.is_empty() && event.paths.iter().all(|p| p.starts_with(&git_dir))
+                {
+                    return;
+                }
+                // A full channel cannot happen (unbounded); a closed one means the
+                // workspace moved on, and the watcher is about to be dropped with it.
+                let _ = callback_tx.try_send(());
+            }) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    eprintln!("ellefuanti: tree watcher unavailable ({err}); refresh stays manual");
+                    return;
+                }
+            };
+        if let Err(err) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
+            eprintln!(
+                "ellefuanti: cannot watch {} ({err}); refresh stays manual",
+                root.display()
+            );
+            return;
+        }
+
+        let timer_executor = cx.background_executor().clone();
+        let task = cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_ok() {
+                timer_executor.timer(std::time::Duration::from_millis(300)).await;
+                while rx.try_recv().is_ok() {} // coalesce the burst into one refresh
+                if this.update(cx, |this, cx| this.refresh_tree(cx)).is_err() {
+                    break; // the workspace is gone; so is the point
+                }
+            }
+        });
+        self.tree_watcher = Some((watcher, tx, task));
+    }
+
+    /// Simulates one FS event, since a headless test has no FSEvents to fire. Goes
+    /// through the real channel, debounce and refresh path.
+    #[cfg(test)]
+    pub fn poke_tree_watcher_for_test(&self) -> bool {
+        match self.tree_watcher.as_ref() {
+            Some((_, tx, _)) => tx.try_send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Starts the real watcher, which `open_folder_for_test` deliberately does not:
+    /// most tests want a root, not an FSEvents stream per test.
+    #[cfg(test)]
+    pub fn start_tree_watcher_for_test(
+        &mut self,
+        root: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_tree_watcher(root, cx);
     }
 
     /// Sets the syntax language for the active tab (#127).

@@ -2278,6 +2278,44 @@ fn project() -> tempfile::TempDir {
     dir
 }
 
+/// A filesystem change refreshes the tree by itself — no manual refresh (owner request).
+///
+/// The event is fired through the watcher's own channel rather than by waiting on real
+/// FSEvents: the debounce and refresh path is what this test owns; delivery from the OS
+/// to the callback is notify's contract. Time is advanced, not slept — the debounce
+/// timer runs on gpui's executor exactly so a test controls it (the search pattern).
+#[gpui::test]
+async fn the_tree_refreshes_itself_when_the_filesystem_changes(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.start_tree_watcher_for_test(dir.path().to_path_buf(), cx);
+    });
+
+    std::fs::create_dir(dir.path().join("nova")).unwrap();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            !workspace.tree_names_for_test().contains(&"nova".to_string()),
+            "not yet — nothing has refreshed"
+        );
+        assert!(workspace.poke_tree_watcher_for_test(), "the watcher is running");
+    });
+
+    cx.executor().advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.tree_names_for_test().contains(&"nova".to_string()),
+            "the new folder appeared without a manual refresh"
+        );
+    });
+
+    draw(cx);
+}
+
 /// Right-clicking a row opens a menu about *that* row.
 ///
 /// The report #126 came from was "não dá pra apertar click direito" — there was no

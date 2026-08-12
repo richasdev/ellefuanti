@@ -54,6 +54,7 @@ anyhow.workspace = true
 # cost #79 and #93 exist to keep out — a channel that wakes the task when an event arrives
 # costs nothing when no run is happening.
 smol.workspace = true
+notify.workspace = true
 regex.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
