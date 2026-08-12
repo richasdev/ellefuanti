@@ -93,6 +93,7 @@ actions!(
         SelectNextOccurrence,
         GoToDefinition,
         FormatDocument,
+        PushToRemote,
         RenameSymbol,
         QuickFix,
         FoldBlock,
@@ -194,6 +195,9 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // ⇧⌥F is VS Code's chord, on the workspace like F12: it acts on the active
         // editor and must not require focus juggling to reach.
         KeyBinding::new("shift-alt-f", FormatDocument, Some(context::WORKSPACE)),
+        // ⇧⌥P pushes — the follow-through the commit feedback points at, so the whole
+        // commit→push flow is reachable from the keyboard without the palette.
+        KeyBinding::new("shift-alt-p", PushToRemote, Some(context::WORKSPACE)),
         // F2 is the rename key everywhere; like F12 it acts on the active editor.
         KeyBinding::new("f2", RenameSymbol, Some(context::WORKSPACE)),
         // ⌘. is VS Code's quick-fix chord and nothing here claims it.

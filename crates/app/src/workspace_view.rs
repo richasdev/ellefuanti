@@ -19,7 +19,7 @@ use gpui::{
 
 use crate::actions::{
     CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
-    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
+    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol, PushToRemote,
     IncreaseFontSize, QuickFix, RenameSymbol,
     NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
     RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
@@ -1032,10 +1032,18 @@ impl WorkspaceView {
 
             this.update(cx, |this, cx| {
                 match done {
-                    Ok(_) => {
+                    Ok(output) => {
                         // The commit box empties only on success; a hook's refusal must
                         // not eat the message the user typed.
                         this.git.update(cx, |panel, cx| panel.clear_commit_message(cx));
+                        // Say what happened, on the status line. The owner read a silent
+                        // commit as "só esconde" — git's own summary ("[main abc123] msg")
+                        // is the proof the commit landed. A staged-only write (no output)
+                        // stays quiet as before.
+                        let summary = output.lines().next().unwrap_or("").trim();
+                        if !summary.is_empty() {
+                            this.status = Some(format!("✓ {summary}  ·  ⇧⌥P to push").into());
+                        }
                     }
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
@@ -4154,6 +4162,22 @@ impl WorkspaceView {
         self.go_to_definition_at_cursor(window, cx);
     }
 
+    /// Pushes the current branch (⇧⌥P, and the palette's Git: Push). One place so the
+    /// chord and the command cannot diverge; the CLI carries the user's credentials.
+    fn push_to_remote(&mut self, _: &PushToRemote, _window: &mut Window, cx: &mut Context<Self>) {
+        self.status = Some("Pushing…".into());
+        cx.notify();
+        self.run_git_operation(
+            |root| {
+                elle_git::push(&root).map(|out| {
+                    let out = out.trim();
+                    if out.is_empty() { "✓ Pushed".to_string() } else { out.to_string() }
+                })
+            },
+            cx,
+        );
+    }
+
     /// Formats the whole document through the language server (#19, ⇧⌥F).
     ///
     /// Silent with no server, like every navigation command (§24). The buffer is
@@ -5830,13 +5854,7 @@ impl WorkspaceView {
                         |root| elle_git::fetch(&root).map(|_| "Fetched".to_string()),
                         cx,
                     ),
-                    Dispatch::GitPush => self.run_git_operation(
-                        |root| elle_git::push(&root).map(|out| {
-                            let out = out.trim();
-                            if out.is_empty() { "Pushed".to_string() } else { out.to_string() }
-                        }),
-                        cx,
-                    ),
+                    Dispatch::GitPush => self.push_to_remote(&PushToRemote, window, cx),
                     Dispatch::GitSwitchBranch => {
                         self.toggle_palette(PaletteMode::Branches, window, cx)
                     }
@@ -6260,6 +6278,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::format_document))
+            .on_action(cx.listener(Self::push_to_remote))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::quick_fix))
             .on_action(cx.listener(Self::find_references))
