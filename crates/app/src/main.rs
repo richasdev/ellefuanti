@@ -2,6 +2,7 @@
 
 mod actions;
 mod ai;
+mod ai_chat;
 mod artisan;
 mod completion;
 mod context_menu;

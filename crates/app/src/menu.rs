@@ -178,6 +178,10 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 Item::command("Toggle Zen Mode", "view.zen", |label| {
                     MenuItem::action(label, crate::actions::ToggleZen)
                 }),
+                // The AI chat panel (#99), under View with the other panels.
+                Item::command("Toggle AI Chat", "ai.chat", |label| {
+                    MenuItem::action(label, crate::actions::ToggleAiChat)
+                }),
                 Item::command("Toggle Hidden Files", "workspace.toggle_hidden_files", |label| {
                     MenuItem::action(label, ToggleHiddenFiles)
                 }),

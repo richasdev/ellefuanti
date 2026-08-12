@@ -217,6 +217,9 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("theme.toggle", "Switch Theme"),
     Command::new("view.fullscreen", "Toggle Full Screen"),
     Command::new("view.zen", "Toggle Zen Mode"),
+    // The AI chat panel (#99). One command, because the panel is one thing: everything
+    // else about it (provider, key, enablement) lives in Settings, not the palette.
+    Command::new("ai.chat", "Toggle AI Chat"),
 ];
 
 #[cfg(test)]
