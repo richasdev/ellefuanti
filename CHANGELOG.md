@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Self-update: the app checks GitHub Releases on launch and every six hours. A newer
+  version shows an `Update vX.Y.Z ↓` cell in the status bar; clicking downloads the
+  dmg, swaps `/Applications/ellefuanti.app` and clears quarantine, then the cell reads
+  `Restart to update`. Dev builds and dmg-less releases fall back to opening the
+  release page.
+
 ## [0.2.0] — 2026-08-12
 
 ### Added
