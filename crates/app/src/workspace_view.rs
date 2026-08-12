@@ -7954,10 +7954,17 @@ impl WorkspaceView {
         let modified: std::collections::HashSet<PathBuf> =
             self.git.read(cx).state().files().iter().map(|file| file.path.clone()).collect();
 
+        let selection = theme.selection;
         let tree_scroll = self.tree_scroll.clone();
         uniform_list("file-tree", count, move |range, _window, cx| {
             entity.update(cx, |this, _cx| {
                 let Some(tree) = this.tree.as_ref() else { return Vec::new() };
+                // The active tab's file gets a persistent row tint — "which file am I
+                // in" answered by the tree itself (owner request). Read here, not
+                // captured outside: the closure re-runs per frame and the active tab
+                // changes under it.
+                let active_path =
+                    this.tabs.get(this.active_tab).and_then(|tab| tab.path.clone());
 
                 range
                     .filter_map(|index| {
@@ -7978,6 +7985,7 @@ impl WorkspaceView {
                             icons::for_file(&entry.name)
                         };
                         let is_modified = modified.contains(&path);
+                        let is_active = active_path.as_deref() == Some(path.as_path());
 
                         Some(
                             div()
@@ -7990,10 +7998,13 @@ impl WorkspaceView {
                                 .pl(px(8.0 + entry.depth as f32 * 12.0))
                                 .hover(|el| el.bg(hover))
                                 .active(|el| el.bg(pressed))
+                                // Persistent, unlike hover: the tint follows the active
+                                // tab so the tree always answers "which file am I in".
+                                .when(is_active, |el| el.bg(selection))
                                 .cursor_pointer()
                                 .text_color(if modified.contains(&path) {
                                     modified_color
-                                } else if is_dir {
+                                } else if is_dir || is_active {
                                     text
                                 } else {
                                     muted
