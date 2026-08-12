@@ -501,3 +501,20 @@ fn a_non_route_static_call_is_ignored() {
         extract_routes("<?php\nCache::get('/users');\nGate::define('x', fn () => true);\n");
     assert_eq!(extraction, Default::default());
 }
+
+#[test]
+fn the_livewire_verb_registers_a_page_route() {
+    // richas-blog registers almost every page with Route::livewire('/path', 'component')
+    // — a Livewire Volt helper. Without it, the routes palette misses ~90% of the app.
+    // It maps to GET (a page), the URI is the first arg, the name rides ->name() as usual.
+    let source = "<?php\nRoute::livewire('/posts', 'posts')->name('posts');\nRoute::livewire('/read/{slug}', 'read-post')->name('read-post');\n";
+    let routes = extract_routes(source).routes;
+    assert_eq!(routes.len(), 2, "both livewire routes are found");
+
+    let posts = by_uri(&routes, "/posts");
+    assert_eq!(posts.method, HttpMethod::Get, "a livewire page is a GET");
+    assert_eq!(name(posts), Some("posts"));
+
+    let read = by_uri(&routes, "/read/{slug}");
+    assert_eq!(name(read), Some("read-post"));
+}
