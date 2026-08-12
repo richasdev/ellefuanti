@@ -2940,11 +2940,38 @@ impl WorkspaceView {
         // Already open: this event cannot fire, because the popup holds focus and the
         // character reaches `completion_typed` instead. Guarded anyway — the two paths
         // narrowing the same popup would double every character in the query.
-        let declared = self.is_completion_trigger(text);
+        //
+        // Two ways a keystroke opens the popup. A server *trigger* character (`$`, `->`
+        // via `>`, `::` via `:`) opens it always. But the owner's report was that the
+        // LSP "felt weak" because it only popped on those symbols — VS Code/Zed pop while
+        // you type an identifier. So a *word* character opens it too, once a small prefix
+        // exists, so completing an ordinary name works without ⌥⌘I. The prefix floor
+        // keeps a single letter from opening a hundred-row list on every keystroke.
+        let declared = self.is_completion_trigger(text)
+            || self.should_open_on_word_char(text, cx);
         if !Self::should_open_on_trigger(self.completion.is_some(), declared) {
             return;
         }
         self.open_completion(CompletionTrigger::Character, window, cx);
+    }
+
+    /// Whether typing `text` (one keystroke) should open the popup as an
+    /// autocomplete-as-you-type, the VS Code behaviour (#20 follow-up).
+    ///
+    /// Only when a language server is present (buffer words alone are too weak a source
+    /// to interrupt with), only for a word character, and only once the word under the
+    /// cursor is at least `MIN_AUTOCOMPLETE_PREFIX` long — so `u`, `us` stay quiet and
+    /// `use` opens. That floor is what keeps this from firing a request on every letter.
+    fn should_open_on_word_char(&self, text: &str, cx: &Context<Self>) -> bool {
+        if self.lsp.client().is_none() {
+            return false;
+        }
+        let Some(editor) = self.active_editor() else { return false };
+        let document = &editor.read(cx).document;
+        let offset = document.selection.head;
+        let buffer_text = document.buffer.text();
+        let prefix = crate::completion::word_before(&buffer_text, offset);
+        word_char_reaches_prefix_floor(text, prefix)
     }
 
     /// Whether a character typed in the editor should open a popup.
@@ -5946,6 +5973,18 @@ fn read_file_tail(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Str
     Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
+/// Whether one keystroke `text` is a word character AND the word already typed reaches
+/// the autocomplete floor — the pure half of `should_open_on_word_char`, testable
+/// without a language server (which the handler needs and a headless test lacks).
+fn word_char_reaches_prefix_floor(text: &str, prefix: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(c) = chars.next() else { return false };
+    if chars.next().is_some() || !(c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    prefix.chars().count() >= MIN_AUTOCOMPLETE_PREFIX
+}
+
 /// One indexed column as a popup item, provenance in the detail (`string · migration`).
 /// A cast with no migration behind it says just `cast` — an empty type is not a type.
 fn column_item(column: elle_index::laravel::ModelColumn) -> CompletionItem {
@@ -6551,6 +6590,12 @@ const DB_CELL_WIDTH: gpui::Pixels = px(180.0);
 /// The most log entries the panel keeps (#25) — a viewer, not an archive. Paired with
 /// the tail read below so a megabyte log costs a bounded read and a bounded row count.
 const LOG_MAX_ENTRIES: usize = 500;
+
+/// How many characters of a word must be typed before autocomplete opens on its own
+/// (#20 follow-up). VS Code uses 1 with a debounce; without a debounce, 3 keeps a stray
+/// letter from opening a full list on every keystroke while still feeling immediate on a
+/// real identifier. ⌥⌘I opens it at any length for the user who wants it sooner.
+const MIN_AUTOCOMPLETE_PREFIX: usize = 3;
 
 /// Rows per page in the database table view (#65) — a screenful, not a SELECT * on a
 /// production table (the #65 rule). Paging beyond the first is the next slice.
@@ -7672,6 +7717,20 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn autocomplete_opens_on_a_word_char_only_past_the_prefix_floor() {
+        // A trigger char is handled separately; this is the type-an-identifier path.
+        // Below the floor stays quiet (no popup on every letter); at the floor it opens.
+        assert!(!word_char_reaches_prefix_floor("e", "us"), "'us' + 'e' -> prefix 'us', too short");
+        assert!(word_char_reaches_prefix_floor("e", "use"), "'use' + 'e' -> prefix 'use', opens");
+        // Not a single word character.
+        assert!(!word_char_reaches_prefix_floor("(", "getName"), "a symbol is the trigger path");
+        assert!(!word_char_reaches_prefix_floor("ab", "getName"), "one keystroke, not a paste");
+        assert!(!word_char_reaches_prefix_floor(" ", "getName"), "whitespace does not open it");
+        // A digit or underscore is a word character.
+        assert!(word_char_reaches_prefix_floor("_", "obj_"), "underscore is a word char");
+    }
 
     #[test]
     fn read_file_tail_returns_the_end_at_a_line_boundary() {
