@@ -77,6 +77,9 @@ actions!(
         // Zen hides the chrome around the editor and is this app's own state.
         ToggleFullscreen,
         ToggleZen,
+        // The AI chat panel (#99). Workspace-scoped like the terminal toggle, and for the
+        // same reason: the chord must also *close* the panel while the panel has focus.
+        ToggleAiChat,
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
@@ -173,6 +176,10 @@ pub mod context {
     /// Sharing `FIND` would have meant three handlers that begin by asking which one they
     /// are in — the shape a second widget wears when it is pretending to be the first.
     pub const SEARCH_PANEL: &str = "SearchPanel";
+    /// The AI chat panel's input (#99). Its own context for the find bar's reasons:
+    /// `enter` here sends a message, `escape` cancels a streaming reply, and neither
+    /// meaning belongs anywhere else in the window.
+    pub const AI_CHAT: &str = "AiChat";
 }
 
 /// Registers the default keymap and the palette's command list.
@@ -195,6 +202,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // so the muscle memory transfers.
         KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, Some(context::WORKSPACE)),
         KeyBinding::new("cmd-k z", ToggleZen, Some(context::WORKSPACE)),
+        // ⌘⇧A toggles the AI chat panel (#99). Nothing else in this keymap claims the
+        // chord, and macOS's symbolic-hotkey table (read for the ⌥⌘I decision above)
+        // does not either.
+        KeyBinding::new("cmd-shift-a", ToggleAiChat, Some(context::WORKSPACE)),
         // #82 stage 1: ⌘D grows a cursor per occurrence; Escape (the editor's existing
         // Cancel) collapses back to one.
         KeyBinding::new("cmd-d", SelectNextOccurrence, Some(context::EDITOR)),
@@ -335,6 +346,13 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("cmd-alt-w", ToggleWholeWord, Some(context::SEARCH_PANEL)),
         KeyBinding::new("cmd-alt-r", ToggleRegex, Some(context::SEARCH_PANEL)),
         //
+        // The AI chat input (#99). `enter` sends; `escape` cancels a reply in flight and
+        // is otherwise inert — it does not close the panel, because a stray Esc throwing
+        // away a conversation is the find-in-project "results must survive" lesson.
+        KeyBinding::new("enter", Confirm, Some(context::AI_CHAT)),
+        KeyBinding::new("escape", Cancel, Some(context::AI_CHAT)),
+        KeyBinding::new("backspace", Backspace, Some(context::AI_CHAT)),
+        //
         // The completion popup (#61). These exist *only* while the popup is on screen,
         // because the context comes from the popup's own element — which is what makes
         // "arrows must still move the cursor when nothing is open" true by construction
@@ -466,6 +484,7 @@ pub enum Dispatch {
     ToggleTheme,
     ToggleFullscreen,
     ToggleZen,
+    ToggleAiChat,
     ToggleHiddenFiles,
     OpenSettings,
     Find,
@@ -521,6 +540,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "theme.toggle" => Dispatch::ToggleTheme,
         "view.fullscreen" => Dispatch::ToggleFullscreen,
         "view.zen" => Dispatch::ToggleZen,
+        "ai.chat" => Dispatch::ToggleAiChat,
         "workspace.toggle_hidden_files" => Dispatch::ToggleHiddenFiles,
         "workspace.open_settings" => Dispatch::OpenSettings,
         "editor.find" => Dispatch::Find,

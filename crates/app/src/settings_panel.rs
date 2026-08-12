@@ -40,6 +40,11 @@ pub enum SettingsPanelEvent {
     Dismissed,
     /// The "edit the file" button: the workspace opens settings.json in a tab.
     OpenJson,
+    /// The AI section's "Set API key…" (#99). The workspace opens the prompt and does
+    /// the Keychain write, because the panel must never hold the key — a key that only
+    /// ever exists in the prompt's text and the `security` argv is a key that cannot be
+    /// logged or persisted by accident here.
+    SetApiKey,
 }
 
 pub struct SettingsPanel {
@@ -84,10 +89,28 @@ impl SettingsPanel {
     }
 
     /// Moves the theme picker one step through the registry, wrapping.
-    /// Flips the autosave flag and persists it — the panel toggle the owner asked for.
-    fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
-        let now = crate::settings::current(cx).autosave();
-        crate::settings::update_settings(cx, |settings| settings.set_autosave(!now));
+    /// Flips one of the boolean settings and persists it, through the one door.
+    fn toggle(&mut self, kind: ToggleKind, cx: &mut Context<Self>) {
+        let settings = crate::settings::current(cx);
+        crate::settings::update_settings(cx, |mutable| match kind {
+            ToggleKind::Autosave => mutable.set_autosave(!settings.autosave()),
+            // The AI switches (#99): off by default, and this panel is how they come on.
+            ToggleKind::AiChat => mutable.set_ai_chat_enabled(!settings.ai_chat_enabled()),
+            ToggleKind::AiAutocomplete => {
+                mutable.set_ai_autocomplete_enabled(!settings.ai_autocomplete_enabled())
+            }
+        });
+        cx.notify();
+    }
+
+    /// Steps the AI provider cycler (#99). Three values, so backward is two forwards —
+    /// cheaper than teaching `Provider` a `previous` it needs nowhere else.
+    fn cycle_provider(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let current = crate::ai::Provider::from_setting(crate::settings::current(cx).ai_provider());
+        let next = if forward { current.next() } else { current.next().next() };
+        crate::settings::update_settings(cx, |settings| {
+            settings.set_ai_provider(next.setting_name());
+        });
         cx.notify();
     }
 
@@ -174,6 +197,14 @@ enum NumericField {
     LineHeight,
 }
 
+/// Which boolean setting a toggle row flips.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToggleKind {
+    Autosave,
+    AiChat,
+    AiAutocomplete,
+}
+
 /// The next index in a wrapping cycle.
 fn step_index(index: usize, len: usize, forward: bool) -> usize {
     if forward { (index + 1) % len } else { (index + len - 1) % len }
@@ -225,7 +256,34 @@ impl Render for SettingsPanel {
                 &theme,
                 &entity,
             ),
-            row_toggle("Auto save", settings.autosave(), &theme, &entity),
+            row_toggle("Auto save", ToggleKind::Autosave, settings.autosave(), &theme, &entity),
+        ];
+
+        // The AI section (#99). The provider and the two switches are writable; the
+        // models are shown read-only with the JSON as the edit path — a free-text model
+        // field is a text input this panel deliberately does not fake (see the find
+        // bar's `text_field` note). The key never appears here at all: the button asks
+        // the workspace to prompt, and the Keychain is the only destination.
+        let ai_rows = [
+            row_picker(
+                "AI provider",
+                crate::ai::Provider::from_setting(settings.ai_provider())
+                    .setting_name()
+                    .to_string(),
+                RowKind::AiProvider,
+                &theme,
+                &entity,
+            ),
+            row_toggle("AI chat", ToggleKind::AiChat, settings.ai_chat_enabled(), &theme, &entity),
+            row_toggle(
+                "AI autocomplete",
+                ToggleKind::AiAutocomplete,
+                settings.ai_autocomplete_enabled(),
+                &theme,
+                &entity,
+            ),
+            row_readonly("Chat model", settings.ai_chat_model().to_string(), &theme),
+            row_readonly("Autocomplete model", settings.ai_completion_model().to_string(), &theme),
         ];
 
         // The theme picker: every selectable theme as a chip with four swatch dots —
@@ -291,6 +349,26 @@ impl Render for SettingsPanel {
             .children(editor_rows)
             .child(section_header("Appearance", &theme))
             .child(div().flex().flex_wrap().gap_1().children(theme_chips))
+            .child(section_header("AI", &theme))
+            .children(ai_rows)
+            .child(
+                div()
+                    .id("settings-set-api-key")
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.border)
+                    .hover(|el| el.bg(theme.hover))
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = cx.entity();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |_this, cx| cx.emit(SettingsPanelEvent::SetApiKey));
+                        }
+                    })
+                    .child("Set API key…"),
+            )
             .child(
                 // The escape hatch the issue requires: the panel must not become a wall
                 // between the user and their file.
@@ -329,6 +407,8 @@ fn section_header(label: &'static str, theme: &crate::theme::Theme) -> gpui::Any
 #[derive(Clone, Copy)]
 enum RowKind {
     Family,
+    /// The AI provider (#99): anthropic → ant → custom, wrapping.
+    AiProvider,
 }
 
 /// A row with ‹ value › controls.
@@ -350,6 +430,7 @@ fn row_picker(
             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                 entity.update(cx, |panel, cx| match kind {
                     RowKind::Family => panel.cycle_family(forward, cx),
+                    RowKind::AiProvider => panel.cycle_provider(forward, cx),
                 });
             })
             .child(glyph)
@@ -362,6 +443,7 @@ fn row_picker(
 /// the toggle needs no colour to be read (the house rule: nothing by colour alone).
 fn row_toggle(
     label: &'static str,
+    kind: ToggleKind,
     on: bool,
     theme: &crate::theme::Theme,
     entity: &gpui::Entity<SettingsPanel>,
@@ -375,10 +457,19 @@ fn row_toggle(
         .when(on, |el| el.bg(theme.selected))
         .hover(|el| el.bg(theme.hover))
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-            entity.update(cx, |panel, cx| panel.toggle_autosave(cx));
+            entity.update(cx, |panel, cx| panel.toggle(kind, cx));
         })
         .child(if on { "On" } else { "Off" });
     row(label, String::new(), button, gpui::div().into_any_element(), theme)
+}
+
+/// A row that only shows a value — the models (#99), whose edit path is the JSON file.
+fn row_readonly(
+    label: &'static str,
+    value: String,
+    theme: &crate::theme::Theme,
+) -> gpui::AnyElement {
+    row(label, value, gpui::div().into_any_element(), gpui::div().into_any_element(), theme)
 }
 
 /// A row with − value + controls.

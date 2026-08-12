@@ -2299,6 +2299,89 @@ async fn zen_mode_toggles_and_the_window_still_draws(cx: &mut TestAppContext) {
     draw(cx);
 }
 
+// --- the AI chat panel (#99) --------------------------------------------------------
+
+/// The panel toggles through the real action handler and survives a paint, empty and
+/// populated. Populated matters separately: turn rendering (fence splitting, the code
+/// box, the copy button) only exists when there are turns to render.
+#[gpui::test]
+async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatTurn, Role};
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.ai_chat_for_test().is_none(), "closed until asked for (#99)");
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace
+        .read_with(cx, |workspace, _cx| workspace.ai_chat_for_test())
+        .expect("the toggle opens the panel");
+    draw(cx);
+
+    // A conversation with prose, a fenced block and a panel note — every render arm.
+    panel.update(cx, |panel, cx| {
+        panel.seed_turns_for_test(
+            vec![
+                ChatTurn { role: Role::User, text: "what does this do?".to_string() },
+                ChatTurn {
+                    role: Role::Assistant,
+                    text: "It echoes:\n```php\necho 1;\n```\nthat is all.".to_string(),
+                },
+                ChatTurn { role: Role::Note, text: "overloaded".to_string() },
+            ],
+            cx,
+        );
+    });
+    draw(cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.ai_chat_for_test().is_none(), "the same toggle closes it");
+    });
+    draw(cx);
+}
+
+/// The send path runs to the edge of the transport and stops there — the whole pipeline
+/// (settings read, turn push, body build) without a network or a curl child (#99).
+#[gpui::test]
+async fn ai_chat_send_builds_the_body_and_spawns_nothing(cx: &mut TestAppContext) {
+    use crate::ai_chat::Role;
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.type_input_for_test("does artisan tinker eval?", cx);
+        panel.send_for_test(cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let turns = panel.turns_for_test();
+        assert_eq!(turns.len(), 2, "the user turn plus the assistant placeholder");
+        assert_eq!(turns[0].role, Role::User);
+        assert_eq!(turns[0].text, "does artisan tinker eval?");
+        assert_eq!(turns[1].role, Role::Assistant);
+        assert_eq!(turns[1].text, "", "the placeholder streams in later");
+
+        let bodies = panel.sent_bodies_for_test();
+        assert_eq!(bodies.len(), 1, "one send, one body, zero processes");
+        assert!(bodies[0].contains("does artisan tinker eval?"), "{}", bodies[0]);
+        assert!(
+            !bodies[0].contains("\"role\":\"assistant\""),
+            "the empty placeholder must not reach the wire: {}",
+            bodies[0]
+        );
+    });
+
+    // And the streaming state renders (the dim ellipsis row).
+    draw(cx);
+}
+
 /// The status bar's update cell exists only while there is something to do, and its
 /// label follows the updater's state (owner request: "restart to update").
 #[gpui::test]

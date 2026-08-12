@@ -22,10 +22,11 @@ use crate::actions::{
     FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
     IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
     OpenSettings, PushToRemote, QuickFix, RenameSymbol, Replace, RerunFailedTests, ResetFontSize,
-    RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch, ToggleCommandPalette,
+    RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch, ToggleAiChat, ToggleCommandPalette,
     ToggleFullscreen, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel,
     ToggleTheme, ToggleZen, context, dispatch_for,
 };
+use crate::ai_chat::AiChatPanel;
 use crate::completion::{
     CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, CompletionTrigger,
     word_before,
@@ -113,6 +114,10 @@ enum Job {
     /// and the swap must cancel the ask rather than race it.
     ArtisanList,
     ClosePrompt,
+    /// Writing an API key to the Keychain (#99). Its own slot: superseding a slow
+    /// `security` call with a retyped key is the right behaviour, and nothing else may
+    /// cancel a write the user just confirmed.
+    SetApiKey,
     /// A create, rename or delete started from the tree's context menu (#126).
     ///
     /// One slot: these are all started by a click on a modal overlay, so two cannot be in
@@ -663,6 +668,15 @@ pub struct WorkspaceView {
     /// Zen mode (owner request): chrome hidden, editor centred. Session-only on
     /// purpose — reopening the app in zen with no visible way out is a trap.
     zen: bool,
+    /// The AI chat panel (#99). `Some` only while it is open, like the terminal: a
+    /// closed panel is absent, so a reply still streaming when it closes is cancelled
+    /// by the drop rather than narrating to nobody.
+    ai_chat: Option<Entity<AiChatPanel>>,
+    /// Which Keychain account the open API-key prompt writes to (#99): `Some` between
+    /// the settings panel's "Set API key…" and the prompt's confirm or dismissal.
+    /// Cleared on dismissal so a stale arm cannot route a later prompt's text — which
+    /// would be a filename — into the Keychain.
+    pending_api_key: Option<String>,
     /// Cancels an in-flight status walk, for the same reason `quick_open_cancel` exists:
     /// dropping the Task stops the await, not the libgit2 walk behind it (ADR-0007).
     git_cancel: Option<CancelFlag>,
@@ -768,6 +782,8 @@ impl WorkspaceView {
             git,
             sidebar: Sidebar::default(),
             zen: false,
+            ai_chat: None,
+            pending_api_key: None,
             git_cancel: None,
             git_diff: None,
             window_activation: None,
@@ -1215,6 +1231,44 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// ⌘⇧A (#99): the AI chat panel on the right. Absent when closed, like the terminal —
+    /// dropping the entity is also what cancels a reply still streaming into it.
+    fn toggle_ai_chat(&mut self, _: &ToggleAiChat, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_chat.take().is_some() {
+            self.focus_editor_or_workspace(window, cx);
+            cx.notify();
+            return;
+        }
+        self.dismiss_completion(window, cx);
+
+        // The panel reads the editor through this closure, *at send or attach time* —
+        // a snapshot taken any earlier describes a tab the user has since left. The
+        // workspace owns the tabs, so the workspace writes the closure; the weak handle
+        // is what keeps the panel from keeping a dead workspace alive.
+        let workspace = cx.entity().downgrade();
+        let snapshot: crate::ai_chat::SnapshotFn = Box::new(move |cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return crate::ai_chat::EditorSnapshot::default();
+            };
+            let workspace = workspace.read(cx);
+            let Some(tab) = workspace.tabs.get(workspace.active_tab) else {
+                return crate::ai_chat::EditorSnapshot::default();
+            };
+            let editor = tab.editor.read(cx);
+            crate::ai_chat::EditorSnapshot {
+                selection: editor.document.selected_text(),
+                // The buffer, not the disk: unsaved edits are part of "the current file"
+                // as the user understands it.
+                file: tab.path.clone().map(|path| (path, editor.document.buffer.text())),
+            }
+        });
+
+        let panel = cx.new(|cx| AiChatPanel::new(snapshot, cx));
+        window.focus(&panel.read(cx).focus_handle(cx));
+        self.ai_chat = Some(panel);
+        cx.notify();
+    }
+
     /// ⌘+ / ⌘- / ⌘0 (#49).
     ///
     /// Turned out to be cheap, which is why it is here: nothing caches a size. Every view
@@ -1476,6 +1530,18 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn zen_for_test(&self) -> bool {
         self.zen
+    }
+
+    /// The AI chat toggle, through the real handler (#99) — same reasoning as the
+    /// terminal's hook: assigning the field directly would pass while the action broke.
+    #[cfg(test)]
+    pub fn toggle_ai_chat_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_ai_chat(&ToggleAiChat, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn ai_chat_for_test(&self) -> Option<Entity<AiChatPanel>> {
+        self.ai_chat.clone()
     }
 
     #[cfg(test)]
@@ -4128,6 +4194,25 @@ impl WorkspaceView {
                 this.open_settings_file(window, cx);
                 cx.notify();
             }
+            // "Set API key…" (#99): the panel closes and the name prompt opens, because
+            // two things both claiming the keyboard is the palette/completion lesson.
+            // The typed key goes to the Keychain via `on_name_confirmed` and nowhere
+            // else — never the settings JSON, never a log line.
+            SettingsPanelEvent::SetApiKey => {
+                this.settings_panel = None;
+                let provider =
+                    crate::ai::Provider::from_setting(crate::settings::current(cx).ai_provider());
+                // The Keychain account per provider: the `ant` CLI holds its own token,
+                // so everything that is not the Anthropic key is the custom slot.
+                let account =
+                    if provider == crate::ai::Provider::Anthropic { "anthropic" } else { "custom" };
+                this.pending_api_key = Some(account.to_string());
+                this.show_overlay(
+                    cx.new(|cx| Overlay::prompt("Set", format!("API key ({account})"), "", cx)),
+                    window,
+                    cx,
+                );
+            }
         })
         .detach();
         window.focus(&panel.read(cx).focus_handle(cx));
@@ -5258,6 +5343,9 @@ impl WorkspaceView {
     fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = None;
         self.pending = None;
+        // Disarm the API-key route too (#99): a dismissed key prompt must not leave the
+        // next Named confirmation writing a filename into the Keychain.
+        self.pending_api_key = None;
         match self.active_editor() {
             Some(editor) => {
                 let handle = editor.read(cx).focus_handle(cx);
@@ -5350,6 +5438,35 @@ impl WorkspaceView {
     /// The file operation is blocking, so it goes to the background executor (ADR-0007) and
     /// the tree is refreshed on the main thread when it returns.
     fn on_name_confirmed(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        // The API-key prompt (#99) rides the same Named event as the file prompts, told
+        // apart by its own arm rather than by a `PendingKind`: the "name" here is a
+        // secret, and it must reach `keychain_set` and nothing else — not the file
+        // machinery below, not a log, not the settings JSON. Taken, not read, so a
+        // confirm disarms it exactly once.
+        if let Some(account) = self.pending_api_key.take() {
+            self.dismiss_overlay(window, cx);
+            if name.trim().is_empty() {
+                return; // an empty confirm is a dismissal, not a key
+            }
+            let task = cx.spawn(async move |this, cx| {
+                // Blocking: `security` is a subprocess, so off the main thread (the same
+                // reason resolve_auth is).
+                let result = cx
+                    .background_spawn(async move { crate::ai::keychain_set(&account, name.trim()) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.status = Some(match result {
+                        Ok(()) => "API key saved to the Keychain".into(),
+                        Err(err) => format!("could not save the API key: {err}").into(),
+                    });
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.jobs.start(Job::SetApiKey, task);
+            return;
+        }
+
         let Some(pending) = self.pending.clone() else { return };
         self.dismiss_overlay(window, cx);
 
@@ -6455,6 +6572,7 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                     Dispatch::ToggleTheme => self.toggle_theme(&ToggleTheme, window, cx),
                     Dispatch::ToggleFullscreen => window.toggle_fullscreen(),
                     Dispatch::ToggleZen => self.toggle_zen(&ToggleZen, window, cx),
+                    Dispatch::ToggleAiChat => self.toggle_ai_chat(&ToggleAiChat, window, cx),
                     Dispatch::ToggleHiddenFiles => {
                         self.toggle_hidden_files(&ToggleHiddenFiles, window, cx)
                     }
@@ -6984,6 +7102,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::toggle_fullscreen))
             .on_action(cx.listener(Self::toggle_zen))
+            .on_action(cx.listener(Self::toggle_ai_chat))
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
             .on_action(cx.listener(|this, _: &ResetFontSize, _w, cx| this.zoom(None, cx)))
@@ -7070,6 +7189,11 @@ impl Render for WorkspaceView {
                             // And the log under those, same column, same reasoning.
                             .children(self.logs.clone()),
                     )
+                    // The AI chat panel (#99): a right-side column between the editor
+                    // and the window edge, full height under the titlebar. Chrome, so
+                    // zen hides it with the rest — the conversation survives, hidden,
+                    // because the entity is only dropped by the toggle.
+                    .when(!zen, |el| el.children(self.ai_chat.clone()))
             })
             .when(!self.zen, |el| el.child(self.render_status_bar(&theme, cx)))
             .children(self.palette.clone().map(|palette| {
