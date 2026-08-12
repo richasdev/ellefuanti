@@ -296,6 +296,11 @@ impl Settings {
         self.document.insert(FONT_FAMILY_KEY.to_string(), Value::String(family.to_string()));
     }
 
+    /// Writes the autosave flag (#25 follow-up: a toggle in the panel).
+    pub fn set_autosave(&mut self, enabled: bool) {
+        self.document.insert("autosave".to_string(), Value::Bool(enabled));
+    }
+
     /// Writes the chrome font size, clamped like the read is.
     pub fn set_ui_font_size(&mut self, size: f32) {
         let size = f64::from(size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
@@ -659,4 +664,15 @@ mod tests {
         settings.set_font_size(1_000.0);
         assert_eq!(settings.font_size(), MAX_FONT_SIZE);
     }
+    #[test]
+    fn autosave_defaults_on_and_set_persists() {
+        // The panel toggle writes through set_autosave; the read is the same key.
+        let mut settings = Settings::default();
+        assert!(settings.autosave(), "default on");
+        settings.set_autosave(false);
+        assert!(!settings.autosave(), "the write is read back");
+        settings.set_autosave(true);
+        assert!(settings.autosave());
+    }
+
 }
