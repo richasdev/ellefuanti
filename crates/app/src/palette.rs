@@ -297,6 +297,22 @@ impl Palette {
         self.confirm_inner(cx);
     }
 
+    /// Confirms the row a click landed on, guarding a stale index — the shared tail of the
+    /// row's `on_mouse_down`, exposed so a test can land a click on an index the list no
+    /// longer has (the paint-then-refilter race) without a real `MouseDownEvent`.
+    fn confirm_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(item) = self.filtered.get(index) {
+            let id = item.id.clone();
+            self.selected = index;
+            cx.emit(PaletteEvent::Confirmed(id));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn click_row_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.confirm_row(index, cx);
+    }
+
     fn cancel(&mut self, _: &Cancel, _w: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PaletteEvent::Dismissed);
     }
@@ -414,11 +430,15 @@ impl Render for Palette {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             move |_ev, _window, cx| {
+                                                // `index` is captured at paint time. A refilter
+                                                // (type fast, then click) can shrink `filtered`
+                                                // before the click lands, so `filtered[index]`
+                                                // would panic out of bounds — `confirm_row`
+                                                // reads it with `.get`, the same defensive shape
+                                                // `confirm_inner` uses for the keyboard path, and
+                                                // a stale row simply does nothing.
                                                 entity.update(cx, |palette, cx| {
-                                                    palette.selected = index;
-                                                    cx.emit(PaletteEvent::Confirmed(
-                                                        palette.filtered[index].id.clone(),
-                                                    ));
+                                                    palette.confirm_row(index, cx);
                                                 });
                                             },
                                         )

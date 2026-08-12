@@ -1489,6 +1489,54 @@ fn lsp_item(label: &str) -> CompletionItem {
     CompletionItem::new(label.to_string(), CompletionSource::Lsp)
 }
 
+/// The arrows move the completion selection and wrap, past the visible window — the popup
+/// holds `MAX_VISIBLE_ROWS` but a real server answers with more, and before the scroll handle
+/// the selection walked off the bottom with no way back but the mouse (#171's shape). The
+/// scroll *offset* itself is not observable headlessly (#112); the selection movement that
+/// feeds it is, so that is what this pins.
+#[gpui::test]
+async fn completion_arrows_move_and_wrap_past_the_visible_window(cx: &mut TestAppContext) {
+    use crate::completion::{CompletionPopup, CompletionTrigger, MAX_VISIBLE_ROWS};
+    install_theme(cx);
+
+    // More rows than fit, so moving the selection genuinely needs the list to scroll.
+    let count = MAX_VISIBLE_ROWS + 5;
+    let items: Vec<CompletionItem> = (0..count).map(|i| lsp_item(&format!("item{i}"))).collect();
+
+    let popup = cx.update(|cx| {
+        use gpui::AppContext as _;
+        cx.new(|cx| {
+            CompletionPopup::new(
+                items,
+                String::new(),
+                gpui::point(px(0.0), px(0.0)),
+                CompletionTrigger::Invoked,
+                cx,
+            )
+        })
+    });
+
+    popup.update(cx, |popup, cx| {
+        assert_eq!(popup.selected_for_test(), 0);
+        // Step past the last visible row: the selection must keep moving, not stall at the
+        // window edge.
+        for _ in 0..MAX_VISIBLE_ROWS {
+            popup.select_next_for_test(cx);
+        }
+        assert_eq!(
+            popup.selected_for_test(),
+            MAX_VISIBLE_ROWS,
+            "selection moves past the visible window instead of stalling"
+        );
+        // From the top, up wraps to the last row.
+        for _ in 0..MAX_VISIBLE_ROWS {
+            popup.select_prev_for_test(cx);
+        }
+        popup.select_prev_for_test(cx);
+        assert_eq!(popup.selected_for_test(), count - 1, "up from the top wraps to the bottom");
+    });
+}
+
 #[gpui::test]
 async fn the_completion_popup_renders_with_items_from_both_sources(cx: &mut TestAppContext) {
     // One list, two provenances, rendered under both themes. The badge is a *sibling* of the
@@ -4273,4 +4321,47 @@ async fn palette_arrows_move_and_wrap_the_selection(cx: &mut TestAppContext) {
         palette.select_prev_for_test(cx);
         assert_eq!(palette.selected_for_test(), 2, "up from the top wraps to the bottom");
     });
+}
+
+/// A click on a row the list no longer has must not panic — the paint-then-refilter race.
+///
+/// A row's `on_mouse_down` captures its index at paint time; typing fast can narrow the list
+/// before the click's mouse-up lands, so the captured index now points past the end. The old
+/// code indexed `filtered[index]` and panicked; the guard reads with `.get` and does nothing.
+#[gpui::test]
+async fn palette_click_on_a_stale_row_is_ignored_not_a_panic(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let confirmed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+
+    let (palette, subscription) = cx.update(|cx| {
+        use gpui::AppContext as _;
+        let palette = cx.new(|cx| {
+            crate::palette::Palette::new(
+                crate::palette::PaletteMode::Commands,
+                vec![
+                    ("Alpha".into(), "a".into()),
+                    ("Beta".into(), "b".into()),
+                    ("Gamma".into(), "c".into()),
+                ],
+                cx,
+            )
+        });
+        let sink = confirmed.clone();
+        let subscription = cx.subscribe(&palette, move |_palette, event, _cx| {
+            if let crate::palette::PaletteEvent::Confirmed(id) = event {
+                sink.borrow_mut().push(id.clone());
+            }
+        });
+        (palette, subscription)
+    });
+
+    palette.update(cx, |palette, cx| {
+        // Narrow to one row, then land the click the last frame painted on row 2.
+        palette.type_for_test("alpha", cx);
+        assert_eq!(palette.labels_for_test().len(), 1, "only Alpha survives the filter");
+        palette.click_row_for_test(2, cx); // would be `filtered[2]` — out of bounds
+    });
+
+    assert!(confirmed.borrow().is_empty(), "a stale click confirms nothing");
+    drop(subscription);
 }
