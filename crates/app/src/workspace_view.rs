@@ -14,7 +14,7 @@ use elle_text::Point;
 use elle_workspace::{CancelFlag, FileTree, read_file, write_file};
 use gpui::{
     App, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
-    SharedString, Task, Window, div, prelude::*, px, rgb, svg, uniform_list,
+    Pixels, SharedString, Task, Window, div, prelude::*, px, rgb, svg, uniform_list,
 };
 
 use crate::actions::{
@@ -74,6 +74,26 @@ struct Tab {
 #[derive(Clone)]
 struct DraggedTreeEntry {
     path: PathBuf,
+}
+
+/// A pane's new width after the pointer has moved `travel` from where the drag began.
+///
+/// `growing` is +1 for a pane that grows rightwards (the sidebar) and -1 for one that
+/// grows leftwards (the chat panel on the right edge). A free function because the
+/// clamp is the part with a consequence — a pane dragged to zero takes its own divider
+/// with it and cannot be recovered — and a closure inside a drag handler is not
+/// something a test can reach.
+fn resized_width(start: Pixels, travel: Pixels, growing: f32) -> Pixels {
+    (start + travel * growing).clamp(Metrics::PANEL_MIN_WIDTH, Metrics::PANEL_MAX_WIDTH)
+}
+
+/// What a divider drag carries: the pane's width when the drag began.
+///
+/// Measuring every move against a fixed origin, rather than accumulating per-frame
+/// deltas, is what keeps the divider under the pointer when a frame is dropped.
+#[derive(Clone, Copy)]
+struct DividerGrab {
+    start_width: Pixels,
 }
 
 /// What a tab's drag carries: its index at drag start, resolved against the tabs vec
@@ -668,6 +688,17 @@ pub struct WorkspaceView {
     /// Zen mode (owner request): chrome hidden, editor centred. Session-only on
     /// purpose — reopening the app in zen with no visible way out is a trap.
     zen: bool,
+    /// Live width of the sidebar and of the AI chat panel (owner report: "o
+    /// redimensionamento do chat e do explorer, eles sao fixos"). Seeded from the
+    /// metrics and then owned by the dividers.
+    ///
+    /// Session-only for now, deliberately: the settings crate is being edited on
+    /// another branch this cycle, and a width that persists is a follow-up of two
+    /// lines rather than a reason to hold the resize itself back.
+    sidebar_width: Pixels,
+    ai_chat_width: Pixels,
+    /// Where the pointer was when the current divider drag began. `None` between drags.
+    divider_origin: Option<Pixels>,
     /// The AI chat panel (#99). `Some` only while it is open, like the terminal: a
     /// closed panel is absent, so a reply still streaming when it closes is cancelled
     /// by the drop rather than narrating to nobody.
@@ -782,6 +813,9 @@ impl WorkspaceView {
             git,
             sidebar: Sidebar::default(),
             zen: false,
+            sidebar_width: Metrics::SIDEBAR_WIDTH,
+            ai_chat_width: Metrics::AI_CHAT_WIDTH,
+            divider_origin: None,
             ai_chat: None,
             pending_api_key: None,
             git_cancel: None,
@@ -7178,6 +7212,8 @@ impl Render for WorkspaceView {
                     .when(!zen, |el| {
                         el.child(self.render_activity_bar(&theme, cx))
                             .child(self.render_sidebar(&theme, cx))
+                            // The grab handle, between the sidebar and the editor.
+                            .child(self.render_divider("divider-sidebar", 1.0, &theme, cx))
                     })
                     .child(
                         div()
@@ -7207,7 +7243,16 @@ impl Render for WorkspaceView {
                     // and the window edge, full height under the titlebar. Chrome, so
                     // zen hides it with the rest — the conversation survives, hidden,
                     // because the entity is only dropped by the toggle.
-                    .when(!zen, |el| el.children(self.ai_chat.clone()))
+                    .when(!zen && self.ai_chat.is_some(), |el| {
+                        // Divider first: it sits between the editor and the panel, and
+                        // the panel grows leftwards, hence the -1.
+                        el.child(self.render_divider("divider-ai-chat", -1.0, &theme, cx))
+                    })
+                    .when(!zen, |el| {
+                        el.children(self.ai_chat.clone().map(|panel| {
+                            div().w(self.ai_chat_width).flex_none().h_full().child(panel)
+                        }))
+                    })
             })
             .when(!self.zen, |el| el.child(self.render_status_bar(&theme, cx)))
             .children(self.palette.clone().map(|palette| {
@@ -8272,7 +8317,9 @@ impl WorkspaceView {
         };
 
         div()
-            .w(Metrics::SIDEBAR_WIDTH)
+            // The live width, dragged by the divider — not `Metrics::SIDEBAR_WIDTH`,
+            // which is now only the first-launch seed.
+            .w(self.sidebar_width)
             .flex_none()
             .flex()
             .flex_col()
@@ -8466,6 +8513,73 @@ impl WorkspaceView {
             .child(reveal)
             .child(button(icons::EXPAND_ALL, "Expand All", true))
             .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
+    }
+
+    /// A draggable divider between two panes (owner request: the sidebar and the chat
+    /// panel were both fixed widths).
+    ///
+    /// Four pixels wide with an eight-pixel hit area either side of the border it sits
+    /// on: a one-pixel target is a target nobody hits, and every editor cheats the same
+    /// way. `on_drag_move` rather than tracking mouse-down state ourselves, because gpui
+    /// already owns "a drag is in progress" and a second copy of that state is how a
+    /// divider ends up stuck to the cursor after the button is released.
+    ///
+    /// `growing` says which way the mouse moves to make the pane bigger: the sidebar
+    /// grows rightwards (+1), the right-hand chat panel grows leftwards (-1).
+    fn render_divider(
+        &self,
+        id: &'static str,
+        growing: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity();
+        let is_sidebar = growing > 0.0;
+        div()
+            .id(id)
+            .w(px(4.0))
+            .flex_none()
+            .h_full()
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .hover(|el| el.bg(theme.accent))
+            // The drag payload is the pane's width at grab time; every move is measured
+            // against it, so the divider never drifts from the pointer the way a
+            // per-frame delta accumulator does when a frame is dropped.
+            .on_drag(
+                DividerGrab {
+                    start_width: if is_sidebar { self.sidebar_width } else { self.ai_chat_width },
+                },
+                |_, _offset, _window, cx| cx.new(|_| crate::tooltip::Tooltip::new("")),
+            )
+            .on_drag_move(move |event: &gpui::DragMoveEvent<DividerGrab>, _window, cx| {
+                let grab = *event.drag(cx);
+                let pointer = event.event.position.x;
+                entity.update(cx, |this, cx| {
+                    // The grab's origin is captured on the first move rather than at
+                    // drag start: `on_drag` has no cursor position, and reading it from
+                    // the element's bounds would measure the divider, not the pointer.
+                    let origin = match this.divider_origin {
+                        Some(origin) => origin,
+                        None => {
+                            this.divider_origin = Some(pointer);
+                            pointer
+                        }
+                    };
+                    let width = resized_width(grab.start_width, pointer - origin, growing);
+                    if is_sidebar {
+                        this.sidebar_width = width;
+                    } else {
+                        this.ai_chat_width = width;
+                    }
+                    cx.notify();
+                });
+            })
+            // Dropping is what ends a drag in gpui, and the origin has to go with it or
+            // the next drag measures from the last one's start.
+            .on_drop(cx.listener(|this, _: &DividerGrab, _window, cx| {
+                this.divider_origin = None;
+                cx.notify();
+            }))
     }
 
     /// The titlebar's AI button (owner request): the chat panel had only ⌘⇧A, which
@@ -9746,6 +9860,32 @@ mod tests {
         assert_eq!(active_after_close(2, 2, 2), 1);
         // Closing the only tab leaves nothing; index 0 is what an empty tab bar renders as.
         assert_eq!(active_after_close(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_divider_drag_moves_the_pane_with_the_pointer() {
+        // The sidebar grows rightwards, the right-hand panel leftwards — the sign is the
+        // only difference between the two dividers, so it is the thing worth pinning.
+        assert_eq!(resized_width(px(240.0), px(60.0), 1.0), px(300.0), "sidebar follows right");
+        assert_eq!(resized_width(px(240.0), px(-60.0), 1.0), px(180.0), "and back left");
+        assert_eq!(resized_width(px(380.0), px(-60.0), -1.0), px(440.0), "chat grows leftwards");
+    }
+
+    #[test]
+    fn a_pane_cannot_be_dragged_away_or_over_the_editor() {
+        // Both ends have a consequence. Dragged to zero, the pane takes its own divider
+        // with it and there is no way back; dragged wide, it eats the editor the window
+        // exists for.
+        assert_eq!(
+            resized_width(px(240.0), px(-9999.0), 1.0),
+            Metrics::PANEL_MIN_WIDTH,
+            "a pane never disappears"
+        );
+        assert_eq!(
+            resized_width(px(240.0), px(9999.0), 1.0),
+            Metrics::PANEL_MAX_WIDTH,
+            "and never swallows the editor"
+        );
     }
 
     #[test]
