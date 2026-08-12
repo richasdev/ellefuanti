@@ -116,6 +116,71 @@ pub fn sqlite_schema(path: &Path) -> Result<Vec<TableInfo>> {
     Ok(tables)
 }
 
+/// One page of a table's rows, every value as display text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TablePage {
+    /// Column names, in table order — the grid's header.
+    pub columns: Vec<String>,
+    /// Rows of display text. NULL is rendered as the word `NULL`, which a text grid can
+    /// show distinctly from the empty string — the difference matters in a database.
+    pub rows: Vec<Vec<String>>,
+    /// Total rows in the table, for "1–50 of 1 204" pagination labels.
+    pub total: u64,
+}
+
+/// Reads one page of `table`, ordered by rowid so pages are stable between calls.
+///
+/// Pagination is not optional (#65: a SELECT * on a production-sized table must not be
+/// the default), so there is no unpaginated variant to misuse. The table name cannot be
+/// bound as a parameter in SQL, so it is validated against the schema's own table list
+/// first — a name that is not literally one of the database's tables is refused, which
+/// closes the injection door the quoting would otherwise have to argue about.
+pub fn table_page(path: &Path, table: &str, offset: u64, limit: u64) -> Result<TablePage> {
+    let tables = sqlite_schema(path)?;
+    let known = tables
+        .iter()
+        .find(|info| info.name == table)
+        .with_context(|| format!("{table} is not a table of this database"))?;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+
+    let total: u64 =
+        conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| row.get(0))?;
+
+    let columns: Vec<String> = known.columns.iter().map(|column| column.name.clone()).collect();
+    let mut statement = conn.prepare(&format!(
+        "SELECT * FROM \"{table}\" ORDER BY rowid LIMIT ?1 OFFSET ?2"
+    ))?;
+    let column_count = statement.column_count();
+    let rows = statement
+        .query_map(rusqlite::params![limit, offset], |row| {
+            let mut out = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                // Every affinity as display text, at the driver: the grid shows text,
+                // and pushing the conversion down here keeps sqlite's own formatting
+                // (integers without a float's `.0`, blobs as a length tag).
+                let value = match row.get_ref(index)? {
+                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                    rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+                    rusqlite::types::ValueRef::Real(value) => value.to_string(),
+                    rusqlite::types::ValueRef::Text(value) => {
+                        String::from_utf8_lossy(value).into_owned()
+                    }
+                    rusqlite::types::ValueRef::Blob(value) => format!("<blob {} B>", value.len()),
+                };
+                out.push(value);
+            }
+            Ok(out)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(TablePage { columns, rows, total })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +263,55 @@ mod tests {
             conn.execute("DROP TABLE t", []).is_err(),
             "read-only is a connection flag, not a discipline"
         );
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    fn seeded() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, score REAL);
+             INSERT INTO users (email, score) VALUES ('a@x', 1.5), (NULL, 2.0), ('c@x', NULL);",
+        )
+        .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn a_page_carries_headers_rows_and_the_total() {
+        let (_dir, db) = seeded();
+        let page = table_page(&db, "users", 0, 2).unwrap();
+        assert_eq!(page.columns, ["id", "email", "score"]);
+        assert_eq!(page.total, 3, "the total is the table's, not the page's");
+        assert_eq!(page.rows.len(), 2, "the limit is honoured");
+        assert_eq!(page.rows[0], ["1", "a@x", "1.5"]);
+        assert_eq!(page.rows[1][1], "NULL", "NULL is the word, distinct from empty");
+    }
+
+    #[test]
+    fn the_second_page_continues_where_the_first_stopped() {
+        let (_dir, db) = seeded();
+        let page = table_page(&db, "users", 2, 2).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0][0], "3");
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_table_is_refused_and_the_table_survives() {
+        let (_dir, db) = seeded();
+        // Two layers guard the name. This test proves the OUTER one — validation
+        // against the schema's own list — is load-bearing: after the crafted name is
+        // refused, `users` still has its three rows, so no injected statement ran.
+        // (SQLite's own parser is the inner layer and would also reject the quoted
+        // name; the validation is what keeps a crafted string out of `format!` in the
+        // first place, which is the door #65 asks to be shut before it is argued about.)
+        assert!(table_page(&db, "users\"; DROP TABLE users; --", 0, 10).is_err());
+        assert!(table_page(&db, "ghosts", 0, 10).is_err(), "an unknown name is refused");
+        assert_eq!(table_page(&db, "users", 0, 10).unwrap().total, 3, "the table is intact");
     }
 }

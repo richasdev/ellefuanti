@@ -4106,3 +4106,38 @@ async fn losing_focus_autosaves_dirty_tabs(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Opening a table from the Database panel loads its rows into the view (#65).
+#[gpui::test]
+async fn opening_a_db_table_shows_its_rows(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    let db = dir.path().join("database/database.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+         INSERT INTO users (email) VALUES ('a@x'), (NULL);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.open_db_table_for_test("users", cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let (name, rows) = workspace.db_table_for_test().expect("a table is open");
+        assert_eq!(name, "users");
+        let rows = rows.expect("read ok");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ["1", "a@x"]);
+        assert_eq!(rows[1][1], "NULL", "NULL shows as the word, not empty");
+    });
+
+    draw(cx);
+}
