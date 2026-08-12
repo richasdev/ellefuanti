@@ -41,6 +41,21 @@ pub fn parse_laravel_log(text: &str) -> Vec<LogEntry> {
     entries
 }
 
+/// The last `max` entries of a log, for the panel (#25).
+///
+/// A real `laravel.log` reaches megabytes; a log *viewer* wants the recent tail, not the
+/// whole history rendered into a `uniform_list`. Parsing the whole text and keeping the
+/// tail is O(file) still, but the caller reads only the file's final chunk, so together
+/// they bound both the read and the row count — see the panel's use. Kept a separate
+/// function so `parse_laravel_log`'s full-file contract (and its tests) are untouched.
+pub fn parse_laravel_log_tail(text: &str, max: usize) -> Vec<LogEntry> {
+    let mut entries = parse_laravel_log(text);
+    if entries.len() > max {
+        entries.drain(..entries.len() - max);
+    }
+    entries
+}
+
 /// `[2026-08-12 03:04:05] local.ERROR: message …` → an entry, or `None`.
 fn header(line: &str) -> Option<LogEntry> {
     let rest = line.strip_prefix('[')?;
@@ -122,6 +137,20 @@ mod tests {
             "frame #0 is [internal function] and must be skipped for the throw site"
         );
         assert_eq!(entries[1].target, None, "an INFO line has no trace and claims none");
+    }
+
+    #[test]
+    fn the_tail_keeps_the_most_recent_entries() {
+        let mut log = String::new();
+        for i in 0..10 {
+            log.push_str(&format!("[2026-08-12 03:0{i}:00] local.INFO: entry {i}\n"));
+        }
+        let tail = parse_laravel_log_tail(&log, 3);
+        assert_eq!(tail.len(), 3, "capped to the last three");
+        assert_eq!(tail[0].message, "entry 7", "and they are the LAST three, in order");
+        assert_eq!(tail[2].message, "entry 9");
+        // A short log is returned whole.
+        assert_eq!(parse_laravel_log_tail(&log, 100).len(), 10);
     }
 
     #[test]
