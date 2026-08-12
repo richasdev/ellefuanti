@@ -4208,7 +4208,13 @@ impl WorkspaceView {
                     if provider == crate::ai::Provider::Anthropic { "anthropic" } else { "custom" };
                 this.pending_api_key = Some(account.to_string());
                 this.show_overlay(
-                    cx.new(|cx| Overlay::prompt("Set", format!("API key ({account})"), "", cx)),
+                    cx.new(|cx| {
+                        Overlay::secret_prompt(
+                            "Set",
+                            format!("API key ({account}) — ⌘V to paste"),
+                            cx,
+                        )
+                    }),
                     window,
                     cx,
                 );
@@ -7150,7 +7156,15 @@ impl Render for WorkspaceView {
                     })
                     // The app's name, not the folder's — the owner's call, and the tab
                     // bar plus the tree header already say what is open.
-                    .child("ellefuanti"),
+                    //
+                    // `relative()` on the strip plus an absolutely-positioned button at
+                    // the right: the title stays optically centred in the window, which
+                    // a flex row with a trailing child would quietly break.
+                    .relative()
+                    .child("ellefuanti")
+                    .child(
+                        div().absolute().right_2().child(self.render_ai_chat_button(&theme, cx)),
+                    ),
             )
             .child({
                 // Zen (owner request): the chrome around the editor disappears — activity
@@ -8452,6 +8466,47 @@ impl WorkspaceView {
             .child(reveal)
             .child(button(icons::EXPAND_ALL, "Expand All", true))
             .child(button(icons::COLLAPSE_ALL, "Collapse All", false))
+    }
+
+    /// The titlebar's AI button (owner request): the chat panel had only ⌘⇧A, which
+    /// makes a whole panel invisible to anyone who has not read the keymap — "não
+    /// aparece" was the report. Top-right is where every editor with a chat puts it.
+    ///
+    /// Lit while the panel is open, so the button doubles as the answer to "is it
+    /// already there?" — the state the keyboard shortcut alone never showed.
+    fn render_ai_chat_button(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let open = self.ai_chat.is_some();
+        div()
+            .id("titlebar-ai-chat")
+            .size(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .when(open, |el| el.bg(theme.selected))
+            .hover(|el| el.bg(theme.hover))
+            .active(|el| el.bg(theme.pressed))
+            .tooltip(crate::tooltip::Tooltip::text(if open {
+                "Close AI chat (⌘⇧A)"
+            } else {
+                "AI chat (⌘⇧A)"
+            }))
+            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.toggle_ai_chat(&ToggleAiChat, window, cx);
+                });
+            })
+            .child(
+                svg()
+                    .path(icons::SPARKLE)
+                    .size(px(15.0))
+                    // Set on the svg itself: gpui fills an SVG's alpha mask from the
+                    // element's own `text.color` and does not inherit it (the trap the
+                    // tree, tab and activity-bar icons all document).
+                    .text_color(if open { theme.accent } else { theme.text_muted }),
+            )
     }
 
     /// The database header's expand-all / collapse-all pair — the explorer's buttons

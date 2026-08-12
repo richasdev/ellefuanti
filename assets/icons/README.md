@@ -24,6 +24,16 @@ operating system — see `../README.md`.
 | `laravel.svg`  | Drawn for this repository | Apache-2.0 |
 | `docker.svg`   | Drawn for this repository | Apache-2.0 |
 
+## Titlebar
+
+| File          | Source                    | Licence    |
+| ------------- | ------------------------- | ---------- |
+| `sparkle.svg` | Drawn for this repository | Apache-2.0 |
+
+`sparkle.svg` opens the AI chat panel. Drawn here rather than taken from Codicons because
+that set's `sparkle` arrived after tag 0.0.36, which the rest of the in-app glyphs are
+pinned to — mixing generations is the drift the file-tree icons already document.
+
 ## File tree and tabs
 
 All Codicons, all taken from tag **0.0.36** — the same tag `explorer.svg` and `git.svg` are
