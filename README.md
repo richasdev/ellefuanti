@@ -1,63 +1,110 @@
 # ellefuanti
 
-A native, GPU-accelerated IDE built **for** PHP, Laravel, Livewire and Blade — not a
-generic editor that happens to support them.
+A native, GPU-accelerated IDE that aims for **Zed's speed with PhpStorm's understanding of
+Laravel** — written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
 
-Written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
+> **v0.3.0 is out.** Editor, LSP intelligence, Eloquent/route/Livewire awareness, Git /
+> Database / Docker / Composer / test panels, and now an opt-in AI chat panel and inline
+> AI autocomplete. 1369 tests, clippy clean.
+> [Changelog](CHANGELOG.md) · [Latest release](https://github.com/richasdev/ellefuanti/releases/latest)
 
-> **Status: v0.1.0 released.** A working editor for PHP, Laravel, Livewire and Blade —
-> editor, LSP intelligence, Eloquent/route/Livewire awareness, and Git / Database / Docker /
-> Composer / test panels. Verified in daily use on a real Laravel project. 1300+ tests,
-> clippy clean. See [CHANGELOG.md](CHANGELOG.md) and
-> [the latest release](https://github.com/richasdev/ellefuanti/releases/latest).
+---
 
-## Install
+## Download
 
-Download the **`.dmg`** from [Releases](https://github.com/richasdev/ellefuanti/releases/latest),
-open it, and drag `ellefuanti.app` onto the Applications folder.
+**[⬇ Download ellefuanti for macOS (.dmg)](https://github.com/richasdev/ellefuanti/releases/latest)**
 
-Because the build is unsigned, macOS quarantines it on download and the first launch says
-the app **"is damaged"**. It is not — clear the quarantine flag once:
+Then, in a terminal, run this **once** — it clears the download quarantine flag that makes
+macOS claim the app "is damaged":
 
 ```sh
+xattr -dr com.apple.quarantine /Applications/ellefuanti.app
+```
+
+That's it. Three steps, in full:
+
+1. Open the `.dmg` and drag **ellefuanti** onto **Applications**.
+2. Run the `xattr` command above.
+3. Open the app.
+
+<details>
+<summary><b>Prefer to do the whole thing from the terminal?</b></summary>
+
+```sh
+curl -L -o ellefuanti.dmg \
+  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-v0.3.0-macos.dmg
+hdiutil attach ellefuanti.dmg
+cp -R "/Volumes/ellefuanti 0.3.0/ellefuanti.app" /Applications/
+hdiutil detach "/Volumes/ellefuanti 0.3.0"
 xattr -dr com.apple.quarantine /Applications/ellefuanti.app
 open /Applications/ellefuanti.app
 ```
 
-Or do the whole thing from the terminal:
+</details>
 
-```sh
-curl -L -o ellefuanti.dmg \
-  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-v0.1.0-macos.dmg
-hdiutil attach ellefuanti.dmg
-cp -R "/Volumes/ellefuanti 0.1.0/ellefuanti.app" /Applications/
-hdiutil detach "/Volumes/ellefuanti 0.1.0"
-xattr -dr com.apple.quarantine /Applications/ellefuanti.app   # clears the "damaged" flag
-open /Applications/ellefuanti.app
-```
+<details>
+<summary><b>Why does macOS say the app is damaged?</b></summary>
 
-A `.zip` of the bare `.app` is also attached to the release if you prefer it.
+It isn't. The build is not code-signed with an Apple Developer certificate (that requires a
+paid account), so Gatekeeper flags anything downloaded from the internet. The `xattr` command
+removes the download flag. Right-click → **Open** → **Open** works too, the first time.
+Signing and notarization are on the roadmap.
 
-**Why "damaged"?** The build is not code-signed with an Apple Developer certificate, so
-Gatekeeper flags the downloaded bundle. The `xattr -dr com.apple.quarantine` command above
-removes the download flag; alternatively, right-click the app → **Open** the first time and
-confirm. Signing/notarization is on the roadmap.
+</details>
 
-**PHP language features** need a language server on your `PATH` (or under a common installer
-prefix like Herd/nvm) — install [Intelephense](https://intelephense.com/):
+**Updates install themselves.** From v0.2.1 onward the app checks for new releases and shows
+`Update v0.x.y ↓` in the status bar — one click downloads and installs it, a second click
+restarts into the new version. No re-downloading by hand.
+
+### Recommended: a PHP language server
+
+Completion, diagnostics, hover and go-to-definition come from a language server. Install
+[Intelephense](https://intelephense.com/) and it is picked up automatically:
 
 ```sh
 npm install -g intelephense
 ```
 
-## Why
+Everything else — editing, highlighting, the file tree, Git, terminal, panels — works
+without it.
 
-PhpStorm understands Laravel but is heavy. Zed is fast but framework-agnostic. VS Code is
-discoverable but a browser in a trenchcoat. The goal is one tool that opens and responds
-like Zed, is as approachable as VS Code, and understands Eloquent, routes, migrations and
-Livewire as deeply as PhpStorm does.
+### Requirements
 
-Performance is treated as a feature, not a later optimisation pass:
+macOS (Apple Silicon or Intel). Linux and Windows are not supported yet; see
+[the roadmap](#roadmap).
+
+---
+
+## What this is
+
+I work in PHP, Laravel and Livewire every day, and the two editors I kept switching between
+each got one half right:
+
+- **PhpStorm** genuinely understands the framework — Eloquent, routes, migrations, Blade —
+  but it is heavy, and you feel every one of those milliseconds.
+- **Zed** is astonishingly fast and pleasant to type in, but it is framework-agnostic: it
+  does not know what `route('users.show')` means.
+
+**ellefuanti is an attempt to have both at once**: an editor that opens and responds like
+Zed, and a project index that knows your models, routes and components like PhpStorm does.
+That is the whole idea.
+
+**Today it is deliberately narrow.** The Laravel/Livewire/Blade features are built first and
+built deepest, because that is the stack I use at work and the only way to know whether the
+framework awareness is actually good is to depend on it daily. Being honest about this beats
+claiming general-purpose support that is not there.
+
+**Tomorrow it does not have to stay narrow.** Nothing in the architecture is PHP-specific:
+the editor, the rope buffer, the tree-sitter layer, the LSP client and the panels are all
+language-agnostic by construction — the Laravel logic lives in one crate that everything
+else is forbidden from depending on (a test enforces it). Adding another language means a
+grammar and a language server, not a rewrite. Syntax highlighting already ships for
+JavaScript, TypeScript, Rust, JSON, CSS, HTML, YAML, TOML, Bash and Markdown, and other
+languages already work as an editor with LSP support.
+
+So: **a Laravel IDE first, a multi-language IDE eventually.** In that order, on purpose.
+
+### Performance is a feature, not a later pass
 
 | Metric            | Target     |
 | ----------------- | ---------- |
@@ -66,19 +113,98 @@ Performance is treated as a feature, not a later optimisation pass:
 | Cached completion | < 50 ms    |
 | Idle RAM          | 100–200 MB |
 
-## Build
+These are enforced by a gate in CI, not aspirations in a document.
 
-Requires Rust stable (1.85+ for edition 2024; developed on 1.94) and macOS.
+---
+
+## What's in it
+
+**Editor** — custom rope-backed editor, multi-cursor, find & replace (project-wide too),
+folding, bracket matching, PHP smart typing (quotes auto-close in code, `=` becomes `=>`
+inside arrays), drag & drop from Finder and within the file tree, zen mode (⌘K Z) and
+fullscreen (⌃⌘F), and thirteen themes — Dark, Light, One Dark Pro, GitHub Dark/Light,
+Dracula, Nord, Catppuccin Mocha/Latte, Gruvbox, Tokyo Night and Solarized Dark/Light —
+plus VS Code theme import.
+
+**PHP & Laravel** — LSP completion, diagnostics, hover, go-to-definition and find-references;
+a SQLite project index over models, migrations and routes; Artisan command palette;
+Blade and Livewire awareness with `wire:` completion.
+
+**Panels** — Git (status, diff, branches, log, push), database explorer (schema browser and
+row editing), Docker, Composer, test runner, log viewer, and an integrated terminal.
+
+**AI, entirely opt-in** — a chat panel (⌘⇧A) and inline ghost-text autocomplete. You choose
+the provider: an Anthropic API key, your `ant` CLI login, or any OpenAI-compatible endpoint
+including a **local Ollama, where nothing leaves your machine**. Both features are off by
+default. See [Privacy](#privacy-and-ai) below — this part has hard rules.
+
+---
+
+## Privacy and AI
+
+**Nothing is sent anywhere without your explicit action.** This is a design constraint, not
+a preference:
+
+- AI chat and AI autocomplete are **off by default** and each has its own switch.
+- You pick the provider and supply your own key. There is no vendor baked in, and no
+  telemetry of any kind.
+- API keys live in the **macOS Keychain**, never in the settings file.
+- Chat context is attached **per item, by you** — the current selection, a specific file —
+  and is visible and removable before you send. Nothing is attached automatically.
+- A **denylist with no override** refuses `.env` files, SSH keys, `.pem`/`.key` material,
+  sqlite databases and anything named like a credential or token.
+- Autocomplete sends a window around your cursor from the **current file only** — never the
+  project.
+
+[docs/RISKS.md](docs/RISKS.md) documents this as an explicit risk, including where a
+denylist is not a guarantee.
+
+---
+
+## Settings
+
+`~/Library/Application Support/ellefuanti/settings.json`, created on the first change — or
+edit everything in the settings panel (⌘,). The app runs fine without the file, and every key
+has a sensible default.
+
+| Key                   | Type   | Default              | Meaning                                         |
+| --------------------- | ------ | -------------------- | ----------------------------------------------- |
+| `theme`               | string | `"dark"`             | Any built-in or shipped theme name              |
+| `font_family`         | string | system monospace     | Must measure as monospace                       |
+| `font_size`           | number | `13`                 | Editor text size                                |
+| `ui_font_size`        | number | `13`                 | Chrome text size                                |
+| `line_height`         | number | `1.5`                | Multiplier                                      |
+| `autosave`            | bool   | `true`               | Save dirty tabs when the window loses focus     |
+| `ai.provider`         | string | `"anthropic"`        | `anthropic`, `ant`, or `custom`                 |
+| `ai.base_url`         | string | `""`                 | For `custom` — e.g. `http://localhost:11434/v1` |
+| `ai.chat`             | bool   | `false`              | The chat panel                                  |
+| `ai.autocomplete`     | bool   | `false`              | Inline ghost text                               |
+| `ai.chat_model`       | string | `"claude-opus-5"`    | Model for the chat panel                        |
+| `ai.completion_model` | string | `"claude-haiku-4-5"` | Model for autocomplete (latency matters here)   |
+
+A file that is not valid JSON is reported with its line and column, and the app launches on
+defaults **without saving over it** — your text stays there to fix. A single key of the wrong
+type falls back to that key's default and costs nothing else. Unrecognised keys are preserved
+on save, so downgrading never loses configuration.
+
+Settings are global; there is no per-project file, deliberately —
+[ADR-0009](docs/adr/0009-json-settings-global-only.md) explains why.
+
+---
+
+## Build from source
+
+Requires Rust stable (1.85+ for edition 2024) and macOS.
 
 ```sh
 cargo run
 ```
 
-Full Xcode is **not** required. GPUI's build script shells out to `xcrun metal`, which ships
-only with Xcode — so `runtime-shaders` is on by default and shaders compile at launch
-instead.
+Full Xcode is **not** required for development. GPUI's build script shells out to
+`xcrun metal`, which ships only with Xcode — so `runtime-shaders` is on by default and
+shaders compile at launch instead.
 
-That default costs startup time, so release builds turn it off and precompile:
+That costs startup time, so release builds turn it off and precompile:
 
 ```sh
 cargo build --release -p ellefuanti --no-default-features   # needs full Xcode
@@ -88,39 +214,21 @@ CI does this on every push, precisely because the release path can break while `
 keeps working locally. See [ADR-0002](docs/adr/0002-gpui-for-ui.md).
 
 ```sh
-cargo test        # 522 tests across every crate
-cargo bench       # performance baselines — see benchmarks/BASELINE.md
+cargo test --workspace   # 1369 tests
+cargo bench              # performance baselines — see benchmarks/BASELINE.md
 ```
 
-## Settings
-
-`~/Library/Application Support/ellefuanti/settings.json`, created on the first change. The
-app runs without it, and every key has a default that is what a first run should get.
-
-| Key       | Type   | Default  | Meaning                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------ |
-| `theme`   | string | `"dark"` | `dark`, `light`, `one-dark-pro`, `github-dark` or `github-light`   |
-| `version` | number | `1`      | Written by the app. Present so a future format change has a marker |
-
-A file that is not valid JSON is reported with its line and column and the app launches on
-defaults, **without saving over it** — the text you typed is still there to fix, and a theme
-switch during that session is not persisted rather than overwriting your config with
-defaults. A single key of the wrong type falls back to that key's default and costs nothing
-else. Keys this build does not recognise are preserved when it saves, so downgrading does
-not lose configuration.
-
-Settings are global. There is no per-project settings file, deliberately —
-[ADR-0009](docs/adr/0009-json-settings-global-only.md) explains why, and what would have to
-change for one to exist.
+---
 
 ## Architecture
 
 Three layers, one direction of dependency. **Only `crates/app` may depend on `gpui`** —
 enforced by a test, not by convention, so the Laravel engine can never grow a UI dependency.
+That is also what keeps the door open for other languages later.
 
 ```
 crates/
-├── app/         gpui: window, views, keymap, editor rendering
+├── app/         gpui: window, views, keymap, editor rendering, AI panels
 ├── core/        command registry
 ├── text/        rope buffer, undo/redo, edit log
 ├── syntax/      tree-sitter incremental parsing, highlighting
@@ -128,12 +236,14 @@ crates/
 ├── terminal/    PTY sessions, VT/ANSI emulation
 ├── lsp/         generic LSP client with substitutable backends
 ├── index/       SQLite project index
-├── laravel/     route extraction
+├── laravel/     route extraction, framework awareness
+├── git/         libgit2 status, diff, branches
+├── db/          sqlite schema browsing
+├── docker/      compose service state
+├── test-runner/ Pest/PHPUnit process supervision
+├── theme/       theme file format and VS Code theme import
 └── settings/    settings.json: read, merge with defaults, write atomically
 ```
-
-Ten crates, not the eighteen the spec sketches. Crates are added when there is code to put
-in them.
 
 Read next:
 
@@ -141,35 +251,35 @@ Read next:
   management, performance strategy
 - [docs/adr/](docs/adr/) — why Rust, why GPUI, why a rope, why tree-sitter, why SQLite
 - [docs/RISKS.md](docs/RISKS.md) — what could sink this and what is being done about it
-- [docs/MILESTONE-1.md](docs/MILESTONE-1.md) — the task breakdown
+
+---
 
 ## Roadmap
 
-| Milestone | Scope                                                                                   |
-| --------- | --------------------------------------------------------------------------------------- |
-| **0.1.0** | Editor foundation, shippable: open a project, browse, edit, save, run a terminal        |
-| **1**     | ✅ Editor: window, file tree, tabs, custom rope editor, PHP/Blade highlighting, palette |
-| **2**     | PHP: generic LSP client, completion, diagnostics, hover, definition, references         |
-| **3**     | Laravel: project index, models, migrations, routes, Artisan, Laravel panel              |
-| **4**     | Livewire/Blade: component indexing, PHP ⇄ Blade navigation, `wire:` completion          |
-| **5**     | Tools: Git, database explorer, Docker, tests, log viewer                                |
-| **6**     | Advanced: Composer UI, queues, HTTP client, Xdebug debugger                             |
-| **7**     | Extensibility: plugin system, opt-in provider-agnostic AI completion                    |
-| **8**     | Embedded browser preview                                                                |
+Shipped:
 
-Every tool integration is a leaf in the dependency graph: a broken Docker daemon cannot
-break the editor, and a broken LSP cannot stop you typing.
+| Version   | Scope                                                                       |
+| --------- | --------------------------------------------------------------------------- |
+| **0.1.0** | Editor, LSP, Laravel/Livewire awareness, Git/DB/Docker/Composer/test panels |
+| **0.2.0** | Drag & drop, tree auto-refresh, active-file indicator, no file-size limit   |
+| **0.2.1** | Self-update from within the app                                             |
+| **0.3.0** | AI chat panel and inline autocomplete, PHP smart typing, zen mode, 8 themes |
 
-## Sequencing, not exclusion
+Next, roughly in order:
 
-Plugins, AI completion, a debugger, an embedded browser and a multi-session terminal are all
-committed features — Milestones 6–8. They are sequenced **after** the editor foundation, on
-the principle that an IDE with a mediocre editor is not rescued by having a browser in it.
+| Theme            | Scope                                                       |
+| ---------------- | ----------------------------------------------------------- |
+| Debugging        | Xdebug via DAP                                              |
+| Extensibility    | Plugin system                                               |
+| Preview          | Embedded browser preview                                    |
+| Distribution     | Code signing and notarization                               |
+| **Beyond PHP**   | More first-class languages once the Laravel core is settled |
+| **Beyond macOS** | Linux, when GPUI's support makes it worth doing             |
 
-One rule holds regardless of what gets built: **nothing is sent to an external service
-without explicit consent.** Source code, `.env` files, database contents, credentials and
-tokens stay local. AI is opt-in and provider-agnostic — you choose the provider and supply
-your own key.
+Every tool integration is a leaf in the dependency graph: a broken Docker daemon cannot break
+the editor, and a broken LSP cannot stop you typing.
+
+---
 
 ## License
 
