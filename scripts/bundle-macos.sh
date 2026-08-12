@@ -45,6 +45,11 @@ VERSION=$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
 # and it is fully derived from assets/macos/ellefuanti.iconset, which IS reviewable.
 iconutil -c icns "$ROOT/assets/macos/ellefuanti.iconset" -o "$APP/Contents/Resources/ellefuanti.icns"
 
+# Shipped disk themes (#58's loader looks in Contents/Resources/themes). Only the theme
+# files themselves — the README is repository documentation, not a resource.
+mkdir -p "$APP/Contents/Resources/themes"
+cp "$ROOT"/assets/themes/*.json "$APP/Contents/Resources/themes/"
+
 # Without this the Finder may keep showing a stale or generic icon for a path it has
 # already cached, which looks exactly like the icon not working.
 touch "$APP"
