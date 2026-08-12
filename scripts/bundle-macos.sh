@@ -50,6 +50,24 @@ iconutil -c icns "$ROOT/assets/macos/ellefuanti.iconset" -o "$APP/Contents/Resou
 mkdir -p "$APP/Contents/Resources/themes"
 cp "$ROOT"/assets/themes/*.json "$APP/Contents/Resources/themes/"
 
+# Ad-hoc sign the whole bundle, *last* — after every resource is in place, because
+# signing seals the resources as they are and any later copy invalidates the seal.
+#
+# This is not code signing in the Apple-Developer sense and does not stop Gatekeeper
+# asking about an unidentified developer. It fixes a different and worse failure: the
+# Rust linker leaves the executable with a bare `linker-signed` ad-hoc signature that
+# covers the binary and nothing else — `Info.plist=not bound`, `Sealed Resources=none`.
+# A quarantined bundle in that state is not merely unsigned, it is *malformed*, and the
+# message macOS picks for malformed is "is damaged and can't be opened" — the one users
+# keep reporting, and the reason the README has to teach an `xattr` incantation.
+#
+# `codesign --sign -` binds the plist and seals Resources/, so `codesign --verify
+# --deep --strict` passes and the bundle is a well-formed unsigned app rather than a
+# broken one. Signing and notarisation with a real certificate remain the actual fix
+# for the Gatekeeper prompt; this removes the "damaged" claim, which is a lie.
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+
 # Without this the Finder may keep showing a stale or generic icon for a path it has
 # already cached, which looks exactly like the icon not working.
 touch "$APP"
