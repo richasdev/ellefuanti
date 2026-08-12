@@ -25,7 +25,8 @@
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels,
-    SharedString, Window, div, prelude::*, px, uniform_list,
+    ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 
 use crate::actions::{Backspace, Cancel, Confirm, SelectNext, SelectPrev, context};
@@ -218,6 +219,12 @@ pub struct CompletionPopup {
     /// What the user has typed *since the popup opened*, which is what narrows the list.
     query: String,
     selected: usize,
+    /// Keeps the selected row on screen as the arrows move it. The list holds up to
+    /// `MAX_VISIBLE_ROWS` and a real server answers with far more, so without this the
+    /// selection walks off the bottom of the popup and there is no way to see it short of
+    /// the mouse — the same dead-keyboard shape #171 fixed in the palette. One handle,
+    /// threaded into the `uniform_list`.
+    scroll: UniformListScrollHandle,
     /// Whether every source has reported. "No matches" is a claim, and making it while the
     /// language server is still thinking is a false one — the same reasoning as the
     /// palette's `loaded`.
@@ -256,6 +263,7 @@ impl CompletionPopup {
             filtered,
             query,
             selected: 0,
+            scroll: UniformListScrollHandle::new(),
             loaded: false,
             origin,
             trigger,
@@ -361,6 +369,24 @@ impl CompletionPopup {
         &self.filtered
     }
 
+    /// The highlighted row, for the keyboard-nav test.
+    #[cfg(test)]
+    pub fn selected_for_test(&self) -> usize {
+        self.selected
+    }
+
+    /// ↓ / ↑ through the movement logic the arrows use, so a test drives the same path
+    /// without a `Window` it cannot fabricate headlessly — the palette's door shape.
+    #[cfg(test)]
+    pub fn select_next_for_test(&mut self, cx: &mut Context<Self>) {
+        self.move_selection(1, cx);
+    }
+
+    #[cfg(test)]
+    pub fn select_prev_for_test(&mut self, cx: &mut Context<Self>) {
+        self.move_selection(-1, cx);
+    }
+
     /// Extends the query by a character the user typed in the editor.
     ///
     /// Returns whether the popup should stay open. Normally that is "does anything still
@@ -452,18 +478,30 @@ impl CompletionPopup {
     }
 
     fn select_next(&mut self, _: &SelectNext, _w: &mut Window, cx: &mut Context<Self>) {
-        if !self.filtered.is_empty() {
-            self.selected = (self.selected + 1) % self.filtered.len();
-            cx.notify();
-        }
+        self.move_selection(1, cx);
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _w: &mut Window, cx: &mut Context<Self>) {
-        if !self.filtered.is_empty() {
-            self.selected =
-                if self.selected == 0 { self.filtered.len() - 1 } else { self.selected - 1 };
-            cx.notify();
+        self.move_selection(-1, cx);
+    }
+
+    /// Moves the highlighted row by `delta`, wrapping — the palette's `move_selection`. Split
+    /// from the action handlers so it takes no `Window`, which is what lets the arrow-nav
+    /// test drive it headlessly.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
         }
+        self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+        self.reveal_selected(cx);
+    }
+
+    /// Scrolls the list so the selected row is visible, then repaints — the keyboard-nav
+    /// half the mouse should never be needed for, the palette's `reveal_selected`.
+    fn reveal_selected(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_item(self.selected, ScrollStrategy::Center);
+        cx.notify();
     }
 
     fn confirm(&mut self, _: &Confirm, _w: &mut Window, cx: &mut Context<Self>) {
@@ -549,6 +587,7 @@ impl Render for CompletionPopup {
                             .collect()
                     })
                 })
+                .track_scroll(self.scroll.clone())
                 // An explicit height, never `flex_1`. The wrapper above has `max_h` and no
                 // `h`, so its height comes from its content — and `flex_1` is flex-basis 0,
                 // which *contributes no content height*. The two resolve to a popup exactly
