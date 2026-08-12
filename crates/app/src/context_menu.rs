@@ -128,6 +128,10 @@ enum Mode {
         verb: SharedString,
         subject: SharedString,
         text: String,
+        /// Render the text as bullets instead of characters (#99's API key). A secret
+        /// on screen is a secret in every screenshot and over every shoulder; the
+        /// length still shows, which is the feedback that matters while typing.
+        secret: bool,
     },
     /// A yes/no about something that cannot be undone.
     Confirm {
@@ -166,7 +170,37 @@ impl Overlay {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            mode: Mode::Prompt { verb: verb.into(), subject: subject.into(), text: initial.into() },
+            mode: Mode::Prompt {
+                verb: verb.into(),
+                subject: subject.into(),
+                text: initial.into(),
+                secret: false,
+            },
+            focus_handle: cx.focus_handle(),
+            selected: 0,
+            origin: Point::default(),
+        }
+    }
+
+    /// A prompt for a secret: the text renders as bullets and ⌘V is accepted.
+    ///
+    /// Both halves exist because of the same user report (#99). An API key is ~100
+    /// random characters — nobody types one, everybody pastes it — and the file-name
+    /// prompt this shares its shape with drops every keystroke carrying ⌘, so paste was
+    /// silently doing nothing. Masking is the other half: a key on screen is a key in
+    /// the screenshot.
+    pub fn secret_prompt(
+        verb: impl Into<SharedString>,
+        subject: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            mode: Mode::Prompt {
+                verb: verb.into(),
+                subject: subject.into(),
+                text: String::new(),
+                secret: true,
+            },
             focus_handle: cx.focus_handle(),
             selected: 0,
             origin: Point::default(),
@@ -209,9 +243,27 @@ impl Overlay {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        // ⌘V before the modifier guard below, which drops every ⌘ chord — the reason
+        // pasting into this prompt silently did nothing (#99: an API key is ~100 random
+        // characters, so paste is the *only* realistic way to enter one). Handled here
+        // rather than as a bound `Paste` action because the overlay owns the keyboard
+        // while it is up, and one arm is cheaper than a key context for one chord.
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform && keystroke.key == "v" {
+            if let Mode::Prompt { text, .. } = &mut self.mode
+                && let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text())
+            {
+                // Newlines would make a one-line field render as one long line with
+                // invisible breaks in it; a key pasted from a terminal often carries a
+                // trailing one.
+                text.push_str(pasted.trim());
+                cx.notify();
+            }
+            return;
+        }
+
         let Mode::Prompt { text, .. } = &mut self.mode else { return };
 
-        let keystroke = &event.keystroke;
         if keystroke.modifiers.platform
             || keystroke.modifiers.control
             || keystroke.modifiers.function
@@ -366,12 +418,8 @@ impl Render for Overlay {
                     }),
                 )
             }
-            Mode::Prompt { verb, subject, text } => {
-                let shown = if text.is_empty() {
-                    SharedString::from("…")
-                } else {
-                    SharedString::from(text.clone())
-                };
+            Mode::Prompt { verb, subject, text, secret } => {
+                let shown = SharedString::from(prompt_display(text, *secret));
                 panel.w(px(420.0)).px_3().py_2().child(
                     div()
                         .flex()
@@ -452,6 +500,27 @@ impl Render for Overlay {
     }
 }
 
+/// What a prompt puts on screen for the text typed into it.
+///
+/// A free function because the masking is a security guarantee and a guarantee that
+/// cannot be tested is a hope: rendering lives inside a `Render` impl that needs a
+/// window, this does not.
+fn prompt_display(text: &str, secret: bool) -> String {
+    if text.is_empty() {
+        // The placeholder, not an empty box — an empty field with no caret reads as
+        // "this is not accepting input".
+        "…".to_string()
+    } else if secret {
+        // Bullets, not the key. The count still moves as you type or paste, which is the
+        // feedback that matters ("did the paste land?") without putting a credential on
+        // screen. Counting *chars*, not bytes: a pasted key is ASCII, but a mistaken
+        // paste of anything else must not render one bullet per UTF-8 byte.
+        "•".repeat(text.chars().count())
+    } else {
+        text.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +556,35 @@ mod tests {
         assert!(actions.contains(&MenuAction::NewFile), "the root is where new files start");
         assert!(!actions.contains(&MenuAction::Delete));
         assert!(!actions.contains(&MenuAction::Rename));
+    }
+
+    #[test]
+    fn a_secret_prompt_never_renders_the_secret() {
+        // #99: the API key prompt. The guarantee is that the characters do not reach the
+        // screen — stated as a test because "we mask it" is otherwise one refactor away
+        // from being false, and the failure is silent and permanent (a key in every
+        // screenshot).
+        let key = "sk-ant-api03-SECRET";
+        let shown = prompt_display(key, true);
+        assert!(!shown.contains("sk-ant"), "no part of the key may appear: {shown}");
+        assert!(!shown.contains("SECRET"));
+        assert_eq!(shown.chars().count(), key.chars().count(), "length still shows");
+        assert!(shown.chars().all(|c| c == '•'));
+    }
+
+    #[test]
+    fn a_plain_prompt_shows_what_was_typed() {
+        // The other half: file-name prompts must NOT be masked, or renaming becomes
+        // guesswork.
+        assert_eq!(prompt_display("UserController.php", false), "UserController.php");
+        assert_eq!(prompt_display("", false), "…", "empty is a placeholder, not a blank");
+        assert_eq!(prompt_display("", true), "…", "and an empty secret shows no bullets");
+    }
+
+    #[test]
+    fn masking_counts_characters_not_bytes() {
+        // A mistaken paste of non-ASCII must not leak its byte length as a bullet count.
+        assert_eq!(prompt_display("ação", true).chars().count(), 4);
     }
 
     #[test]

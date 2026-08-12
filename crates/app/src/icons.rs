@@ -88,6 +88,10 @@ pub const ICONS: &[Icon] = icons![
     "file-lock",
     "file-shell",
     "file-config",
+    // Titlebar. Deliberately after the file types rather than among the activity-bar
+    // seven: `ACTIVITY_ICONS` is a *prefix slice* of this list, so anything inserted
+    // before `ACTIVITY_ICON_COUNT` would shift every panel's glyph one place.
+    "sparkle",
 ];
 
 /// How many of [`ICONS`] belong to the activity bar, from the front.
@@ -115,6 +119,8 @@ pub const EXPAND_ALL: &str = "icons/expand-all.svg";
 /// The "reveal active file in the tree" crosshair (owner request).
 pub const REVEAL_FILE: &str = "icons/reveal-file.svg";
 pub const COLLAPSE_ALL: &str = "icons/collapse-all.svg";
+/// The titlebar's AI chat button (#99 follow-up: the panel was keyboard-only).
+pub const SPARKLE: &str = "icons/sparkle.svg";
 
 /// The icon for a file, chosen from its name.
 ///
