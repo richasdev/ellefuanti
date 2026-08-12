@@ -7391,8 +7391,19 @@ impl WorkspaceView {
 
     /// The schema browser's rows (#65): tables, their columns, types and the two
     /// shape markers. Text markers, not colour — `pk` and `?` survive every theme.
-    fn render_db_panel(&self, theme: &Theme, self_entity: &Entity<Self>) -> gpui::Div {
-        let body = div().flex_1().flex().flex_col().overflow_hidden().px_3().py_2().gap_1();
+    fn render_db_panel(&self, theme: &Theme, self_entity: &Entity<Self>) -> impl IntoElement {
+        // Scrolls vertically: an expanded schema (every table's columns) is taller than the
+        // sidebar, and `overflow_hidden` clipped the tail — the owner could not see it all.
+        // `overflow_y_scroll` needs an id (InteractiveElement).
+        let body = div()
+            .id("db-schema-scroll")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .px_3()
+            .py_2()
+            .gap_1();
         match &self.db_schema {
             None => body.child(
                 div().text_color(theme.text_muted).child("Reading the database schema…"),
@@ -7472,8 +7483,16 @@ impl WorkspaceView {
 
     /// The Docker panel's rows: service names with a text state marker. The actions
     /// (up/stop/logs) live in the palette and TYPE into the terminal — the #146 rule.
-    fn render_docker_panel(&self, theme: &Theme) -> gpui::Div {
-        let body = div().flex_1().flex().flex_col().overflow_hidden().px_3().py_2().gap_1();
+    fn render_docker_panel(&self, theme: &Theme) -> impl IntoElement {
+        let body = div()
+            .id("docker-scroll")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .px_3()
+            .py_2()
+            .gap_1();
         match &self.docker_services {
             None => body.child(div().text_color(theme.text_muted).child("Asking docker compose…")),
             Some(Err(message)) => body
