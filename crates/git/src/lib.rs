@@ -195,6 +195,56 @@ pub fn commit(root: &Path, message: &str) -> anyhow::Result<String> {
 /// file, so the danger note on this issue (uncommitted work is unrecoverable) does not
 /// reach it. Credentials come from the user's own git — ssh agent, credential helper —
 /// which is the entire reason this is the CLI and not libgit2's auth callbacks.
+/// One commit for the history view: the graph column, hash, and subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    /// The ASCII graph prefix git draws (`* `, `|\ `, `|/`), verbatim — rendering it
+    /// ourselves would be re-implementing `--graph`, which is exactly what this asks git
+    /// for. Empty on a line that is pure graph (a merge's connector), which still renders.
+    pub graph: String,
+    /// The short hash, or empty on a graph-only line.
+    pub hash: String,
+    /// The commit subject, or empty on a graph-only line.
+    pub subject: String,
+}
+
+/// The commit history with the graph, most recent first — `git log --graph` (#64).
+///
+/// Bounded to `limit` commits: a full log on a large repository is a stall for a view
+/// nobody scrolls to the bottom of, and the panel pages if anyone asks. The format uses
+/// a field separator git will not emit inside the graph, so splitting is unambiguous.
+pub fn log(root: &Path, limit: usize) -> anyhow::Result<Vec<LogEntry>> {
+    // %x1f is the ASCII unit separator — it cannot appear in a hash, and a subject
+    // containing one is pathological enough to accept a mis-split over quoting.
+    let format = format!("--pretty=format:%h%x1f%s");
+    let out = run_git(
+        root,
+        &["log", "--graph", "--decorate", &format!("--max-count={limit}"), &format],
+    )?;
+    Ok(out.lines().map(parse_log_line).collect())
+}
+
+/// Splits one `git log --graph` line into graph / hash / subject.
+///
+/// A commit line is `<graph>* <hash><subject>`; a connector line (`|/`, `|\`) has no
+/// commit and no separator, so it is all graph. The graph is everything up to and
+/// including the `* ` (or the whole line when there is no commit).
+fn parse_log_line(line: &str) -> LogEntry {
+    match line.split_once('') {
+        Some((left, subject)) => {
+            // `left` is `<graph>* <hash>`; the hash is the last whitespace-separated token,
+            // the graph is what precedes it.
+            let hash_start = left.rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
+            LogEntry {
+                graph: left[..hash_start].to_string(),
+                hash: left[hash_start..].to_string(),
+                subject: subject.to_string(),
+            }
+        }
+        None => LogEntry { graph: line.to_string(), hash: String::new(), subject: String::new() },
+    }
+}
+
 pub fn fetch(root: &Path) -> anyhow::Result<String> {
     run_git(root, &["fetch", "--prune"])
 }
@@ -319,6 +369,34 @@ mod write_tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&heads.stdout).contains("init"));
+    }
+
+    #[test]
+    fn the_log_carries_the_graph_hash_and_subject_newest_first() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success()
+            );
+        };
+        std::fs::write(dir.path().join("b.php"), "<?php\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "second"]);
+
+        let entries = log(dir.path(), 10).unwrap();
+        assert!(entries.len() >= 2);
+        assert_eq!(entries[0].subject, "second", "newest first");
+        assert_eq!(entries[1].subject, "init");
+        assert!(!entries[0].hash.is_empty(), "a commit line has a hash");
+        assert!(entries[0].graph.contains('*'), "the graph marker is the commit dot");
+    }
+
+    #[test]
+    fn a_graph_only_connector_line_parses_to_pure_graph() {
+        let entry = parse_log_line("|\\  ");
+        assert_eq!(entry.hash, "", "no commit on a connector line");
+        assert_eq!(entry.subject, "");
+        assert!(entry.graph.contains('|'));
     }
 
     #[test]

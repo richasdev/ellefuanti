@@ -21,6 +21,10 @@ pub enum PaletteMode {
     /// The project's artisan commands (#23). Confirming types the command into the
     /// terminal; nothing executes out of sight.
     Artisan,
+    /// The commit history with the graph (#64). A read-only list — confirming does
+    /// nothing yet (a commit detail view is the next slice); it is the palette because
+    /// the overlay already scrolls and filters a list, which is what a log is.
+    GitLog,
     /// The project's composer scripts (#26). Confirming TYPES the run-script command
     /// into the terminal — the #146 rule, like artisan.
     ComposerScripts,
@@ -61,6 +65,7 @@ impl PaletteMode {
             PaletteMode::CodeActions => "Apply a fix…",
             PaletteMode::Branches => "Switch to a branch…",
             PaletteMode::ComposerScripts => "Type a composer script into the terminal…",
+            PaletteMode::GitLog => "Commit history…",
             PaletteMode::Languages => "Set the language…",
         }
     }

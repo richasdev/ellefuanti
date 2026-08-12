@@ -3837,7 +3837,8 @@ impl WorkspaceView {
             | PaletteMode::Rename
             | PaletteMode::CodeActions
             | PaletteMode::Branches
-            | PaletteMode::ComposerScripts => Vec::new(),
+            | PaletteMode::ComposerScripts
+            | PaletteMode::GitLog => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3874,6 +3875,7 @@ impl WorkspaceView {
             }
             PaletteMode::Branches => self.load_branch_items(palette, cx),
             PaletteMode::ComposerScripts => self.load_composer_script_items(palette, cx),
+            PaletteMode::GitLog => self.load_git_log_items(palette, cx),
             PaletteMode::Commands
             | PaletteMode::Languages
             | PaletteMode::Rename
@@ -5679,6 +5681,10 @@ impl WorkspaceView {
             Some(PaletteMode::ComposerScripts) => {
                 self.type_terminal_command(&format!("composer run-script {id} "), window, cx);
             }
+            // #64. The log is read-only for now — a commit detail view is the next
+            // slice, and until it exists confirming a row does nothing rather than
+            // pretending to.
+            Some(PaletteMode::GitLog) => {}
             // #64. The id is the branch name; the dirty-tree guard lives in the crate.
             Some(PaletteMode::Branches) => self.run_git_operation(
                 move |root| elle_git::switch_branch(&root, &id).map(|_| format!("On {id}")),
@@ -5801,6 +5807,7 @@ impl WorkspaceView {
                     Dispatch::GitSwitchBranch => {
                         self.toggle_palette(PaletteMode::Branches, window, cx)
                     }
+                    Dispatch::GitLog => self.toggle_palette(PaletteMode::GitLog, window, cx),
                     Dispatch::FoldAll => {
                         if let Some(editor) = self.active_editor().cloned() {
                             editor.update(cx, |editor, cx| editor.fold_all(cx));
@@ -6852,6 +6859,32 @@ impl WorkspaceView {
 
     fn type_docker_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.type_terminal_command(&format!("docker compose {command} "), window, cx);
+    }
+
+    /// Fills the palette with the commit graph — the log as a scrollable list (#64).
+    fn load_git_log_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let entries =
+                cx.background_spawn(async move { elle_git::log(&root, 200).unwrap_or_default() }).await;
+            let items = entries
+                .into_iter()
+                .map(|entry| {
+                    // The graph column, the short hash, the subject — the same three the
+                    // terminal shows, so the two agree. A graph-only connector line is a
+                    // label with no id; confirming it is a no-op, which is right.
+                    let label = if entry.hash.is_empty() {
+                        entry.graph
+                    } else {
+                        format!("{}{}  {}", entry.graph, entry.hash, entry.subject)
+                    };
+                    (label, entry.hash)
+                })
+                .collect();
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
     }
 
     /// Fills the composer-script palette from composer.json's own scripts.
