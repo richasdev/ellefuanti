@@ -593,7 +593,14 @@ fn completion_row(
         .h(Metrics::ROW_HEIGHT)
         .px_2()
         .cursor_pointer()
-        .when(index == selected, |el| el.bg(theme.selected))
+        // Selection carries a second channel — brighter label text — not the background
+        // tint alone. `one_dark_pro` sets `hover` and `selected` to the same colour, so a
+        // row's tint cannot say whether Enter would accept it or the mouse merely grazed
+        // it; the text brightness can. This mirrors the palette's selected-row treatment
+        // so the two lists read the same, and keeps the house rule that nothing is
+        // signalled by colour alone (`CONTEXT.md`).
+        .when(index == selected, |el| el.bg(theme.selected).text_color(theme.text))
+        .when(index != selected, |el| el.text_color(theme.text_muted))
         .hover(|el| el.bg(theme.hover))
         .active(|el| el.bg(theme.pressed))
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {

@@ -7287,7 +7287,20 @@ impl WorkspaceView {
                                                 } else {
                                                     icons::CHEVRON_RIGHT
                                                 })
-                                                .size(px(16.0)),
+                                                .size(px(16.0))
+                                                // Set here, not inherited: `svg()` fills its
+                                                // alpha mask from `style.text.color` on the
+                                                // element itself, and the row does not pass
+                                                // one down — the same trap the file glyph
+                                                // below documents (#121/#122). Without this
+                                                // the chevron painted with no colour and the
+                                                // disclosure triangle simply did not appear.
+                                                // Muted rather than `text`: it is a secondary
+                                                // affordance next to the filename, not a peer.
+                                                // `muted` is the owned copy — the closure is
+                                                // `move` and `'static`, so it cannot borrow
+                                                // `theme`.
+                                                .text_color(muted),
                                         )
                                     },
                                 ))

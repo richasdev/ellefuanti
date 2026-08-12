@@ -420,6 +420,14 @@ impl Render for Overlay {
                                     .rounded(px(4.0))
                                     .cursor_pointer()
                                     .border_1()
+                                    // The selected button carries a fill as well as the
+                                    // accent border, so which button Enter would press does
+                                    // not rest on the border colour alone — the house rule
+                                    // that nothing is signalled by colour alone, and cheap
+                                    // insurance on a theme where `accent` sits close to
+                                    // `border`. `theme.selected` is the same fill the
+                                    // palette and completion list use for their selection.
+                                    .when(index == selected, |el| el.bg(theme.selected))
                                     .border_color(if index == selected {
                                         theme.accent
                                     } else {
