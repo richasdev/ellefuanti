@@ -7154,6 +7154,34 @@ impl Render for WorkspaceView {
                     ),
                 )
             }))
+            // The ghost suggestion's continuation lines (#29). The first line lives
+            // inside the cursor row's own text (the editor splices it — see
+            // `render_rows`); the rest cannot, because `uniform_list` owns the row grid
+            // and extra rows would shift every line number below the cursor. So they
+            // draw here, the hover card's split: the editor measured where (window
+            // coordinates, from the painted frame), the workspace places it. Editor
+            // font and background on purpose — this pretends to be text, not a card —
+            // and `text_muted` throughout, so it can never be read as committed code.
+            .children(self.active_editor().and_then(|editor| {
+                let (lines, origin) = editor.read(cx).ghost_overlay(cx)?;
+                let fonts = Fonts::get(cx);
+                Some(
+                    div().absolute().top_0().left_0().size_full().child(
+                        div()
+                            .absolute()
+                            .left(origin.x)
+                            .top(origin.y)
+                            .bg(theme.background)
+                            .font_family(fonts.family.clone())
+                            .text_size(fonts.size)
+                            .line_height(fonts.line_height())
+                            .text_color(theme.text_muted)
+                            .children(lines.into_iter().map(|line| {
+                                div().h(fonts.line_height()).whitespace_nowrap().child(line)
+                            })),
+                    ),
+                )
+            }))
             // The settings panel (#100): centred like the palette, modal like the tree's
             // overlays. Dismiss-on-click-outside is the panel's own `on_mouse_down_out`.
             .children(self.settings_panel.clone().map(|panel| {

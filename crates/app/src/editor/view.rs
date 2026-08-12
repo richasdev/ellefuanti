@@ -24,6 +24,7 @@ use crate::actions::{
     SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
     ToggleComment, Undo, UnfoldBlock, context,
 };
+use crate::editor::ghost::{self, GhostSuggestion};
 use crate::editor::line::Line;
 use crate::editor::state::{Document, Selection};
 use crate::fonts::Fonts;
@@ -132,6 +133,25 @@ pub struct EditorView {
     /// deactivates. Registered on first render for the same reason `WorkspaceView` does it:
     /// `observe_window_activation` needs a `&mut Window`, and `new` has none.
     window_activation: Option<gpui::Subscription>,
+    /// The AI ghost suggestion, if one is showing (#29).
+    ///
+    /// Stamped with the buffer version and cursor offset it was made for, and only ever
+    /// consulted through its validity check — see [`GhostSuggestion::is_valid_for`]. The
+    /// stamp is what makes stale state harmless: paths that move the cursor without
+    /// passing through a dismissal leave a ghost that simply never renders or accepts.
+    ghost: Option<GhostSuggestion>,
+    /// The 400ms pause-then-request timer (#29). Dropping it cancels it — the blink's
+    /// contract — so every keystroke replaces the task rather than stacking timers, and
+    /// no timer exists at all while the feature is off or the editor sits unedited (#93).
+    ghost_debounce: Option<gpui::Task<()>>,
+    /// The completion request in flight, at most one (#93). The task owns the `curl`
+    /// child via `kill_on_drop`, so replacing or clearing this slot kills the process —
+    /// see `editor::ghost`'s module doc for the full cancellation chain.
+    ghost_request: Option<gpui::Task<()>>,
+    /// Bumped by every dismissal; a request result whose epoch no longer matches is
+    /// discarded. Belt to the version-stamp's braces: the stamp proves the *document*
+    /// is unchanged, the epoch proves the user did not dismiss in the meantime.
+    ghost_epoch: u64,
 }
 
 /// Half the blink period: the caret is shown for this long, then hidden for this long.
@@ -185,6 +205,10 @@ impl EditorView {
             caret_visible: true,
             blink: None,
             window_activation: None,
+            ghost: None,
+            ghost_debounce: None,
+            ghost_request: None,
+            ghost_epoch: 0,
         }
     }
 
@@ -487,6 +511,9 @@ impl EditorView {
         if self.document.has_multiple_cursors() {
             self.document.insert_at_all_cursors(text);
             self.restart_blink(cx);
+            // Multi-cursor typing still discards a ghost and re-arms the debounce (#29);
+            // the fire itself declines multi-cursor states, so no request results.
+            self.ghost_after_edit(cx);
             cx.emit(EditorEvent::Typed(text.to_string()));
             cx.notify();
             return;
@@ -498,6 +525,9 @@ impl EditorView {
         self.scroll_cursor_into_view();
         // The case the blink exists to get right: a caret must not blink mid-keystroke.
         self.restart_blink(cx);
+        // This path skips `after_edit` (no search rescan for a plain keystroke without
+        // the find bar involved), so the ghost's edit hook is called by hand (#29).
+        self.ghost_after_edit(cx);
         cx.notify();
 
         // Reported *after* the buffer has it, so a listener asking for the cursor offset
@@ -525,14 +555,19 @@ impl EditorView {
         self.after_edit(cx);
     }
 
-    /// Escape with multiple cursors collapses to one; otherwise the key belongs to
-    /// whoever else wants it (`propagate`), so find-dismissal and friends keep working.
+    /// Escape with a ghost showing dismisses it (#29); with multiple cursors it collapses
+    /// to one; otherwise the key belongs to whoever else wants it (`propagate`), so
+    /// find-dismissal and friends keep working. The ghost goes first because it is the
+    /// most recent thing on screen — Escape peels the newest layer, every editor's rule.
     fn cancel_multi_cursor(
         &mut self,
         _: &crate::actions::Cancel,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cancel_ghost(cx) {
+            return;
+        }
         if self.document.has_multiple_cursors() {
             self.document.clear_extra_selections();
             cx.notify();
@@ -573,6 +608,16 @@ impl EditorView {
     }
 
     fn tab(&mut self, _: &Tab, _w: &mut Window, cx: &mut Context<Self>) {
+        self.tab_impl(cx);
+    }
+
+    /// Split from the handler so tests can drive it without a `Window` (unused anyway).
+    fn tab_impl(&mut self, cx: &mut Context<Self>) {
+        // A visible ghost claims Tab first (#29): accepting is what the dimmed text has
+        // been promising, and the validity stamp means this can never fire on a stale one.
+        if self.accept_ghost(cx) {
+            return;
+        }
         // With a selection ⇥ shifts the whole block right; with a bare cursor it types.
         // ponytail: four spaces, which is PSR-12 and therefore right for Laravel. Reads
         // indent settings once a settings crate exists (Milestone 1 task 15+).
@@ -857,6 +902,8 @@ impl EditorView {
         self.document.refresh_search();
         self.scroll_cursor_into_view();
         self.restart_blink(cx);
+        // An edit is the one thing that both discards a ghost and asks for a new one (#29).
+        self.ghost_after_edit(cx);
         cx.notify();
     }
 
@@ -866,7 +913,216 @@ impl EditorView {
         // file with the caret strobing is the same distraction, and arriving somewhere with
         // the caret in its dark half means not being able to see where you landed.
         self.restart_blink(cx);
+        // Movement discards the ghost and cancels any pending request, but does not ask
+        // for a new one — only edits do (#29). The validity stamp already keeps a moved
+        // cursor from rendering or accepting it; this reclaims the memory and the socket.
+        self.dismiss_ghost();
         cx.notify();
+    }
+
+    // --- ghost text (#29) --------------------------------------------------------
+    //
+    // The suggestion itself, its cleaning and its request live in `editor::ghost`; what
+    // belongs here is the *lifecycle* — when a request may fire, when a result may land,
+    // and when everything is thrown away. The rules, from the roadmap:
+    //
+    //   - nothing fires unless `ai.autocomplete` is on (off by default);
+    //   - 400ms after the last edit, and only while the document is still idle;
+    //   - at most one request in flight, a newer trigger kills the older curl (#93);
+    //   - any edit or cursor move discards; Tab accepts; Escape dismisses.
+
+    /// The ghost, if it is showing *right now* — stamped for exactly this buffer state.
+    fn visible_ghost(&self) -> Option<&GhostSuggestion> {
+        self.ghost.as_ref().filter(|ghost| ghost.is_valid_for(&self.document))
+    }
+
+    /// Throws away the suggestion, the pending timer and the in-flight request.
+    ///
+    /// Dropping the tasks is the cancellation (the blink's contract), and dropping the
+    /// request task kills its `curl` child — so after this returns, the feature costs
+    /// nothing until the next edit, which is #93's idle rule.
+    fn dismiss_ghost(&mut self) {
+        self.ghost_epoch += 1;
+        self.ghost_debounce = None;
+        self.ghost_request = None;
+        self.ghost = None;
+    }
+
+    /// The edit half of the lifecycle: discard, then re-arm the debounce while enabled.
+    fn ghost_after_edit(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_ghost();
+        // Tests drive edits by the thousand and must never find a timer or a subprocess
+        // behind one — the same blanket guard the update check uses.
+        if cfg!(test) {
+            return;
+        }
+        if !crate::settings::current(cx).ai_autocomplete_enabled() {
+            return;
+        }
+        let epoch = self.ghost_epoch;
+        self.ghost_debounce = Some(cx.spawn(async move |this, cx| {
+            // An edit inside this window drops the task and starts a new one, so a burst
+            // of typing costs zero requests — the tree watcher's latest-wins shape.
+            cx.background_executor().timer(ghost::DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.ghost_fire(epoch, cx));
+        }));
+    }
+
+    /// The debounce elapsed with no further edits: snapshot the context and go.
+    fn ghost_fire(&mut self, epoch: u64, cx: &mut Context<Self>) {
+        self.ghost_debounce = None;
+        if epoch != self.ghost_epoch {
+            return; // dismissed while the timer slept
+        }
+        // "Insert at the cursor" must be one well-defined place.
+        if !self.document.selection.is_empty() || self.document.has_multiple_cursors() {
+            return;
+        }
+        let settings = crate::settings::current(cx);
+        if !settings.ai_autocomplete_enabled() {
+            return; // switched off during the debounce
+        }
+        let provider = crate::ai::Provider::from_setting(settings.ai_provider());
+        let base_url = settings.ai_base_url().to_string();
+        let model = settings.ai_completion_model().to_string();
+
+        let offset = self.document.selection.head;
+        let version = self.document.buffer.version();
+        let text = self.document.buffer.text();
+        let user_turn = ghost::build_user_turn(&text, offset);
+        // The cursor line's tail, for the echo-stripping half of `clean_completion`.
+        let cursor = self.document.cursor_point();
+        let line = self.document.buffer.line(cursor.row);
+        let line_before_cursor = line[..cursor.column.min(line.len())].to_string();
+
+        // Replacing the slot cancels any older request and kills its curl — at most one
+        // in flight, which is the #93 budget for a feature that runs between keystrokes.
+        self.ghost_request = Some(cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(ghost::fetch_completion(provider, base_url, model, user_turn))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.ghost_request = None;
+                if this.ghost_epoch != epoch {
+                    return; // dismissed while the request ran
+                }
+                let raw = match outcome {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        // Silence, not a toast: nobody asked a question (the update
+                        // check's rule). The log keeps the why for whoever goes looking.
+                        tracing::debug!("ghost completion failed: {err}");
+                        return;
+                    }
+                };
+                let cleaned = ghost::clean_completion(&raw, &line_before_cursor);
+                if cleaned.is_empty() {
+                    return;
+                }
+                // Shown only if the document is byte-for-byte the one the request
+                // described — otherwise the suggestion is about a file that no longer
+                // exists, and showing it would be confident wrongness (RISKS.md #4).
+                let unchanged = this.document.buffer.version() == version
+                    && this.document.selection.is_empty()
+                    && this.document.selection.head == offset
+                    && !this.document.has_multiple_cursors();
+                if !unchanged {
+                    return;
+                }
+                this.ghost = Some(GhostSuggestion { text: cleaned, at_offset: offset, version });
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Tab's first meaning while a ghost shows: insert it whole, as one undo step.
+    ///
+    /// Through `Document::insert` — the same door every programmatic insertion uses — so
+    /// undo, selection collapse and syntax sync all behave exactly as if the user had
+    /// typed it. Returns whether a ghost was accepted, so `tab` knows to keep its hands
+    /// off the indent behaviour.
+    fn accept_ghost(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.visible_ghost().is_none() {
+            return false;
+        }
+        let ghost = self.ghost.take().expect("visible_ghost checked");
+        self.dismiss_ghost();
+        self.document.insert(&ghost.text);
+        self.after_edit(cx);
+        true
+    }
+
+    /// Escape's first meaning while a ghost shows: dismiss it and consume the key.
+    fn cancel_ghost(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.visible_ghost().is_none() {
+            return false;
+        }
+        self.dismiss_ghost();
+        cx.notify();
+        true
+    }
+
+    /// The ghost's continuation lines and where to draw them, in window coordinates.
+    ///
+    /// The first ghost line is spliced into the cursor row's own text (see
+    /// `render_rows`); lines two onward cannot be — `uniform_list` owns the row grid,
+    /// and inserting rows would shift every line number and fold below the cursor. So
+    /// they render as a workspace overlay at window coordinates, the hover card's
+    /// arrangement: the editor measures (only it can), the workspace places (the card
+    /// must sit above every panel).
+    ///
+    /// `None` when there is no ghost, no continuation, or the cursor row was not painted
+    /// last frame — no on-screen caret means nowhere honest to anchor.
+    pub fn ghost_overlay(&self, cx: &App) -> Option<(Vec<SharedString>, gpui::Point<Pixels>)> {
+        let ghost = self.visible_ghost()?;
+        let rest: Vec<SharedString> = ghost
+            .text
+            .split('\n')
+            .skip(1)
+            .map(|line| SharedString::from(line.to_string()))
+            .collect();
+        if rest.is_empty() {
+            return None;
+        }
+        let fonts = Fonts::get(cx);
+        let x = self.text_origin_x?;
+        let y = self.cursor_row_origin_y? + fonts.line_height();
+        Some((rest, gpui::point(x, y)))
+    }
+
+    /// Plants a suggestion at the current cursor, stamped as a fresh request would be.
+    #[cfg(test)]
+    pub fn set_ghost_for_test(&mut self, text: &str) {
+        self.ghost = Some(GhostSuggestion {
+            text: text.to_string(),
+            at_offset: self.document.selection.head,
+            version: self.document.buffer.version(),
+        });
+    }
+
+    /// The stored ghost's text, valid or not — `None` proves a dismissal actually
+    /// cleared state rather than leaving an invisible corpse behind.
+    #[cfg(test)]
+    pub fn ghost_for_test(&self) -> Option<String> {
+        self.ghost.as_ref().map(|ghost| ghost.text.clone())
+    }
+
+    /// Whether the ghost would render this frame.
+    #[cfg(test)]
+    pub fn ghost_visible_for_test(&self) -> bool {
+        self.visible_ghost().is_some()
+    }
+
+    /// Tab's decision path, minus the `Window` the action handler signature drags in.
+    #[cfg(test)]
+    pub fn tab_for_test(&mut self, cx: &mut Context<Self>) {
+        self.tab_impl(cx);
+    }
+
+    /// Escape's ghost half, for the same reason.
+    #[cfg(test)]
+    pub fn cancel_ghost_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_ghost(cx)
     }
 
     /// ⌘G / ⌘⇧G, driven by the find bar (#80).
@@ -1098,6 +1354,10 @@ impl EditorView {
             3 => self.document.select_line_at(row),
             _ => self.document.select_all(),
         }
+
+        // A click is a cursor move: the ghost dies with it, and so does any pending
+        // request — the after_move rule, arriving by mouse (#29).
+        self.dismiss_ghost();
 
         // ⌘click is go-to-definition, the way it is in every IDE. The cursor moves first
         // either way, so a ⌘click that finds nothing still behaves like the ordinary click
@@ -1431,6 +1691,17 @@ impl EditorView {
             .map(|range| (range.clone(), Some(range) == current_match.as_ref()))
             .collect();
 
+        // The ghost's first line, spliced into the cursor row's own text (#29). Resolved
+        // once per frame through the validity stamp, so a stale suggestion costs one
+        // comparison and paints nothing. Lines beyond the first are the workspace
+        // overlay's job — see `ghost_overlay`.
+        let ghost_inline: Option<(usize, String)> = self
+            .visible_ghost()
+            .map(|ghost| {
+                (cursor.column, ghost.text.split('\n').next().unwrap_or_default().to_string())
+            })
+            .filter(|(_, first)| !first.is_empty());
+
         let entity = cx.entity();
 
         range
@@ -1591,6 +1862,16 @@ impl EditorView {
                                 .link_hint
                                 .clone()
                                 .filter(|range| range.start < line_end && range.end > line_start);
+                            // Only the cursor row can carry a ghost: `at_offset` equals
+                            // the selection head, and the head is on the cursor row by
+                            // definition (#29).
+                            let ghost = if is_cursor_row {
+                                ghost_inline
+                                    .as_ref()
+                                    .map(|(column, first)| (*column, first.as_str()))
+                            } else {
+                                None
+                            };
                             let rendered = styled_line(
                                 &line,
                                 line_start,
@@ -1600,6 +1881,7 @@ impl EditorView {
                                 &row_selections,
                                 brackets,
                                 &row_matches,
+                                ghost,
                                 &theme,
                                 &fonts,
                             );
@@ -1706,6 +1988,7 @@ fn styled_line(
     selections: &[Range<usize>],
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
+    ghost: Option<(usize, &str)>,
     theme: &Theme,
     fonts: &Fonts,
 ) -> Line {
@@ -1713,14 +1996,70 @@ fn styled_line(
         line_runs(line, line_start, spans, diagnostics, link, selections, brackets, matches, theme);
     // Guides come from the line's own indent, so they are computed here and painted by the
     // element — not folded into the runs above, which is what made them blocks (#108).
+    // From the *real* text, before any ghost splice: a suggestion must not move guides.
     let guides = indent_guide_columns(&text).into_iter().map(|range| range.start).collect();
-    Line::new(
-        text.clone(),
-        to_runs(&text, &highlights, theme, fonts),
-        fonts.size,
-        fonts.line_height(),
-    )
-    .with_guides(guides, theme.indent_guide)
+    let mut runs = to_runs(&text, &highlights, theme, fonts);
+    let mut text = text;
+
+    // The ghost's first line, visually inserted at the cursor (#29). Splicing a *run*
+    // is what keeps every colour after the cursor honest for free: `TextRun`s are
+    // relative lengths, so text after the insertion point shifts with its own colours
+    // still attached — no range arithmetic, no drift. Dim (`text_muted`), the roadmap's
+    // "rendered distinctly, never confused with LSP completions".
+    if let Some((at, ghost_text)) = ghost
+        && !ghost_text.is_empty()
+    {
+        let at = floor_boundary(&text, at);
+        let dim = TextRun {
+            len: ghost_text.len(),
+            font: fonts.font(),
+            color: theme.text_muted,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        splice_ghost_run(&mut text, &mut runs, at, ghost_text, dim);
+    }
+
+    Line::new(text, runs, fonts.size, fonts.line_height()).with_guides(guides, theme.indent_guide)
+}
+
+/// Inserts `ghost` into `text` at byte `at` and a matching run into `runs`, splitting
+/// the run that spans the insertion point.
+///
+/// Pure on purpose (#29): whether the splice lands mid-run, between runs, or past the
+/// last run is exactly the arithmetic that can be wrong without a GPU, so it is the part
+/// with tests. `runs` must cover `text` contiguously — `to_runs`' guarantee — and
+/// `ghost_run.len` must equal `ghost.len()`.
+fn splice_ghost_run(
+    text: &mut String,
+    runs: &mut Vec<TextRun>,
+    at: usize,
+    ghost: &str,
+    ghost_run: TextRun,
+) {
+    text.insert_str(at, ghost);
+    let mut consumed = 0usize;
+    for index in 0..runs.len() {
+        if consumed == at {
+            runs.insert(index, ghost_run);
+            return;
+        }
+        let len = runs[index].len;
+        if consumed + len > at {
+            // The insertion point is inside this run: split it around the ghost.
+            let head = at - consumed;
+            let mut tail = runs[index].clone();
+            runs[index].len = head;
+            tail.len = len - head;
+            runs.insert(index + 1, ghost_run);
+            runs.insert(index + 2, tail);
+            return;
+        }
+        consumed += len;
+    }
+    // At (or clamped to) the end of the line — the common case: a cursor at end-of-line.
+    runs.push(ghost_run);
 }
 
 /// Turns the sparse `(range, style)` list into the contiguous runs `shape_line` needs.
@@ -2186,6 +2525,64 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ghost splice (#29) ------------------------------------------------------------
+    //
+    // The splice is the arithmetic half of ghost rendering: whether the dim run lands
+    // between runs, splits one, or appends, and whether every colour after the cursor
+    // stays on its own bytes. The painting half needs a GPU and stays on #35's list.
+
+    /// A run of `len` bytes; the font and colour are irrelevant to the arithmetic.
+    fn plain_run(len: usize) -> TextRun {
+        TextRun {
+            len,
+            font: gpui::font("Menlo"),
+            color: gpui::white(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    }
+
+    #[test]
+    fn a_ghost_at_end_of_line_appends_one_run() {
+        let mut text = String::from("$a = 1;");
+        let mut runs = vec![plain_run(7)];
+        splice_ghost_run(&mut text, &mut runs, 7, " // done", plain_run(8));
+        assert_eq!(text, "$a = 1; // done");
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![7, 8]);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len(), "runs cover the text");
+    }
+
+    #[test]
+    fn a_ghost_mid_run_splits_it_and_shifts_nothing_else() {
+        // Two syntax runs; the cursor sits inside the first. The second run's *length*
+        // is untouched, which is exactly what keeps its colour on its own (shifted)
+        // bytes — the property the run splice was chosen for.
+        let mut text = String::from("$user->save();");
+        let mut runs = vec![plain_run(5), plain_run(9)];
+        splice_ghost_run(&mut text, &mut runs, 2, "XY", plain_run(2));
+        assert_eq!(text, "$uXYser->save();");
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![2, 2, 3, 9]);
+    }
+
+    #[test]
+    fn a_ghost_on_a_run_boundary_slots_between() {
+        let mut text = String::from("abcdef");
+        let mut runs = vec![plain_run(3), plain_run(3)];
+        splice_ghost_run(&mut text, &mut runs, 3, "-", plain_run(1));
+        assert_eq!(text, "abc-def");
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![3, 1, 3]);
+    }
+
+    #[test]
+    fn a_ghost_on_an_empty_line_is_the_only_run() {
+        let mut text = String::new();
+        let mut runs: Vec<TextRun> = Vec::new();
+        splice_ghost_run(&mut text, &mut runs, 0, "return;", plain_run(7));
+        assert_eq!(text, "return;");
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![7]);
+    }
 
     // --- autoscroll margin -----------------------------------------------------------
     //

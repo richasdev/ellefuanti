@@ -2,6 +2,7 @@
 
 mod find;
 pub mod folds;
+pub(crate) mod ghost;
 pub(crate) mod line;
 mod project_search;
 mod state;

@@ -302,6 +302,103 @@ async fn typing_holds_the_caret_solid(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn tab_accepts_a_ghost_suggestion_as_one_edit(cx: &mut TestAppContext) {
+    install_theme(cx);
+    // The acceptance contract of #29: Tab inserts the whole suggestion at the cursor
+    // through the Document's normal insert path — one undo step — and clears the ghost,
+    // while a Tab with no ghost keeps its indent meaning. The suggestion is planted by a
+    // test hook because the request path is network and never runs under cfg(test).
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("ghost.php")), "<?php\n$a = 1;\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        let end = editor.document.buffer.text().find("1;").expect("fixture") + 2;
+        editor.document.move_to(end, false);
+        editor.set_ghost_for_test("\n$b = 2;");
+        assert!(editor.ghost_visible_for_test(), "a fresh ghost at the cursor is visible");
+
+        editor.tab_for_test(cx);
+        assert!(
+            editor.document.buffer.text().contains("$a = 1;\n$b = 2;"),
+            "Tab must insert the suggestion at the cursor"
+        );
+        assert!(editor.ghost_for_test().is_none(), "acceptance clears the ghost");
+
+        // One edit, one undo: the whole suggestion comes back out in a single step.
+        editor.document.undo();
+        assert!(
+            !editor.document.buffer.text().contains("$b = 2;"),
+            "accepting must be a single undo step"
+        );
+
+        // With no ghost, Tab means indent — the behaviour it has always had.
+        editor.tab_for_test(cx);
+        assert!(editor.document.buffer.text().contains("    "), "a bare Tab still indents");
+    });
+
+    draw(cx);
+}
+
+#[gpui::test]
+async fn typing_discards_a_ghost_and_escape_dismisses_one(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("ghost2.php")), "<?php\n$a = 1;\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        let end = editor.document.buffer.text().find("1;").expect("fixture") + 2;
+        editor.document.move_to(end, false);
+
+        // Typing: the edit path must clear the stored ghost, not merely hide it — a
+        // corpse held across edits is state waiting for a stale-offset bug (#29).
+        editor.set_ghost_for_test(" // ok");
+        editor.document.insert("$");
+        editor.after_edit_for_test(cx);
+        assert!(editor.ghost_for_test().is_none(), "an edit must clear the ghost outright");
+
+        // Escape: consumed by the dismissal when a ghost shows, untouched otherwise.
+        editor.set_ghost_for_test(" // ok");
+        assert!(editor.cancel_ghost_for_test(cx), "Escape takes the ghost first");
+        assert!(editor.ghost_for_test().is_none());
+        assert!(!editor.cancel_ghost_for_test(cx), "with no ghost, Escape belongs to others");
+    });
+}
+
+#[gpui::test]
+async fn the_editor_renders_a_multi_line_ghost_suggestion(cx: &mut TestAppContext) {
+    install_theme(cx);
+    // The render half of #29 that a machine can check: the cursor row's text is spliced
+    // with a dim run mid-line, and a full layout/paint pass survives it. Whether it
+    // *looks* dim is #35's human list, like every other pixel claim.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(
+            Some(std::path::PathBuf::from("ghost3.php")),
+            "<?php\n$user = new User();\n$user->\n",
+            true,
+        )
+        .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, _cx| {
+        let offset = editor.document.buffer.text().find("$user->").expect("fixture") + 7;
+        editor.document.move_to(offset, false);
+        editor.set_ghost_for_test("save();\nreturn $user;");
+        assert!(editor.ghost_visible_for_test());
+    });
+
+    draw(cx);
+}
+
+#[gpui::test]
 async fn a_click_inside_the_workspace_chrome_lands_on_the_right_column(cx: &mut TestAppContext) {
     install_theme(cx);
     // End-to-end on the bug PR #39 fixed. It must run **inside the workspace**, not against a
