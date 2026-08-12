@@ -300,13 +300,40 @@ impl Settings {
     // user turns it on, which is the issues' non-negotiable. Keys are NOT here: the
     // settings file is plain JSON and API keys live in the macOS Keychain.
 
-    /// Which AI backend: `"anthropic"`, `"ant"` (CLI login), or `"custom"` (base URL).
+    /// Which AI backend: `"anthropic"`, `"ant"` (CLI login), `"custom"` (base URL), or
+    /// `"codex"` (the user's own `codex` CLI login). Autocomplete reads this one.
     pub fn ai_provider(&self) -> &str {
         self.string_or("ai.provider", "anthropic")
     }
 
     pub fn set_ai_provider(&mut self, provider: &str) {
         self.document.insert("ai.provider".to_string(), Value::String(provider.to_string()));
+    }
+
+    /// The chat panel's backend, which may differ from autocomplete's (#99).
+    ///
+    /// Absent means "whatever `ai.provider` says", so every existing settings file keeps
+    /// behaving exactly as it did — the key only starts mattering once someone sets it.
+    /// The split exists because the two features want different trades: a subscription
+    /// (Codex) answers chat well and is far too slow for per-keystroke ghost text, which
+    /// wants a cheap API-key model.
+    pub fn ai_chat_provider(&self) -> &str {
+        match self.document.get("ai.chat_provider") {
+            Some(Value::String(value)) => value,
+            Some(other) => {
+                tracing::warn!(
+                    key = "ai.chat_provider",
+                    found = type_name(other),
+                    "settings: expected a string, falling back to ai.provider"
+                );
+                self.ai_provider()
+            }
+            None => self.ai_provider(),
+        }
+    }
+
+    pub fn set_ai_chat_provider(&mut self, provider: &str) {
+        self.document.insert("ai.chat_provider".to_string(), Value::String(provider.to_string()));
     }
 
     /// The OpenAI-compatible base URL for the custom provider (e.g. a local Ollama).
@@ -657,6 +684,39 @@ mod tests {
 
         settings.set_theme("light");
         assert!(settings.to_json().contains("Comic Sans"), "{}", settings.to_json());
+    }
+
+    /// The chat provider is a *new* key, so its absence must change nothing (#99).
+    #[test]
+    fn the_chat_provider_falls_back_to_the_shared_provider_until_it_is_set() {
+        // An existing settings file: one provider, both features.
+        let existing = Settings::parse(&path(), r#"{"ai.provider": "custom"}"#).unwrap();
+        assert_eq!(existing.ai_chat_provider(), "custom", "absent means ai.provider");
+
+        // The split the owner wants: autocomplete on a key, chat on the subscription.
+        let split = Settings::parse(
+            &path(),
+            r#"{"ai.provider": "anthropic", "ai.chat_provider": "codex"}"#,
+        )
+        .unwrap();
+        assert_eq!(split.ai_provider(), "anthropic", "autocomplete keeps its key provider");
+        assert_eq!(split.ai_chat_provider(), "codex");
+
+        // Nothing configured at all: the same default as before.
+        assert_eq!(Settings::parse(&path(), "{}").unwrap().ai_chat_provider(), "anthropic");
+
+        // A wrong type warns and falls back rather than costing the file (the house rule).
+        let wrong = Settings::parse(&path(), r#"{"ai.provider": "custom", "ai.chat_provider": 7}"#)
+            .unwrap();
+        assert_eq!(wrong.ai_chat_provider(), "custom");
+    }
+
+    #[test]
+    fn setting_the_chat_provider_leaves_the_autocomplete_provider_alone() {
+        let mut settings = Settings::parse(&path(), r#"{"ai.provider": "anthropic"}"#).unwrap();
+        settings.set_ai_chat_provider("codex");
+        assert_eq!(settings.ai_chat_provider(), "codex");
+        assert_eq!(settings.ai_provider(), "anthropic", "one cycler must not move the other");
     }
 
     /// Sizes are clamped rather than rejected, and the reason is asymmetric: a 0px editor

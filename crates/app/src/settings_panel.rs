@@ -59,13 +59,29 @@ pub struct SettingsPanel {
     /// changed *around* it (the palette's toggle) drifts this until the next click, which
     /// resyncs from the applied name's neighbour and is the cheap end of that trade.
     chosen_theme: Option<String>,
+    /// Codex availability (#99), resolved once off the main thread and cached. `None`
+    /// while the probe runs. It lives here rather than being read per-render because the
+    /// check spawns `codex --version`, and a render must never spawn a process.
+    codex_status: Option<Result<(), String>>,
 }
 
 impl EventEmitter<SettingsPanelEvent> for SettingsPanel {}
 
 impl SettingsPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self { focus_handle: cx.focus_handle(), chosen_theme: None }
+        // Probed unconditionally: the cycler can reach Codex from any starting provider,
+        // and an answer that only arrives after the user lands there reads as a stall.
+        #[cfg(not(test))]
+        cx.spawn(async move |this, cx| {
+            let status = cx.background_spawn(async { crate::ai_codex::availability() }).await;
+            this.update(cx, |this, cx| {
+                this.codex_status = Some(status);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        Self { focus_handle: cx.focus_handle(), chosen_theme: None, codex_status: None }
     }
 
     fn cancel(&mut self, _: &Cancel, _w: &mut Window, cx: &mut Context<Self>) {
@@ -103,13 +119,31 @@ impl SettingsPanel {
         cx.notify();
     }
 
-    /// Steps the AI provider cycler (#99). Three values, so backward is two forwards —
-    /// cheaper than teaching `Provider` a `previous` it needs nowhere else.
-    fn cycle_provider(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let current = crate::ai::Provider::from_setting(crate::settings::current(cx).ai_provider());
-        let next = if forward { current.next() } else { current.next().next() };
+    /// Steps one of the AI provider cyclers (#99). Backward is `next` repeated to the
+    /// wrap — cheaper than teaching `Provider` a `previous` it needs nowhere else.
+    ///
+    /// Two cyclers because chat and autocomplete can differ: the owner runs ghost text on
+    /// an API key and chat on the Codex subscription, and one shared value cannot say that.
+    fn cycle_provider(&mut self, chat: bool, forward: bool, cx: &mut Context<Self>) {
+        let settings = crate::settings::current(cx);
+        let current = crate::ai::Provider::from_setting(if chat {
+            settings.ai_chat_provider()
+        } else {
+            settings.ai_provider()
+        });
+        let mut next = current.next();
+        if !forward {
+            // Backward: keep stepping until the *next* step would come home.
+            while next.next() != current {
+                next = next.next();
+            }
+        }
         crate::settings::update_settings(cx, |settings| {
-            settings.set_ai_provider(next.setting_name());
+            if chat {
+                settings.set_ai_chat_provider(next.setting_name());
+            } else {
+                settings.set_ai_provider(next.setting_name());
+            }
         });
         cx.notify();
     }
@@ -268,9 +302,17 @@ impl Render for SettingsPanel {
         // field is a text input this panel deliberately does not fake (see the find
         // bar's `text_field` note). The key never appears here at all: the button asks
         // the workspace to prompt, and the Keychain is the only destination.
+        let chat_provider = crate::ai::Provider::from_setting(settings.ai_chat_provider());
         let ai_rows = [
             row_picker(
-                "AI provider",
+                "Chat provider",
+                chat_provider.setting_name().to_string(),
+                RowKind::AiChatProvider,
+                &theme,
+                &entity,
+            ),
+            row_picker(
+                "Autocomplete provider",
                 crate::ai::Provider::from_setting(settings.ai_provider())
                     .setting_name()
                     .to_string(),
@@ -289,6 +331,23 @@ impl Render for SettingsPanel {
             row_readonly("Chat model", settings.ai_chat_model().to_string(), &theme),
             row_readonly("Autocomplete model", settings.ai_completion_model().to_string(), &theme),
         ];
+
+        // Codex's state, shown only when it is selected: whether the CLI is there and
+        // logged in, or the command that would fix it. Cached by the panel rather than
+        // probed here — a render must not spawn a process.
+        let codex_row = (chat_provider == crate::ai::Provider::Codex).then(|| {
+            let status = match &self.codex_status {
+                None => "checking…".to_string(),
+                Some(Ok(())) => "installed, logged in".to_string(),
+                Some(Err(reason)) => reason.clone(),
+            };
+            row_readonly("Codex", status, &theme)
+        });
+
+        // "Set API key…" is meaningless for a provider that holds its own login, and a
+        // button that cannot do anything is worse than no button (#99).
+        let takes_key = chat_provider.takes_api_key()
+            || crate::ai::Provider::from_setting(settings.ai_provider()).takes_api_key();
 
         // The theme picker: every selectable theme as a chip with four swatch dots —
         // background, accent, string, keyword — so palettes are told apart on sight
@@ -355,24 +414,28 @@ impl Render for SettingsPanel {
             .child(div().flex().flex_wrap().gap_1().children(theme_chips))
             .child(section_header("AI", &theme))
             .children(ai_rows)
-            .child(
-                div()
-                    .id("settings-set-api-key")
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(theme.border)
-                    .hover(|el| el.bg(theme.hover))
-                    .on_mouse_down(MouseButton::Left, {
-                        let entity = cx.entity();
-                        move |_ev, _window, cx| {
-                            entity.update(cx, |_this, cx| cx.emit(SettingsPanelEvent::SetApiKey));
-                        }
-                    })
-                    .child("Set API key…"),
-            )
+            .children(codex_row)
+            .when(takes_key, |el| {
+                el.child(
+                    div()
+                        .id("settings-set-api-key")
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(theme.border)
+                        .hover(|el| el.bg(theme.hover))
+                        .on_mouse_down(MouseButton::Left, {
+                            let entity = cx.entity();
+                            move |_ev, _window, cx| {
+                                entity
+                                    .update(cx, |_this, cx| cx.emit(SettingsPanelEvent::SetApiKey));
+                            }
+                        })
+                        .child("Set API key…"),
+                )
+            })
             .child(
                 // The escape hatch the issue requires: the panel must not become a wall
                 // between the user and their file.
@@ -411,8 +474,10 @@ fn section_header(label: &'static str, theme: &crate::theme::Theme) -> gpui::Any
 #[derive(Clone, Copy)]
 enum RowKind {
     Family,
-    /// The AI provider (#99): anthropic → ant → custom, wrapping.
+    /// Autocomplete's provider (`ai.provider`): anthropic → ant → custom → codex.
     AiProvider,
+    /// Chat's own provider (`ai.chat_provider`), which may differ (#99).
+    AiChatProvider,
 }
 
 /// A row with ‹ value › controls.
@@ -434,7 +499,8 @@ fn row_picker(
             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                 entity.update(cx, |panel, cx| match kind {
                     RowKind::Family => panel.cycle_family(forward, cx),
-                    RowKind::AiProvider => panel.cycle_provider(forward, cx),
+                    RowKind::AiProvider => panel.cycle_provider(false, forward, cx),
+                    RowKind::AiChatProvider => panel.cycle_provider(true, forward, cx),
                 });
             })
             .child(glyph)

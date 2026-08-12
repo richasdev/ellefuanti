@@ -29,10 +29,23 @@
 //! background reader. The half-received turn is kept and marked "(cancelled)" rather than
 //! deleted — the user saw those words arrive; making them vanish would be a lie about what
 //! happened.
+//!
+//! # Two transports behind one UI
+//!
+//! Most providers are an HTTP POST via `curl`. Codex (#99) is not: it is a long-lived
+//! `codex app-server` child speaking JSON-RPC, carrying the conversation itself. So the
+//! send path branches once — on [`ai::Provider::wire`] being `Some` or `None` — and both
+//! branches feed the *same* [`StreamEvent`] channel, the same 50ms batched drain, and the
+//! same kill handle. The UI below that seam cannot tell the two apart, which is the point:
+//! one panel, one cancel story, one repaint budget.
+//!
+//! The Codex child outlives a single turn on purpose — one thread is one conversation, so
+//! history lives in the CLI rather than being re-sent as a message array. It dies with the
+//! panel or with a cancel.
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -95,6 +108,33 @@ pub struct EditorSnapshot {
 /// already owns the tabs, so it is the only party that can write this closure.
 pub type SnapshotFn = Box<dyn Fn(&App) -> EditorSnapshot + 'static>;
 
+/// A live `codex app-server` child and the thread it opened (#99).
+///
+/// Held across turns because the *thread* is the conversation: Codex keeps the history,
+/// so a second question is a `turn/start` on the same id rather than a re-sent transcript.
+/// Both fields are behind the panel's `Arc<Mutex<..>>` so the background reader and the
+/// foreground cancel can reach them without either blocking a paint.
+struct CodexSession {
+    /// The child's stdin, for `turn/start` and `turn/interrupt`. Separate from the kill
+    /// handle because writing a request must not need the lock that a kill takes.
+    stdin: ChildStdin,
+    /// The child's stdout, mid-stream. It has to live in the session rather than in the
+    /// turn that opened it: a `BufReader` owns a buffer, and the bytes of turn two are
+    /// routinely already sitting in it when turn one's `turn/completed` is parsed.
+    /// Dropping the reader between turns would drop those bytes.
+    stdout: BufReader<ChildStdout>,
+    thread_id: String,
+}
+
+/// What the panel knows about its Codex child between turns.
+#[derive(Default)]
+struct CodexState {
+    session: Option<CodexSession>,
+    /// The model the CLI reported at `thread/start`, shown in the header so the user can
+    /// see which one their subscription handed them.
+    model: Option<String>,
+}
+
 pub struct AiChatPanel {
     focus_handle: FocusHandle,
     turns: Vec<ChatTurn>,
@@ -114,6 +154,16 @@ pub struct AiChatPanel {
     note: Option<SharedString>,
     scroll: ScrollHandle,
     snapshot: SnapshotFn,
+    /// The open folder, so a Codex thread can be rooted at the project the user is
+    /// actually looking at. `None` when nothing is open — then the thread gets no `cwd`
+    /// rather than one pointing wherever the app was launched from.
+    project_root: Option<PathBuf>,
+    /// The Codex child and thread, when that is the chat provider (#99). Shared because
+    /// the background handshake fills it in and the foreground cancel empties it.
+    codex: Arc<Mutex<CodexState>>,
+    /// Codex availability, resolved off the main thread once per panel and cached: the
+    /// check spawns `codex --version`, which a render must never do.
+    codex_status: Option<Result<(), String>>,
     /// Stops `send` just before the curl spawn, recording the body instead. What lets a
     /// test exercise the whole send path — settings read, context build, turn pushed,
     /// body built — with no network and no child process.
@@ -128,8 +178,12 @@ pub struct AiChatPanel {
 }
 
 impl AiChatPanel {
-    pub fn new(snapshot: SnapshotFn, cx: &mut Context<Self>) -> Self {
-        Self {
+    pub fn new(
+        snapshot: SnapshotFn,
+        project_root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let panel = Self {
             focus_handle: cx.focus_handle(),
             turns: Vec::new(),
             input: String::new(),
@@ -141,13 +195,39 @@ impl AiChatPanel {
             note: None,
             scroll: ScrollHandle::new(),
             snapshot,
+            project_root,
+            codex: Arc::default(),
+            codex_status: None,
             #[cfg(test)]
             transport_disabled: false,
             #[cfg(test)]
             sent_bodies: Vec::new(),
             #[cfg(test)]
             force_enabled: false,
+        };
+        // Probed at open, not at render: `codex --version` is a subprocess, and a render
+        // that spawns one would pay for it every frame. Only when Codex is the chat
+        // provider — nobody else's panel should run a CLI they did not ask for.
+        #[cfg(not(test))]
+        if ai::Provider::from_setting(crate::settings::current(cx).ai_chat_provider())
+            == ai::Provider::Codex
+        {
+            panel.probe_codex(cx);
         }
+        panel
+    }
+
+    /// Resolves Codex availability off the main thread and caches the answer.
+    fn probe_codex(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let status = cx.background_spawn(async { crate::ai_codex::availability() }).await;
+            this.update(cx, |this, cx| {
+                this.codex_status = Some(status);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // --- sending ---------------------------------------------------------------------
@@ -199,23 +279,28 @@ impl AiChatPanel {
             }
         };
 
-        let provider = ai::Provider::from_setting(settings.ai_provider());
-        let wire = provider.wire();
+        // Chat reads its *own* provider key, falling back to `ai.provider` when unset
+        // (#99): the owner wants ghost text on an API key and chat on the subscription.
+        let provider = ai::Provider::from_setting(settings.ai_chat_provider());
         let base_url = settings.ai_base_url().to_string();
 
+        let message = format!("{context_blocks}{prompt}");
         self.input.clear();
         self.note = None;
-        self.turns.push(ChatTurn { role: Role::User, text: format!("{context_blocks}{prompt}") });
+        self.turns.push(ChatTurn { role: Role::User, text: message.clone() });
 
         // The body carries the history *up to and including* the new user turn; the empty
-        // assistant turn below is a UI placeholder the wire must not see.
-        let body = ai::chat_body(
-            wire,
-            settings.ai_chat_model(),
-            SYSTEM_PROMPT,
-            &self.wire_turns(),
-            MAX_TOKENS,
-        );
+        // assistant turn below is a UI placeholder the wire must not see. Codex has no
+        // body at all — the CLI holds the conversation, so a turn is just the new text.
+        let body = provider.wire().map(|wire| {
+            ai::chat_body(
+                wire,
+                settings.ai_chat_model(),
+                SYSTEM_PROMPT,
+                &self.wire_turns(),
+                MAX_TOKENS,
+            )
+        });
 
         self.turns.push(ChatTurn { role: Role::Assistant, text: String::new() });
         self.streaming = true;
@@ -224,11 +309,17 @@ impl AiChatPanel {
 
         #[cfg(test)]
         if self.transport_disabled {
-            self.sent_bodies.push(body);
+            // Codex's "body" for the test seam is the message itself: there is no wire
+            // body, and what a test needs to pin is what would reach the CLI.
+            self.sent_bodies.push(body.unwrap_or(message));
             return;
         }
 
-        self.start_stream(provider, wire, base_url, body, cx);
+        match (provider.wire(), body) {
+            (Some(wire), Some(body)) => self.start_stream(provider, wire, base_url, body, cx),
+            // Codex: the long-lived child, driven from the same channel and drain.
+            _ => self.start_codex_stream(message, cx),
+        }
     }
 
     /// The conversation as the wire wants it: user and assistant turns only. Notes are
@@ -270,6 +361,41 @@ impl AiChatPanel {
             loop {
                 let Ok(first) = rx.recv().await else { break };
                 // The batching (#93): sleep out the burst, then sweep it into one apply.
+                timer.timer(BATCH_INTERVAL).await;
+                let mut batch = vec![first];
+                while let Ok(event) = rx.try_recv() {
+                    batch.push(event);
+                }
+                let finished =
+                    this.update(cx, |this, cx| this.apply_events(batch, cx)).unwrap_or(true);
+                if finished {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The Codex half of the send path (#99): ensure a child and a thread, then one turn.
+    ///
+    /// Deliberately the *same* shape as [`Self::start_stream`] — one channel of
+    /// [`StreamEvent`], one batched drain — so everything downstream (the placeholder,
+    /// the ellipsis, cancel, the note rows) is shared rather than reimplemented.
+    fn start_codex_stream(&mut self, message: String, cx: &mut Context<Self>) {
+        let (tx, rx) = smol::channel::unbounded::<StreamEvent>();
+        let codex = self.codex.clone();
+        let kill: Arc<Mutex<Option<Child>>> = Arc::default();
+        self.kill = kill.clone();
+        let root = self.project_root.clone();
+
+        let producer = cx.background_spawn(async move {
+            codex_turn(&codex, &kill, root.as_deref(), &message, &tx);
+        });
+
+        let timer = cx.background_executor().clone();
+        self.stream_task = Some(cx.spawn(async move |this, cx| {
+            let _producer = producer;
+            loop {
+                let Ok(first) = rx.recv().await else { break };
                 timer.timer(BATCH_INTERVAL).await;
                 let mut batch = vec![first];
                 while let Ok(event) = rx.try_recv() {
@@ -328,6 +454,11 @@ impl AiChatPanel {
         if !self.streaming {
             return;
         }
+        // Codex gets the polite cancel first: `turn/interrupt` stops the turn server-side
+        // so the subscription is not billed for tokens nobody will read. The kill below
+        // is still the guarantee — an interrupt the CLI never gets around to reading must
+        // not leave a turn running behind a panel the user has stopped listening to.
+        self.interrupt_codex();
         if let Some(mut child) =
             self.kill.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
         {
@@ -347,6 +478,24 @@ impl AiChatPanel {
             }
         }
         cx.notify();
+    }
+
+    /// Asks the Codex CLI to stop the running turn, and drops the session with it.
+    ///
+    /// The session goes because the child is about to be killed: keeping a thread id
+    /// whose process is gone would make the next send write into a closed pipe. The next
+    /// turn re-handshakes, which costs a second and is the honest price of a cancel.
+    ///
+    /// A failed write is deliberately ignored — the child may already be dead, and that
+    /// is the outcome this method wanted anyway.
+    fn interrupt_codex(&mut self) {
+        let mut state = self.codex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut session) = state.session.take() {
+            let request = crate::ai_codex::interrupt_request(&session.thread_id);
+            let _ = session.stdin.write_all(request.as_bytes());
+            let _ = session.stdin.flush();
+        }
+        state.model = None;
     }
 
     // --- chips -----------------------------------------------------------------------
@@ -554,7 +703,15 @@ fn deny_note(path: &Path, reason: &str) -> String {
 
 /// What stands in the conversation area before the panel can work: which provider is
 /// selected and what is missing. `None` means the panel is ready for an input row.
-pub fn setup_guidance(enabled: bool, provider: ai::Provider, base_url: &str) -> Option<String> {
+///
+/// `codex_status` is the cached [`crate::ai_codex::availability`] answer: `None` while the
+/// probe is still running, and consulted only when Codex is the selected provider.
+pub fn setup_guidance(
+    enabled: bool,
+    provider: ai::Provider,
+    base_url: &str,
+    codex_status: Option<&Result<(), String>>,
+) -> Option<String> {
     if !enabled {
         return Some(format!(
             "AI chat is off. Provider: {}. Nothing is sent anywhere until you enable it \
@@ -568,6 +725,20 @@ pub fn setup_guidance(enabled: bool, provider: ai::Provider, base_url: &str) -> 
              (e.g. http://localhost:11434/v1 for Ollama)."
                 .to_string(),
         );
+    }
+    if provider == ai::Provider::Codex {
+        return match codex_status {
+            // The probe's own sentence already names the command to run — repeating it
+            // here in different words is how two error messages start disagreeing.
+            Some(Err(reason)) => Some(format!(
+                "{reason}.\n\nChat runs your local `codex` CLI, which uses your own \
+                 ChatGPT login. This editor never sees your credentials, and the thread \
+                 is read-only — it can read the open project, not write to it."
+            )),
+            // Still probing: no input row yet, because a send would race the answer.
+            None => Some("Checking for the Codex CLI…".to_string()),
+            Some(Ok(())) => None,
+        };
     }
     None
 }
@@ -669,6 +840,185 @@ fn stream_reply(
     }
 }
 
+// --- the Codex producer -----------------------------------------------------------------
+
+/// Runs one Codex turn, spawning and handshaking the child first if there is not one yet.
+///
+/// Blocking, like [`stream_reply`] and for the same reason: it lives inside
+/// `background_spawn`, and a blocked channel send is the drain applying a batch.
+///
+/// The child is *not* killed on the way out — that is the whole point of a session. It is
+/// killed by a cancel, or when the panel drops and takes the `Arc` with it.
+fn codex_turn(
+    codex: &Arc<Mutex<CodexState>>,
+    kill: &Arc<Mutex<Option<Child>>>,
+    root: Option<&Path>,
+    message: &str,
+    tx: &smol::channel::Sender<StreamEvent>,
+) {
+    // Availability first, so "not installed" and "not logged in" arrive as the sentence
+    // that names the command to run, rather than as a spawn error nobody can act on.
+    if let Err(reason) = crate::ai_codex::availability() {
+        let _ = tx.send_blocking(StreamEvent::Error(reason));
+        return;
+    }
+
+    // The lock is held for the whole turn. That is deliberate and cheap: only one turn
+    // runs at a time (the panel refuses a second while `streaming`), and the alternative —
+    // taking the session out and putting it back — loses the child on every early return.
+    let mut state = codex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // An existing session means the CLI already holds this conversation, so a second
+    // question is one `turn/start` on the same thread rather than a fresh handshake.
+    if let Some(session) = state.session.as_mut() {
+        let request = crate::ai_codex::turn_start_request(&session.thread_id, message);
+        if session.stdin.write_all(request.as_bytes()).and_then(|()| session.stdin.flush()).is_ok()
+        {
+            read_codex_turn(session, tx);
+            return;
+        }
+        // The child died between turns (a crash, a logout). Drop the corpse and fall
+        // through to a fresh spawn rather than reporting a broken pipe at the user.
+        state.session = None;
+    }
+
+    let mut command = std::process::Command::new("codex");
+    command
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // The CLI's own logging goes to stderr and is none of the panel's business; the
+        // protocol is entirely on stdout.
+        .stderr(Stdio::null());
+    // Rooting the child at the project is the fallback that actually works if a future
+    // CLI stops honouring the `cwd` param — belt and braces, per the probe.
+    if let Some(root) = root {
+        command.current_dir(root);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = tx.send_blocking(StreamEvent::Error(format!(
+                "could not run the Codex CLI: {err} — install it and run `codex login`"
+            )));
+            return;
+        }
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = tx.send_blocking(StreamEvent::Error("the Codex CLI gave no stdin".to_string()));
+        return;
+    };
+    let stdout = child.stdout.take();
+    *kill.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
+
+    let handshake = crate::ai_codex::initialize_request(env!("CARGO_PKG_VERSION"))
+        + &crate::ai_codex::thread_start_request(root);
+    if stdin.write_all(handshake.as_bytes()).and_then(|()| stdin.flush()).is_err() {
+        let _ = tx.send_blocking(StreamEvent::Error(
+            "the Codex CLI closed before the handshake finished".to_string(),
+        ));
+        return;
+    }
+
+    let Some(stdout) = stdout else {
+        let _ = tx.send_blocking(StreamEvent::Error("the Codex CLI gave no stdout".to_string()));
+        return;
+    };
+    let mut stdout = BufReader::new(stdout);
+
+    // Read until the thread id arrives, then send the message that has been waiting for
+    // an id to address. Nothing before `thread/start` can carry reply text, so this loop
+    // forwards nothing — it is the handshake, not the turn.
+    let mut thread_id = None;
+    let mut model = None;
+    let mut line = String::new();
+    while thread_id.is_none() {
+        line.clear();
+        match stdout.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                let _ = tx.send_blocking(StreamEvent::Error(
+                    "the Codex CLI closed before the thread opened — try `codex login`".to_string(),
+                ));
+                return;
+            }
+            Ok(_) => {}
+        }
+        match crate::ai_codex::parse_line(&line) {
+            Some(crate::ai_codex::CodexEvent::ThreadStarted(id)) => {
+                model = model_from_thread_start(&line);
+                thread_id = Some(id);
+            }
+            // A refusal during the handshake (a bad param, a logged-out CLI) is the
+            // user's answer, not a hang.
+            Some(crate::ai_codex::CodexEvent::TurnFailed(message)) => {
+                let _ = tx.send_blocking(StreamEvent::Error(message));
+                return;
+            }
+            _ => {}
+        }
+    }
+    let Some(thread_id) = thread_id else { return };
+
+    let request = crate::ai_codex::turn_start_request(&thread_id, message);
+    if stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush()).is_err() {
+        let _ = tx.send_blocking(StreamEvent::Error(
+            "the Codex CLI closed before the turn started".to_string(),
+        ));
+        return;
+    }
+
+    state.model = model;
+    let session = state.session.insert(CodexSession { stdin, stdout, thread_id });
+    read_codex_turn(session, tx);
+}
+
+/// Forwards one turn's worth of events from an established session.
+///
+/// Returns at `turn/completed` / `turn/failed` — and *only* then — leaving the reader
+/// parked mid-stream for the next turn. That is why the reader lives in the session: the
+/// next turn's bytes may already be in this `BufReader`'s buffer.
+fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<StreamEvent>) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match session.stdout.read_line(&mut line) {
+            // EOF: the CLI exited (killed by a cancel, crashed, logged out mid-turn).
+            // Whatever arrived is the reply, and it is over.
+            Ok(0) | Err(_) => {
+                let _ = tx.send_blocking(StreamEvent::Done);
+                return;
+            }
+            Ok(_) => {}
+        }
+        match crate::ai_codex::parse_line(&line) {
+            Some(crate::ai_codex::CodexEvent::Delta(text)) => {
+                if tx.send_blocking(StreamEvent::Delta(text)).is_err() {
+                    return; // the drain went away: a cancel, and the kill is coming
+                }
+            }
+            Some(crate::ai_codex::CodexEvent::TurnCompleted) => {
+                let _ = tx.send_blocking(StreamEvent::Done);
+                return;
+            }
+            Some(crate::ai_codex::CodexEvent::TurnFailed(message)) => {
+                let _ = tx.send_blocking(StreamEvent::Error(message));
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Digs the model name out of a `thread/start` reply, for the header row.
+///
+/// Parsed here rather than in [`crate::ai_codex`] because it is a display nicety, not
+/// protocol: a missing model costs a label, never a turn.
+fn model_from_thread_start(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    value.get("result")?.get("model")?.as_str().map(str::to_string)
+}
+
 // --- rendering -------------------------------------------------------------------------
 
 impl Focusable for AiChatPanel {
@@ -692,9 +1042,24 @@ impl Render for AiChatPanel {
                 settings.ai_chat_enabled()
             }
         };
-        let provider = ai::Provider::from_setting(settings.ai_provider());
-        let guidance = setup_guidance(enabled, provider, settings.ai_base_url());
+        let provider = ai::Provider::from_setting(settings.ai_chat_provider());
+        let guidance =
+            setup_guidance(enabled, provider, settings.ai_base_url(), self.codex_status.as_ref());
         let ready = guidance.is_none();
+
+        // The header's right-hand label: which model is answering. Codex picks its own
+        // (the subscription decides), so it is reported back from `thread/start` rather
+        // than read from `ai.chat_model`, which it does not obey.
+        let model = if provider == ai::Provider::Codex {
+            self.codex
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .model
+                .clone()
+                .unwrap_or_else(|| "subscription".to_string())
+        } else {
+            settings.ai_chat_model().to_string()
+        };
 
         div()
             .key_context(context::AI_CHAT)
@@ -727,11 +1092,7 @@ impl Render for AiChatPanel {
                     .border_color(theme.border)
                     .child("AI Chat")
                     .child(div().text_color(theme.text_muted).text_size(px(11.0)).child(
-                        SharedString::from(format!(
-                            "{} · {}",
-                            provider.setting_name(),
-                            settings.ai_chat_model()
-                        )),
+                        SharedString::from(format!("{} · {model}", provider.setting_name())),
                     )),
             )
             .child(match guidance {
@@ -758,6 +1119,15 @@ impl AiChatPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let entity = cx.entity();
+        // Codex has no key to set, so pointing at the key prompt would send the user
+        // somewhere that cannot help them.
+        let codex = ai::Provider::from_setting(crate::settings::current(cx).ai_chat_provider())
+            == ai::Provider::Codex;
+        let footer = if codex {
+            "Provider lives in Settings (⌘,) → AI. Codex uses your own `codex login`."
+        } else {
+            "Provider and API key live in Settings (⌘,) → AI."
+        };
         div()
             .flex_1()
             .flex()
@@ -789,9 +1159,7 @@ impl AiChatPanel {
                         .child("Enable AI chat"),
                 )
             })
-            .child(
-                div().text_size(px(11.0)).child("Provider and API key live in Settings (⌘,) → AI."),
-            )
+            .child(div().text_size(px(11.0)).child(footer))
             .into_any_element()
     }
 
@@ -1109,13 +1477,41 @@ mod tests {
 
     #[test]
     fn guidance_stands_in_while_disabled_or_unconfigured_and_leaves_when_ready() {
-        let disabled = setup_guidance(false, ai::Provider::Anthropic, "");
+        let disabled = setup_guidance(false, ai::Provider::Anthropic, "", None);
         assert!(disabled.unwrap().contains("anthropic"), "guidance names the provider");
 
-        let no_url = setup_guidance(true, ai::Provider::Custom, "  ");
+        let no_url = setup_guidance(true, ai::Provider::Custom, "  ", None);
         assert!(no_url.unwrap().contains("ai.base_url"), "guidance names what is missing");
 
-        assert_eq!(setup_guidance(true, ai::Provider::Anthropic, ""), None);
-        assert_eq!(setup_guidance(true, ai::Provider::Custom, "http://localhost:11434"), None);
+        assert_eq!(setup_guidance(true, ai::Provider::Anthropic, "", None), None);
+        assert_eq!(
+            setup_guidance(true, ai::Provider::Custom, "http://localhost:11434", None),
+            None
+        );
+    }
+
+    /// An unavailable Codex must say the command that fixes it, never fail silently (#99).
+    #[test]
+    fn codex_guidance_carries_the_command_that_fixes_it() {
+        let missing = Err("Codex CLI not found — install it and run `codex login`".to_string());
+        let guidance = setup_guidance(true, ai::Provider::Codex, "", Some(&missing)).unwrap();
+        assert!(guidance.contains("codex login"), "the exact command to run: {guidance}");
+        assert!(
+            guidance.contains("never sees your credentials"),
+            "and who owns the login: {guidance}"
+        );
+
+        let logged_out =
+            Err("Codex is installed but not logged in — run `codex login` in a terminal"
+                .to_string());
+        let guidance = setup_guidance(true, ai::Provider::Codex, "", Some(&logged_out)).unwrap();
+        assert!(guidance.contains("not logged in"), "{guidance}");
+        assert!(guidance.contains("codex login"), "{guidance}");
+
+        // While the probe is in flight there is still no input row: a send would race it.
+        assert!(setup_guidance(true, ai::Provider::Codex, "", None).is_some());
+
+        // Available: the panel is ready, and the base URL is none of Codex's business.
+        assert_eq!(setup_guidance(true, ai::Provider::Codex, "", Some(&Ok(()))), None);
     }
 }

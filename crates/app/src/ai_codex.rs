@@ -1,0 +1,377 @@
+//! Chat through the user's own `codex` login (#99): a subscription instead of a key.
+//!
+//! # Why this exists at all
+//!
+//! Every other provider in [`crate::ai`] wants an API key. The owner already pays for a
+//! ChatGPT subscription, and the `codex` CLI already knows how to use it — so the cheapest
+//! honest path to "chat without a second bill" is to drive that CLI instead of inventing
+//! an auth flow. PhpStorm's Codex integration is the same shape.
+//!
+//! # The credential is never ours
+//!
+//! `codex login` writes `~/.codex/auth.json` and the CLI reads it; this editor never
+//! opens that file, never holds a token, never logs one. [`availability`] checks that the
+//! path *exists* and stops there — existence is the whole question, contents are none of
+//! our business. Nothing here is bundled with an account either: we spawn whatever
+//! `codex` is on the user's PATH, and it answers with whoever is logged into it.
+//!
+//! Anthropic forbids the equivalent for Claude, which is why there is no Claude OAuth
+//! provider next to this one and must not be.
+//!
+//! # The protocol, as probed rather than as documented
+//!
+//! `codex app-server` speaks JSON-RPC 2.0 over newline-delimited JSON on stdin/stdout,
+//! one message per line. The published docs still describe `newConversation`, which the
+//! binary no longer has; everything below was captured live against `codex-cli 0.146.0`
+//! and the exact captured lines are the test fixtures at the bottom of this file.
+//!
+//! ```text
+//! → initialize   {"clientInfo":{"name":"ellefuanti","version":"…"}}
+//! ← {"id":1,"result":{"userAgent":…,"codexHome":…}}
+//! → thread/start {"cwd":"<project root>"}
+//! ← {"id":2,"result":{"thread":{"id":"019ff658-…"},"model":"gpt-5.6-luna",…}}
+//! → turn/start   {"threadId":"019ff658-…","input":[{"type":"text","text":"…"}]}
+//! ← item/agentMessage/delta ×N, then turn/completed
+//! ```
+//!
+//! # Read-only, by default and on purpose
+//!
+//! `thread/start` defaults to `sandbox: readOnly` with `approvalPolicy: on-request`, and
+//! this pass sends nothing to change that. A chat panel that could write files is a
+//! different feature with a different consent story; "ask mode" is what #99 scoped.
+//!
+//! The `cwd` param is verified accepted — the returned thread echoes it back, and the
+//! spawned child's own working directory is set to the same root as a belt-and-braces
+//! fallback, since that is what actually roots a thread when a param is ignored.
+
+use std::path::Path;
+
+use serde_json::{Value, json};
+
+/// The JSON-RPC ids, fixed per message kind. The app-server answers `initialize` and
+/// `thread/start` by id, and nothing here ever has two of either in flight, so constants
+/// beat a counter that would need synchronising across the reader and the writer.
+pub const INITIALIZE_ID: u64 = 1;
+pub const THREAD_START_ID: u64 = 2;
+/// Every turn reuses this id: replies to `turn/start` are not what drives the UI (the
+/// `item/agentMessage/delta` notifications are), so a unique id per turn would buy
+/// nothing and cost a counter.
+pub const TURN_START_ID: u64 = 3;
+pub const INTERRUPT_ID: u64 = 4;
+
+/// The handshake. `clientInfo` is what shows up in the CLI's own user-agent string, so
+/// it names this editor honestly rather than impersonating another client.
+pub fn initialize_request(client_version: &str) -> String {
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": INITIALIZE_ID,
+        "method": "initialize",
+        "params": {"clientInfo": {"name": "ellefuanti", "version": client_version}},
+    }))
+}
+
+/// Opens the conversation. One thread per panel session — the thread *is* the history,
+/// which is why the panel keeps the child alive across turns instead of respawning.
+///
+/// `cwd` is how Codex gets to read the open project for context. Omitted when no folder
+/// is open, because a thread rooted at wherever the app happened to launch would let it
+/// read a directory the user never opened.
+pub fn thread_start_request(cwd: Option<&Path>) -> String {
+    let mut params = json!({});
+    if let Some(cwd) = cwd {
+        params["cwd"] = json!(cwd.to_string_lossy());
+    }
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": THREAD_START_ID,
+        "method": "thread/start",
+        "params": params,
+    }))
+}
+
+/// One user message. The `input` array is a content-block list like the HTTP wires'; only
+/// text blocks are sent, because only text is what the panel can produce.
+pub fn turn_start_request(thread_id: &str, text: &str) -> String {
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": TURN_START_ID,
+        "method": "turn/start",
+        "params": {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text}],
+        },
+    }))
+}
+
+/// Cancel, the polite half. The panel also kills the child as a fallback — an interrupt
+/// that is never read because the reader already went away must not leave a turn running.
+pub fn interrupt_request(thread_id: &str) -> String {
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": INTERRUPT_ID,
+        "method": "turn/interrupt",
+        "params": {"threadId": thread_id},
+    }))
+}
+
+/// Serialises one JSON-RPC message as exactly one line: the framing *is* the newline.
+fn line(value: Value) -> String {
+    format!("{value}\n")
+}
+
+/// One parsed line of the app-server's output, reduced to what the panel acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodexEvent {
+    /// The `initialize` reply landed; the handshake may proceed.
+    Initialized,
+    /// The thread exists, and this is the id every later message needs.
+    ThreadStarted(String),
+    /// A piece of assistant text to append.
+    Delta(String),
+    /// The turn finished normally.
+    TurnCompleted,
+    /// The turn failed; the string is for the user.
+    TurnFailed(String),
+    /// A line that is well-formed and deliberately carries nothing: lifecycle chatter,
+    /// rate-limit updates, MCP startup noise. Distinct from `None` (unparseable) so a
+    /// reader can tell "understood and skipped" from "not JSON at all".
+    Ignored,
+}
+
+/// Parses one line of app-server output. `None` for anything that is not a JSON object —
+/// a stray log line on stdout must never take the stream down.
+///
+/// Note what is *not* here: `item/started` and `item/completed` carry a whole item, and
+/// the first `item/started` of a turn is the echoed **user** message, not the reply. Only
+/// `item/agentMessage/delta` is treated as text, so nothing gets appended twice and the
+/// user's own words never come back as the assistant's.
+pub fn parse_line(text: &str) -> Option<CodexEvent> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+
+    // A reply carries `id`; a notification carries `method`. Replies first, because the
+    // handshake is the only thing that waits on one.
+    if let Some(id) = value.get("id").and_then(Value::as_u64) {
+        if let Some(error) = value.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("the Codex CLI refused the request");
+            return Some(CodexEvent::TurnFailed(message.to_string()));
+        }
+        let result = value.get("result")?;
+        return match id {
+            INITIALIZE_ID => Some(CodexEvent::Initialized),
+            THREAD_START_ID => {
+                let thread_id = result.get("thread")?.get("id")?.as_str()?;
+                Some(CodexEvent::ThreadStarted(thread_id.to_string()))
+            }
+            // `turn/start` and `turn/interrupt` acknowledgements: the notifications are
+            // what the panel follows, so the acks are noise.
+            _ => Some(CodexEvent::Ignored),
+        };
+    }
+
+    let method = value.get("method").and_then(Value::as_str)?;
+    let params = value.get("params");
+    match method {
+        "item/agentMessage/delta" => {
+            // `delta` is a bare String here, not an object — the shape the probe pinned.
+            let delta = params?.get("delta")?.as_str()?;
+            Some(CodexEvent::Delta(delta.to_string()))
+        }
+        "turn/completed" => Some(CodexEvent::TurnCompleted),
+        "turn/failed" => {
+            let message = params
+                .and_then(|params| params.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("the Codex turn failed");
+            Some(CodexEvent::TurnFailed(message.to_string()))
+        }
+        // Everything else is lifecycle or telemetry: thread/started, turn/started,
+        // item/started, item/completed, remoteControl/status/changed,
+        // mcpServer/startupStatus/updated, account/rateLimits/updated,
+        // thread/tokenUsage/updated, thread/status/changed.
+        _ => Some(CodexEvent::Ignored),
+    }
+}
+
+/// Whether this machine can chat through Codex at all, as a sentence the user can act on.
+///
+/// **Blocking** — it runs `codex --version` — so call it off the main thread, the same
+/// rule `resolve_auth` follows.
+///
+/// The two failures are deliberately distinct: an uninstalled CLI and a logged-out one
+/// need different commands, and "AI chat is broken" would be neither.
+pub fn availability() -> Result<(), String> {
+    let installed = std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !installed {
+        return Err("Codex CLI not found — install it and run `codex login`".to_string());
+    }
+    if !auth_path().is_some_and(|path| path.exists()) {
+        return Err(
+            "Codex is installed but not logged in — run `codex login` in a terminal".to_string()
+        );
+    }
+    Ok(())
+}
+
+/// Where the CLI keeps its login. Only ever asked whether it *exists* — reading it would
+/// mean holding a credential this app has no business holding.
+fn auth_path() -> Option<std::path::PathBuf> {
+    // `CODEX_HOME` is the CLI's own override; honouring it keeps the check truthful for
+    // anyone who moved their config, instead of reporting "not logged in" at a stale path.
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        return Some(Path::new(&home).join("auth.json"));
+    }
+    std::env::var_os("HOME").map(|home| Path::new(&home).join(".codex").join("auth.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // The fixtures below are real captured lines from `codex-cli 0.146.0`, trimmed only
+    // where a field is irrelevant to parsing. They are the contract: if a future CLI
+    // changes shape, these fail and say exactly which message moved.
+
+    #[test]
+    fn the_handshake_requests_are_one_line_each_with_the_ids_the_replies_use() {
+        let init = initialize_request("0.3.0");
+        assert!(init.ends_with('\n'), "the newline is the framing");
+        assert_eq!(init.matches('\n').count(), 1, "exactly one line per message");
+        let value: Value = serde_json::from_str(&init).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], INITIALIZE_ID);
+        assert_eq!(value["method"], "initialize");
+        assert_eq!(value["params"]["clientInfo"]["name"], "ellefuanti");
+        assert_eq!(value["params"]["clientInfo"]["version"], "0.3.0");
+    }
+
+    #[test]
+    fn thread_start_carries_the_project_root_when_there_is_one() {
+        let rooted: Value =
+            serde_json::from_str(&thread_start_request(Some(&PathBuf::from("/srv/app")))).unwrap();
+        assert_eq!(rooted["method"], "thread/start");
+        assert_eq!(rooted["id"], THREAD_START_ID);
+        assert_eq!(rooted["params"]["cwd"], "/srv/app", "how Codex gets to read the project");
+
+        // No folder open: no cwd, rather than a cwd pointing at wherever we launched.
+        let rootless: Value = serde_json::from_str(&thread_start_request(None)).unwrap();
+        assert!(rootless["params"].get("cwd").is_none(), "{rootless}");
+    }
+
+    #[test]
+    fn a_turn_sends_the_thread_id_and_one_text_block() {
+        let value: Value =
+            serde_json::from_str(&turn_start_request("019ff658-abc", "explain this")).unwrap();
+        assert_eq!(value["method"], "turn/start");
+        assert_eq!(value["params"]["threadId"], "019ff658-abc");
+        let input = value["params"]["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "explain this");
+    }
+
+    #[test]
+    fn an_interrupt_names_the_thread_it_cancels() {
+        let value: Value = serde_json::from_str(&interrupt_request("019ff658-abc")).unwrap();
+        assert_eq!(value["method"], "turn/interrupt");
+        assert_eq!(value["params"]["threadId"], "019ff658-abc");
+    }
+
+    #[test]
+    fn the_initialize_reply_opens_the_handshake() {
+        let captured = r#"{"id":1,"result":{"userAgent":"ellefuanti/0.146.0 (Mac OS 26.5.2; arm64)","codexHome":"/Users/x/.codex","platformFamily":"unix","platformOs":"macos"}}"#;
+        assert_eq!(parse_line(captured), Some(CodexEvent::Initialized));
+    }
+
+    #[test]
+    fn the_thread_start_reply_yields_the_id_every_later_message_needs() {
+        let captured = r#"{"id":2,"result":{"thread":{"id":"019ff659-c12b-7331-9690-228b71b89440","cwd":"/Users/x/app","status":{"type":"idle"}},"model":"gpt-5.6-luna","approvalPolicy":"on-request","sandbox":{"type":"readOnly","networkAccess":false}}}"#;
+        assert_eq!(
+            parse_line(captured),
+            Some(CodexEvent::ThreadStarted("019ff659-c12b-7331-9690-228b71b89440".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_delta_is_the_text_the_panel_appends() {
+        let captured = r#"{"method":"item/agentMessage/delta","params":{"threadId":"019ff65a-131a","turnId":"019ff65a-1354","itemId":"msg_0157b6","delta":"OK"},"emittedAtMs":1786544528866}"#;
+        assert_eq!(parse_line(captured), Some(CodexEvent::Delta("OK".to_string())));
+    }
+
+    #[test]
+    fn a_completed_turn_is_the_signal_to_stop_reading() {
+        let captured = r#"{"method":"turn/completed","params":{"threadId":"019ff65a-131a","turn":{"id":"019ff65a-1354","status":"completed","error":null,"durationMs":3032}},"emittedAtMs":1786544529198}"#;
+        assert_eq!(parse_line(captured), Some(CodexEvent::TurnCompleted));
+    }
+
+    #[test]
+    fn a_failed_turn_carries_its_message_to_the_user() {
+        let captured = r#"{"method":"turn/failed","params":{"threadId":"019ff65a","error":{"message":"usage limit reached"}}}"#;
+        assert_eq!(
+            parse_line(captured),
+            Some(CodexEvent::TurnFailed("usage limit reached".to_string()))
+        );
+
+        // A failure with no message still ends the turn rather than hanging it.
+        let bare = r#"{"method":"turn/failed","params":{"threadId":"019ff65a"}}"#;
+        assert!(matches!(parse_line(bare), Some(CodexEvent::TurnFailed(_))));
+    }
+
+    #[test]
+    fn the_echoed_user_message_is_never_mistaken_for_the_reply() {
+        // The first `item/started` of every turn is the *user's* own message coming back.
+        // Treating item payloads as text would append the question to the answer, and
+        // then append the answer twice when `item/completed` repeats it in full.
+        let user_item = r#"{"method":"item/started","params":{"item":{"type":"userMessage","id":"019ff65a","content":[{"type":"text","text":"Responda apenas: OK"}]},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
+        assert_eq!(parse_line(user_item), Some(CodexEvent::Ignored));
+
+        let agent_started = r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg_0157b6","text":"","phase":"final_answer"},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
+        assert_eq!(parse_line(agent_started), Some(CodexEvent::Ignored));
+
+        let agent_completed = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg_0157b6","text":"OK","phase":"final_answer"},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
+        assert_eq!(
+            parse_line(agent_completed),
+            Some(CodexEvent::Ignored),
+            "the full text here would double every reply"
+        );
+    }
+
+    #[test]
+    fn lifecycle_and_telemetry_chatter_is_understood_and_skipped() {
+        for captured in [
+            r#"{"method":"thread/started","params":{"thread":{"id":"019ff65a","cwd":"/tmp"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"019ff65a","turn":{"id":"019ff65a","status":"inProgress"}}}"#,
+            r#"{"method":"remoteControl/status/changed","params":{"status":"disabled"}}"#,
+            r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"herd","status":"starting"}}"#,
+            r#"{"method":"account/rateLimits/updated","params":{}}"#,
+            r#"{"method":"thread/tokenUsage/updated","params":{}}"#,
+            r#"{"method":"thread/status/changed","params":{}}"#,
+        ] {
+            assert_eq!(parse_line(captured), Some(CodexEvent::Ignored), "{captured}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_is_not_json_never_takes_the_stream_down() {
+        assert_eq!(parse_line(""), None);
+        assert_eq!(parse_line("codex: starting app-server"), None);
+        assert_eq!(parse_line("{not json"), None);
+        assert_eq!(parse_line("[1,2,3]"), None, "an array carries neither id nor method");
+    }
+
+    #[test]
+    fn a_jsonrpc_error_reply_reaches_the_user_instead_of_hanging_the_handshake() {
+        let captured = r#"{"id":2,"error":{"code":-32602,"message":"invalid params"}}"#;
+        assert_eq!(
+            parse_line(captured),
+            Some(CodexEvent::TurnFailed("invalid params".to_string()))
+        );
+    }
+}
