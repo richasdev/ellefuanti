@@ -3188,6 +3188,7 @@ impl WorkspaceView {
 
         let Some((target, range)) = elle_laravel::wire_context_at(&text, offset) else { return };
         // Widen range and query together — both or neither (the route source's rule).
+        let offset = char_boundary_at_or_below(&text, offset);
         if range.start <= offset && range.end <= offset {
             self.completion_word_start = Some((editor.clone(), range.start));
             let typed = text[range.start..offset].to_string();
@@ -3272,6 +3273,7 @@ impl WorkspaceView {
         // doubling, from the other side. Declining leaves the generic word scan in charge,
         // which is narrower but never wrong.
         if reference.range.start <= offset && reference.range.end <= offset {
+            let offset = char_boundary_at_or_below(&source, offset);
             self.completion_word_start = Some((tab_editor.clone(), reference.range.start));
             let typed = source[reference.range.start..offset].to_string();
             popup.update(cx, |popup, cx| popup.set_query(typed, cx));
@@ -3331,6 +3333,7 @@ impl WorkspaceView {
             // source established (see `request_route_completions` for the two bugs the
             // halves each cause). Declined when the caret sits mid-literal.
             if context.range.start <= offset && context.range.end <= offset {
+                let offset = char_boundary_at_or_below(&text, offset);
                 self.completion_word_start = Some((editor.clone(), context.range.start));
                 let typed = text[context.range.start..offset].to_string();
                 popup.update(cx, |popup, cx| popup.set_query(typed, cx));
@@ -6012,6 +6015,19 @@ fn read_file_tail(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Str
     // Drop everything up to and including the first newline — the seam is mid-line.
     let start = bytes.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
     Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
+/// The char boundary at or below `offset` in `text` — belt against a cursor offset that
+/// a pixel hit-test placed inside a multi-byte character. Slicing `&str` at a
+/// non-boundary byte panics, and this codebase edits accented Portuguese constantly, so
+/// every `text[..offset]` on a cursor offset routes through here. (The editor keeps the
+/// caret on boundaries, but a defence this cheap against a crash this total is worth it.)
+fn char_boundary_at_or_below(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 /// Whether one keystroke `text` is a word character AND the word already typed reaches
