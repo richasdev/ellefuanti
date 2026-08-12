@@ -6211,6 +6211,17 @@ impl Render for WorkspaceView {
                     .border_color(theme.border)
                     .text_color(theme.text_muted)
                     .text_size(px(12.0))
+                    // Painting our own strip took the real titlebar's behaviour with it
+                    // (#owner report: double-click no longer fills the screen). This
+                    // hands the gesture back to the platform rather than hard-coding
+                    // zoom, because macOS lets the user pick what a titlebar
+                    // double-click does — Zoom, Fill, Minimize, or nothing — and
+                    // `titlebar_double_click` reads that preference.
+                    .on_mouse_down(MouseButton::Left, |event, window, _cx| {
+                        if event.click_count == 2 {
+                            window.titlebar_double_click();
+                        }
+                    })
                     // The app's name, not the folder's — the owner's call, and the tab
                     // bar plus the tree header already say what is open.
                     .child("ellefuanti"),
