@@ -172,6 +172,12 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 Item::command("Switch Theme", "theme.toggle", |label| {
                     MenuItem::action(label, ToggleTheme)
                 }),
+                Item::command("Toggle Full Screen", "view.fullscreen", |label| {
+                    MenuItem::action(label, crate::actions::ToggleFullscreen)
+                }),
+                Item::command("Toggle Zen Mode", "view.zen", |label| {
+                    MenuItem::action(label, crate::actions::ToggleZen)
+                }),
                 Item::command("Toggle Hidden Files", "workspace.toggle_hidden_files", |label| {
                     MenuItem::action(label, ToggleHiddenFiles)
                 }),

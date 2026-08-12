@@ -2278,6 +2278,27 @@ fn project() -> tempfile::TempDir {
     dir
 }
 
+/// Zen mode hides the chrome and comes back with the same toggle (owner request).
+/// The draw after each flip is the real assertion: a layout that lost a child it
+/// still references would panic here.
+#[gpui::test]
+async fn zen_mode_toggles_and_the_window_still_draws(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(!workspace.zen_for_test(), "zen starts off");
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_zen_for_test(window, cx));
+    workspace.read_with(cx, |workspace, _cx| assert!(workspace.zen_for_test()));
+    draw(cx);
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_zen_for_test(window, cx));
+    workspace.read_with(cx, |workspace, _cx| assert!(!workspace.zen_for_test()));
+    draw(cx);
+}
+
 /// The status bar's update cell exists only while there is something to do, and its
 /// label follows the updater's state (owner request: "restart to update").
 #[gpui::test]

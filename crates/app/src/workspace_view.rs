@@ -23,8 +23,8 @@ use crate::actions::{
     IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
     OpenSettings, PushToRemote, QuickFix, RenameSymbol, Replace, RerunFailedTests, ResetFontSize,
     RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch, ToggleCommandPalette,
-    ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
-    dispatch_for,
+    ToggleFullscreen, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel,
+    ToggleTheme, ToggleZen, context, dispatch_for,
 };
 use crate::completion::{
     CompletionEvent, CompletionItem, CompletionPopup, CompletionSource, CompletionTrigger,
@@ -660,6 +660,9 @@ pub struct WorkspaceView {
     git: Entity<GitPanel>,
     /// Which sidebar the activity bar has selected. Explorer until someone clicks Git.
     sidebar: Sidebar,
+    /// Zen mode (owner request): chrome hidden, editor centred. Session-only on
+    /// purpose — reopening the app in zen with no visible way out is a trap.
+    zen: bool,
     /// Cancels an in-flight status walk, for the same reason `quick_open_cancel` exists:
     /// dropping the Task stops the await, not the libgit2 walk behind it (ADR-0007).
     git_cancel: Option<CancelFlag>,
@@ -764,6 +767,7 @@ impl WorkspaceView {
             db_expanded: std::collections::HashSet::new(),
             git,
             sidebar: Sidebar::default(),
+            zen: false,
             git_cancel: None,
             git_diff: None,
             window_activation: None,
@@ -1193,6 +1197,24 @@ impl WorkspaceView {
         cx.refresh_windows();
     }
 
+    /// ⌃⌘F. The platform owns fullscreen — animation, Spaces, the menu bar reveal —
+    /// so this only asks; there is no state here to get out of sync.
+    fn toggle_fullscreen(
+        &mut self,
+        _: &ToggleFullscreen,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        window.toggle_fullscreen();
+    }
+
+    /// ⌘K Z (owner request). Chrome off, editor centred; the same chord restores.
+    fn toggle_zen(&mut self, _: &ToggleZen, _w: &mut Window, cx: &mut Context<Self>) {
+        self.zen = !self.zen;
+        self.status = Some(if self.zen { "Zen on — ⌘K Z to leave" } else { "Zen off" }.into());
+        cx.notify();
+    }
+
     /// ⌘+ / ⌘- / ⌘0 (#49).
     ///
     /// Turned out to be cheap, which is why it is here: nothing caches a size. Every view
@@ -1444,6 +1466,16 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn db_expanded_for_test(&self, table: &str) -> bool {
         self.db_expanded.contains(table)
+    }
+
+    #[cfg(test)]
+    pub fn toggle_zen_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_zen(&ToggleZen, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn zen_for_test(&self) -> bool {
+        self.zen
     }
 
     #[cfg(test)]
@@ -6421,6 +6453,8 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                     Dispatch::NewTerminal => self.new_terminal(&NewTerminal, window, cx),
                     Dispatch::ToggleTerminal => self.toggle_terminal(&ToggleTerminal, window, cx),
                     Dispatch::ToggleTheme => self.toggle_theme(&ToggleTheme, window, cx),
+                    Dispatch::ToggleFullscreen => window.toggle_fullscreen(),
+                    Dispatch::ToggleZen => self.toggle_zen(&ToggleZen, window, cx),
                     Dispatch::ToggleHiddenFiles => {
                         self.toggle_hidden_files(&ToggleHiddenFiles, window, cx)
                     }
@@ -6948,6 +6982,8 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::run_tests_in_file))
             .on_action(cx.listener(Self::rerun_failed_tests))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::toggle_fullscreen))
+            .on_action(cx.listener(Self::toggle_zen))
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
             .on_action(cx.listener(|this, _: &ResetFontSize, _w, cx| this.zoom(None, cx)))
@@ -6997,20 +7033,27 @@ impl Render for WorkspaceView {
                     // bar plus the tree header already say what is open.
                     .child("ellefuanti"),
             )
-            .child(
+            .child({
+                // Zen (owner request): the chrome around the editor disappears — activity
+                // bar, sidebar, tab strip, status bar — and the text gets breathing room
+                // via fractional side padding, which centres it on any monitor width.
+                let zen = self.zen;
                 div()
                     .flex()
                     .flex_1()
                     .overflow_hidden()
-                    .child(self.render_activity_bar(&theme, cx))
-                    .child(self.render_sidebar(&theme, cx))
+                    .when(!zen, |el| {
+                        el.child(self.render_activity_bar(&theme, cx))
+                            .child(self.render_sidebar(&theme, cx))
+                    })
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
                             .overflow_hidden()
-                            .child(self.render_tab_bar(&theme, cx))
+                            .when(zen, |el| el.px(gpui::relative(0.16)))
+                            .when(!zen, |el| el.child(self.render_tab_bar(&theme, cx)))
                             // Between the tabs and the text, which is where every editor
                             // puts it — and in the flow rather than absolutely positioned
                             // like the palette, so it *pushes* the text down instead of
@@ -7026,9 +7069,9 @@ impl Render for WorkspaceView {
                             .children(self.tests.clone())
                             // And the log under those, same column, same reasoning.
                             .children(self.logs.clone()),
-                    ),
-            )
-            .child(self.render_status_bar(&theme, cx))
+                    )
+            })
+            .when(!self.zen, |el| el.child(self.render_status_bar(&theme, cx)))
             .children(self.palette.clone().map(|palette| {
                 // The overlay is absolutely positioned over everything, so it does not
                 // reflow the layout underneath while it is open. A click on the backdrop

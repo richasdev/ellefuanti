@@ -215,6 +215,8 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("tests.run_file", "Run Tests in Current File"),
     Command::new("tests.rerun_failed", "Rerun Failed Tests"),
     Command::new("theme.toggle", "Switch Theme"),
+    Command::new("view.fullscreen", "Toggle Full Screen"),
+    Command::new("view.zen", "Toggle Zen Mode"),
 ];
 
 #[cfg(test)]
