@@ -255,24 +255,68 @@ pub fn update_cell(
     Ok(())
 }
 
-/// Inserts one empty row and returns its `rowid`, for the "add row" button (#65).
+/// Inserts a row with the given `(column, value)` pairs, returning its `rowid` (#65).
 ///
-/// A blank row the user then fills with the cell editor — the TablePlus "+ row" shape.
-/// `INSERT INTO t DEFAULT VALUES` fills every column with its default (NULL where none),
-/// which is the honest empty row; a NOT NULL column with no default makes sqlite refuse,
-/// and that error is surfaced rather than worked around (the row genuinely cannot be
-/// blank). The table name is schema-validated first, like every write here.
-pub fn insert_empty_row(path: &Path, table: &str) -> Result<i64> {
+/// The create half of data editing. Unlike a blank `DEFAULT VALUES` row (which a NOT NULL
+/// column with no default refuses), this carries the values the user filled in the draft
+/// row, so a table like `courses (name NOT NULL, slug NOT NULL)` inserts once its required
+/// columns are provided. Every column name is schema-validated (no crafted identifier
+/// reaches SQL), every value is a bound parameter, and the literal `NULL` writes a real
+/// NULL. A column left out of `values` is simply not named — sqlite applies its default
+/// or NULL, and a still-missing NOT NULL column makes it refuse honestly.
+pub fn insert_row(path: &Path, table: &str, values: &[(String, String)]) -> Result<i64> {
     let schema = sqlite_schema(path)?;
-    if !schema.iter().any(|info| info.name == table) {
-        bail!("{table} is not a table of this database");
+    let known = schema
+        .iter()
+        .find(|info| info.name == table)
+        .with_context(|| format!("{table} is not a table of this database"))?;
+    for (column, _) in values {
+        if !known.columns.iter().any(|c| &c.name == column) {
+            bail!("{column} is not a column of {table}");
+        }
     }
+
+    // Seed every NOT NULL, non-primary-key column the caller did not supply with an empty
+    // string — the empty string satisfies NOT NULL (only NULL violates it), so an "add
+    // row" button produces a row the user can then edit instead of the constraint error
+    // the owner hit on `courses`. The primary key is left out (autoincrement fills it).
+    let mut values: Vec<(String, String)> = values.to_vec();
+    for column in &known.columns {
+        let supplied = values.iter().any(|(c, _)| c == &column.name);
+        if !supplied && !column.nullable && !column.primary_key {
+            values.push((column.name.clone(), String::new()));
+        }
+    }
+
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
     )
     .with_context(|| format!("opening {} for write", path.display()))?;
-    conn.execute(&format!("INSERT INTO \"{table}\" DEFAULT VALUES"), [])
+
+    if values.is_empty() {
+        conn.execute(&format!("INSERT INTO \"{table}\" DEFAULT VALUES"), [])
+            .with_context(|| format!("inserting a row into {table}"))?;
+        return Ok(conn.last_insert_rowid());
+    }
+
+    // `"col1", "col2"` and `?1, ?2` — columns validated above, values bound.
+    let columns = values.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let placeholders =
+        (1..=values.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    let sql = format!("INSERT INTO \"{table}\" ({columns}) VALUES ({placeholders})");
+
+    let params: Vec<rusqlite::types::Value> = values
+        .iter()
+        .map(|(_, v)| {
+            if v == "NULL" {
+                rusqlite::types::Value::Null
+            } else {
+                rusqlite::types::Value::Text(v.clone())
+            }
+        })
+        .collect();
+    conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
         .with_context(|| format!("inserting a row into {table}"))?;
     Ok(conn.last_insert_rowid())
 }
@@ -449,25 +493,54 @@ mod page_tests {
     }
 
     #[test]
-    fn insert_empty_row_adds_a_blank_row_then_a_cell_edit_fills_it() {
-        let (_dir, db) = seeded();
-        let before = table_page(&db, "users", 0, 100).unwrap().total;
+    fn insert_row_with_values_fills_a_not_null_table() {
+        // The courses shape: NOT NULL columns that DEFAULT VALUES cannot satisfy.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE courses (id INTEGER PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL);")
+            .unwrap();
 
-        let rowid = insert_empty_row(&db, "users").unwrap();
-        let after = table_page(&db, "users", 0, 100).unwrap();
-        assert_eq!(after.total, before + 1, "one row added");
-        // The new row is blank (its non-pk columns are NULL) and editable by its rowid.
-        update_cell(&db, "users", "email", rowid, "fresh@x").unwrap();
-        let page = table_page(&db, "users", 0, 100).unwrap();
+        // Providing the required columns inserts; a blank DEFAULT VALUES would fail.
+        let rowid = insert_row(
+            &db,
+            "courses",
+            &[("name".into(), "Rust".into()), ("slug".into(), "rust".into())],
+        )
+        .unwrap();
+        let page = table_page(&db, "courses", 0, 100).unwrap();
         let row = page.rowids.iter().position(|r| *r == Some(rowid)).unwrap();
-        assert_eq!(page.rows[row][1], "fresh@x", "the added row was filled by a cell edit");
+        assert_eq!(page.rows[row][1], "Rust");
+        assert_eq!(page.rows[row][2], "rust");
     }
 
     #[test]
-    fn insert_refuses_a_bad_table_name() {
+    fn an_empty_add_row_seeds_not_null_columns_so_it_does_not_error() {
+        // The owner's exact case: courses (name, slug both NOT NULL). A blank add-row
+        // must not error — the NOT NULL columns seed with '' (which satisfies NOT NULL),
+        // giving an editable row instead of the constraint failure.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE courses (id INTEGER PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL, note TEXT);")
+            .unwrap();
+
+        let rowid = insert_row(&db, "courses", &[]).expect("a blank add-row must succeed");
+        let page = table_page(&db, "courses", 0, 100).unwrap();
+        let row = page.rowids.iter().position(|r| *r == Some(rowid)).unwrap();
+        assert_eq!(page.rows[row][1], "", "name seeded empty, not NULL");
+        assert_eq!(page.rows[row][2], "", "slug seeded empty");
+        assert_eq!(page.rows[row][3], "NULL", "the nullable column stays NULL");
+    }
+
+    #[test]
+    fn insert_refuses_a_bad_table_or_column_name() {
         let (_dir, db) = seeded();
-        assert!(insert_empty_row(&db, "ghosts").is_err());
-        assert!(insert_empty_row(&db, "users\"; DROP TABLE users; --").is_err());
+        assert!(insert_row(&db, "ghosts", &[]).is_err());
+        assert!(insert_row(&db, "users\"; DROP TABLE users; --", &[]).is_err());
+        assert!(insert_row(&db, "users", &[("email\"; --".into(), "x".into())]).is_err());
         assert_eq!(table_page(&db, "users", 0, 10).unwrap().total, 3, "table intact");
     }
 
