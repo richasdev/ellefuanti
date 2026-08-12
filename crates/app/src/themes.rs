@@ -342,6 +342,24 @@ mod tests {
 
     /// A file called `dark.json` must not be able to replace the built-in Dark, which is the
     /// theme the "always available" guarantee is about.
+    #[test]
+    fn every_shipped_theme_parses_with_a_complete_palette() {
+        // The eight shipped palettes (owner request) are hand-written JSON; a missing
+        // key would silently drop the theme from the registry at launch. This is the
+        // check that a palette edit cannot ship half-done.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes");
+        let mut found = 0;
+        for entry in std::fs::read_dir(&dir).expect("assets/themes exists") {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "json") {
+                elle_theme::ThemeFile::load(&path)
+                    .unwrap_or_else(|err| panic!("{} must parse: {err}", path.display()));
+                found += 1;
+            }
+        }
+        assert_eq!(found, 8, "the eight shipped themes are all present");
+    }
+
     #[gpui::test]
     async fn a_disk_theme_cannot_shadow_a_built_in_name(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
