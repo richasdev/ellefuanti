@@ -110,6 +110,13 @@ impl SettingsPanel {
         cx.notify();
     }
 
+    /// The picker grid's direct route: click a theme, get that theme.
+    fn choose_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        crate::themes::apply_named(name, cx);
+        self.chosen_theme = Some(name.to_string());
+        cx.notify();
+    }
+
     /// Moves the font family one step through the installed families, skipping any that
     /// fail the monospace check.
     ///
@@ -196,8 +203,10 @@ impl Render for SettingsPanel {
         let line_height = format!("{:.2}", settings.line_height());
 
         let entity = cx.entity();
-        let rows = [
-            row_picker("Theme", theme_name, RowKind::Theme, &theme, &entity),
+
+        // Sections (owner request): the flat five-row form grew enough controls to need
+        // grouping. Editor first because it is what people come to change most.
+        let editor_rows = [
             row_picker("Editor font", family, RowKind::Family, &theme, &entity),
             row_stepper(
                 "Editor font size",
@@ -219,6 +228,45 @@ impl Render for SettingsPanel {
             row_toggle("Auto save", settings.autosave(), &theme, &entity),
         ];
 
+        // The theme picker: every selectable theme as a chip with four swatch dots —
+        // background, accent, string, keyword — so palettes are told apart on sight
+        // instead of by cycling through them one repaint at a time.
+        let current_theme = theme_name;
+        let theme_chips: Vec<gpui::AnyElement> = crate::themes::selectable_names(cx)
+            .into_iter()
+            .map(|name| {
+                let swatches = crate::themes::preview(&name, cx);
+                let selected = name == current_theme;
+                let entity = entity.clone();
+                let chip_name = name.clone();
+                div()
+                    .id(gpui::ElementId::Name(format!("theme-{name}").into()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if selected { theme.accent } else { theme.border })
+                    .when(selected, |el| el.bg(theme.selected))
+                    .hover(|el| el.bg(theme.hover))
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        entity.update(cx, |panel, cx| panel.choose_theme(&chip_name, cx));
+                    })
+                    .children(swatches.map(|colors| {
+                        div().flex().gap_1().children(
+                            colors
+                                .into_iter()
+                                .map(|color| div().size(px(10.0)).rounded(px(5.0)).bg(color)),
+                        )
+                    }))
+                    .child(SharedString::from(name))
+                    .into_any_element()
+            })
+            .collect();
+
         div()
             .key_context(context::PALETTE)
             .track_focus(&self.focus_handle(cx))
@@ -239,7 +287,10 @@ impl Render for SettingsPanel {
             .text_color(theme.text)
             .text_size(fonts.ui_size)
             .child(div().text_color(theme.text_muted).child("Settings"))
-            .children(rows)
+            .child(section_header("Editor", &theme))
+            .children(editor_rows)
+            .child(section_header("Appearance", &theme))
+            .child(div().flex().flex_wrap().gap_1().children(theme_chips))
             .child(
                 // The escape hatch the issue requires: the panel must not become a wall
                 // between the user and their file.
@@ -269,10 +320,14 @@ impl Render for SettingsPanel {
     }
 }
 
+/// A muted group label with room above it — what turns the flat form into sections.
+fn section_header(label: &'static str, theme: &crate::theme::Theme) -> gpui::AnyElement {
+    div().mt_1().text_color(theme.text_muted).child(label).into_any_element()
+}
+
 /// Which cycler a ‹ › pair drives.
 #[derive(Clone, Copy)]
 enum RowKind {
-    Theme,
     Family,
 }
 
@@ -294,7 +349,6 @@ fn row_picker(
             .hover(|el| el.bg(theme.hover))
             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                 entity.update(cx, |panel, cx| match kind {
-                    RowKind::Theme => panel.cycle_theme(forward, cx),
                     RowKind::Family => panel.cycle_family(forward, cx),
                 });
             })

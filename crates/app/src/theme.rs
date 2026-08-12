@@ -168,6 +168,14 @@ impl ThemeVariant {
         }
     }
 
+    /// Four swatch colours — background, accent, string, keyword — for the settings
+    /// panel's theme picker. Lives here rather than in the picker because building a
+    /// `Theme` is this module's monopoly (#48's architecture test enforces it).
+    pub fn preview(self) -> [Hsla; 4] {
+        let theme = self.build();
+        [theme.background, theme.accent, theme.string, theme.keyword]
+    }
+
     /// The next variant in the cycle, for `theme.toggle`.
     ///
     /// Ordered dark-then-light rather than by origin, so a toggle does not swing between
