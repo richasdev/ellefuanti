@@ -114,6 +114,10 @@ impl SettingsPanel {
         cx.notify();
     }
 
+    // Production callers moved to the chip grid's `choose_theme`; the lap behaviour this
+    // implements (skip-nothing wrap over the registry) is still pinned by a render test,
+    // which is the only reachable door — hence the cfg gate rather than deletion.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn cycle_theme(&mut self, forward: bool, cx: &mut Context<Self>) {
         let names = crate::themes::selectable_names(cx);
         if names.is_empty() {
