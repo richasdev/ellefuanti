@@ -57,6 +57,22 @@ impl CancelFlag {
     }
 }
 
+/// Kills the runner and everything it spawned.
+///
+/// The child leads its own process group (`process_group(0)` at spawn), so the negative
+/// pid addresses the group — `sh` *and* the suite under it. `Child::kill` follows as a
+/// fallback for the group already being gone, and because it is what updates the
+/// `Child`'s own bookkeeping.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: plain syscall with no memory to manage; a stale pid is answered with
+    // ESRCH, which is ignored like every other way the tree can already be dead.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
 /// How a run ended.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
@@ -93,7 +109,8 @@ pub fn run(
         bail!("{} is not installed", command.program.display());
     }
 
-    let mut child = StdCommand::new(&command.program)
+    let mut spawned = StdCommand::new(&command.program);
+    spawned
         .args(&command.args)
         .current_dir(&command.root)
         .stdin(Stdio::null())
@@ -101,7 +118,19 @@ pub fn run(
         // Merged into stdout rather than dropped: a runner that dies on a PHP fatal error
         // prints it here, and that text is the only explanation the user will get. It
         // reaches them as `Event::Unparsed`, which is exactly what that variant is for.
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The runner leads its own process group, so cancellation can kill the whole tree.
+    // A test runner is never just one process — `sh` runs `pest` runs `php` — and
+    // killing only the direct child leaves the suite running *and* holding the stdout
+    // and stderr pipes open, which keeps the reader threads blocked for as long as the
+    // orphans live. That was a real 30-second "cancel" on CI, won locally only by the
+    // kill racing the shell's fork.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        spawned.process_group(0);
+    }
+    let mut child = spawned
         .spawn()
         .with_context(|| format!("could not start {}", command.program.display()))?;
 
@@ -156,7 +185,7 @@ pub fn run(
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if watcher_cancel.is_cancelled() {
                             if let Ok(mut child) = watcher_child.lock() {
-                                let _ = child.kill();
+                                kill_tree(&mut child);
                             }
                             return true;
                         }
@@ -197,7 +226,7 @@ pub fn run(
         // The watcher may have killed it already; doing it again is harmless, and it is
         // what handles a run cancelled before the watcher noticed.
         let mut child = child.lock().expect("the child mutex");
-        let _ = child.kill();
+        kill_tree(&mut child);
         let _ = child.wait();
         let _ = errors.join();
         return Ok(Outcome::Cancelled);
@@ -313,7 +342,13 @@ mod tests {
             program: PathBuf::from("/bin/sh"),
             args: vec![
                 "-c".to_string(),
-                "echo \"##teamcity[testStarted name='a' flowId='1']\"; sleep 30".to_string(),
+                // The sleep goes into the background *first*, then the line that triggers
+                // the cancel, then `wait` keeps sh alive. This guarantees the grandchild
+                // exists before the kill — the shape that made the old direct-child kill
+                // fail on CI: `sleep` survived `sh` and held the output pipes open for
+                // the full 30 s. With `sleep` last, the kill only won by racing sh's fork.
+                "sleep 30 & echo \"##teamcity[testStarted name='a' flowId='1']\"; wait"
+                    .to_string(),
             ],
             root: dir.path().to_path_buf(),
         };

@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# Killing the *process group*, which std's Child::kill cannot do. Already compiled for
+# every build (gpui and half the tree depend on it); the alternative was leaving a
+# cancelled suite's grandchildren running and holding the output pipes — the CI-caught
+# 30-second cancel.
+libc = "0.2"
 
 [dev-dependencies]
 # Detection answers "is there a runner in this project", so the tests have to build trees
