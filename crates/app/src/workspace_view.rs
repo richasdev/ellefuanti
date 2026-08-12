@@ -2154,6 +2154,11 @@ impl WorkspaceView {
             // A character reached the buffer. Only the workspace knows whether the server
             // declared it a completion trigger, so only the workspace can decide (#61).
             EditorEvent::Typed(text) => this.editor_typed(text, window, cx),
+            // The gutter bulb. Straight into ⌘.'s own handler — the bulb only ever draws
+            // on the cursor row, so "where the cursor is" is already the line the user
+            // pointed at, and routing through the same function is what keeps the click
+            // and the chord from ever answering about different lines.
+            EditorEvent::QuickFix => this.quick_fix(&QuickFix, window, cx),
         })
         .detach();
         editor
@@ -4160,9 +4165,30 @@ impl WorkspaceView {
             if start > end || end > document.buffer.len_bytes() {
                 return;
             }
-            document.move_to(start, false);
-            document.move_to(end, true);
-            document.insert(&item.insert);
+
+            // The ordinary case, and the one that must stay exactly as it was: no import
+            // to add, so the completion is a selection and an insert, joining the undo
+            // history the way #83's insertion does.
+            if item.additional_edits.is_empty() {
+                document.move_to(start, false);
+                document.move_to(end, true);
+                document.insert(&item.insert);
+                cx.notify();
+                return;
+            }
+
+            // Auto-import. The identifier and the `use` line are one edit as far as the
+            // user is concerned, so they are one batch and therefore one ⌘Z — the same
+            // reason Format Document and Rename Symbol (#151/#154) go through
+            // `apply_edits` rather than a loop of inserts. `apply_edits` sorts and
+            // rejects overlaps itself; the descending-offset trap is already handled
+            // there, so there is no second ordering rule written here.
+            let text = document.buffer.text();
+            let main = start..end;
+            let edits = completion_byte_edits(&text, &main, &item);
+            // The caret must follow the identifier, not the offset: the import goes in
+            // above the cursor and moves everything below it down.
+            document.apply_edits_landing_after(edits, Some(main));
             cx.notify();
         });
     }
@@ -6791,6 +6817,12 @@ fn relation_item((name, kind, target): (String, String, String)) -> CompletionIt
         .with_detail(Some(format!("{kind} · {target}")))
 }
 
+/// The server's completion reply, decoded into the popup's own item type.
+///
+/// `additional_text_edits` is carried, and that is the auto-import feature entire: the
+/// server was already sending the `use App\Models\User;` line for every unimported class
+/// and this decode was dropping it, so accepting `User` wrote half the answer. Nothing was
+/// missing from the request — only from the read. See [`CompletionItem::additional_edits`].
 fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool) {
     let (items, incomplete) = match response {
         CompletionResponse::Array(items) => (items, false),
@@ -6804,10 +6836,40 @@ fn completion_items(response: CompletionResponse) -> (Vec<CompletionItem>, bool)
             CompletionItem::new(item.label, CompletionSource::Lsp)
                 .with_insert(insert)
                 .with_detail(item.detail)
+                .with_additional_edits(item.additional_text_edits)
         })
         .collect();
 
     (items, incomplete)
+}
+
+/// The one batch an accepted completion becomes: the identifier at the cursor, plus every
+/// `additionalTextEdits` range the server sent, all in byte offsets into `text`.
+///
+/// The LSP ranges are converted through `LineIndex` in UTF-16, the same path Format
+/// Document and Rename Symbol take — a second conversion here would be a second place the
+/// encoding could be got wrong, and the encoding is exactly what is easy to get wrong.
+///
+/// Edits that collide with the identifier's own range are dropped rather than applied.
+/// `apply_edits` refuses an overlapping batch *whole*, so keeping one would mean accepting
+/// the completion inserted nothing at all — a server confused about its own ranges must
+/// cost the import, never the word the user asked for.
+fn completion_byte_edits(
+    text: &str,
+    main: &std::ops::Range<usize>,
+    item: &CompletionItem,
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let index = elle_lsp::LineIndex::new(text);
+    let mut edits = vec![(main.clone(), item.insert.clone())];
+    for edit in &item.additional_edits {
+        let range = index.byte_range(text, edit.range, elle_lsp::OffsetEncoding::Utf16);
+        if range.start < main.end && main.start < range.end {
+            tracing::debug!("dropping an additional edit overlapping the completion: {range:?}");
+            continue;
+        }
+        edits.push((range, edit.new_text.clone()));
+    }
+    edits
 }
 
 /// Where an open should land, in whichever unit the producer actually has.
@@ -9357,6 +9419,96 @@ mod tests {
         let (items, incomplete) = completion_items(response);
         assert_eq!(items.len(), 1);
         assert!(!incomplete);
+    }
+
+    /// A `TextEdit` inserting `text` at the start of `line`, the shape Intelephense sends
+    /// for an import.
+    fn import_edit(line: u32, text: &str) -> elle_lsp::lsp_types::TextEdit {
+        let at = elle_lsp::lsp_types::Position { line, character: 0 };
+        elle_lsp::lsp_types::TextEdit {
+            range: elle_lsp::lsp_types::Range { start: at, end: at },
+            new_text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_import_the_server_sent_survives_the_trip_off_the_wire() {
+        // The bug, at the exact line it lived on. `additionalTextEdits` was never read, so
+        // every completion for an unimported class arrived with its `use` line already in
+        // the reply and lost it here. Same vacuum as `isIncomplete` above: the decode is
+        // pure and the whole feature is one field, so it is tested where it is decoded.
+        let response = CompletionResponse::Array(vec![elle_lsp::lsp_types::CompletionItem {
+            label: "User".into(),
+            additional_text_edits: Some(vec![import_edit(2, "use App\\Models\\User;\n")]),
+            ..Default::default()
+        }]);
+        let (items, _) = completion_items(response);
+        assert_eq!(items[0].additional_edits.len(), 1);
+        assert_eq!(items[0].additional_edits[0].new_text, "use App\\Models\\User;\n");
+    }
+
+    #[test]
+    fn a_completion_the_server_sent_no_import_for_carries_none() {
+        // The common case, and the one that must stay untouched: `None` off the wire is an
+        // empty list here, so the accept path takes its original branch.
+        let (items, _) = completion_items(incomplete_list(&["strlen"], false));
+        assert!(items[0].additional_edits.is_empty());
+    }
+
+    #[test]
+    fn accepting_a_class_batches_the_import_with_the_identifier() {
+        // The edit batch an accept becomes, built without a server. Both edits are in it,
+        // both in byte offsets, and the import's LSP line/character has been resolved
+        // through the same `LineIndex` path formatting uses.
+        let text = "<?php\nnamespace App;\n\n$u = new Us;\n";
+        let word = text.find("Us;").unwrap();
+        let item = CompletionItem::new("User", CompletionSource::Lsp)
+            .with_additional_edits(Some(vec![import_edit(2, "use App\\Models\\User;\n")]));
+
+        let edits = completion_byte_edits(text, &(word..word + 2), &item);
+        assert_eq!(edits.len(), 2);
+        assert!(edits.contains(&(word..word + 2, "User".to_string())));
+        // Line 2 is the blank one: it starts at the byte after `namespace App;`'s newline.
+        let line_two = text.find("\n\n$u").unwrap() + 1;
+        assert!(edits.contains(&(line_two..line_two, "use App\\Models\\User;\n".to_string())));
+    }
+
+    #[test]
+    fn accepting_the_same_class_twice_does_not_import_it_twice() {
+        // The server stops sending `additionalTextEdits` once the class is imported — that
+        // is its job, not ours, and this pins that we do not invent a second import from
+        // some memory of the first. The second accept carries nothing, so it produces the
+        // identifier alone.
+        let text = "<?php\nuse App\\Models\\User;\n\n$a = new User;\n$b = new Us;\n";
+        let word = text.rfind("Us;").unwrap();
+        // No `additional_text_edits` in the reply this time.
+        let (items, _) = completion_items(CompletionResponse::Array(vec![
+            elle_lsp::lsp_types::CompletionItem { label: "User".into(), ..Default::default() },
+        ]));
+
+        let edits = completion_byte_edits(text, &(word..word + 2), &items[0]);
+        assert_eq!(edits.len(), 1, "the identifier and nothing else");
+        assert_eq!(edits[0], (word..word + 2, "User".to_string()));
+    }
+
+    #[test]
+    fn an_extra_edit_overlapping_the_identifier_is_dropped_not_the_completion() {
+        // `Document::apply_edits` refuses an overlapping batch *whole*, so a server that
+        // sends an edit colliding with the word being completed would otherwise cost the
+        // user the completion itself. The import is the expendable half.
+        let text = "$u = new Us;";
+        let at = elle_lsp::lsp_types::Position { line: 0, character: 9 };
+        let end = elle_lsp::lsp_types::Position { line: 0, character: 11 };
+        let item =
+            CompletionItem::new("User", CompletionSource::Lsp).with_additional_edits(Some(vec![
+                elle_lsp::lsp_types::TextEdit {
+                    range: elle_lsp::lsp_types::Range { start: at, end },
+                    new_text: "nonsense".into(),
+                },
+            ]));
+
+        let edits = completion_byte_edits(text, &(9..11), &item);
+        assert_eq!(edits, vec![(9..11, "User".to_string())]);
     }
 
     /// `render_activity_bar` zips its panel list against `icons::ACTIVITY_ICONS`, and `zip`

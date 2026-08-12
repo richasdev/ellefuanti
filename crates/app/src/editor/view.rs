@@ -12,7 +12,7 @@ use gpui::{
     App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
     HighlightStyle as GpuiHighlight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
     ScrollStrategy, SharedString, TextRun, UniformListScrollHandle, Window, div, prelude::*, px,
-    uniform_list,
+    svg, uniform_list,
 };
 
 use crate::actions::{
@@ -1419,6 +1419,14 @@ pub enum EditorEvent {
     /// handler, and with a popup open the keystroke goes to
     /// [`CompletionEvent::Typed`](crate::completion::CompletionEvent::Typed) instead.
     Typed(String),
+    /// The gutter's quick-fix bulb was clicked.
+    ///
+    /// Carries nothing, and that is deliberate: the workspace runs the *same* handler ⌘.
+    /// runs, which reads the cursor. The click moves the cursor to that line first, so
+    /// there is one definition of "where the fix is asked about" rather than two that can
+    /// drift — a bulb that fixed a different line than the chord would be worse than no
+    /// bulb.
+    QuickFix,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -1844,10 +1852,29 @@ impl EditorView {
                             .justify_end()
                             .pr_3()
                             .text_color(if is_cursor_row { theme.text } else { theme.text_muted })
-                            // The buffer line's own number — after a fold, rows are not
-                            // consecutive and pretending they are would misnumber every
-                            // line below the fold.
-                            .child(SharedString::from((line_index + 1).to_string())),
+                            // The quick-fix bulb (the ⌘. discoverability fix), or the
+                            // line's number. **Replacing** the number rather than sitting
+                            // beside it, because the gutter is one fixed width and a bulb
+                            // added alongside would either widen the column on the cursor
+                            // row — every line of code jumping sideways as the caret moves
+                            // — or squeeze the digits into a narrower space than the rows
+                            // above. The number is the thing that can be spared: it is
+                            // still readable on every other row, and the row it vanishes
+                            // from is the one the caret is already marking.
+                            //
+                            // Shown only on the cursor row, and only from diagnostics
+                            // already in hand — never an LSP round trip to decide whether
+                            // to draw it, which would be a request per cursor move. See
+                            // `row_diagnostics` above: the editor is told about
+                            // diagnostics, so this costs nothing.
+                            .child(if is_cursor_row && !row_diagnostics.is_empty() {
+                                quick_fix_bulb(&theme, &entity).into_any_element()
+                            } else {
+                                // The buffer line's own number — after a fold, rows are
+                                // not consecutive and pretending they are would misnumber
+                                // every line below the fold.
+                                SharedString::from((line_index + 1).to_string()).into_any_element()
+                            }),
                     )
                     .child(
                         // `relative` so the caret's absolute position is resolved against
@@ -1968,6 +1995,38 @@ fn autoscroll_fit(
     } else {
         None
     }
+}
+
+/// The gutter's quick-fix bulb: what makes ⌘. visible.
+///
+/// The chord has worked since #19 and nobody could tell it was there — PhpStorm and VS Code
+/// both put a bulb in the margin, and that glyph is the entire difference between a feature
+/// and a secret. Clicking it emits [`EditorEvent::QuickFix`], which the workspace answers
+/// with the *same* code-action request the chord runs; the request logic is not duplicated
+/// here, and this element deliberately knows nothing about the language server.
+///
+/// Drawn in the accent colour because it is an offer, not a problem — the problem already
+/// has its own underline on the text, and a second red mark in the margin would double-count
+/// one diagnostic.
+fn quick_fix_bulb(theme: &Theme, entity: &gpui::Entity<EditorView>) -> impl IntoElement {
+    let entity = entity.clone();
+    div()
+        .id("quick-fix-bulb")
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+            entity.update(cx, |_editor, cx| cx.emit(EditorEvent::QuickFix));
+        })
+        .child(
+            svg()
+                .path(crate::icons::LIGHTBULB)
+                .size(px(13.0))
+                // Set on the svg itself: gpui fills an SVG's alpha mask from the element's
+                // own `text.color` and does not inherit it (the trap the tree, tab and
+                // activity-bar icons all document).
+                .text_color(theme.accent),
+        )
 }
 
 /// Renders one line with syntax colours, diagnostics, search hits and the matching bracket.

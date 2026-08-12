@@ -30,6 +30,17 @@ operating system — see `../README.md`.
 | ------------- | ------------------------- | ---------- |
 | `sparkle.svg` | Drawn for this repository | Apache-2.0 |
 
+## Editor gutter
+
+| File            | Source                    | Licence    |
+| --------------- | ------------------------- | ---------- |
+| `lightbulb.svg` | Drawn for this repository | Apache-2.0 |
+
+`lightbulb.svg` marks a line with a diagnostic and runs the same ⌘. quick-fix request when
+clicked. Drawn rather than lifted from Codicons' `lightbulb` for the reason below: that
+glyph postdates tag 0.0.36, and the outline weight here is matched to `expand-all.svg` so
+it does not read heavier than the digits it sits beside.
+
 `sparkle.svg` opens the AI chat panel. Drawn here rather than taken from Codicons because
 that set's `sparkle` arrived after tag 0.0.36, which the rest of the in-app glyphs are
 pinned to — mixing generations is the drift the file-tree icons already document.
