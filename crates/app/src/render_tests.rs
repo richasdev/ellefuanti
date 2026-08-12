@@ -4365,3 +4365,56 @@ async fn palette_click_on_a_stale_row_is_ignored_not_a_panic(cx: &mut TestAppCon
     assert!(confirmed.borrow().is_empty(), "a stale click confirms nothing");
     drop(subscription);
 }
+
+// --- Blade go-to-definition (fix/blade-definition) --------------------------
+
+/// A Laravel project with a named route and a Blade template that links to it.
+fn laravel_blade_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("routes")).unwrap();
+    std::fs::create_dir_all(root.join("resources/views/layouts")).unwrap();
+    std::fs::write(
+        root.join("routes/web.php"),
+        "<?php\nRoute::livewire('/', 'home')->name('home');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("resources/views/layouts/app.blade.php"),
+        "<a href=\"{{ route('home') }}\" wire:navigate>Home</a>\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// PROBE: F12 / ⌘click on `route('home')` inside a `.blade.php` file must jump to the
+/// route declaration in `routes/web.php`. This is the exact shape richas-blog uses.
+#[gpui::test]
+async fn go_to_definition_in_a_blade_file_lands_on_the_route(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = laravel_blade_project();
+    let root = dir.path().to_path_buf();
+    let blade = root.join("resources/views/layouts/app.blade.php");
+    let source = std::fs::read_to_string(&blade).unwrap();
+    let offset = source.find("home')").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(root.clone(), cx);
+        let document = Document::new(Some(blade.clone()), &source, true).unwrap();
+        workspace.open_document_for_test(document, window, cx);
+        workspace.go_to_definition_at_offset_for_test(offset, window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let path = workspace.active_tab_path_for_test().expect("a jump landed on a file");
+        // Canonicalize both: macOS resolves the tempdir through /private, so a raw compare
+        // of the two spellings of the same file fails on the symlink, not on the navigation.
+        assert_eq!(
+            path.canonicalize().unwrap(),
+            root.join("routes/web.php").canonicalize().unwrap(),
+            "route('home') in a blade file must open routes/web.php; landed on {path:?}"
+        );
+    });
+}

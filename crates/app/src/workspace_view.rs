@@ -1600,6 +1600,32 @@ impl WorkspaceView {
         Some(self.active_editor()?.read(cx).document.cursor_point())
     }
 
+    /// The active tab's path, for asserting which file a jump opened.
+    #[cfg(test)]
+    pub fn active_tab_path_for_test(&self) -> Option<PathBuf> {
+        self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone())
+    }
+
+    /// Places the cursor at a byte offset and runs go-to-definition, the way a ⌘click does.
+    ///
+    /// A ⌘click moves the caret and then emits `GoToDefinition`; F12 acts on the caret
+    /// already there. Both land in `go_to_definition_at_cursor`, so a test that moves the
+    /// caret and calls it exercises the same gate, dialect decision and reference read the
+    /// real gestures do — without a pixel-to-offset hit test that the fake text system
+    /// cannot make honest (see `hover_for_offset`).
+    #[cfg(test)]
+    pub fn go_to_definition_at_offset_for_test(
+        &mut self,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.active_editor() {
+            editor.update(cx, |editor, _cx| editor.document.move_to(offset, false));
+        }
+        self.go_to_definition_at_cursor(window, cx);
+    }
+
     /// ⌘, through the real handler.
     #[cfg(test)]
     pub fn toggle_settings_panel_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
