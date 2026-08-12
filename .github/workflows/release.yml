@@ -91,7 +91,13 @@ jobs:
         with:
           files: ${{ steps.package.outputs.artifact }}
           body_path: CHANGELOG.md
-          # Prerelease: 0.1.0 has unverified UI rendering (issue #35) and is not something
-          # to present as production-ready.
-          prerelease: true
+          # NOT a prerelease, and this is load-bearing rather than cosmetic. GitHub
+          # excludes prereleases when it resolves `releases/latest`, and that URL is
+          # what the README's download button points at *and* what the in-app updater
+          # polls. Tagging 0.2.0 through 0.3.0 as prereleases left both of them serving
+          # 0.1.0: a new user downloaded a version three releases old, and nobody was
+          # ever offered an update. The 0.1.0-era caveat this inherited (#35's
+          # unverified rendering) no longer justifies breaking the install path.
+          prerelease: false
+          make_latest: true
           fail_on_unmatched_files: true
