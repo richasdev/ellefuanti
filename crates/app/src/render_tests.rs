@@ -2278,6 +2278,41 @@ fn project() -> tempfile::TempDir {
     dir
 }
 
+/// The status bar's update cell exists only while there is something to do, and its
+/// label follows the updater's state (owner request: "restart to update").
+#[gpui::test]
+async fn the_update_cell_labels_follow_the_state(cx: &mut TestAppContext) {
+    use crate::update::{Available, UpdateState, Version};
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.update_label_for_test(), None, "no cell while idle");
+    });
+
+    let release = Available {
+        version: Version(9, 9, 9),
+        dmg_url: None,
+        html_url: "https://example.com/rel".to_string(),
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.set_update_state_for_test(UpdateState::Available(release), cx);
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.update_label_for_test().as_deref(), Some("Update v9.9.9 ↓"));
+    });
+    draw(cx);
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.set_update_state_for_test(UpdateState::ReadyToRestart, cx);
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert_eq!(workspace.update_label_for_test().as_deref(), Some("Restart to update"));
+    });
+    draw(cx);
+}
+
 /// A filesystem change refreshes the tree by itself — no manual refresh (owner request).
 ///
 /// The event is fired through the watcher's own channel rather than by waiting on real
