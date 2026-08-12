@@ -34,6 +34,13 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/assets/macos/Info.plist" "$APP/Contents/"
 cp "$BIN" "$APP/Contents/MacOS/ellefuanti"
 
+# Stamp the real version over the committed plist's placeholder. Cargo.toml is the one
+# source of truth for the version; a hardcoded plist shipped v0.2.1 apps whose Finder
+# "Get Info" said 0.1.0.
+VERSION=$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" \
+	-c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+
 # Built here rather than committed: a .icns is a binary blob that no reviewer can diff,
 # and it is fully derived from assets/macos/ellefuanti.iconset, which IS reviewable.
 iconutil -c icns "$ROOT/assets/macos/ellefuanti.iconset" -o "$APP/Contents/Resources/ellefuanti.icns"
