@@ -203,6 +203,27 @@ impl Settings {
     /// exist (ADR-0004), and the app resolves an unrecognised name to its default. Which
     /// means a typo'd theme name keeps its spelling in the file and is therefore still
     /// there to be corrected, rather than being helpfully rewritten to "dark".
+    /// Whether dirty tabs save themselves when the window loses focus.
+    ///
+    /// **On by default** — the owner's reference IDEs (PhpStorm, TablePlus) autosave,
+    /// and the first real rename session ended with "não fica um dot… nem vai pro
+    /// source control" precisely because an applied edit sat unsaved in a buffer.
+    /// `"autosave": false` turns it off for whoever prefers explicit ⌘S.
+    pub fn autosave(&self) -> bool {
+        match self.document.get("autosave") {
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(other) => {
+                tracing::warn!(
+                    key = "autosave",
+                    found = type_name(other),
+                    "settings: expected a bool, using the default"
+                );
+                true
+            }
+            None => true,
+        }
+    }
+
     pub fn theme(&self) -> &str {
         match self.document.get(THEME_KEY) {
             Some(Value::String(name)) => name,

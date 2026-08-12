@@ -313,7 +313,33 @@ impl Render for Palette {
                     .border_b_1()
                     .border_color(theme.border)
                     .when(query_is_placeholder, |el| el.text_color(theme.text_muted))
-                    .child(query_shown),
+                    // The caret sits BEFORE placeholder text and after typed text —
+                    // the input reads as an input either way (the rename prompt was
+                    // reported as unreadable without one). Solid, not blinking: the
+                    // palette has no timer, and a steady bar says "type here" just as
+                    // well; the editor's blink machinery is a timer per open palette
+                    // that this ephemeral overlay does not earn.
+                    .when(query_is_placeholder, |el| {
+                        el.child(
+                            div()
+                                .w(px(2.0))
+                                .h(px(20.0))
+                                .mr_1()
+                                .flex_none()
+                                .bg(theme.cursor),
+                        )
+                    })
+                    .child(query_shown)
+                    .when(!query_is_placeholder, |el| {
+                        el.child(
+                            div()
+                                .w(px(2.0))
+                                .h(px(20.0))
+                                .ml(px(1.0))
+                                .flex_none()
+                                .bg(theme.cursor),
+                        )
+                    }),
             )
             .child(if count == 0 {
                 div()

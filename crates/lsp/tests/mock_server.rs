@@ -181,7 +181,21 @@ fn full_capabilities() -> Value {
         "referencesProvider": true,
         "documentSymbolProvider": true,
         "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
+        "renameProvider": true,
     })
+}
+
+#[test]
+fn the_rename_capability_is_read_not_assumed() {
+    // Intelephense without a licence key omits renameProvider; the app checks this flag
+    // BEFORE opening the prompt, so it must track the handshake and not a default.
+    let (client, _server) = open_client(full_capabilities(), |_, _| Reply::Silence);
+    assert!(client.capabilities().rename);
+
+    let mut without = full_capabilities();
+    without.as_object_mut().unwrap().remove("renameProvider");
+    let (client, _server) = open_client(without, |_, _| Reply::Silence);
+    assert!(!client.capabilities().rename, "an absent provider is a declined feature");
 }
 
 fn uri() -> lsp_types::Uri {
