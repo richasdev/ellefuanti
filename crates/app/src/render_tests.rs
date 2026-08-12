@@ -4245,3 +4245,32 @@ async fn the_git_log_palette_shows_the_graph(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// Arrow keys move the palette selection and wrap — keyboard nav, no mouse (#13).
+#[gpui::test]
+async fn palette_arrows_move_and_wrap_the_selection(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let palette = cx.update(|cx| {
+        use gpui::AppContext as _;
+        cx.new(|cx| {
+            crate::palette::Palette::new(
+                crate::palette::PaletteMode::Commands,
+                vec![
+                    ("Alpha".into(), "a".into()),
+                    ("Beta".into(), "b".into()),
+                    ("Gamma".into(), "c".into()),
+                ],
+                cx,
+            )
+        })
+    });
+
+    palette.update(cx, |palette, cx| {
+        assert_eq!(palette.selected_for_test(), 0);
+        palette.select_next_for_test(cx);
+        assert_eq!(palette.selected_for_test(), 1, "down moves selection");
+        palette.select_prev_for_test(cx);
+        palette.select_prev_for_test(cx);
+        assert_eq!(palette.selected_for_test(), 2, "up from the top wraps to the bottom");
+    });
+}

@@ -5630,7 +5630,17 @@ impl WorkspaceView {
         // A walk still running is now pure waste — nothing will consume its results.
         self.cancel_quick_open_walk();
         self.palette = None;
-        window.focus(&self.focus_handle);
+        // Focus goes back to the *editor* when one is open, not just the workspace: after
+        // the language menu closes the owner reported the keyboard felt dead, because a
+        // workspace with no editor focus does not forward typing or the reopen chord to
+        // where the eye is. The workspace handle is the fallback for a window with no tab.
+        match self.active_editor() {
+            Some(editor) => {
+                let handle = editor.read(cx).focus_handle(cx);
+                window.focus(&handle);
+            }
+            None => window.focus(&self.focus_handle),
+        }
         cx.notify();
     }
 
@@ -6295,8 +6305,32 @@ impl Render for WorkspaceView {
             .child(self.render_status_bar(&theme, cx))
             .children(self.palette.clone().map(|palette| {
                 // The overlay is absolutely positioned over everything, so it does not
-                // reflow the layout underneath while it is open.
-                div().absolute().top_0().left_0().size_full().flex().justify_center().child(palette)
+                // reflow the layout underneath while it is open. A click on the backdrop
+                // (the area around the centred panel) dismisses it — the every-overlay
+                // "click outside to close" the owner expected; the panel itself stops
+                // propagation so a click *on* a row still selects.
+                let entity = cx.entity();
+                div()
+                    .id("palette-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        entity.update(cx, |this, cx| this.dismiss_palette(window, cx));
+                    })
+                    .child(
+                        // The panel swallows the backdrop's click so selecting a row does
+                        // not also dismiss.
+                        div()
+                            .id("palette-panel")
+                            .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                cx.stop_propagation()
+                            })
+                            .child(palette),
+                    )
             }))
             // The completion popup, in the same overlay layer and for the same reason, but
             // *not* centred: it positions itself at the cursor, which is the whole point of

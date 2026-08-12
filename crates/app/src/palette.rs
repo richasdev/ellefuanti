@@ -1,13 +1,13 @@
 //! The command palette and quick open, which are the same overlay over different lists.
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, SharedString,
-    Window, div, prelude::*, px, uniform_list,
+    App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, ScrollStrategy,
+    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::actions::{Backspace, Cancel, Confirm, SelectNext, SelectPrev, context};
 use crate::fonts::Fonts;
-use crate::theme::{Metrics, Themed};
+use crate::theme::Themed;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
@@ -95,6 +95,10 @@ pub struct Palette {
     items: Vec<Item>,
     filtered: Vec<Item>,
     selected: usize,
+    /// Keeps the selected row on screen as the arrows move it — without this the
+    /// selection walks off the bottom and the user has to reach for the mouse, which
+    /// was the report. One handle per palette, threaded into the `uniform_list`.
+    scroll: UniformListScrollHandle,
     /// Whether the candidate list is final. Quick open opens empty while a background walk
     /// runs, and "No matches" would be a lie during that window.
     loaded: bool,
@@ -122,6 +126,7 @@ impl Palette {
             ),
             items,
             selected: 0,
+            scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -164,12 +169,31 @@ impl Palette {
             filter_items(&self.items, &self.query)
         };
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        // A narrowed list should show its top hit, not stay scrolled where the old list
+        // was — the selection just jumped to 0-ish and the view must follow it.
+        self.scroll.scroll_to_item(self.selected, ScrollStrategy::Center);
     }
 
     /// The rows currently shown, after filtering.
     #[cfg(test)]
     pub fn labels_for_test(&self) -> Vec<String> {
         self.filtered.iter().map(|item| item.label.to_string()).collect()
+    }
+
+    /// The highlighted row, for the keyboard-nav tests.
+    #[cfg(test)]
+    pub fn selected_for_test(&self) -> usize {
+        self.selected
+    }
+
+    #[cfg(test)]
+    pub fn select_next_for_test(&mut self, cx: &mut Context<Self>) {
+        self.move_selection(1, cx);
+    }
+
+    #[cfg(test)]
+    pub fn select_prev_for_test(&mut self, cx: &mut Context<Self>) {
+        self.move_selection(-1, cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
@@ -217,20 +241,29 @@ impl Palette {
     }
 
     fn select_next(&mut self, _: &SelectNext, _w: &mut Window, cx: &mut Context<Self>) {
-        if !self.filtered.is_empty() {
-            // Wraps, because a palette that stops at the bottom is a palette you have to
-            // look at while navigating.
-            self.selected = (self.selected + 1) % self.filtered.len();
-            cx.notify();
-        }
+        self.move_selection(1, cx);
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _w: &mut Window, cx: &mut Context<Self>) {
-        if !self.filtered.is_empty() {
-            self.selected =
-                if self.selected == 0 { self.filtered.len() - 1 } else { self.selected - 1 };
-            cx.notify();
+        self.move_selection(-1, cx);
+    }
+
+    /// Moves the highlighted row by `delta`, wrapping — a palette that stops at an edge
+    /// is one you have to look at while navigating.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
         }
+        self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+        self.reveal_selected(cx);
+    }
+
+    /// Scrolls the list so the selected row is visible, then repaints — the keyboard nav
+    /// half the mouse should never be needed for.
+    fn reveal_selected(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_item(self.selected, ScrollStrategy::Center);
+        cx.notify();
     }
 
     fn confirm(&mut self, _: &Confirm, _w: &mut Window, cx: &mut Context<Self>) {
@@ -297,9 +330,9 @@ impl Render for Palette {
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
-            .mt(px(80.0))
-            .w(px(520.0))
-            .max_h(px(420.0))
+            .mt(px(90.0))
+            .w(px(560.0))
+            .max_h(px(440.0))
             .flex()
             .flex_col()
             .bg(theme.panel)
@@ -307,6 +340,7 @@ impl Render for Palette {
             .border_color(theme.border)
             .rounded_lg()
             .shadow_lg()
+            .overflow_hidden()
             .text_size(Fonts::get(cx).ui_size)
             .text_color(theme.text)
             .child(
@@ -364,10 +398,17 @@ impl Render for Palette {
                                         .id(("palette-row", index))
                                         .flex()
                                         .items_center()
-                                        .h(Metrics::ROW_HEIGHT)
+                                        .h(px(32.0))
                                         .px_3()
+                                        .mx_1()
+                                        .rounded_md()
                                         .cursor_pointer()
-                                        .when(index == selected, |el| el.bg(theme.selected))
+                                        .when(index == selected, |el| {
+                                            el.bg(theme.selected).text_color(theme.text)
+                                        })
+                                        .when(index != selected, |el| {
+                                            el.text_color(theme.text_muted)
+                                        })
                                         .hover(|el| el.bg(theme.hover))
                                         .active(|el| el.bg(theme.pressed))
                                         .on_mouse_down(
@@ -388,7 +429,9 @@ impl Render for Palette {
                             .collect()
                     })
                 })
+                .track_scroll(self.scroll.clone())
                 .flex_1()
+                .py_1()
                 .into_any_element()
             })
     }
