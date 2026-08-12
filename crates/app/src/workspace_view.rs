@@ -5888,6 +5888,29 @@ fn rebuild_laravel_index(root: PathBuf, cx: &mut Context<WorkspaceView>) {
     .detach();
 }
 
+/// Reads at most `max_bytes` from the end of a file, cut to a full-line boundary.
+///
+/// A log viewer wants the recent tail of a possibly-huge file; reading the whole thing
+/// to show the last screenful is waste. The first partial line at the cut is dropped so
+/// a half-read entry cannot be mis-parsed as a header. Blocking — runs on the background
+/// pool with the rest of the log read.
+fn read_file_tail(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= max_bytes {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    file.seek(SeekFrom::Start(len - max_bytes))?;
+    let mut bytes = Vec::with_capacity(max_bytes as usize);
+    file.read_to_end(&mut bytes)?;
+    // Drop everything up to and including the first newline — the seam is mid-line.
+    let start = bytes.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
 /// One indexed column as a popup item, provenance in the detail (`string · migration`).
 /// A cast with no migration behind it says just `cast` — an empty type is not a type.
 fn column_item(column: elle_index::laravel::ModelColumn) -> CompletionItem {
@@ -6489,6 +6512,10 @@ impl Render for WorkspaceView {
 /// scrolls horizontally, the TablePlus/Excel behaviour.
 const DB_CELL_WIDTH: gpui::Pixels = px(180.0);
 
+/// The most log entries the panel keeps (#25) — a viewer, not an archive. Paired with
+/// the tail read below so a megabyte log costs a bounded read and a bounded row count.
+const LOG_MAX_ENTRIES: usize = 500;
+
 /// Rows per page in the database table view (#65) — a screenful, not a SELECT * on a
 /// production table (the #65 rule). Paging beyond the first is the next slice.
 const DB_PAGE_SIZE: u64 = 200;
@@ -6671,9 +6698,14 @@ impl WorkspaceView {
                         .unwrap_or_default();
                     logs.sort();
                     let newest = logs.pop()?;
-                    let text = std::fs::read_to_string(&newest).ok()?;
+                    // Read only the file's tail, not the whole thing: a real laravel.log
+                    // reaches megabytes and a viewer wants the recent entries. The window
+                    // is generous (256 KiB ≈ hundreds of entries) and cut at the first
+                    // full line so a half-read entry at the seam is dropped, not
+                    // mis-parsed.
+                    let text = read_file_tail(&newest, 256 * 1024).ok()?;
                     let name = newest.file_name()?.to_string_lossy().into_owned();
-                    Some((elle_laravel::parse_laravel_log(&text), name))
+                    Some((elle_laravel::parse_laravel_log_tail(&text, LOG_MAX_ENTRIES), name))
                 })
                 .await;
             panel
@@ -7591,6 +7623,30 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn read_file_tail_returns_the_end_at_a_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        // Ten numbered lines; ask for a window that only covers the last few, small
+        // enough that the cut lands mid-line so the boundary trim is exercised.
+        let body: String = (0..10).map(|i| format!("line {i}
+")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        // A window bigger than the file returns it whole.
+        assert_eq!(read_file_tail(&path, 10_000).unwrap(), body);
+
+        // A ~25-byte window covers the last 3-ish lines; the partial first line is
+        // dropped, so every line returned is complete.
+        let tail = read_file_tail(&path, 25).unwrap();
+        assert!(tail.ends_with("line 9
+"));
+        assert!(!tail.contains("line 0"), "the old lines are outside the window");
+        for line in tail.lines() {
+            assert!(line.starts_with("line "), "no half-line at the seam: {line:?}");
+        }
+    }
 
     /// A `CompletionList` carrying the server's own `isIncomplete`.
     fn incomplete_list(labels: &[&str], is_incomplete: bool) -> CompletionResponse {
