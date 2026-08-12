@@ -69,6 +69,21 @@ struct Tab {
     editor: Entity<EditorView>,
 }
 
+/// What a tree row's drag carries: enough to move the entry when it lands on a
+/// directory. A plain value, not an entity — gpui clones it into the drag state.
+#[derive(Clone)]
+struct DraggedTreeEntry {
+    path: PathBuf,
+}
+
+/// What a tab's drag carries: its index at drag start, resolved against the tabs vec
+/// at drop. Stale-index safety is the drop handler's bounds check, not a lookup — the
+/// strip cannot reorder itself mid-drag.
+#[derive(Clone, Copy)]
+struct DraggedTab {
+    index: usize,
+}
+
 /// The kinds of background work the workspace runs, one slot each.
 ///
 /// The slot is the unit of cancellation: starting a second folder load supersedes the
@@ -1245,6 +1260,19 @@ impl WorkspaceView {
     /// selected off-screen looks like nothing happened.
     fn scroll_active_tab_into_view(&self) {
         self.tab_scroll.scroll_to_item(self.active_tab);
+    }
+
+    /// A tab dragged from `from` lands in slot `to`; the file the user was in stays
+    /// active wherever its tab went (`active_after_reorder`'s contract, tested there).
+    fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = active_after_reorder(self.active_tab, from, to);
+        self.scroll_active_tab_into_view();
+        cx.notify();
     }
 
     /// The database header's "expand all": every table shows its columns — the bulk
@@ -5435,6 +5463,54 @@ impl WorkspaceView {
         }
     }
 
+    /// A tree row was dropped on a directory (or the empty space, meaning the root).
+    ///
+    /// Synchronous, unlike delete: a rename within one filesystem is a metadata operation
+    /// at human-drag speed, and `move_entry` carries the refusals (own subtree, existing
+    /// name, outside the root) that make it safe to call with whatever was dropped.
+    /// The moved file's open tabs follow via the rename machinery above — same operation
+    /// as far as a buffer is concerned.
+    fn drop_tree_entry(&mut self, source: PathBuf, dest_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else {
+            return;
+        };
+        match elle_workspace::move_entry(&source, &dest_dir, &root) {
+            Ok(dest) if dest == source => {} // dropped where it already lives
+            Ok(dest) => {
+                self.retarget_tabs(&source, &dest, cx);
+                self.refresh_tree(cx);
+            }
+            Err(err) => {
+                self.status = Some(format!("{err:#}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Files dragged in from Finder (owner request): a folder becomes the open project,
+    /// a file becomes a tab. Both doors already exist — this is only a third handle on
+    /// them, which is what keeps a dropped folder and ⌘O indistinguishable afterwards.
+    fn external_drop(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for path in paths {
+            if path.is_dir() {
+                match FileTree::new(path.clone()) {
+                    Ok(tree) => self.adopt_tree(tree, cx),
+                    Err(err) => {
+                        self.status = Some(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                }
+            } else {
+                self.open_path(path.clone(), window, cx);
+            }
+        }
+    }
+
     /// The delete confirmation was accepted.
     ///
     /// The `root` handed to `elle_workspace::delete` is what keeps a recursive delete inside
@@ -6616,6 +6692,23 @@ fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
     active.min(remaining.saturating_sub(1))
 }
 
+/// Which tab is active after the one at `from` is dragged to `to` — the strip's reorder.
+///
+/// The identity rule: the *file* the user was in stays active, wherever its tab lands.
+/// Moving the active tab means the active index follows it; dragging another tab across
+/// the active one shifts it by one, the same slide `active_after_close` handles.
+fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
+    if active == from {
+        to
+    } else if from < active && to >= active {
+        active - 1
+    } else if from > active && to <= active {
+        active + 1
+    } else {
+        active
+    }
+}
+
 /// Recovers the `&'static str` id for a title the palette returned.
 ///
 /// `CommandId` holds a `&'static str` so the registry costs no allocation; the palette
@@ -6704,6 +6797,12 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
             .on_action(cx.listener(|this, _: &ResetFontSize, _w, cx| this.zoom(None, cx)))
+            // Finder drops land on the whole window: a file opens, a folder becomes the
+            // project. Registered here rather than on a target strip because there is no
+            // wrong place to drop a file onto an editor.
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                this.external_drop(paths.paths(), window, cx);
+            }))
             .relative()
             .size_full()
             .flex()
@@ -7877,6 +7976,8 @@ impl WorkspaceView {
                     // belonging to nothing.
                     Some(tree) if !tree.is_empty() => {
                         let entity = cx.entity();
+                        let drop_entity = entity.clone();
+                        let root = tree.root().to_path_buf();
                         div()
                             // A flex column, not a block: the rows list sizes itself with
                             // `flex_1`, which in a non-flex parent is the exact zero-height
@@ -7887,6 +7988,18 @@ impl WorkspaceView {
                             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                                 entity.update(cx, |this, cx| {
                                     this.open_tree_root_menu(event.position, window, cx);
+                                });
+                            })
+                            // The space below the rows means "the root": dropping there
+                            // moves the entry to the top level, the same way the
+                            // right-click there creates at the top level (#126).
+                            .on_drop(move |dragged: &DraggedTreeEntry, _window, cx| {
+                                drop_entity.update(cx, |this, cx| {
+                                    this.drop_tree_entry(
+                                        dragged.path.clone(),
+                                        root.clone(),
+                                        cx,
+                                    );
                                 });
                             })
                             .child(self.render_tree_rows(tree.len(), theme, cx))
@@ -8102,6 +8215,39 @@ impl WorkspaceView {
                                 .pl(px(8.0 + entry.depth as f32 * 12.0))
                                 .hover(|el| el.bg(hover))
                                 .active(|el| el.bg(pressed))
+                                // Every row can be picked up; the label under the pointer
+                                // is the entry's name (the tooltip card, repurposed —
+                                // gpui only wants some `Render` to float).
+                                .on_drag(
+                                    DraggedTreeEntry { path: path.clone() },
+                                    |dragged, _offset, _window, cx| {
+                                        let name = dragged
+                                            .path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default();
+                                        cx.new(|_| crate::tooltip::Tooltip::new(name))
+                                    },
+                                )
+                                // Only directories receive: dropping a file on a file has
+                                // no meaning this tree wants to invent. The tint says
+                                // "this folder will take it" before the mouse commits.
+                                .when(is_dir, |el| {
+                                    let drop_entity = entity.clone();
+                                    let dest = path.clone();
+                                    el.drag_over::<DraggedTreeEntry>(move |style, _, _, _| {
+                                        style.bg(selection)
+                                    })
+                                    .on_drop(move |dragged: &DraggedTreeEntry, _window, cx| {
+                                        drop_entity.update(cx, |this, cx| {
+                                            this.drop_tree_entry(
+                                                dragged.path.clone(),
+                                                dest.clone(),
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                })
                                 // Persistent, unlike hover: the tint follows the active
                                 // tab so the tree always answers "which file am I in".
                                 .when(is_active, |el| el.bg(selection))
@@ -8279,9 +8425,28 @@ impl WorkspaceView {
                 let (icon, icon_color) = icons::for_file(&title);
                 let entity = entity.clone();
                 let close_entity = entity.clone();
+                let drop_entity = entity.clone();
+                let drag_title = title.clone();
+                let accent = theme.accent;
 
                 div()
                     .id(("tab", index))
+                    // Tabs reorder by drag (owner request). The dragged value is the
+                    // index at pick-up; the strip cannot reorder under an open drag, so
+                    // resolving it at drop is safe with a bounds check.
+                    .on_drag(DraggedTab { index }, move |_dragged, _offset, _window, cx| {
+                        cx.new(|_| crate::tooltip::Tooltip::new(drag_title.clone()))
+                    })
+                    // The accent border says "it lands here" — dropping on a tab puts
+                    // the dragged one in its place.
+                    .drag_over::<DraggedTab>(move |style, _, _, _| {
+                        style.border_l_2().border_color(accent)
+                    })
+                    .on_drop(move |dragged: &DraggedTab, _window, cx| {
+                        drop_entity.update(cx, |this, cx| {
+                            this.reorder_tab(dragged.index, index, cx);
+                        });
+                    })
                     .flex()
                     // `flex_none` is the other half of the scroll fix: in a plain flex row
                     // the tabs shrink to share the width, which is the "squeeze" — with many
@@ -9152,6 +9317,19 @@ mod tests {
         assert_eq!(active_after_close(2, 2, 2), 1);
         // Closing the only tab leaves nothing; index 0 is what an empty tab bar renders as.
         assert_eq!(active_after_close(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn reordering_tabs_keeps_the_same_file_active() {
+        // Dragging the active tab: the selection follows it to where it lands.
+        assert_eq!(active_after_reorder(1, 1, 3), 3);
+        assert_eq!(active_after_reorder(3, 3, 0), 0);
+        // Dragging another tab across the active one shifts it by one slot.
+        assert_eq!(active_after_reorder(2, 0, 3), 1, "left-of-active dragged past it");
+        assert_eq!(active_after_reorder(1, 3, 0), 2, "right-of-active dragged before it");
+        // A drag that never crosses the active tab leaves it alone.
+        assert_eq!(active_after_reorder(0, 1, 2), 0);
+        assert_eq!(active_after_reorder(3, 1, 2), 3);
     }
 
     #[test]

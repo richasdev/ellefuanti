@@ -183,6 +183,53 @@ pub fn rename(from: &Path, new_name: &str) -> Result<PathBuf> {
     Ok(to)
 }
 
+/// Moves a file or directory into `dest_dir`, keeping its name — the tree's drag & drop.
+///
+/// Separate from [`rename`] on purpose: that one takes a *name* and this one takes a
+/// *directory*, so the UI can always say which of the two it just did. Same root
+/// containment as [`delete`] — both ends must be inside the open folder, because the tree's
+/// paths were correct when read, not necessarily when dropped.
+///
+/// The refusals, each one a way a drop destroys something or loops:
+/// - a directory into itself or its own subtree (`a/` into `a/b/` has no coherent result);
+/// - onto an existing name — `fs::rename` on Unix replaces silently, and a drop is even
+///   less deliberate than a typed name;
+/// - a drop into the directory it already lives in is an honest no-op, not an error, so a
+///   shaky hand does not produce a toast.
+pub fn move_entry(source: &Path, dest_dir: &Path, root: &Path) -> Result<PathBuf> {
+    let name = source
+        .file_name()
+        .with_context(|| format!("{} has no file name", source.display()))?;
+
+    let real_root = root.canonicalize().with_context(|| format!("resolving {}", root.display()))?;
+    for end in [source.parent().unwrap_or(root), dest_dir] {
+        let real = end.canonicalize().with_context(|| format!("resolving {}", end.display()))?;
+        if !real.starts_with(&real_root) {
+            bail!("{} is outside the open folder", end.display());
+        }
+    }
+
+    if dest_dir == source {
+        // Dropped on itself: an aborted drag, not a request. Silent, like the
+        // current-parent no-op below.
+        return Ok(source.to_path_buf());
+    }
+    if dest_dir.starts_with(source) {
+        bail!("cannot move a folder into itself");
+    }
+    let dest = dest_dir.join(name);
+    if dest == source {
+        return Ok(dest);
+    }
+    if dest.exists() && !same_file(source, &dest) {
+        bail!("{} already exists", dest.display());
+    }
+
+    fs::rename(source, &dest)
+        .with_context(|| format!("moving {} to {}", source.display(), dest.display()))?;
+    Ok(dest)
+}
+
 /// Whether two paths refer to the same file on disk.
 ///
 /// Compares device and inode rather than the paths themselves, which is the only way to
@@ -252,6 +299,86 @@ mod tests {
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn move_entry_moves_a_file_into_a_directory() {
+        let root = tmp();
+        let file = root.path().join("a.php");
+        stdfs::write(&file, "<?php").unwrap();
+        let sub = root.path().join("app");
+        stdfs::create_dir(&sub).unwrap();
+
+        let dest = move_entry(&file, &sub, root.path()).unwrap();
+        assert_eq!(dest, sub.join("a.php"));
+        assert!(dest.exists());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn move_entry_refuses_a_directory_into_its_own_subtree() {
+        let root = tmp();
+        let outer = root.path().join("outer");
+        let inner = outer.join("inner");
+        stdfs::create_dir_all(&inner).unwrap();
+
+        let err = move_entry(&outer, &inner, root.path()).unwrap_err();
+        assert!(err.to_string().contains("into itself"), "{err:#}");
+        assert!(outer.exists() && inner.exists(), "nothing moved");
+    }
+
+    #[test]
+    fn move_entry_refuses_to_overwrite_and_leaves_the_source() {
+        let root = tmp();
+        let file = root.path().join("a.php");
+        stdfs::write(&file, "source").unwrap();
+        let sub = root.path().join("app");
+        stdfs::create_dir(&sub).unwrap();
+        stdfs::write(sub.join("a.php"), "already here").unwrap();
+
+        let err = move_entry(&file, &sub, root.path()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err:#}");
+        assert_eq!(stdfs::read_to_string(&file).unwrap(), "source", "source untouched");
+        assert_eq!(
+            stdfs::read_to_string(sub.join("a.php")).unwrap(),
+            "already here",
+            "destination untouched"
+        );
+    }
+
+    #[test]
+    fn move_entry_into_its_current_parent_is_a_no_op() {
+        let root = tmp();
+        let file = root.path().join("a.php");
+        stdfs::write(&file, "still me").unwrap();
+
+        let dest = move_entry(&file, root.path(), root.path()).unwrap();
+        assert_eq!(dest, file);
+        assert_eq!(stdfs::read_to_string(&file).unwrap(), "still me");
+    }
+
+    #[test]
+    fn move_entry_of_a_directory_onto_itself_is_a_silent_no_op() {
+        // The aborted-drag case: pick a folder up, drop it where it was.
+        let root = tmp();
+        let dir = root.path().join("app");
+        stdfs::create_dir(&dir).unwrap();
+
+        let dest = move_entry(&dir, &dir, root.path()).unwrap();
+        assert_eq!(dest, dir);
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn move_entry_refuses_to_leave_the_open_folder() {
+        let root = tmp();
+        let outside = tmp();
+        let file = root.path().join("a.php");
+        stdfs::write(&file, "<?php").unwrap();
+
+        let err = move_entry(&file, outside.path(), root.path()).unwrap_err();
+        assert!(err.to_string().contains("outside the open folder"), "{err:#}");
+        assert!(file.exists(), "nothing moved");
     }
 
     #[test]
