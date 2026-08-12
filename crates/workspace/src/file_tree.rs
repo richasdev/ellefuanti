@@ -225,6 +225,43 @@ impl FileTree {
         Ok(())
     }
 
+    /// Expands the ancestor folders of `path` so it is visible, and returns its row index
+    /// — the "reveal in tree" the owner asked for (sync the tree to the open file).
+    ///
+    /// Walks the path's ancestors from the root down, expanding each folder that is still
+    /// collapsed (which splices its children in, so the next ancestor is then present to
+    /// find and expand). `None` when the path is not under the root, or a folder on the
+    /// way cannot be read — silence over a wrong row, the honesty rule (§24).
+    pub fn reveal(&mut self, path: &Path) -> Option<usize> {
+        // Canonicalise the incoming path: the tree's root is canonical, a tab's path is
+        // whatever opened it, and on macOS the temp dir is a symlink so the same file is
+        // `/var/…` from one and `/private/var/…` from the other — the recurring trap.
+        // Two paths from different sources never compare raw.
+        let canonical = path.canonicalize().ok()?;
+        let relative = canonical.strip_prefix(&self.root).ok()?;
+        let path = canonical.as_path();
+
+        // Build the chain of ancestor directories, root-first:
+        // `app`, `app/Models`, … (not the file itself).
+        let mut ancestor = self.root.clone();
+        for component in relative.components() {
+            let candidate = ancestor.join(component);
+            // The final component is the file; stop expanding at its parent.
+            if candidate == *path {
+                break;
+            }
+            ancestor = candidate;
+            // Find this directory's row and expand it if it is closed, so its children
+            // (the next ancestor, eventually the file) become present.
+            let index = self.entries.iter().position(|e| e.path == ancestor)?;
+            if self.entries[index].is_dir() && !self.entries[index].expanded {
+                self.toggle(index).ok()?;
+            }
+        }
+
+        self.entries.iter().position(|e| e.path == *path)
+    }
+
     /// Reads one directory level, filtered and sorted for display.
     fn read_dir(&self, dir: &Path, depth: usize) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
@@ -295,6 +332,27 @@ mod tests {
         fs::write(p.join(".gitignore"), "/vendor\n").unwrap();
         fs::write(p.join("vendor/laravel/x.php"), "<?php").unwrap();
         dir
+    }
+
+    #[test]
+    fn reveal_expands_the_ancestors_and_returns_the_files_row() {
+        let dir = fixture();
+        let mut tree = FileTree::new(dir.path()).unwrap();
+        // The file is two levels deep and its folders start collapsed.
+        let target = dir.path().join("app/Models/User.php");
+
+        let index = tree.reveal(&target).expect("the file is under the root");
+        // The entry at that index is the file itself (compared canonically — the tree
+        // stores canonical paths, the /var-vs-/private/var trap this very method handles).
+        assert_eq!(tree.entries()[index].path, target.canonicalize().unwrap());
+        // Its ancestors were expanded so it is actually visible.
+        let app = tree.entries().iter().find(|e| e.name == "app").unwrap();
+        assert!(app.expanded, "app/ was expanded to reveal the file");
+        let models = tree.entries().iter().find(|e| e.name == "Models").unwrap();
+        assert!(models.expanded, "app/Models/ was expanded too");
+
+        // A path outside the root reveals nothing rather than guessing.
+        assert_eq!(tree.reveal(std::path::Path::new("/nowhere/x.php")), None);
     }
 
     #[test]
