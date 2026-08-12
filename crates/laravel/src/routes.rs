@@ -323,7 +323,9 @@ fn handle_chain(expr: Node, src: &[u8], group: &GroupContext, out: &mut RouteExt
         "resource" | "apiResource" => {
             handle_resource(root, src, group, &local, method_name == "apiResource", out)
         }
-        "view" | "redirect" => handle_framework_route(root, src, group, &local, method_name, out),
+        "view" | "redirect" | "livewire" | "volt" => {
+            handle_framework_route(root, src, group, &local, method_name, out)
+        }
         "match" => handle_match(root, src, group, &local, out),
         // `is_registration_verb` already vetted this, so the fallback is unreachable.
         _ => {
@@ -351,7 +353,13 @@ const MODIFIERS: [&str; 10] = [
 /// Whether a `Route::`/`->` call name registers a route.
 fn is_registration_verb(name: &str) -> bool {
     HttpMethod::from_verb(name).is_some()
-        || matches!(name, "resource" | "apiResource" | "view" | "redirect" | "match")
+        || matches!(
+            name,
+            // `livewire`/`volt` are Livewire Volt's page helpers — a GET page served by a
+            // component. richas-blog registers almost its whole app with them, and without
+            // this they were invisible to the routes palette.
+            "resource" | "apiResource" | "view" | "redirect" | "match" | "livewire" | "volt"
+        )
 }
 
 /// Modifiers read off one chain, before group context is merged in.
@@ -437,6 +445,10 @@ fn handle_framework_route(
 
     let (method, action) = match verb {
         "view" => (HttpMethod::Get, RouteAction::View { template: target }),
+        // A Livewire/Volt page is a GET served by a component; the component name is the
+        // navigable target, reported through the same View action (its "template" is the
+        // component). Resolving that name to a class is the index's job (#24), not here.
+        "livewire" | "volt" => (HttpMethod::Get, RouteAction::View { template: target }),
         // `Route::redirect` answers every verb in Laravel, which is why this is not Get.
         _ => (HttpMethod::Any, RouteAction::Redirect { to: target }),
     };
