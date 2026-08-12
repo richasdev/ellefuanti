@@ -141,7 +141,9 @@ impl FileDiagnostics {
         self.items
             .iter()
             .zip(&self.raw)
-            .filter(|(resolved, _)| resolved.range.start <= range.end && range.start <= resolved.range.end)
+            .filter(|(resolved, _)| {
+                resolved.range.start <= range.end && range.start <= resolved.range.end
+            })
             .map(|(_, raw)| raw.clone())
             .collect()
     }
@@ -508,7 +510,11 @@ pub fn workspace_symbol_items(
                     OneOf::Left(location) => (&location.uri, location.range.start.line),
                     OneOf::Right(workspace_location) => (&workspace_location.uri, 0),
                 };
-                Some((label(&symbol.name, &symbol.container_name), elle_lsp::uri_to_path(uri).ok()?, line))
+                Some((
+                    label(&symbol.name, &symbol.container_name),
+                    elle_lsp::uri_to_path(uri).ok()?,
+                    line,
+                ))
             })
             .collect(),
     }

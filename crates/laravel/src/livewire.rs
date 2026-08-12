@@ -88,8 +88,7 @@ pub fn livewire_class_path(
     view: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let relative = view.strip_prefix(root).unwrap_or(view);
-    let mut parts: Vec<&str> =
-        relative.iter().filter_map(|part| part.to_str()).collect();
+    let mut parts: Vec<&str> = relative.iter().filter_map(|part| part.to_str()).collect();
     let position = parts.iter().position(|part| *part == "livewire")?;
     parts.drain(..=position);
     let stem = parts.pop()?.strip_suffix(".blade.php")?;
@@ -136,7 +135,10 @@ pub enum WireTarget {
 /// `wire:xxx="` on the same attribute and forward for the closing quote. `wire:` inside
 /// ordinary text does not match — the shape requires the `="` and an unclosed value
 /// runs to the cursor, which is the mid-typing moment completion exists for.
-pub fn wire_context_at(source: &str, offset: usize) -> Option<(WireTarget, std::ops::Range<usize>)> {
+pub fn wire_context_at(
+    source: &str,
+    offset: usize,
+) -> Option<(WireTarget, std::ops::Range<usize>)> {
     let before = &source[..offset.min(source.len())];
     let attr_at = before.rfind("wire:")?;
     let after_wire = &before[attr_at + "wire:".len()..];
@@ -154,10 +156,8 @@ pub fn wire_context_at(source: &str, offset: usize) -> Option<(WireTarget, std::
     if offset < content_start {
         return None; // On the `=` or the quote itself, not in the value.
     }
-    let content_end = source[content_start..]
-        .find(quote)
-        .map(|at| content_start + at)
-        .unwrap_or(source.len());
+    let content_end =
+        source[content_start..].find(quote).map(|at| content_start + at).unwrap_or(source.len());
     if offset > content_end {
         return None;
     }
@@ -166,8 +166,8 @@ pub fn wire_context_at(source: &str, offset: usize) -> Option<(WireTarget, std::
         "model" => WireTarget::Property,
         // The event attributes Livewire documents; `wire:navigate` and friends take no
         // expression and are absent on purpose.
-        "click" | "submit" | "change" | "keydown" | "keyup" | "blur" | "focus"
-        | "mouseenter" | "mouseleave" => WireTarget::Action,
+        "click" | "submit" | "change" | "keydown" | "keyup" | "blur" | "focus" | "mouseenter"
+        | "mouseleave" => WireTarget::Action,
         _ => return None,
     };
     Some((target, content_start..content_end))
@@ -229,10 +229,7 @@ class UserTable extends Component
         std::fs::write(root.join("app/Livewire/Admin/AuditLog.php"), "x").unwrap();
 
         let view = root.join("resources/views/livewire/user-table.blade.php");
-        assert_eq!(
-            livewire_class_path(root, &view),
-            Some(root.join("app/Livewire/UserTable.php"))
-        );
+        assert_eq!(livewire_class_path(root, &view), Some(root.join("app/Livewire/UserTable.php")));
         let nested = root.join("resources/views/livewire/admin/audit-log.blade.php");
         assert_eq!(
             livewire_class_path(root, &nested),
@@ -247,8 +244,7 @@ class UserTable extends Component
     fn wire(fixture: &str) -> Option<(WireTarget, String)> {
         let offset = fixture.find('|').expect("a cursor");
         let source = fixture.replace('|', "");
-        wire_context_at(&source, offset)
-            .map(|(target, range)| (target, source[range].to_string()))
+        wire_context_at(&source, offset).map(|(target, range)| (target, source[range].to_string()))
     }
 
     #[test]
@@ -273,10 +269,7 @@ class UserTable extends Component
 
     #[test]
     fn an_unclosed_value_is_the_mid_typing_moment() {
-        assert_eq!(
-            wire(r#"<button wire:click="so|"#),
-            Some((WireTarget::Action, "so".into()))
-        );
+        assert_eq!(wire(r#"<button wire:click="so|"#), Some((WireTarget::Action, "so".into())));
     }
 
     #[test]

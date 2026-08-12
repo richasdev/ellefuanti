@@ -3209,11 +3209,8 @@ async fn a_where_call_offers_the_models_columns_inside_the_literal(cx: &mut Test
     std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
     std::fs::create_dir_all(dir.path().join("app/Http/Controllers")).unwrap();
     std::fs::create_dir_all(dir.path().join("database/migrations")).unwrap();
-    std::fs::write(
-        dir.path().join("app/Models/User.php"),
-        "<?php\nclass User extends Model {}\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("app/Models/User.php"), "<?php\nclass User extends Model {}\n")
+        .unwrap();
     std::fs::write(
         dir.path().join("database/migrations/2026_01_01_create_users.php"),
         "<?php\nreturn new class extends Migration {\n  public function up(): void {\n    Schema::create('users', function (Blueprint $table) {\n      $table->id();\n      $table->string('email');\n    });\n  }\n};\n",
@@ -3340,10 +3337,7 @@ async fn a_with_call_offers_relationships_not_columns(cx: &mut TestAppContext) {
         let items = popup.visible_items();
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_ref()).collect();
         assert!(labels.contains(&"posts"), "the relationship arrives: {labels:?}");
-        assert!(
-            !labels.contains(&"email"),
-            "columns are not an answer to with(): {labels:?}"
-        );
+        assert!(!labels.contains(&"email"), "columns are not an answer to with(): {labels:?}");
         let posts = items.iter().find(|item| item.label.as_ref() == "posts").unwrap();
         assert!(matches!(posts.source, CompletionSource::LaravelRelation));
     });
@@ -3464,7 +3458,11 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
 
     workspace.update_in(cx, |workspace, window, cx| {
-        workspace.toggle_palette_for_test(crate::palette::PaletteMode::WorkspaceSymbols, window, cx);
+        workspace.toggle_palette_for_test(
+            crate::palette::PaletteMode::WorkspaceSymbols,
+            window,
+            cx,
+        );
     });
     let palette = workspace
         .read_with(cx, |workspace, _cx| workspace.palette_for_test())
@@ -3478,13 +3476,8 @@ async fn the_workspace_symbol_palette_trusts_the_server_not_a_local_filter(
         palette.set_items(vec![("UserController::handle".into(), "x".into())], cx);
     });
 
-    let labels =
-        workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
-    assert_eq!(
-        labels,
-        ["UserController::handle"],
-        "the server's hit must survive the local query"
-    );
+    let labels = workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
+    assert_eq!(labels, ["UserController::handle"], "the server's hit must survive the local query");
 
     draw(cx);
 }
@@ -3776,8 +3769,9 @@ async fn the_rename_prompt_confirms_its_query_not_a_row(cx: &mut TestAppContext)
 
     let (palette, subscription) = cx.update(|cx| {
         use gpui::AppContext as _;
-        let palette =
-            cx.new(|cx| crate::palette::Palette::new(crate::palette::PaletteMode::Rename, Vec::new(), cx));
+        let palette = cx.new(|cx| {
+            crate::palette::Palette::new(crate::palette::PaletteMode::Rename, Vec::new(), cx)
+        });
         let sink = confirmed.clone();
         let subscription = cx.subscribe(&palette, move |_palette, event, _cx| {
             if let crate::palette::PaletteEvent::Confirmed(name) = event {
@@ -4000,7 +3994,8 @@ async fn saving_a_model_rebuilds_the_laravel_index(cx: &mut TestAppContext) {
     let dir = project();
     std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
     let model_path = dir.path().join("app/Models/User.php");
-    let before = "<?php\nclass User extends Model {\n    protected $casts = ['is_admin' => 'boolean'];\n}\n";
+    let before =
+        "<?php\nclass User extends Model {\n    protected $casts = ['is_admin' => 'boolean'];\n}\n";
     std::fs::write(&model_path, before).unwrap();
 
     let canonical = dir.path().canonicalize().unwrap();
@@ -4061,11 +4056,8 @@ async fn returning_to_the_window_rebuilds_the_laravel_index(cx: &mut TestAppCont
     install_theme(cx);
     let dir = project();
     std::fs::create_dir_all(dir.path().join("app/Models")).unwrap();
-    std::fs::write(
-        dir.path().join("app/Models/User.php"),
-        "<?php\nclass User extends Model {}\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("app/Models/User.php"), "<?php\nclass User extends Model {}\n")
+        .unwrap();
 
     let canonical = dir.path().canonicalize().unwrap();
     let index_path = crate::file_cache::index_path(&canonical).expect("index path");
@@ -4120,7 +4112,11 @@ async fn the_log_panel_lists_entries_and_jumps_to_the_frame(cx: &mut TestAppCont
 
     // Two files; the newest by name must win. The trace points at a real file so the
     // jump has somewhere honest to land.
-    std::fs::write(dir.path().join("storage/logs/laravel-2026-08-11.log"), "[2026-08-11 09:00:00] local.INFO: old day\n").unwrap();
+    std::fs::write(
+        dir.path().join("storage/logs/laravel-2026-08-11.log"),
+        "[2026-08-11 09:00:00] local.INFO: old day\n",
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("storage/logs/laravel-2026-08-12.log"),
         format!(
@@ -4574,8 +4570,11 @@ async fn editing_a_db_cell_writes_it_to_the_database(cx: &mut TestAppContext) {
     std::fs::create_dir_all(dir.path().join("database")).unwrap();
     let db = dir.path().join("database/database.sqlite");
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
-                        INSERT INTO users (name) VALUES ('old');").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+                        INSERT INTO users (name) VALUES ('old');",
+    )
+    .unwrap();
     drop(conn);
 
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
@@ -4593,7 +4592,8 @@ async fn editing_a_db_cell_writes_it_to_the_database(cx: &mut TestAppContext) {
 
     // The database itself has the new value.
     let conn = rusqlite::Connection::open(&db).unwrap();
-    let name: String = conn.query_row("SELECT name FROM users WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let name: String =
+        conn.query_row("SELECT name FROM users WHERE id = 1", [], |r| r.get(0)).unwrap();
     assert_eq!(name, "new", "the edit reached the database, keyed by rowid");
 
     draw(cx);
@@ -4608,8 +4608,11 @@ async fn adding_a_db_row_inserts_it_into_the_database(cx: &mut TestAppContext) {
     std::fs::create_dir_all(dir.path().join("database")).unwrap();
     let db = dir.path().join("database/database.sqlite");
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);
-                        INSERT INTO tags (name) VALUES ('one');").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);
+                        INSERT INTO tags (name) VALUES ('one');",
+    )
+    .unwrap();
     drop(conn);
 
     let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));

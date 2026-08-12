@@ -418,24 +418,12 @@ impl Render for Palette {
                     // well; the editor's blink machinery is a timer per open palette
                     // that this ephemeral overlay does not earn.
                     .when(query_is_placeholder, |el| {
-                        el.child(
-                            div()
-                                .w(px(2.0))
-                                .h(px(20.0))
-                                .mr_1()
-                                .flex_none()
-                                .bg(theme.cursor),
-                        )
+                        el.child(div().w(px(2.0)).h(px(20.0)).mr_1().flex_none().bg(theme.cursor))
                     })
                     .child(query_shown)
                     .when(!query_is_placeholder, |el| {
                         el.child(
-                            div()
-                                .w(px(2.0))
-                                .h(px(20.0))
-                                .ml(px(1.0))
-                                .flex_none()
-                                .bg(theme.cursor),
+                            div().w(px(2.0)).h(px(20.0)).ml(px(1.0)).flex_none().bg(theme.cursor),
                         )
                     }),
             )
@@ -544,7 +532,11 @@ mod tests {
         // palette is still a comfortable box, and a huge list caps at MAX_VISIBLE_ROWS so
         // the panel stays inside its `max_h` and the `uniform_list` scrolls past that.
         assert_eq!(list_height(0), ROW_HEIGHT * MIN_VISIBLE_ROWS, "empty floors, never zero");
-        assert_eq!(list_height(1), ROW_HEIGHT * MIN_VISIBLE_ROWS, "one hit still shows a real area");
+        assert_eq!(
+            list_height(1),
+            ROW_HEIGHT * MIN_VISIBLE_ROWS,
+            "one hit still shows a real area"
+        );
         assert_eq!(list_height(MIN_VISIBLE_ROWS), ROW_HEIGHT * MIN_VISIBLE_ROWS);
         // Between the floor and the cap the list is exactly the rows it holds — no dead space.
         let mid = MIN_VISIBLE_ROWS + 2;

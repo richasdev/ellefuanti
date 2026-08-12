@@ -6,9 +6,7 @@
 //! stack frame, which is the throw site — both decided in the domain crate, tested
 //! there; this file is rows and a jump.
 
-use gpui::{
-    App, Context, MouseButton, SharedString, Window, div, prelude::*, px, uniform_list,
-};
+use gpui::{App, Context, MouseButton, SharedString, Window, div, prelude::*, px, uniform_list};
 
 use crate::fonts::Fonts;
 use crate::theme::{Metrics, Themed};
@@ -28,7 +26,10 @@ impl LogView {
         Self { entries: Vec::new(), source: None, on_jump: None }
     }
 
-    pub fn on_jump(&mut self, jump: impl Fn(&std::path::Path, u32, &mut Window, &mut App) + 'static) {
+    pub fn on_jump(
+        &mut self,
+        jump: impl Fn(&std::path::Path, u32, &mut Window, &mut App) + 'static,
+    ) {
         self.on_jump = Some(Box::new(jump));
     }
 
@@ -97,11 +98,7 @@ impl Render for LogView {
                     .child(header),
             )
             .child(if count == 0 {
-                div()
-                    .p_3()
-                    .text_color(theme.text_muted)
-                    .child("No log entries")
-                    .into_any_element()
+                div().p_3().text_color(theme.text_muted).child("No log entries").into_any_element()
             } else {
                 let row_height = fonts.line_height();
                 uniform_list("log-rows", count, move |range, _window, cx| {

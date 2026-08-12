@@ -17,13 +17,12 @@ use gpui::{
 
 use crate::actions::{
     Backspace, Copy, Cut, Delete, DeleteLine, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
-    FoldBlock, UnfoldBlock,
-    DeleteWordRight, DuplicateLineDown, DuplicateLineUp, Indent, MoveDocumentEnd,
+    DeleteWordRight, DuplicateLineDown, DuplicateLineUp, FoldBlock, Indent, MoveDocumentEnd,
     MoveDocumentStart, MoveDown, MoveLeft, MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp,
     MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent,
     Paste, Redo, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft,
     SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
-    ToggleComment, Undo, context,
+    ToggleComment, Undo, UnfoldBlock, context,
 };
 use crate::editor::line::Line;
 use crate::editor::state::{Document, Selection};
@@ -356,8 +355,7 @@ impl EditorView {
     pub fn fold_block_at_cursor(&mut self, cx: &mut Context<Self>) {
         let text = self.document.buffer.text();
         let cursor = self.document.cursor_point();
-        let Some((header, body)) = crate::editor::folds::enclosing_block(&text, cursor.row)
-        else {
+        let Some((header, body)) = crate::editor::folds::enclosing_block(&text, cursor.row) else {
             return;
         };
         self.folds.fold(body, self.document.buffer.len_lines());
@@ -428,10 +426,7 @@ impl EditorView {
             self.folds.unfold_containing(line);
         }
         let Some(row) = self.folds.row_of_line(line) else { return };
-        let last_row = self
-            .folds
-            .visible_count(self.document.buffer.len_lines())
-            .saturating_sub(1);
+        let last_row = self.folds.visible_count(self.document.buffer.len_lines()).saturating_sub(1);
 
         if let Some((item, strategy)) = autoscroll_fit(row, &self.visible_rows, last_row) {
             self.scroll.scroll_to_item(item, strategy);
@@ -1449,8 +1444,7 @@ impl EditorView {
                 // version survived a mutation that broke the render path.
                 let line_index = self.row_line_index(row);
                 let line = self.document.buffer.line(line_index);
-                let line_start =
-                    self.document.buffer.point_to_offset(Point::new(line_index, 0));
+                let line_start = self.document.buffer.point_to_offset(Point::new(line_index, 0));
                 let line_end = line_start + line.len();
 
                 // Sliced per row rather than passed whole: `line_runs` would otherwise

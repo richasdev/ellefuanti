@@ -3190,7 +3190,6 @@ $ação = 1;
     // unparseable file has no tree and correctly matches nothing, which is asserted below
     // rather than worked around.
 
-
     #[test]
     fn the_bracket_under_the_cursor_finds_its_partner() {
         let mut d = doc("<?php\nfunction f() { return 1; }\n");

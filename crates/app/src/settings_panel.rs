@@ -387,5 +387,4 @@ mod tests {
         assert_eq!(step_index(0, 3, false), 2, "backward wraps");
         assert_eq!(step_index(1, 1, true), 0, "a single entry cycles to itself");
     }
-
 }

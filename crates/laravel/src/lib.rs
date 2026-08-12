@@ -30,10 +30,10 @@ mod targets;
 
 pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at, scope_context_at};
 pub use composer::composer_scripts;
-pub use logs::{LogEntry, parse_laravel_log, parse_laravel_log_tail};
 pub use livewire::{
     LivewireFacts, WireTarget, extract_livewire, livewire_class_path, wire_context_at,
 };
+pub use logs::{LogEntry, parse_laravel_log, parse_laravel_log_tail};
 pub use models::{ModelFacts, extract_migration_columns, extract_model};
 pub use references::{Reference, ReferenceKind, reference_at};
 pub use resolved::Resolved;

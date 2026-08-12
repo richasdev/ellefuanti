@@ -479,23 +479,24 @@ impl GitPanel {
         // A pointer-route button: a bordered pill that dispatches `action` on click. Dispatch
         // (not a direct call) so the click travels the same keymap path the chord does and
         // lands on the workspace's registered handler.
-        let button = |id: &'static str, label: &'static str, action: fn() -> Box<dyn gpui::Action>| {
-            div()
-                .id(id)
-                .px_2()
-                .py_1()
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(theme.border)
-                .text_color(theme.text)
-                .cursor_pointer()
-                .hover(|el| el.bg(theme.hover))
-                .active(|el| el.bg(theme.pressed))
-                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                    window.dispatch_action(action(), cx);
-                })
-                .child(label)
-        };
+        let button =
+            |id: &'static str, label: &'static str, action: fn() -> Box<dyn gpui::Action>| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.hover))
+                    .active(|el| el.bg(theme.pressed))
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        window.dispatch_action(action(), cx);
+                    })
+                    .child(label)
+            };
 
         Some(
             div()

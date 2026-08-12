@@ -55,7 +55,8 @@ pub fn env_database(root: &Path) -> Option<PathBuf> {
             let raw = raw.trim();
             // A quoted value is literal to its closing quote — a `#` inside is data. An
             // unquoted value ends at the first `#`, which dotenv treats as a comment.
-            let value = if let Some(inner) = raw.strip_prefix('"').and_then(|r| r.split('"').next()) {
+            let value = if let Some(inner) = raw.strip_prefix('"').and_then(|r| r.split('"').next())
+            {
                 inner
             } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.split('\'').next()) {
                 inner
@@ -89,11 +90,9 @@ pub fn env_database(root: &Path) -> Option<PathBuf> {
 /// not by discipline — the flag is the guarantee #65's destructive-operation section
 /// asks for, applied to the only operations this slice performs.
 pub fn sqlite_schema(path: &Path) -> Result<Vec<TableInfo>> {
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("opening {}", path.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening {}", path.display()))?;
 
     let mut names: Vec<String> = conn
         .prepare(
@@ -108,7 +107,8 @@ pub fn sqlite_schema(path: &Path) -> Result<Vec<TableInfo>> {
     for name in names {
         // `pragma_table_info` binds the name as data — no string-built SQL, so a table
         // named `users"; DROP TABLE x` is a name, not a statement.
-        let mut statement = conn.prepare("SELECT name, type, pk, \"notnull\" FROM pragma_table_info(?1)")?;
+        let mut statement =
+            conn.prepare("SELECT name, type, pk, \"notnull\" FROM pragma_table_info(?1)")?;
         let columns = statement
             .query_map([&name], |row| {
                 Ok(TableColumn {
@@ -157,11 +157,9 @@ pub fn table_page(path: &Path, table: &str, offset: u64, limit: u64) -> Result<T
         .find(|info| info.name == table)
         .with_context(|| format!("{table} is not a table of this database"))?;
 
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("opening {}", path.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening {}", path.display()))?;
 
     let total: u64 =
         conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| row.get(0))?;
@@ -219,13 +217,7 @@ pub fn table_page(path: &Path, table: &str, offset: u64, limit: u64) -> Result<T
 /// impossible by construction, there is no WHERE the caller controls), and the value is
 /// bound as a parameter. An empty rowid (WITHOUT ROWID table) is refused. The literal
 /// text `NULL` writes a real NULL, mirroring how the grid renders one.
-pub fn update_cell(
-    path: &Path,
-    table: &str,
-    column: &str,
-    rowid: i64,
-    value: &str,
-) -> Result<()> {
+pub fn update_cell(path: &Path, table: &str, column: &str, rowid: i64, value: &str) -> Result<()> {
     let schema = sqlite_schema(path)?;
     let known = schema
         .iter()
@@ -235,11 +227,9 @@ pub fn update_cell(
         bail!("{column} is not a column of {table}");
     }
 
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .with_context(|| format!("opening {} for write", path.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("opening {} for write", path.display()))?;
 
     // The column name cannot be a bound parameter, so it is quoted; it was just validated
     // against the schema, so it is a real identifier, not attacker input.
@@ -288,11 +278,9 @@ pub fn insert_row(path: &Path, table: &str, values: &[(String, String)]) -> Resu
         }
     }
 
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .with_context(|| format!("opening {} for write", path.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("opening {} for write", path.display()))?;
 
     if values.is_empty() {
         conn.execute(&format!("INSERT INTO \"{table}\" DEFAULT VALUES"), [])
@@ -302,8 +290,7 @@ pub fn insert_row(path: &Path, table: &str, values: &[(String, String)]) -> Resu
 
     // `"col1", "col2"` and `?1, ?2` — columns validated above, values bound.
     let columns = values.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-    let placeholders =
-        (1..=values.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    let placeholders = (1..=values.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
     let sql = format!("INSERT INTO \"{table}\" ({columns}) VALUES ({placeholders})");
 
     let params: Vec<rusqlite::types::Value> = values
@@ -409,11 +396,9 @@ mod tests {
             .execute_batch("CREATE TABLE t (id INTEGER)")
             .unwrap();
 
-        let conn = rusqlite::Connection::open_with_flags(
-            &db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         assert!(
             conn.execute("DROP TABLE t", []).is_err(),
             "read-only is a connection flag, not a discipline"

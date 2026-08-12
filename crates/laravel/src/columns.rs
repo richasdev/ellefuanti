@@ -63,16 +63,8 @@ const COLUMN_METHODS: [&str; 11] = [
 /// The builder methods whose first argument names a *relationship* instead. `with` takes
 /// dotted nested paths (`posts.comments`); only the model's own first segment is knowable
 /// from one class's index rows, which is the piece the completion offers.
-const RELATION_METHODS: [&str; 8] = [
-    "with",
-    "load",
-    "has",
-    "whereHas",
-    "orWhereHas",
-    "doesntHave",
-    "whereDoesntHave",
-    "withCount",
-];
+const RELATION_METHODS: [&str; 8] =
+    ["with", "load", "has", "whereHas", "orWhereHas", "doesntHave", "whereDoesntHave", "withCount"];
 
 /// Finds the column context containing `offset`, if the cursor sits inside the first
 /// argument of a column-taking builder call whose chain root is readable.

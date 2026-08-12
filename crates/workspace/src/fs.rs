@@ -197,9 +197,8 @@ pub fn rename(from: &Path, new_name: &str) -> Result<PathBuf> {
 /// - a drop into the directory it already lives in is an honest no-op, not an error, so a
 ///   shaky hand does not produce a toast.
 pub fn move_entry(source: &Path, dest_dir: &Path, root: &Path) -> Result<PathBuf> {
-    let name = source
-        .file_name()
-        .with_context(|| format!("{} has no file name", source.display()))?;
+    let name =
+        source.file_name().with_context(|| format!("{} has no file name", source.display()))?;
 
     let real_root = root.canonicalize().with_context(|| format!("resolving {}", root.display()))?;
     for end in [source.parent().unwrap_or(root), dest_dir] {

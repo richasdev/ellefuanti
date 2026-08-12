@@ -923,7 +923,8 @@ $função = ação();
 
     #[test]
     fn an_exact_match_outranks_every_prefix() {
-        let all = vec![item("users_count", CompletionSource::Lsp), item("users", CompletionSource::Lsp)];
+        let all =
+            vec![item("users_count", CompletionSource::Lsp), item("users", CompletionSource::Lsp)];
         let matched = filter_items(&all, "users");
         assert_eq!(matched[0].label, "users", "typing the whole word puts it first");
     }
@@ -954,10 +955,8 @@ $função = ação();
 
     #[test]
     fn a_shorter_label_ranks_first_because_it_completes_less() {
-        let all = vec![
-            item("str_replace", CompletionSource::Lsp),
-            item("strlen", CompletionSource::Lsp),
-        ];
+        let all =
+            vec![item("str_replace", CompletionSource::Lsp), item("strlen", CompletionSource::Lsp)];
         let matched = filter_items(&all, "str");
         assert_eq!(matched[0].label, "strlen");
     }
@@ -967,10 +966,8 @@ $função = ação();
         // Stability is what keeps the server's own relevance order meaningful within a
         // rank band — sort_by is stable, and this is the test that notices if the key
         // ever accidentally includes something that reshuffles equals.
-        let all = vec![
-            item("strlen", CompletionSource::Lsp),
-            item("strtok", CompletionSource::Lsp),
-        ];
+        let all =
+            vec![item("strlen", CompletionSource::Lsp), item("strtok", CompletionSource::Lsp)];
         let matched = filter_items(&all, "str");
         assert_eq!(matched[0].label, "strlen");
         assert_eq!(matched[1].label, "strtok");

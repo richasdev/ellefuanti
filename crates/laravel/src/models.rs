@@ -412,7 +412,8 @@ class Post extends Model {
 
     #[test]
     fn guarded_columns_are_facts_too() {
-        let src = "<?php\nclass User extends Model {\n  protected $guarded = ['id', 'is_admin'];\n}\n";
+        let src =
+            "<?php\nclass User extends Model {\n  protected $guarded = ['id', 'is_admin'];\n}\n";
         let facts = extract_model(src).expect("a model");
         assert_eq!(facts.guarded, ["id", "is_admin"]);
     }

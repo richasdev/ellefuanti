@@ -674,5 +674,4 @@ mod tests {
         settings.set_autosave(true);
         assert!(settings.autosave());
     }
-
 }
