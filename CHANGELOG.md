@@ -5,7 +5,11 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-08-12
+
+First release. A working native IDE for PHP, Laravel, Livewire and Blade — GPU-accelerated,
+written in Rust on [GPUI](https://gpui.rs). Verified in daily use against a real Laravel
+project (see #35).
 
 ### Added
 
@@ -40,6 +44,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   `render_activity_bar` zips it positionally and `zip` stops at the shorter side, so an
   insertion among the first seven would have shifted every panel's glyph with nothing
   failing. Both guards were mutation-checked by performing that insertion.
+
 - **The completion popup, at the cursor, with visible provenance** (#61). `crates/app/src/completion.rs`
   is a list anchored to the caret that filters as you type, moves with the arrows, accepts on
   Enter or Tab and dismisses on Escape. Two real sources feed it: the language server, via
@@ -47,17 +52,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   and #83's Laravel route names. ⌃space moved off #83's palette stopgap and onto this.
 
   **Provenance is carried in the type, not attached at render time.** `CompletionItem.source`
-  is a non-optional `CompletionSource`, stamped where the item is *born*: LSP items get theirs
+  is a non-optional `CompletionSource`, stamped where the item is _born_: LSP items get theirs
   at the point the response is decoded, route names at the point they come back from the route
   parser. This is #20's requirement — "a column derived from a migration is a different kind of
   claim than a guess from a method name" — and the reason it is a field rather than a badge
-  chosen by the row renderer is that a renderer would have to *infer* it from the label, which
+  chosen by the row renderer is that a renderer would have to _infer_ it from the label, which
   is precisely the confident wrongness RISKS.md #4 is about. Two items with the same label from
   different sources are different claims, and `a_completion_carries_its_source_rather_than_inferring_it`
   is that stated as a test.
 
   **Cancellation, not queueing, and it is real rather than nominal.** Every keystroke that
-  narrows the list supersedes the request in flight: the task is dropped *and* `$/cancelRequest`
+  narrows the list supersedes the request in flight: the task is dropped _and_ `$/cancelRequest`
   goes out, which is the half that stops the server computing and reclaims its pending slot.
   Measured against a real Intelephense — a cancelled request resolves in **334 ns** where the
   wait would otherwise have run its full two seconds. `Job::Completion` is deliberately a
@@ -72,7 +77,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
   **The popup holds focus, so typing is forwarded rather than swallowed.** Focus has to be on
   the popup for its key context to be active; a character typed there is reported to the
-  workspace, inserted into the buffer through the ordinary `insert_with_pairs` path, and *then*
+  workspace, inserted into the buffer through the ordinary `insert_with_pairs` path, and _then_
   used to narrow the list. Handling it in the popup would have left the character in the filter
   and never in the file.
 
@@ -557,7 +562,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   the tests assert that every style has a distinct colour and that nothing is invisible
   against its own background, which is not the same as readable (#35).
 
-## [0.1.0] — unreleased
+### The foundation (Milestone 1)
 
 First release. A working editor foundation for PHP, Laravel, Livewire and Blade — native,
 GPU-accelerated, written in Rust on [GPUI](https://gpui.rs).
