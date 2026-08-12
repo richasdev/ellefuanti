@@ -4107,6 +4107,68 @@ async fn losing_focus_autosaves_dirty_tabs(cx: &mut TestAppContext) {
     draw(cx);
 }
 
+/// Typing into the git panel's commit box builds the message, and Enter commits only
+/// when something is staged (#64 item 4).
+///
+/// This pins the *state* path — keystroke to `commit_message` to `CommitRequested` —
+/// through the same shared-tail door the palette uses, because a `KeyDownEvent` cannot
+/// be conjured headlessly. What it cannot pin is the focus wiring that was the actual
+/// bug: whether a click on the box puts the panel in the window's focus path so real
+/// keystrokes arrive at all. That stays on issue #35's human list.
+#[gpui::test]
+async fn typing_in_the_commit_box_builds_the_message_and_enter_guards_on_staged(
+    cx: &mut TestAppContext,
+) {
+    use elle_git::{FileStatus, RepoStatus, Status};
+
+    use crate::git_panel::{GitEvent, GitPanel, PanelState};
+
+    install_theme(cx);
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+
+    let (panel, subscription) = cx.update(|cx| {
+        use gpui::AppContext as _;
+        let panel = cx.new(GitPanel::new);
+        let sink = committed.clone();
+        let subscription = cx.subscribe(&panel, move |_panel, event, _cx| {
+            if let GitEvent::CommitRequested { message } = event {
+                sink.borrow_mut().push(message.clone());
+            }
+        });
+        (panel, subscription)
+    });
+
+    panel.update(cx, |panel, cx| {
+        panel.type_for_test("fix: caret!", cx);
+        assert_eq!(panel.commit_message_for_test(), "fix: caret!");
+        panel.backspace_for_test(cx);
+        assert_eq!(panel.commit_message_for_test(), "fix: caret", "backspace pops one char");
+
+        // Nothing staged yet: Enter must be a no-op, not a commit of nothing.
+        panel.commit_for_test(cx);
+    });
+    assert!(committed.borrow().is_empty(), "no staged file, no commit");
+
+    panel.update(cx, |panel, cx| {
+        panel.set_state(
+            PanelState::Repo(RepoStatus {
+                branch: Some("main".to_string()),
+                files: vec![FileStatus {
+                    path: std::path::PathBuf::from("/r/a.php"),
+                    relative: "a.php".to_string(),
+                    status: Status::Modified,
+                    staged: true,
+                }],
+                cancelled: false,
+            }),
+            cx,
+        );
+        panel.commit_for_test(cx);
+    });
+    assert_eq!(*committed.borrow(), ["fix: caret"], "staged + message = commit");
+    drop(subscription);
+}
+
 /// Opening a table from the Database panel loads its rows into the view (#65).
 #[gpui::test]
 async fn opening_a_db_table_shows_its_rows(cx: &mut TestAppContext) {

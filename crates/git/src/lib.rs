@@ -216,10 +216,10 @@ pub struct LogEntry {
 pub fn log(root: &Path, limit: usize) -> anyhow::Result<Vec<LogEntry>> {
     // %x1f is the ASCII unit separator — it cannot appear in a hash, and a subject
     // containing one is pathological enough to accept a mis-split over quoting.
-    let format = format!("--pretty=format:%h%x1f%s");
+    let format = "--pretty=format:%h%x1f%s";
     let out = run_git(
         root,
-        &["log", "--graph", "--decorate", &format!("--max-count={limit}"), &format],
+        &["log", "--graph", "--decorate", &format!("--max-count={limit}"), format],
     )?;
     Ok(out.lines().map(parse_log_line).collect())
 }
