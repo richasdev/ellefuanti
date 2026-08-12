@@ -255,6 +255,28 @@ pub fn update_cell(
     Ok(())
 }
 
+/// Inserts one empty row and returns its `rowid`, for the "add row" button (#65).
+///
+/// A blank row the user then fills with the cell editor — the TablePlus "+ row" shape.
+/// `INSERT INTO t DEFAULT VALUES` fills every column with its default (NULL where none),
+/// which is the honest empty row; a NOT NULL column with no default makes sqlite refuse,
+/// and that error is surfaced rather than worked around (the row genuinely cannot be
+/// blank). The table name is schema-validated first, like every write here.
+pub fn insert_empty_row(path: &Path, table: &str) -> Result<i64> {
+    let schema = sqlite_schema(path)?;
+    if !schema.iter().any(|info| info.name == table) {
+        bail!("{table} is not a table of this database");
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .with_context(|| format!("opening {} for write", path.display()))?;
+    conn.execute(&format!("INSERT INTO \"{table}\" DEFAULT VALUES"), [])
+        .with_context(|| format!("inserting a row into {table}"))?;
+    Ok(conn.last_insert_rowid())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +446,29 @@ mod page_tests {
         assert_eq!(table_page(&db, "users", 0, 10).unwrap().total, 3);
         // A rowid that does not exist changes nothing and says so.
         assert!(update_cell(&db, "users", "email", 9999, "x").is_err());
+    }
+
+    #[test]
+    fn insert_empty_row_adds_a_blank_row_then_a_cell_edit_fills_it() {
+        let (_dir, db) = seeded();
+        let before = table_page(&db, "users", 0, 100).unwrap().total;
+
+        let rowid = insert_empty_row(&db, "users").unwrap();
+        let after = table_page(&db, "users", 0, 100).unwrap();
+        assert_eq!(after.total, before + 1, "one row added");
+        // The new row is blank (its non-pk columns are NULL) and editable by its rowid.
+        update_cell(&db, "users", "email", rowid, "fresh@x").unwrap();
+        let page = table_page(&db, "users", 0, 100).unwrap();
+        let row = page.rowids.iter().position(|r| *r == Some(rowid)).unwrap();
+        assert_eq!(page.rows[row][1], "fresh@x", "the added row was filled by a cell edit");
+    }
+
+    #[test]
+    fn insert_refuses_a_bad_table_name() {
+        let (_dir, db) = seeded();
+        assert!(insert_empty_row(&db, "ghosts").is_err());
+        assert!(insert_empty_row(&db, "users\"; DROP TABLE users; --").is_err());
+        assert_eq!(table_page(&db, "users", 0, 10).unwrap().total, 3, "table intact");
     }
 
     #[test]

@@ -4493,3 +4493,38 @@ async fn editing_a_db_cell_writes_it_to_the_database(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// The "+ Add row" button inserts a blank row into the open table (#65).
+#[gpui::test]
+async fn adding_a_db_row_inserts_it_into_the_database(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    let db = dir.path().join("database/database.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);
+                        INSERT INTO tags (name) VALUES ('one');").unwrap();
+    drop(conn);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.open_db_table_for_test("tags", cx);
+    });
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| workspace.db_insert_row_for_test(cx));
+    cx.run_until_parked();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 2, "a blank row was inserted");
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let (_, rows) = workspace.db_table_for_test().expect("table open");
+        assert_eq!(rows.unwrap().len(), 2, "the view re-read and shows the new row");
+    });
+
+    draw(cx);
+}

@@ -1327,6 +1327,11 @@ impl WorkspaceView {
     }
 
     #[cfg(test)]
+    pub fn db_insert_row_for_test(&mut self, cx: &mut Context<Self>) {
+        self.db_insert_row(cx);
+    }
+
+    #[cfg(test)]
     pub fn db_edit_flow_for_test(
         &mut self,
         row: usize,
@@ -7118,6 +7123,34 @@ impl WorkspaceView {
     /// The write is guarded in the crate (rowid-addressed, name-validated, one row). An
     /// empty buffer writes an empty string; the user who wants a real NULL types `NULL`,
     /// mirroring how the grid shows one.
+    /// Adds a blank row to the open table and re-reads it (#65). The user then fills the
+    /// cells with the inline editor — the TablePlus "+ row" shape.
+    fn db_insert_row(&mut self, cx: &mut Context<Self>) {
+        let Some((table, Ok(_))) = &self.db_table else { return };
+        let table = table.clone();
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move {
+                    let path =
+                        elle_db::env_database(&root).ok_or_else(|| "no sqlite database".to_string())?;
+                    elle_db::insert_empty_row(&path, &table)
+                        .map_err(|err| format!("{err:#}"))
+                        .map(|_rowid| table)
+                })
+                .await;
+            this.update(cx, |this, cx| match outcome {
+                Ok(table) => this.open_db_table(table, cx),
+                Err(message) => {
+                    this.status = Some(format!("insert failed: {message}").into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.jobs.start(Job::DbSchema, task);
+    }
+
     fn db_edit_commit(&mut self, cx: &mut Context<Self>) {
         let Some((row, col, buffer)) = self.db_editing.take() else { return };
         let Some((table, Ok(page))) = &self.db_table else { return };
@@ -7349,6 +7382,7 @@ impl WorkspaceView {
                     })),
             );
 
+        let add_entity = self_entity_for_cells.clone();
         outer
             .child(
                 div()
@@ -7356,9 +7390,25 @@ impl WorkspaceView {
                     .flex_none()
                     .flex()
                     .items_center()
+                    .gap_3()
                     .px_3()
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(header)),
+                    .child(div().text_color(theme.text_muted).child(SharedString::from(header)))
+                    // "+ Add row" inserts a blank row the cell editor then fills — the
+                    // create half of #65's data editing. Text label, not colour, so the
+                    // affordance reads in any theme.
+                    .child(
+                        div()
+                            .id("db-add-row")
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(theme.text)
+                            .hover(|el| el.bg(theme.hover))
+                            .child("+ Add row")
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                add_entity.update(cx, |this, cx| this.db_insert_row(cx));
+                            }),
+                    ),
             )
             .child(scroll)
     }
