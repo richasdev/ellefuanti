@@ -73,6 +73,9 @@ pub const ICONS: &[Icon] = icons![
     "chevron-right",
     "folder",
     "folder-opened",
+    // Explorer header controls.
+    "expand-all",
+    "collapse-all",
     // File types.
     "file",
     "file-code",
@@ -106,6 +109,9 @@ pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
 pub const FOLDER: &str = "icons/folder.svg";
 pub const FOLDER_OPENED: &str = "icons/folder-opened.svg";
 pub const FILE: &str = "icons/file.svg";
+/// The explorer header's expand-all / collapse-all buttons (VS Code's toolbar pair).
+pub const EXPAND_ALL: &str = "icons/expand-all.svg";
+pub const COLLAPSE_ALL: &str = "icons/collapse-all.svg";
 
 /// The icon for a file, chosen from its name.
 ///
@@ -311,7 +317,8 @@ mod tests {
     /// each answer loads turns every one of those into a compile-time-ish failure.
     #[test]
     fn every_named_path_is_in_the_table() {
-        let mut paths = vec![CHEVRON_DOWN, CHEVRON_RIGHT, FOLDER, FOLDER_OPENED, FILE];
+        let mut paths =
+            vec![CHEVRON_DOWN, CHEVRON_RIGHT, FOLDER, FOLDER_OPENED, FILE, EXPAND_ALL, COLLAPSE_ALL];
 
         for name in [
             "User.php",
