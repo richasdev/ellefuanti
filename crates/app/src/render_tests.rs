@@ -4168,3 +4168,80 @@ async fn typing_in_the_commit_box_builds_the_message_and_enter_guards_on_staged(
     assert_eq!(*committed.borrow(), ["fix: caret"], "staged + message = commit");
     drop(subscription);
 }
+
+/// Opening a table from the Database panel loads its rows into the view (#65).
+#[gpui::test]
+async fn opening_a_db_table_shows_its_rows(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    std::fs::write(dir.path().join(".env"), "DB_CONNECTION=sqlite\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("database")).unwrap();
+    let db = dir.path().join("database/database.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+         INSERT INTO users (email) VALUES ('a@x'), (NULL);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, _window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.open_db_table_for_test("users", cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _cx| {
+        let (name, rows) = workspace.db_table_for_test().expect("a table is open");
+        assert_eq!(name, "users");
+        let rows = rows.expect("read ok");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ["1", "a@x"]);
+        assert_eq!(rows[1][1], "NULL", "NULL shows as the word, not empty");
+    });
+
+    draw(cx);
+}
+
+/// The Git: Log palette shows the commit graph, newest first (#64).
+#[gpui::test]
+async fn the_git_log_palette_shows_the_graph(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = project();
+    let run = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@t"]);
+    run(&["config", "user.name", "t"]);
+    std::fs::write(dir.path().join("a.php"), "<?php\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "first commit"]);
+    std::fs::write(dir.path().join("b.php"), "<?php\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "second commit"]);
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_folder_for_test(dir.path().to_path_buf(), cx);
+        workspace.toggle_palette_for_test(crate::palette::PaletteMode::GitLog, window, cx);
+    });
+    cx.run_until_parked();
+
+    let labels = workspace.read_with(cx, |workspace, cx| workspace.palette_labels_for_test(cx));
+    assert!(labels.len() >= 2, "both commits listed: {labels:?}");
+    assert!(labels[0].contains("second commit"), "newest first: {labels:?}");
+    assert!(labels[0].contains('*'), "the graph column is there: {labels:?}");
+
+    draw(cx);
+}

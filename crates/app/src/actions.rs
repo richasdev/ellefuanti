@@ -464,6 +464,7 @@ pub enum Dispatch {
     GitFetch,
     GitPush,
     GitSwitchBranch,
+    GitLog,
     ToggleLogPanel,
     ComposerInstall,
     ComposerUpdate,
@@ -522,6 +523,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "git.fetch" => Dispatch::GitFetch,
         "git.push" => Dispatch::GitPush,
         "git.switch_branch" => Dispatch::GitSwitchBranch,
+        "git.log" => Dispatch::GitLog,
         "editor.fold_all" => Dispatch::FoldAll,
         "editor.unfold_all" => Dispatch::UnfoldAll,
         // `palette.toggle` is how you got here; re-running it is a no-op by design.

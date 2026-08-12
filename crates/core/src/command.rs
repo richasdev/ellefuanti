@@ -193,6 +193,7 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("git.fetch", "Git: Fetch"),
     Command::new("git.push", "Git: Push"),
     Command::new("git.switch_branch", "Git: Switch Branch…"),
+    Command::new("git.log", "Git: Log"),
     Command::new("editor.fold_all", "Fold All"),
     Command::new("editor.unfold_all", "Unfold All"),
     // #100: ⌘, is the panel; the file keeps a named door for the people who prefer it.

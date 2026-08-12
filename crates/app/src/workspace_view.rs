@@ -548,6 +548,10 @@ pub struct WorkspaceView {
     /// The Docker panel's state (#25): `None` before first entry, then services or the
     /// daemon's own words about why not.
     docker_services: Option<std::result::Result<Vec<(String, bool)>, String>>,
+    /// The table whose rows fill the editor area (#65), like the git diff does for a
+    /// selected file: not a tab (nothing to edit or close), just a read-only view that
+    /// shows while a table is picked and vanishes when the sidebar leaves Database.
+    db_table: Option<(String, std::result::Result<elle_db::TablePage, String>)>,
     /// The source control panel (#64), and whether it is the visible sidebar.
     ///
     /// Always constructed rather than `Option`, unlike the terminal and the find bar: those
@@ -652,6 +656,7 @@ impl WorkspaceView {
             pending_code_actions: Vec::new(),
             db_schema: None,
             docker_services: None,
+            db_table: None,
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -1205,6 +1210,29 @@ impl WorkspaceView {
         self.load_docker_services(cx);
         self.sidebar = Sidebar::Docker;
         cx.notify();
+    }
+
+    /// Opens a table's rows and returns what the grid would show, for tests.
+    #[cfg(test)]
+    pub fn open_db_table_for_test(
+        &mut self,
+        table: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_db_table(table.to_string(), cx);
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)] // a test observer; the shape is the panel's own
+    pub fn db_table_for_test(
+        &self,
+    ) -> Option<(String, std::result::Result<Vec<Vec<String>>, String>)> {
+        self.db_table.as_ref().map(|(name, result)| {
+            (
+                name.clone(),
+                result.as_ref().map(|page| page.rows.clone()).map_err(|m| m.clone()),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -3809,7 +3837,8 @@ impl WorkspaceView {
             | PaletteMode::Rename
             | PaletteMode::CodeActions
             | PaletteMode::Branches
-            | PaletteMode::ComposerScripts => Vec::new(),
+            | PaletteMode::ComposerScripts
+            | PaletteMode::GitLog => Vec::new(),
         };
 
         let palette = cx.new(|cx| Palette::new(mode, items, cx));
@@ -3846,6 +3875,7 @@ impl WorkspaceView {
             }
             PaletteMode::Branches => self.load_branch_items(palette, cx),
             PaletteMode::ComposerScripts => self.load_composer_script_items(palette, cx),
+            PaletteMode::GitLog => self.load_git_log_items(palette, cx),
             PaletteMode::Commands
             | PaletteMode::Languages
             | PaletteMode::Rename
@@ -5651,6 +5681,10 @@ impl WorkspaceView {
             Some(PaletteMode::ComposerScripts) => {
                 self.type_terminal_command(&format!("composer run-script {id} "), window, cx);
             }
+            // #64. The log is read-only for now — a commit detail view is the next
+            // slice, and until it exists confirming a row does nothing rather than
+            // pretending to.
+            Some(PaletteMode::GitLog) => {}
             // #64. The id is the branch name; the dirty-tree guard lives in the crate.
             Some(PaletteMode::Branches) => self.run_git_operation(
                 move |root| elle_git::switch_branch(&root, &id).map(|_| format!("On {id}")),
@@ -5773,6 +5807,7 @@ impl WorkspaceView {
                     Dispatch::GitSwitchBranch => {
                         self.toggle_palette(PaletteMode::Branches, window, cx)
                     }
+                    Dispatch::GitLog => self.toggle_palette(PaletteMode::GitLog, window, cx),
                     Dispatch::FoldAll => {
                         if let Some(editor) = self.active_editor().cloned() {
                             editor.update(cx, |editor, cx| editor.fold_all(cx));
@@ -6211,6 +6246,17 @@ impl Render for WorkspaceView {
                     .border_color(theme.border)
                     .text_color(theme.text_muted)
                     .text_size(px(12.0))
+                    // Painting our own strip took the real titlebar's behaviour with it
+                    // (#owner report: double-click no longer fills the screen). This
+                    // hands the gesture back to the platform rather than hard-coding
+                    // zoom, because macOS lets the user pick what a titlebar
+                    // double-click does — Zoom, Fill, Minimize, or nothing — and
+                    // `titlebar_double_click` reads that preference.
+                    .on_mouse_down(MouseButton::Left, |event, window, _cx| {
+                        if event.click_count == 2 {
+                            window.titlebar_double_click();
+                        }
+                    })
                     // The app's name, not the folder's — the owner's call, and the tab
                     // bar plus the tree header already say what is open.
                     .child("ellefuanti"),
@@ -6357,6 +6403,10 @@ impl Render for WorkspaceView {
 /// guards the icons and leaves the array the renderer actually zips unguarded. Renaming a
 /// panel here would have kept the test green while every glyph shifted one place. There is
 /// one list now, and the test reads it.
+/// Rows per page in the database table view (#65) — a screenful, not a SELECT * on a
+/// production table (the #65 rule). Paging beyond the first is the next slice.
+const DB_PAGE_SIZE: u64 = 200;
+
 const ACTIVITY_PANELS: [(&str, Option<Sidebar>); 7] = [
     ("Explorer", Some(Sidebar::Explorer)),
     ("Search", Some(Sidebar::Search)),
@@ -6595,6 +6645,93 @@ impl WorkspaceView {
         self.jobs.start(Job::GitWrite, task);
     }
 
+    /// Opens a table's first page of rows in the editor area (#65).
+    fn open_db_table(&mut self, table: String, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        // Show the header immediately (selected state), fill the rows when the read lands.
+        self.db_table = Some((table.clone(), Ok(elle_db::TablePage {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            total: 0,
+        })));
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_spawn(async move {
+                    let path = elle_db::env_database(&root)
+                        .ok_or_else(|| "no sqlite database".to_string())?;
+                    // The first page; paging is the panel's next slice.
+                    elle_db::table_page(&path, &table, 0, DB_PAGE_SIZE)
+                        .map_err(|err| format!("{err:#}"))
+                        .map(|page| (table, page))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.db_table = Some(match page {
+                    Ok((table, page)) => (table, Ok(page)),
+                    Err(message) => (
+                        this.db_table.as_ref().map(|(name, _)| name.clone()).unwrap_or_default(),
+                        Err(message),
+                    ),
+                });
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::DbSchema, task);
+    }
+
+    /// The table-rows grid for the editor area — headers, then rows, NULL distinct.
+    fn render_db_table_view(&self, theme: &Theme) -> gpui::Div {
+        let Some((name, result)) = &self.db_table else {
+            return div();
+        };
+        let grid = div().size_full().flex().flex_col().overflow_hidden().px_3().py_2();
+        match result {
+            Err(message) => grid.child(
+                div().text_color(theme.text_muted).child(SharedString::from(message.clone())),
+            ),
+            Ok(page) => {
+                let header = format!(
+                    "{}  —  {} row(s){}",
+                    name,
+                    page.total,
+                    if page.total > DB_PAGE_SIZE { ", showing first page" } else { "" }
+                );
+                grid.child(
+                    div()
+                        .h(Metrics::TAB_HEIGHT)
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(header)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .gap_4()
+                        .text_color(theme.text)
+                        .children(page.columns.iter().map(|c| {
+                            div().min_w(px(120.0)).child(SharedString::from(c.clone()))
+                        })),
+                )
+                .child(div().flex_1().flex().flex_col().overflow_hidden().children(
+                    page.rows.iter().map(|row| {
+                        div()
+                            .flex()
+                            .gap_4()
+                            .text_color(theme.text_muted)
+                            .children(row.iter().map(|value| {
+                                div().min_w(px(120.0)).child(SharedString::from(value.clone()))
+                            }))
+                    }),
+                ))
+            }
+        }
+    }
+
     /// Reads the project database's schema on the background pool, superseding.
     fn load_db_schema(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
@@ -6622,7 +6759,7 @@ impl WorkspaceView {
 
     /// The schema browser's rows (#65): tables, their columns, types and the two
     /// shape markers. Text markers, not colour — `pk` and `?` survive every theme.
-    fn render_db_panel(&self, theme: &Theme) -> gpui::Div {
+    fn render_db_panel(&self, theme: &Theme, self_entity: &Entity<Self>) -> gpui::Div {
         let body = div().flex_1().flex().flex_col().overflow_hidden().px_3().py_2().gap_1();
         match &self.db_schema {
             None => body.child(
@@ -6635,11 +6772,26 @@ impl WorkspaceView {
                 body.child(div().text_color(theme.text_muted).child("The database has no tables"))
             }
             Some(Ok(tables)) => body.children(tables.iter().map(|table| {
+                let entity = self_entity.clone();
+                let name = table.name.clone();
+                let selected = self.db_table.as_ref().is_some_and(|(open, _)| open == &name);
                 div()
                     .flex()
                     .flex_col()
                     .child(
-                        div().text_color(theme.text).child(SharedString::from(table.name.clone())),
+                        // Click a table name to open its rows in the editor area — the
+                        // git-diff pattern: a read-only view, not a tab.
+                        div()
+                            .id(gpui::ElementId::Name(format!("db-table-{name}").into()))
+                            .px_1()
+                            .rounded_sm()
+                            .when(selected, |el| el.bg(theme.hover))
+                            .hover(|el| el.bg(theme.hover))
+                            .text_color(theme.text)
+                            .child(SharedString::from(table.name.clone()))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                entity.update(cx, |this, cx| this.open_db_table(name.clone(), cx));
+                            }),
                     )
                     .children(table.columns.iter().map(|column| {
                         let mut label = format!("  {}  {}", column.name, column.column_type);
@@ -6718,6 +6870,32 @@ impl WorkspaceView {
 
     fn type_docker_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.type_terminal_command(&format!("docker compose {command} "), window, cx);
+    }
+
+    /// Fills the palette with the commit graph — the log as a scrollable list (#64).
+    fn load_git_log_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
+        let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
+        let task = cx.spawn(async move |this, cx| {
+            let entries =
+                cx.background_spawn(async move { elle_git::log(&root, 200).unwrap_or_default() }).await;
+            let items = entries
+                .into_iter()
+                .map(|entry| {
+                    // The graph column, the short hash, the subject — the same three the
+                    // terminal shows, so the two agree. A graph-only connector line is a
+                    // label with no id; confirming it is a no-op, which is right.
+                    let label = if entry.hash.is_empty() {
+                        entry.graph
+                    } else {
+                        format!("{}{}  {}", entry.graph, entry.hash, entry.subject)
+                    };
+                    (label, entry.hash)
+                })
+                .collect();
+            palette.update(cx, |palette, cx| palette.set_items(items, cx)).ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.jobs.start(Job::RouteIndex, task);
     }
 
     /// Fills the composer-script palette from composer.json's own scripts.
@@ -6799,7 +6977,9 @@ impl WorkspaceView {
                     Some(panel) => panel.into_any_element(),
                     None => div().into_any_element(),
                 },
-                Sidebar::Database => self.render_db_panel(theme).into_any_element(),
+                Sidebar::Database => {
+                    self.render_db_panel(theme, &cx.entity()).into_any_element()
+                }
                 Sidebar::Docker => self.render_docker_panel(theme).into_any_element(),
                 Sidebar::Explorer => match self.tree.as_ref() {
                     // Wrapped so the empty space *below* the rows is right-clickable: that
@@ -7153,12 +7333,17 @@ impl WorkspaceView {
             _ => None,
         };
 
-        div().flex_1().overflow_hidden().child(match (diff, self.active_editor()) {
-            (Some((file, renderer)), _) => {
+        let db_table = matches!(self.sidebar, Sidebar::Database)
+            .then(|| self.db_table.as_ref())
+            .flatten();
+
+        div().flex_1().overflow_hidden().child(match (diff, db_table, self.active_editor()) {
+            (Some((file, renderer)), _, _) => {
                 render_diff(&file, renderer, theme, cx).into_any_element()
             }
-            (None, Some(editor)) => editor.clone().into_any_element(),
-            (None, None) => div()
+            (None, Some(_), _) => self.render_db_table_view(theme).into_any_element(),
+            (None, None, Some(editor)) => editor.clone().into_any_element(),
+            (None, None, None) => div()
                 .size_full()
                 .flex()
                 .items_center()
