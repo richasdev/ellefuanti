@@ -1297,7 +1297,10 @@ impl WorkspaceView {
             }
         });
 
-        let panel = cx.new(|cx| AiChatPanel::new(snapshot, cx));
+        // The open folder, so a Codex thread can be rooted at the project the user is
+        // looking at (#99) — that is how the CLI gets to read the code it is asked about.
+        let project_root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
+        let panel = cx.new(|cx| AiChatPanel::new(snapshot, project_root, cx));
         window.focus(&panel.read(cx).focus_handle(cx));
         self.ai_chat = Some(panel);
         cx.notify();

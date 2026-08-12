@@ -14,29 +14,38 @@
 //! tool. An HTTP client crate was measured against the 17 MB binary limit in #99 and
 //! declined; `curl -N --no-buffer` streams SSE line-by-line and a kill is a cancel.
 //!
-//! # Two wire formats, three providers
+//! # Two wire formats, four providers
 //!
 //! | Provider  | Wire      | Auth |
 //! |-----------|-----------|------|
 //! | Anthropic | Anthropic | API key from the Keychain (`x-api-key`) |
 //! | `ant` CLI | Anthropic | OAuth token from `ant auth print-credentials` (Bearer) |
 //! | Custom    | OpenAI    | Base URL + optional key — OpenAI, OpenRouter, local Ollama |
+//! | Codex     | *none*    | The user's own `codex login` — see [`crate::ai_codex`] |
 //!
 //! The two wire formats are deliberately *not* one abstraction with adapters: each is a
 //! body builder and an SSE parser, four small functions total, and #99 warns that one
 //! interface stretched over both fits neither.
+//!
+//! Codex is the odd one out and stays that way: it is a subprocess speaking JSON-RPC, not
+//! HTTP, so it has no [`Wire`] and never reaches [`resolve_auth`] or [`curl_args`]. That
+//! is why [`Provider::wire`] answers `Option` — "which wire" has no answer for a provider
+//! that is not on a wire, and a made-up one would send a chat body to a `curl` that has
+//! no URL to POST it to.
 
 use std::path::Path;
 use std::process::Command;
 
 use serde_json::{Value, json};
 
-/// Which backend the user configured (`ai.provider` in settings).
+/// Which backend the user configured (`ai.provider`, or `ai.chat_provider` for chat).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provider {
     Anthropic,
     AntCli,
     Custom,
+    /// The user's own `codex` CLI, driven as a subprocess (#99). Not HTTP, no key.
+    Codex,
 }
 
 impl Provider {
@@ -44,6 +53,7 @@ impl Provider {
         match value {
             "ant" => Provider::AntCli,
             "custom" => Provider::Custom,
+            "codex" => Provider::Codex,
             _ => Provider::Anthropic,
         }
     }
@@ -53,6 +63,7 @@ impl Provider {
             Provider::Anthropic => "anthropic",
             Provider::AntCli => "ant",
             Provider::Custom => "custom",
+            Provider::Codex => "codex",
         }
     }
 
@@ -61,15 +72,26 @@ impl Provider {
         match self {
             Provider::Anthropic => Provider::AntCli,
             Provider::AntCli => Provider::Custom,
-            Provider::Custom => Provider::Anthropic,
+            Provider::Custom => Provider::Codex,
+            Provider::Codex => Provider::Anthropic,
         }
     }
 
-    pub fn wire(self) -> Wire {
+    /// Which request format this provider speaks, or `None` when it is not on a wire at
+    /// all. Codex is a subprocess (#99): the callers that build bodies and `curl` argv
+    /// must branch on this rather than assume every provider POSTs somewhere.
+    pub fn wire(self) -> Option<Wire> {
         match self {
-            Provider::Anthropic | Provider::AntCli => Wire::Anthropic,
-            Provider::Custom => Wire::OpenAi,
+            Provider::Anthropic | Provider::AntCli => Some(Wire::Anthropic),
+            Provider::Custom => Some(Wire::OpenAi),
+            Provider::Codex => None,
         }
+    }
+
+    /// Whether a key can even be set for this provider. Codex holds its own login, so the
+    /// "Set API key…" button has nothing to write for it.
+    pub fn takes_api_key(self) -> bool {
+        self.wire().is_some()
     }
 }
 
@@ -131,6 +153,12 @@ pub fn resolve_auth(provider: Provider, base_url: &str) -> Result<Auth, String> 
                 headers.push(("Authorization".to_string(), format!("Bearer {key}")));
             }
             Ok(Auth { url: openai_endpoint(base_url), headers })
+        }
+        // Unreachable through the chat panel, which branches to the subprocess path
+        // before ever asking for auth — but a silent `Ok` with an empty URL would send a
+        // `curl` at nothing, so the impossible case says so instead of guessing.
+        Provider::Codex => {
+            Err("Codex is not an HTTP provider — it runs the `codex` CLI (#99)".to_string())
         }
     }
 }
@@ -358,10 +386,40 @@ mod tests {
 
     #[test]
     fn providers_round_trip_their_setting_names() {
-        for provider in [Provider::Anthropic, Provider::AntCli, Provider::Custom] {
+        for provider in [Provider::Anthropic, Provider::AntCli, Provider::Custom, Provider::Codex] {
             assert_eq!(Provider::from_setting(provider.setting_name()), provider);
         }
         assert_eq!(Provider::from_setting("gibberish"), Provider::Anthropic, "unknown → default");
+    }
+
+    #[test]
+    fn the_cycler_reaches_every_provider_and_comes_home() {
+        // A provider the cycler cannot reach is a provider the settings panel cannot
+        // select — which is how Codex would ship unusable.
+        let mut seen = vec![Provider::Anthropic];
+        let mut provider = Provider::Anthropic;
+        for _ in 0..4 {
+            provider = provider.next();
+            if provider != Provider::Anthropic {
+                seen.push(provider);
+            }
+        }
+        assert_eq!(seen.len(), 4, "every provider is one ‹ › away: {seen:?}");
+        assert!(seen.contains(&Provider::Codex));
+        assert_eq!(provider, Provider::Anthropic, "the cycle wraps");
+    }
+
+    #[test]
+    fn codex_is_not_on_a_wire_and_takes_no_key() {
+        // The two facts every caller branches on: no body to build, no key to store.
+        assert_eq!(Provider::Codex.wire(), None);
+        assert!(!Provider::Codex.takes_api_key());
+        for http in [Provider::Anthropic, Provider::AntCli, Provider::Custom] {
+            assert!(http.wire().is_some(), "{http:?} POSTs somewhere");
+            assert!(http.takes_api_key());
+        }
+        // And the HTTP auth path refuses it out loud rather than handing back an empty URL.
+        assert!(resolve_auth(Provider::Codex, "").is_err());
     }
 
     #[test]

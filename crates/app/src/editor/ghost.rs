@@ -189,8 +189,12 @@ pub async fn fetch_completion(
     use smol::io::{AsyncBufReadExt, AsyncWriteExt};
     use smol::stream::StreamExt;
 
+    // Ghost text is HTTP-only. Codex is a subprocess that takes seconds and reasons about
+    // a whole project — the opposite of what a between-keystrokes completion needs — so
+    // it is declined here rather than driven badly (#99). Silence is the failure mode a
+    // completion already has, and this string is for the log, not the user.
+    let wire = provider.wire().ok_or("the Codex provider does not do ghost completions")?;
     let auth = ai::resolve_auth(provider, &base_url)?;
-    let wire = provider.wire();
     let body = ai::chat_body(
         wire,
         &model,
