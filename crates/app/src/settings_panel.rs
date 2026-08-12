@@ -84,6 +84,13 @@ impl SettingsPanel {
     }
 
     /// Moves the theme picker one step through the registry, wrapping.
+    /// Flips the autosave flag and persists it — the panel toggle the owner asked for.
+    fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
+        let now = crate::settings::current(cx).autosave();
+        crate::settings::update_settings(cx, |settings| settings.set_autosave(!now));
+        cx.notify();
+    }
+
     fn cycle_theme(&mut self, forward: bool, cx: &mut Context<Self>) {
         let names = crate::themes::selectable_names(cx);
         if names.is_empty() {
@@ -209,6 +216,7 @@ impl Render for SettingsPanel {
                 &theme,
                 &entity,
             ),
+            row_toggle("Auto save", settings.autosave(), &theme, &entity),
         ];
 
         div()
@@ -296,6 +304,29 @@ fn row_picker(
     row(label, value, arrow("‹", false), arrow("›", true), theme)
 }
 
+/// A row with a single on/off control — a labelled button whose text IS the state, so
+/// the toggle needs no colour to be read (the house rule: nothing by colour alone).
+fn row_toggle(
+    label: &'static str,
+    on: bool,
+    theme: &crate::theme::Theme,
+    entity: &gpui::Entity<SettingsPanel>,
+) -> gpui::AnyElement {
+    let entity = entity.clone();
+    let button = div()
+        .id(label)
+        .px_2()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .when(on, |el| el.bg(theme.selected))
+        .hover(|el| el.bg(theme.hover))
+        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            entity.update(cx, |panel, cx| panel.toggle_autosave(cx));
+        })
+        .child(if on { "On" } else { "Off" });
+    row(label, String::new(), button, gpui::div().into_any_element(), theme)
+}
+
 /// A row with − value + controls.
 fn row_stepper(
     label: &'static str,
@@ -356,4 +387,5 @@ mod tests {
         assert_eq!(step_index(0, 3, false), 2, "backward wraps");
         assert_eq!(step_index(1, 1, true), 0, "a single entry cycles to itself");
     }
+
 }

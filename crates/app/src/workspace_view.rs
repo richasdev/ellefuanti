@@ -19,7 +19,7 @@ use gpui::{
 
 use crate::actions::{
     CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
-    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
+    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol, PushToRemote,
     IncreaseFontSize, QuickFix, RenameSymbol,
     NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
     RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ToggleCommandPalette,
@@ -548,6 +548,10 @@ pub struct WorkspaceView {
     /// The Docker panel's state (#25): `None` before first entry, then services or the
     /// daemon's own words about why not.
     docker_services: Option<std::result::Result<Vec<(String, bool)>, String>>,
+    /// Which schema tables show their columns expanded (#65). Empty = all collapsed,
+    /// which is the clean default the owner asked for — a list of table names, columns
+    /// on demand. Clicking a table name toggles it here.
+    db_expanded: std::collections::HashSet<String>,
     /// The table whose rows fill the editor area (#65), like the git diff does for a
     /// selected file: not a tab (nothing to edit or close), just a read-only view that
     /// shows while a table is picked and vanishes when the sidebar leaves Database.
@@ -657,6 +661,7 @@ impl WorkspaceView {
             db_schema: None,
             docker_services: None,
             db_table: None,
+            db_expanded: std::collections::HashSet::new(),
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -1032,10 +1037,18 @@ impl WorkspaceView {
 
             this.update(cx, |this, cx| {
                 match done {
-                    Ok(_) => {
+                    Ok(output) => {
                         // The commit box empties only on success; a hook's refusal must
                         // not eat the message the user typed.
                         this.git.update(cx, |panel, cx| panel.clear_commit_message(cx));
+                        // Say what happened, on the status line. The owner read a silent
+                        // commit as "só esconde" — git's own summary ("[main abc123] msg")
+                        // is the proof the commit landed. A staged-only write (no output)
+                        // stays quiet as before.
+                        let summary = output.lines().next().unwrap_or("").trim();
+                        if !summary.is_empty() {
+                            this.status = Some(format!("✓ {summary}  ·  ⇧⌥P to push").into());
+                        }
                     }
                     Err(err) => this.status = Some(format!("{err:#}").into()),
                 }
@@ -1220,6 +1233,16 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.open_db_table(table.to_string(), cx);
+    }
+
+    #[cfg(test)]
+    pub fn toggle_db_table_for_test(&mut self, table: &str, cx: &mut Context<Self>) {
+        self.toggle_db_table(table.to_string(), cx);
+    }
+
+    #[cfg(test)]
+    pub fn db_expanded_for_test(&self, table: &str) -> bool {
+        self.db_expanded.contains(table)
     }
 
     #[cfg(test)]
@@ -2958,11 +2981,38 @@ impl WorkspaceView {
         // Already open: this event cannot fire, because the popup holds focus and the
         // character reaches `completion_typed` instead. Guarded anyway — the two paths
         // narrowing the same popup would double every character in the query.
-        let declared = self.is_completion_trigger(text);
+        //
+        // Two ways a keystroke opens the popup. A server *trigger* character (`$`, `->`
+        // via `>`, `::` via `:`) opens it always. But the owner's report was that the
+        // LSP "felt weak" because it only popped on those symbols — VS Code/Zed pop while
+        // you type an identifier. So a *word* character opens it too, once a small prefix
+        // exists, so completing an ordinary name works without ⌥⌘I. The prefix floor
+        // keeps a single letter from opening a hundred-row list on every keystroke.
+        let declared = self.is_completion_trigger(text)
+            || self.should_open_on_word_char(text, cx);
         if !Self::should_open_on_trigger(self.completion.is_some(), declared) {
             return;
         }
         self.open_completion(CompletionTrigger::Character, window, cx);
+    }
+
+    /// Whether typing `text` (one keystroke) should open the popup as an
+    /// autocomplete-as-you-type, the VS Code behaviour (#20 follow-up).
+    ///
+    /// Only when a language server is present (buffer words alone are too weak a source
+    /// to interrupt with), only for a word character, and only once the word under the
+    /// cursor is at least `MIN_AUTOCOMPLETE_PREFIX` long — so `u`, `us` stay quiet and
+    /// `use` opens. That floor is what keeps this from firing a request on every letter.
+    fn should_open_on_word_char(&self, text: &str, cx: &Context<Self>) -> bool {
+        if self.lsp.client().is_none() {
+            return false;
+        }
+        let Some(editor) = self.active_editor() else { return false };
+        let document = &editor.read(cx).document;
+        let offset = document.selection.head;
+        let buffer_text = document.buffer.text();
+        let prefix = crate::completion::word_before(&buffer_text, offset);
+        word_char_reaches_prefix_floor(text, prefix)
     }
 
     /// Whether a character typed in the editor should open a popup.
@@ -4178,6 +4228,22 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.go_to_definition_at_cursor(window, cx);
+    }
+
+    /// Pushes the current branch (⇧⌥P, and the palette's Git: Push). One place so the
+    /// chord and the command cannot diverge; the CLI carries the user's credentials.
+    fn push_to_remote(&mut self, _: &PushToRemote, _window: &mut Window, cx: &mut Context<Self>) {
+        self.status = Some("Pushing…".into());
+        cx.notify();
+        self.run_git_operation(
+            |root| {
+                elle_git::push(&root).map(|out| {
+                    let out = out.trim();
+                    if out.is_empty() { "✓ Pushed".to_string() } else { out.to_string() }
+                })
+            },
+            cx,
+        );
     }
 
     /// Formats the whole document through the language server (#19, ⇧⌥F).
@@ -5856,13 +5922,7 @@ impl WorkspaceView {
                         |root| elle_git::fetch(&root).map(|_| "Fetched".to_string()),
                         cx,
                     ),
-                    Dispatch::GitPush => self.run_git_operation(
-                        |root| elle_git::push(&root).map(|out| {
-                            let out = out.trim();
-                            if out.is_empty() { "Pushed".to_string() } else { out.to_string() }
-                        }),
-                        cx,
-                    ),
+                    Dispatch::GitPush => self.push_to_remote(&PushToRemote, window, cx),
                     Dispatch::GitSwitchBranch => {
                         self.toggle_palette(PaletteMode::Branches, window, cx)
                     }
@@ -5952,6 +6012,18 @@ fn read_file_tail(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Str
     // Drop everything up to and including the first newline — the seam is mid-line.
     let start = bytes.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
     Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
+/// Whether one keystroke `text` is a word character AND the word already typed reaches
+/// the autocomplete floor — the pure half of `should_open_on_word_char`, testable
+/// without a language server (which the handler needs and a headless test lacks).
+fn word_char_reaches_prefix_floor(text: &str, prefix: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(c) = chars.next() else { return false };
+    if chars.next().is_some() || !(c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    prefix.chars().count() >= MIN_AUTOCOMPLETE_PREFIX
 }
 
 /// One indexed column as a popup item, provenance in the detail (`string · migration`).
@@ -6286,6 +6358,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::format_document))
+            .on_action(cx.listener(Self::push_to_remote))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::quick_fix))
             .on_action(cx.listener(Self::find_references))
@@ -6390,6 +6463,11 @@ impl Render for WorkspaceView {
                     .size_full()
                     .flex()
                     .justify_center()
+                    // Cross-axis start, not the flex default of `stretch`: the panel is
+                    // content-sized (`max_h`, no `h`), and stretch would override that and
+                    // pull it to the full window height. `justify_center` still centres it
+                    // horizontally; `items_start` keeps its own `mt(90)` as the top offset.
+                    .items_start()
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                         entity.update(cx, |this, cx| this.dismiss_palette(window, cx));
                     })
@@ -6558,6 +6636,12 @@ const DB_CELL_WIDTH: gpui::Pixels = px(180.0);
 /// The most log entries the panel keeps (#25) — a viewer, not an archive. Paired with
 /// the tail read below so a megabyte log costs a bounded read and a bounded row count.
 const LOG_MAX_ENTRIES: usize = 500;
+
+/// How many characters of a word must be typed before autocomplete opens on its own
+/// (#20 follow-up). VS Code uses 1 with a debounce; without a debounce, 3 keeps a stray
+/// letter from opening a full list on every keystroke while still feeling immediate on a
+/// real identifier. ⌥⌘I opens it at any length for the user who wants it sooner.
+const MIN_AUTOCOMPLETE_PREFIX: usize = 3;
 
 /// Rows per page in the database table view (#65) — a screenful, not a SELECT * on a
 /// production table (the #65 rule). Paging beyond the first is the next slice.
@@ -6813,6 +6897,18 @@ impl WorkspaceView {
         self.jobs.start(Job::GitWrite, task);
     }
 
+    /// Toggles a schema table's expanded columns and opens its rows (#65).
+    ///
+    /// One click does both: expand the column list in the panel and load the rows in the
+    /// main view. Clicking an already-expanded table collapses its columns but keeps the
+    /// rows open — the columns are the clutter to hide, the rows are what you came for.
+    fn toggle_db_table(&mut self, table: String, cx: &mut Context<Self>) {
+        if !self.db_expanded.insert(table.clone()) {
+            self.db_expanded.remove(&table);
+        }
+        self.open_db_table(table, cx);
+    }
+
     /// Opens a table's first page of rows in the editor area (#65).
     fn open_db_table(&mut self, table: String, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
@@ -6967,6 +7063,7 @@ impl WorkspaceView {
                 .await;
             this.update(cx, |this, cx| {
                 this.db_schema = Some(result);
+                this.db_expanded.clear();
                 cx.notify();
             })
             .ok();
@@ -6992,12 +7089,17 @@ impl WorkspaceView {
                 let entity = self_entity.clone();
                 let name = table.name.clone();
                 let selected = self.db_table.as_ref().is_some_and(|(open, _)| open == &name);
+                let expanded = self.db_expanded.contains(&name);
+                // The whole table starts collapsed — a clean list of names, columns on
+                // demand (the owner's "menos poluído"). The chevron is a text glyph, not
+                // colour, so the state reads in any theme.
+                let chevron = if expanded { "▾ " } else { "▸ " };
                 div()
                     .flex()
                     .flex_col()
                     .child(
-                        // Click a table name to open its rows in the editor area — the
-                        // git-diff pattern: a read-only view, not a tab.
+                        // Click a table name to expand its columns AND open its rows in
+                        // the editor area — one gesture, the git-diff read-only pattern.
                         div()
                             .id(gpui::ElementId::Name(format!("db-table-{name}").into()))
                             .px_1()
@@ -7005,12 +7107,12 @@ impl WorkspaceView {
                             .when(selected, |el| el.bg(theme.hover))
                             .hover(|el| el.bg(theme.hover))
                             .text_color(theme.text)
-                            .child(SharedString::from(table.name.clone()))
+                            .child(SharedString::from(format!("{chevron}{}", table.name)))
                             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                                entity.update(cx, |this, cx| this.open_db_table(name.clone(), cx));
+                                entity.update(cx, |this, cx| this.toggle_db_table(name.clone(), cx));
                             }),
                     )
-                    .children(table.columns.iter().map(|column| {
+                    .when(expanded, |el| el.children(table.columns.iter().map(|column| {
                         let mut label = format!("  {}  {}", column.name, column.column_type);
                         if column.primary_key {
                             label.push_str("  pk");
@@ -7019,7 +7121,7 @@ impl WorkspaceView {
                             label.push_str("  ?");
                         }
                         div().text_color(theme.text_muted).child(SharedString::from(label))
-                    }))
+                    })))
             })),
         }
     }
@@ -7443,17 +7545,25 @@ impl WorkspaceView {
         let active = self.active_tab;
 
         div()
+            // `id` + `overflow_x_scroll` is what gives the strip a horizontal scroll: the
+            // scroll methods live on `InteractiveElement`, which a div only becomes with an
+            // id (the same shape the db grid uses at `db-grid-scroll`). Without this the row
+            // is a plain flex container and many tabs either squeeze below legibility or
+            // overflow off the window edge with no way to reach them — the report.
+            .id("tab-strip")
             .h(Metrics::TAB_HEIGHT)
             .flex_none()
             .flex()
             .items_center()
+            .overflow_x_scroll()
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
             // Clearance for the macOS traffic lights: the titlebar is transparent (the
             // owner's screenshot was a white system strip over a dark theme), so this row
             // is the top of the window and the buttons overlay its left edge. 78px is
-            // the standard close/min/zoom footprint with breathing room.
+            // the standard close/min/zoom footprint with breathing room. This is padding,
+            // not a flex child, so the scroll container never shrinks it away.
             .pl(px(78.0))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let dirty = tab.editor.read(cx).is_dirty();
@@ -7470,6 +7580,16 @@ impl WorkspaceView {
                 div()
                     .id(("tab", index))
                     .flex()
+                    // `flex_none` is the other half of the scroll fix: in a plain flex row
+                    // the tabs shrink to share the width, which is the "squeeze" — with many
+                    // open, every tab loses its label before the strip ever overflows. Fixed
+                    // basis instead: each tab keeps a legible size and the strip scrolls once
+                    // they no longer fit. A min-width floors short names (`a.php`) so a tab is
+                    // always big enough to click; the label truncates below so a long name
+                    // does not run a single tab off the screen.
+                    .flex_none()
+                    .min_w(px(120.0))
+                    .max_w(px(240.0))
                     .items_center()
                     .gap_2()
                     .h_full()
@@ -7520,7 +7640,19 @@ impl WorkspaceView {
                                 .when_some(icon_color, |el, c| el.text_color(rgb(c))),
                         ),
                     )
-                    .child(SharedString::from(title))
+                    // The name takes the space between the icon and the close slot, and
+                    // truncates rather than widening the tab: `max_w` above only caps the tab
+                    // if the label yields, so this is what keeps a long file name inside it
+                    // (`whitespace_nowrap` + ellipsis, the tab-strip counterpart of the db
+                    // grid cell's clamp).
+                    .child(
+                        div()
+                            .flex_1()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(SharedString::from(title)),
+                    )
                     .child(
                         // One slot for both the dirty marker and the close button, so the
                         // tab width never shifts as the pointer crosses it. A dirty tab
@@ -7679,6 +7811,20 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn autocomplete_opens_on_a_word_char_only_past_the_prefix_floor() {
+        // A trigger char is handled separately; this is the type-an-identifier path.
+        // Below the floor stays quiet (no popup on every letter); at the floor it opens.
+        assert!(!word_char_reaches_prefix_floor("e", "us"), "'us' + 'e' -> prefix 'us', too short");
+        assert!(word_char_reaches_prefix_floor("e", "use"), "'use' + 'e' -> prefix 'use', opens");
+        // Not a single word character.
+        assert!(!word_char_reaches_prefix_floor("(", "getName"), "a symbol is the trigger path");
+        assert!(!word_char_reaches_prefix_floor("ab", "getName"), "one keystroke, not a paste");
+        assert!(!word_char_reaches_prefix_floor(" ", "getName"), "whitespace does not open it");
+        // A digit or underscore is a word character.
+        assert!(word_char_reaches_prefix_floor("_", "obj_"), "underscore is a word char");
+    }
 
     #[test]
     fn read_file_tail_returns_the_end_at_a_line_boundary() {
