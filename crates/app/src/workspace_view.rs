@@ -548,6 +548,10 @@ pub struct WorkspaceView {
     /// The Docker panel's state (#25): `None` before first entry, then services or the
     /// daemon's own words about why not.
     docker_services: Option<std::result::Result<Vec<(String, bool)>, String>>,
+    /// Which schema tables show their columns expanded (#65). Empty = all collapsed,
+    /// which is the clean default the owner asked for — a list of table names, columns
+    /// on demand. Clicking a table name toggles it here.
+    db_expanded: std::collections::HashSet<String>,
     /// The table whose rows fill the editor area (#65), like the git diff does for a
     /// selected file: not a tab (nothing to edit or close), just a read-only view that
     /// shows while a table is picked and vanishes when the sidebar leaves Database.
@@ -657,6 +661,7 @@ impl WorkspaceView {
             db_schema: None,
             docker_services: None,
             db_table: None,
+            db_expanded: std::collections::HashSet::new(),
             git,
             sidebar: Sidebar::default(),
             git_cancel: None,
@@ -1228,6 +1233,16 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.open_db_table(table.to_string(), cx);
+    }
+
+    #[cfg(test)]
+    pub fn toggle_db_table_for_test(&mut self, table: &str, cx: &mut Context<Self>) {
+        self.toggle_db_table(table.to_string(), cx);
+    }
+
+    #[cfg(test)]
+    pub fn db_expanded_for_test(&self, table: &str) -> bool {
+        self.db_expanded.contains(table)
     }
 
     #[cfg(test)]
@@ -6856,6 +6871,18 @@ impl WorkspaceView {
         self.jobs.start(Job::GitWrite, task);
     }
 
+    /// Toggles a schema table's expanded columns and opens its rows (#65).
+    ///
+    /// One click does both: expand the column list in the panel and load the rows in the
+    /// main view. Clicking an already-expanded table collapses its columns but keeps the
+    /// rows open — the columns are the clutter to hide, the rows are what you came for.
+    fn toggle_db_table(&mut self, table: String, cx: &mut Context<Self>) {
+        if !self.db_expanded.insert(table.clone()) {
+            self.db_expanded.remove(&table);
+        }
+        self.open_db_table(table, cx);
+    }
+
     /// Opens a table's first page of rows in the editor area (#65).
     fn open_db_table(&mut self, table: String, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
@@ -7010,6 +7037,7 @@ impl WorkspaceView {
                 .await;
             this.update(cx, |this, cx| {
                 this.db_schema = Some(result);
+                this.db_expanded.clear();
                 cx.notify();
             })
             .ok();
@@ -7035,12 +7063,17 @@ impl WorkspaceView {
                 let entity = self_entity.clone();
                 let name = table.name.clone();
                 let selected = self.db_table.as_ref().is_some_and(|(open, _)| open == &name);
+                let expanded = self.db_expanded.contains(&name);
+                // The whole table starts collapsed — a clean list of names, columns on
+                // demand (the owner's "menos poluído"). The chevron is a text glyph, not
+                // colour, so the state reads in any theme.
+                let chevron = if expanded { "▾ " } else { "▸ " };
                 div()
                     .flex()
                     .flex_col()
                     .child(
-                        // Click a table name to open its rows in the editor area — the
-                        // git-diff pattern: a read-only view, not a tab.
+                        // Click a table name to expand its columns AND open its rows in
+                        // the editor area — one gesture, the git-diff read-only pattern.
                         div()
                             .id(gpui::ElementId::Name(format!("db-table-{name}").into()))
                             .px_1()
@@ -7048,12 +7081,12 @@ impl WorkspaceView {
                             .when(selected, |el| el.bg(theme.hover))
                             .hover(|el| el.bg(theme.hover))
                             .text_color(theme.text)
-                            .child(SharedString::from(table.name.clone()))
+                            .child(SharedString::from(format!("{chevron}{}", table.name)))
                             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                                entity.update(cx, |this, cx| this.open_db_table(name.clone(), cx));
+                                entity.update(cx, |this, cx| this.toggle_db_table(name.clone(), cx));
                             }),
                     )
-                    .children(table.columns.iter().map(|column| {
+                    .when(expanded, |el| el.children(table.columns.iter().map(|column| {
                         let mut label = format!("  {}  {}", column.name, column.column_type);
                         if column.primary_key {
                             label.push_str("  pk");
@@ -7062,7 +7095,7 @@ impl WorkspaceView {
                             label.push_str("  ?");
                         }
                         div().text_color(theme.text_muted).child(SharedString::from(label))
-                    }))
+                    })))
             })),
         }
     }
