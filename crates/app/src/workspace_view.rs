@@ -19,11 +19,10 @@ use gpui::{
 
 use crate::actions::{
     CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
-    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol, PushToRemote,
-    IncreaseFontSize, QuickFix, RenameSymbol,
-    NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, Replace,
-    RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch,
-    ToggleCommandPalette,
+    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
+    IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
+    OpenSettings, PushToRemote, QuickFix, RenameSymbol, Replace, RerunFailedTests, ResetFontSize,
+    RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch, ToggleCommandPalette,
     ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, context,
     dispatch_for,
 };
@@ -1153,9 +1152,7 @@ impl WorkspaceView {
                             this.status = Some(format!("✓ {summary}  ·  ⇧⌥P to push").into());
                         }
                     }
-                    Err(err) => {
-                        this.status = Some(clean_git_error(&format!("{err:#}")).into())
-                    }
+                    Err(err) => this.status = Some(clean_git_error(&format!("{err:#}")).into()),
                 }
                 this.refresh_git_status(cx);
                 cx.notify();
@@ -1410,11 +1407,7 @@ impl WorkspaceView {
 
     /// Opens a table's rows and returns what the grid would show, for tests.
     #[cfg(test)]
-    pub fn open_db_table_for_test(
-        &mut self,
-        table: &str,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_db_table_for_test(&mut self, table: &str, cx: &mut Context<Self>) {
         self.open_db_table(table.to_string(), cx);
     }
 
@@ -1469,10 +1462,7 @@ impl WorkspaceView {
         &self,
     ) -> Option<(String, std::result::Result<Vec<Vec<String>>, String>)> {
         self.db_table.as_ref().map(|(name, result)| {
-            (
-                name.clone(),
-                result.as_ref().map(|page| page.rows.clone()).map_err(|m| m.clone()),
-            )
+            (name.clone(), result.as_ref().map(|page| page.rows.clone()).map_err(|m| m.clone()))
         })
     }
 
@@ -1849,7 +1839,10 @@ impl WorkspaceView {
 
     #[cfg(test)]
     pub fn tree_entry_paths_for_test(&self) -> Vec<PathBuf> {
-        self.tree.as_ref().map(|t| t.entries().iter().map(|e| e.path.clone()).collect()).unwrap_or_default()
+        self.tree
+            .as_ref()
+            .map(|t| t.entries().iter().map(|e| e.path.clone()).collect())
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -2246,8 +2239,9 @@ impl WorkspaceView {
                             });
                         }
                         Err(err) => {
-                            this.status =
-                                Some(format!("autosave failed: {}: {err:#}", path.display()).into());
+                            this.status = Some(
+                                format!("autosave failed: {}: {err:#}", path.display()).into(),
+                            );
                         }
                     }
                 }
@@ -3221,8 +3215,7 @@ impl WorkspaceView {
         // you type an identifier. So a *word* character opens it too, once a small prefix
         // exists, so completing an ordinary name works without ⌥⌘I. The prefix floor
         // keeps a single letter from opening a hundred-row list on every keystroke.
-        let declared = self.is_completion_trigger(text)
-            || self.should_open_on_word_char(text, cx);
+        let declared = self.is_completion_trigger(text) || self.should_open_on_word_char(text, cx);
         self.schedule_autosave(cx);
         if !Self::should_open_on_trigger(self.completion.is_some(), declared) {
             return;
@@ -4333,8 +4326,7 @@ impl WorkspaceView {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
 
         let task = cx.spawn(async move |this, cx| {
-            let commands =
-                cx.background_spawn(async move { crate::artisan::list(&root) }).await;
+            let commands = cx.background_spawn(async move { crate::artisan::list(&root) }).await;
             let items = commands
                 .unwrap_or_default()
                 .into_iter()
@@ -4524,12 +4516,7 @@ impl WorkspaceView {
     /// only if the buffer has not changed since the ask: edits are byte ranges into a
     /// specific text, and applying them to a different one would corrupt the file the
     /// user is typing in.
-    fn format_document(
-        &mut self,
-        _: &FormatDocument,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
         let Some((uri, _)) = self.navigation_origin(cx) else { return };
         let Some(tab) = self.tabs.get(self.active_tab) else { return };
         let Some(path) = tab.path.clone() else { return };
@@ -4784,8 +4771,7 @@ impl WorkspaceView {
         for (path, edits) in changes {
             let open_tab = self.tabs.iter().find(|tab| {
                 tab.path.as_ref().is_some_and(|tab_path| {
-                    tab_path == &path
-                        || tab_path.canonicalize().ok() == path.canonicalize().ok()
+                    tab_path == &path || tab_path.canonicalize().ok() == path.canonicalize().ok()
                 })
             });
             match open_tab {
@@ -5068,10 +5054,9 @@ impl WorkspaceView {
 
         let query = id.clone();
         let task = cx.spawn(async move |this, cx| {
-            let found = Self::poll_query::<elle_lsp::lsp_types::WorkspaceSymbolResponse>(
-                &this, &query, cx,
-            )
-            .await;
+            let found =
+                Self::poll_query::<elle_lsp::lsp_types::WorkspaceSymbolResponse>(&this, &query, cx)
+                    .await;
             this.update(cx, |this, _| this.in_flight_query = None).ok();
 
             let items = match found {
@@ -5499,12 +5484,7 @@ impl WorkspaceView {
     /// Files dragged in from Finder (owner request): a folder becomes the open project,
     /// a file becomes a tab. Both doors already exist — this is only a third handle on
     /// them, which is what keeps a dropped folder and ⌘O indistinguishable afterwards.
-    fn external_drop(
-        &mut self,
-        paths: &[PathBuf],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn external_drop(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         for path in paths {
             if path.is_dir() {
                 match FileTree::new(path.clone()) {
@@ -5638,8 +5618,7 @@ impl WorkspaceView {
         let mut watcher =
             match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 let Ok(event) = event else { return };
-                if !event.paths.is_empty() && event.paths.iter().all(|p| p.starts_with(&git_dir))
-                {
+                if !event.paths.is_empty() && event.paths.iter().all(|p| p.starts_with(&git_dir)) {
                     return;
                 }
                 // A full channel cannot happen (unbounded); a closed one means the
@@ -5653,10 +5632,7 @@ impl WorkspaceView {
                 }
             };
         if let Err(err) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
-            eprintln!(
-                "ellefuanti: cannot watch {} ({err}); refresh stays manual",
-                root.display()
-            );
+            eprintln!("ellefuanti: cannot watch {} ({err}); refresh stays manual", root.display());
             return;
         }
 
@@ -5716,8 +5692,7 @@ impl WorkspaceView {
                             crate::update::UpdateState::Idle
                                 | crate::update::UpdateState::Available(_)
                         ) {
-                            this.update_state =
-                                crate::update::UpdateState::Available(available);
+                            this.update_state = crate::update::UpdateState::Available(available);
                             cx.notify();
                         }
                     });
@@ -5748,9 +5723,7 @@ impl WorkspaceView {
                         self.start_update_install(release, dmg_url, cx);
                     }
                     _ => {
-                        let _ = std::process::Command::new("open")
-                            .arg(&release.html_url)
-                            .spawn();
+                        let _ = std::process::Command::new("open").arg(&release.html_url).spawn();
                     }
                 }
             }
@@ -6389,14 +6362,14 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
             // #19. The id is the chosen action's index into the pending edits.
             Some(PaletteMode::CodeActions) => {
                 let pending = std::mem::take(&mut self.pending_code_actions);
-                if let Some(edit) = id.parse::<usize>().ok().and_then(|i| pending.into_iter().nth(i)) {
+                if let Some(edit) =
+                    id.parse::<usize>().ok().and_then(|i| pending.into_iter().nth(i))
+                {
                     match self.apply_workspace_edit(edit, cx) {
                         Ok(files) => {
                             self.status = Some(format!("Fix applied in {files} file(s)").into())
                         }
-                        Err(err) => {
-                            self.status = Some(format!("Fix not applied: {err}").into())
-                        }
+                        Err(err) => self.status = Some(format!("Fix not applied: {err}").into()),
                     }
                     cx.notify();
                 }
@@ -6465,9 +6438,7 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                     Dispatch::FindInProject => self.find_in_project(&FindInProject, window, cx),
                     // Reopens the palette in artisan mode, like SetLanguage above.
                     Dispatch::Artisan => self.toggle_palette(PaletteMode::Artisan, window, cx),
-                    Dispatch::FormatDocument => {
-                        self.format_document(&FormatDocument, window, cx)
-                    }
+                    Dispatch::FormatDocument => self.format_document(&FormatDocument, window, cx),
                     Dispatch::GoToWorkspaceSymbol => {
                         self.toggle_palette(PaletteMode::WorkspaceSymbols, window, cx)
                     }
@@ -7302,9 +7273,9 @@ impl WorkspaceView {
                         // the owner's report. A disabled panel's tooltip names it too and
                         // adds "(coming soon)", which is the honest reason it does not
                         // respond to a click.
-                        .tooltip(crate::tooltip::Tooltip::text(
-                            crate::tooltip::activity_label(name, enabled),
-                        ))
+                        .tooltip(crate::tooltip::Tooltip::text(crate::tooltip::activity_label(
+                            name, enabled,
+                        )))
                         .when(enabled, |el| {
                             el.cursor_pointer()
                                 .hover(|el| el.bg(theme.hover))
@@ -7427,9 +7398,7 @@ impl WorkspaceView {
                             entries
                                 .flatten()
                                 .map(|entry| entry.path())
-                                .filter(|path| {
-                                    path.extension().is_some_and(|ext| ext == "log")
-                                })
+                                .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -7460,8 +7429,7 @@ impl WorkspaceView {
     fn load_branch_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
         let task = cx.spawn(async move |this, cx| {
-            let branches =
-                cx.background_spawn(async move { elle_git::branches(&root) }).await;
+            let branches = cx.background_spawn(async move { elle_git::branches(&root) }).await;
             let items = branches
                 .unwrap_or_default()
                 .into_iter()
@@ -7491,14 +7459,20 @@ impl WorkspaceView {
         let task = cx.spawn(async move |this, cx| {
             let outcome = cx.background_spawn(async move { operation(root) }).await;
             this.update(cx, |this, cx| {
-                this.status = Some(match outcome {
-                    Ok(message) => {
-                        let message = message.trim();
-                        if message.is_empty() { "Done".to_string() } else { message.to_string() }
+                this.status = Some(
+                    match outcome {
+                        Ok(message) => {
+                            let message = message.trim();
+                            if message.is_empty() {
+                                "Done".to_string()
+                            } else {
+                                message.to_string()
+                            }
+                        }
+                        Err(err) => clean_git_error(&format!("{err:#}")),
                     }
-                    Err(err) => clean_git_error(&format!("{err:#}")),
-                }
-                .into());
+                    .into(),
+                );
                 this.refresh_git_status(cx);
                 cx.notify();
             })
@@ -7521,7 +7495,13 @@ impl WorkspaceView {
 
     /// Opens a table's first page of rows in the editor area (#65).
     /// Starts editing a DB cell — the buffer seeds from its current text (#65).
-    fn begin_db_edit(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_db_edit(
+        &mut self,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((_, Ok(page))) = &self.db_table else { return };
         // Only an editable row (one with a rowid) can be edited; a WITHOUT ROWID table's
         // rows have no key and stay read-only.
@@ -7574,8 +7554,8 @@ impl WorkspaceView {
         let task = cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move {
-                    let path =
-                        elle_db::env_database(&root).ok_or_else(|| "no sqlite database".to_string())?;
+                    let path = elle_db::env_database(&root)
+                        .ok_or_else(|| "no sqlite database".to_string())?;
                     // No values from the caller: insert_row seeds NOT NULL columns with
                     // an empty string so a blank add-row never trips a constraint (the
                     // owner's courses.name error). The user then edits the cells.
@@ -7610,8 +7590,8 @@ impl WorkspaceView {
         let task = cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move {
-                    let path =
-                        elle_db::env_database(&root).ok_or_else(|| "no sqlite database".to_string())?;
+                    let path = elle_db::env_database(&root)
+                        .ok_or_else(|| "no sqlite database".to_string())?;
                     elle_db::update_cell(&path, &table, &column, rowid, &buffer)
                         .map_err(|err| format!("{err:#}"))
                         .map(|()| table)
@@ -7634,12 +7614,15 @@ impl WorkspaceView {
     fn open_db_table(&mut self, table: String, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
         // Show the header immediately (selected state), fill the rows when the read lands.
-        self.db_table = Some((table.clone(), Ok(elle_db::TablePage {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            rowids: Vec::new(),
-            total: 0,
-        })));
+        self.db_table = Some((
+            table.clone(),
+            Ok(elle_db::TablePage {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rowids: Vec::new(),
+                total: 0,
+            }),
+        ));
         self.db_editing = None;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
@@ -7683,24 +7666,22 @@ impl WorkspaceView {
             // While a cell is open the grid takes the keyboard: printable keys extend the
             // buffer, Backspace trims it, Enter writes it by rowid, Escape cancels. Bound
             // here rather than through the editor keymap so the two do not fight.
-            outer = outer
-                .track_focus(&self.focus_handle)
-                .on_key_down(move |event, _window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    key_entity.update(cx, |this, cx| match key {
-                        "enter" => this.db_edit_commit(cx),
-                        "escape" => this.db_edit_cancel(cx),
-                        "backspace" => this.db_edit_backspace(cx),
-                        _ => {
-                            if let Some(text) = event.keystroke.key_char.as_deref()
-                                && !text.is_empty()
-                                && !text.chars().all(|c| c.is_control())
-                            {
-                                this.db_edit_typed(text, cx);
-                            }
+            outer = outer.track_focus(&self.focus_handle).on_key_down(move |event, _window, cx| {
+                let key = event.keystroke.key.as_str();
+                key_entity.update(cx, |this, cx| match key {
+                    "enter" => this.db_edit_commit(cx),
+                    "escape" => this.db_edit_cancel(cx),
+                    "backspace" => this.db_edit_backspace(cx),
+                    _ => {
+                        if let Some(text) = event.keystroke.key_char.as_deref()
+                            && !text.is_empty()
+                            && !text.chars().all(|c| c.is_control())
+                        {
+                            this.db_edit_typed(text, cx);
                         }
-                    });
+                    }
                 });
+            });
         }
         let Ok(page) = result else {
             let Err(message) = result else { unreachable!() };
@@ -7749,83 +7730,67 @@ impl WorkspaceView {
         // The header row and the data rows share one horizontally scrolling column, so a
         // scroll moves both together — a header that stayed put while the rows slid would
         // mislabel every value.
-        let scroll = div()
-            .id("db-grid-scroll")
-            .flex_1()
-            .overflow_scroll()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .min_w_full()
-                    // Header row: sticky look via the panel background, a bottom border to
-                    // divide it from the data.
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .children(
-                                page.columns.iter().map(|c| cell(c, true, false)),
-                            ),
+        let scroll = div().id("db-grid-scroll").flex_1().overflow_scroll().child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_full()
+                // Header row: sticky look via the panel background, a bottom border to
+                // divide it from the data.
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .children(page.columns.iter().map(|c| cell(c, true, false))),
+                )
+                .children(page.rows.iter().enumerate().map(|(row_index, row)| {
+                    let editing = self.db_editing.as_ref();
+                    let self_entity_for_cells = self_entity_for_cells.clone();
+                    div().flex().flex_none().border_b_1().border_color(theme.border).children(
+                        row.iter().enumerate().map(move |(col_index, value)| {
+                            // The cell in edit shows its buffer with a caret; every
+                            // other cell is the read-only clipped text, clickable to
+                            // start editing it.
+                            if let Some((r, c, buffer)) = editing
+                                && *r == row_index
+                                && *c == col_index
+                            {
+                                div()
+                                    .w(DB_CELL_WIDTH)
+                                    .h(row_height)
+                                    .flex_none()
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .border_1()
+                                    .border_color(theme.accent)
+                                    .bg(theme.background)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(buffer.clone()))
+                                    .child(div().w(px(2.0)).h(px(16.0)).bg(theme.cursor))
+                                    .into_any_element()
+                            } else {
+                                let entity = self_entity_for_cells.clone();
+                                cell(value, false, row_index % 2 == 1)
+                                    .id(gpui::ElementId::Name(
+                                        format!("db-cell-{row_index}-{col_index}").into(),
+                                    ))
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.begin_db_edit(row_index, col_index, window, cx)
+                                        });
+                                    })
+                                    .into_any_element()
+                            }
+                        }),
                     )
-                    .children(page.rows.iter().enumerate().map(|(row_index, row)| {
-                        let editing = self.db_editing.as_ref();
-                        let self_entity_for_cells = self_entity_for_cells.clone();
-                        div()
-                            .flex()
-                            .flex_none()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .children(row.iter().enumerate().map(move |(col_index, value)| {
-                                // The cell in edit shows its buffer with a caret; every
-                                // other cell is the read-only clipped text, clickable to
-                                // start editing it.
-                                if let Some((r, c, buffer)) = editing
-                                    && *r == row_index
-                                    && *c == col_index
-                                {
-                                    div()
-                                        .w(DB_CELL_WIDTH)
-                                        .h(row_height)
-                                        .flex_none()
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .border_1()
-                                        .border_color(theme.accent)
-                                        .bg(theme.background)
-                                        .text_color(theme.text)
-                                        .child(SharedString::from(buffer.clone()))
-                                        .child(
-                                            div().w(px(2.0)).h(px(16.0)).bg(theme.cursor),
-                                        )
-                                        .into_any_element()
-                                } else {
-                                    let entity = self_entity_for_cells.clone();
-                                    cell(value, false, row_index % 2 == 1)
-                                        .id(gpui::ElementId::Name(
-                                            format!("db-cell-{row_index}-{col_index}").into(),
-                                        ))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_ev, window, cx| {
-                                                entity.update(cx, |this, cx| {
-                                                    this.begin_db_edit(
-                                                        row_index, col_index, window, cx,
-                                                    )
-                                                });
-                                            },
-                                        )
-                                        .into_any_element()
-                                }
-                            }))
-                    })),
-            );
+                })),
+        );
 
         let add_entity = self_entity_for_cells.clone();
         outer
@@ -7900,12 +7865,12 @@ impl WorkspaceView {
             .py_2()
             .gap_1();
         match &self.db_schema {
-            None => body.child(
-                div().text_color(theme.text_muted).child("Reading the database schema…"),
-            ),
-            Some(Err(message)) => {
-                body.child(div().text_color(theme.text_muted).child(SharedString::from(message.clone())))
+            None => {
+                body.child(div().text_color(theme.text_muted).child("Reading the database schema…"))
             }
+            Some(Err(message)) => body.child(
+                div().text_color(theme.text_muted).child(SharedString::from(message.clone())),
+            ),
             Some(Ok(tables)) if tables.is_empty() => {
                 body.child(div().text_color(theme.text_muted).child("The database has no tables"))
             }
@@ -7933,19 +7898,22 @@ impl WorkspaceView {
                             .text_color(theme.text)
                             .child(SharedString::from(format!("{chevron}{}", table.name)))
                             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                                entity.update(cx, |this, cx| this.toggle_db_table(name.clone(), cx));
+                                entity
+                                    .update(cx, |this, cx| this.toggle_db_table(name.clone(), cx));
                             }),
                     )
-                    .when(expanded, |el| el.children(table.columns.iter().map(|column| {
-                        let mut label = format!("  {}  {}", column.name, column.column_type);
-                        if column.primary_key {
-                            label.push_str("  pk");
-                        }
-                        if column.nullable {
-                            label.push_str("  ?");
-                        }
-                        div().text_color(theme.text_muted).child(SharedString::from(label))
-                    })))
+                    .when(expanded, |el| {
+                        el.children(table.columns.iter().map(|column| {
+                            let mut label = format!("  {}  {}", column.name, column.column_type);
+                            if column.primary_key {
+                                label.push_str("  pk");
+                            }
+                            if column.nullable {
+                                label.push_str("  ?");
+                            }
+                            div().text_color(theme.text_muted).child(SharedString::from(label))
+                        }))
+                    })
             })),
         }
     }
@@ -7961,8 +7929,9 @@ impl WorkspaceView {
             let result = cx
                 .background_spawn(async move {
                     if elle_docker::detect(&root).is_none() {
-                        return Err("Not a Docker project (no Dockerfile or compose file)"
-                            .to_string());
+                        return Err(
+                            "Not a Docker project (no Dockerfile or compose file)".to_string()
+                        );
                     }
                     elle_docker::services(&root).map_err(|err| format!("{err:#}"))
                 })
@@ -7990,8 +7959,9 @@ impl WorkspaceView {
             .gap_1();
         match &self.docker_services {
             None => body.child(div().text_color(theme.text_muted).child("Asking docker compose…")),
-            Some(Err(message)) => body
-                .child(div().text_color(theme.text_muted).child(SharedString::from(message.clone()))),
+            Some(Err(message)) => body.child(
+                div().text_color(theme.text_muted).child(SharedString::from(message.clone())),
+            ),
             Some(Ok(services)) if services.is_empty() => {
                 body.child(div().text_color(theme.text_muted).child("No compose services"))
             }
@@ -8007,7 +7977,12 @@ impl WorkspaceView {
     /// Types a command into the terminal, opening it if needed — the artisan door
     /// (#146): the command sits visibly on the prompt line, arguments are the user's to
     /// add, Enter is theirs to press. Artisan, docker and composer all walk through it.
-    fn type_terminal_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn type_terminal_command(
+        &mut self,
+        command: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.terminal.is_none() {
             self.toggle_terminal(&ToggleTerminal, window, cx);
         }
@@ -8027,8 +8002,9 @@ impl WorkspaceView {
     fn load_git_log_items(&mut self, palette: Entity<Palette>, cx: &mut Context<Self>) {
         let Some(root) = self.tree.as_ref().map(|tree| tree.root().to_path_buf()) else { return };
         let task = cx.spawn(async move |this, cx| {
-            let entries =
-                cx.background_spawn(async move { elle_git::log(&root, 200).unwrap_or_default() }).await;
+            let entries = cx
+                .background_spawn(async move { elle_git::log(&root, 200).unwrap_or_default() })
+                .await;
             let items = entries
                 .into_iter()
                 .map(|entry| {
@@ -8111,10 +8087,9 @@ impl WorkspaceView {
                     // way VS Code puts them — but only for the Explorer with a folder open,
                     // because there is no tree to fold otherwise. Search's and Git's headers
                     // stay a plain label.
-                    .when(
-                        self.sidebar == Sidebar::Explorer && self.tree.is_some(),
-                        |el| el.child(self.render_explorer_header_buttons(theme, cx)),
-                    )
+                    .when(self.sidebar == Sidebar::Explorer && self.tree.is_some(), |el| {
+                        el.child(self.render_explorer_header_buttons(theme, cx))
+                    })
                     // The same pair for the schema panel: there is only something to fold
                     // once tables actually loaded.
                     .when(
@@ -8146,9 +8121,7 @@ impl WorkspaceView {
                     Some(panel) => panel.into_any_element(),
                     None => div().into_any_element(),
                 },
-                Sidebar::Database => {
-                    self.render_db_panel(theme, &cx.entity()).into_any_element()
-                }
+                Sidebar::Database => self.render_db_panel(theme, &cx.entity()).into_any_element(),
                 Sidebar::Docker => self.render_docker_panel(theme).into_any_element(),
                 Sidebar::Explorer => match self.tree.as_ref() {
                     // Wrapped so the empty space *below* the rows is right-clickable: that
@@ -8178,11 +8151,7 @@ impl WorkspaceView {
                             // right-click there creates at the top level (#126).
                             .on_drop(move |dragged: &DraggedTreeEntry, _window, cx| {
                                 drop_entity.update(cx, |this, cx| {
-                                    this.drop_tree_entry(
-                                        dragged.path.clone(),
-                                        root.clone(),
-                                        cx,
-                                    );
+                                    this.drop_tree_entry(dragged.path.clone(), root.clone(), cx);
                                 });
                             })
                             .child(self.render_tree_rows(tree.len(), theme, cx))
@@ -8363,8 +8332,7 @@ impl WorkspaceView {
                 // in" answered by the tree itself (owner request). Read here, not
                 // captured outside: the closure re-runs per frame and the active tab
                 // changes under it.
-                let active_path =
-                    this.tabs.get(this.active_tab).and_then(|tab| tab.path.clone());
+                let active_path = this.tabs.get(this.active_tab).and_then(|tab| tab.path.clone());
 
                 range
                     .filter_map(|index| {
@@ -8421,15 +8389,17 @@ impl WorkspaceView {
                                     el.drag_over::<DraggedTreeEntry>(move |style, _, _, _| {
                                         style.bg(selection)
                                     })
-                                    .on_drop(move |dragged: &DraggedTreeEntry, _window, cx| {
-                                        drop_entity.update(cx, |this, cx| {
-                                            this.drop_tree_entry(
-                                                dragged.path.clone(),
-                                                dest.clone(),
-                                                cx,
-                                            );
-                                        });
-                                    })
+                                    .on_drop(
+                                        move |dragged: &DraggedTreeEntry, _window, cx| {
+                                            drop_entity.update(cx, |this, cx| {
+                                                this.drop_tree_entry(
+                                                    dragged.path.clone(),
+                                                    dest.clone(),
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    )
                                 })
                                 // Persistent, unlike hover: the tint follows the active
                                 // tab so the tree always answers "which file am I in".
@@ -8747,9 +8717,8 @@ impl WorkspaceView {
             _ => None,
         };
 
-        let db_table = matches!(self.sidebar, Sidebar::Database)
-            .then(|| self.db_table.as_ref())
-            .flatten();
+        let db_table =
+            matches!(self.sidebar, Sidebar::Database).then(|| self.db_table.as_ref()).flatten();
 
         div().flex_1().overflow_hidden().child(match (diff, db_table, self.active_editor()) {
             (Some((file, renderer)), _, _) => {
@@ -8887,11 +8856,11 @@ mod tests {
     fn a_fatal_prefix_is_dropped_from_a_git_error() {
         // The status bar already implies "this is a git failure"; the `fatal:` label just
         // pushes the actual sentence right. What is left is the reason, in full.
+        assert_eq!(clean_git_error("fatal: not a git repository"), "not a git repository");
         assert_eq!(
-            clean_git_error("fatal: not a git repository"),
-            "not a git repository"
+            clean_git_error("error: pathspec 'x' did not match"),
+            "pathspec 'x' did not match"
         );
-        assert_eq!(clean_git_error("error: pathspec 'x' did not match"), "pathspec 'x' did not match");
     }
 
     #[test]
@@ -8953,8 +8922,14 @@ mod tests {
         let path = dir.path().join("big.log");
         // Ten numbered lines; ask for a window that only covers the last few, small
         // enough that the cut lands mid-line so the boundary trim is exercised.
-        let body: String = (0..10).map(|i| format!("line {i}
-")).collect();
+        let body: String = (0..10)
+            .map(|i| {
+                format!(
+                    "line {i}
+"
+                )
+            })
+            .collect();
         std::fs::write(&path, &body).unwrap();
 
         // A window bigger than the file returns it whole.
@@ -8963,8 +8938,10 @@ mod tests {
         // A ~25-byte window covers the last 3-ish lines; the partial first line is
         // dropped, so every line returned is complete.
         let tail = read_file_tail(&path, 25).unwrap();
-        assert!(tail.ends_with("line 9
-"));
+        assert!(tail.ends_with(
+            "line 9
+"
+        ));
         assert!(!tail.contains("line 0"), "the old lines are outside the window");
         for line in tail.lines() {
             assert!(line.starts_with("line "), "no half-line at the seam: {line:?}");

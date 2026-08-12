@@ -347,8 +347,7 @@ mod tests {
                 // exists before the kill — the shape that made the old direct-child kill
                 // fail on CI: `sleep` survived `sh` and held the output pipes open for
                 // the full 30 s. With `sleep` last, the kill only won by racing sh's fork.
-                "sleep 30 & echo \"##teamcity[testStarted name='a' flowId='1']\"; wait"
-                    .to_string(),
+                "sleep 30 & echo \"##teamcity[testStarted name='a' flowId='1']\"; wait".to_string(),
             ],
             root: dir.path().to_path_buf(),
         };

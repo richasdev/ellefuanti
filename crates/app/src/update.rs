@@ -55,19 +55,16 @@ pub fn parse_latest_release(json: &str) -> Option<Available> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let version = Version::parse(value.get("tag_name")?.as_str()?)?;
     let html_url = value.get("html_url")?.as_str()?.to_string();
-    let dmg_url = value
-        .get("assets")
-        .and_then(|assets| assets.as_array())
-        .and_then(|assets| {
-            assets.iter().find_map(|asset| {
-                let name = asset.get("name")?.as_str()?;
-                if name.ends_with("-macos.dmg") {
-                    Some(asset.get("browser_download_url")?.as_str()?.to_string())
-                } else {
-                    None
-                }
-            })
-        });
+    let dmg_url = value.get("assets").and_then(|assets| assets.as_array()).and_then(|assets| {
+        assets.iter().find_map(|asset| {
+            let name = asset.get("name")?.as_str()?;
+            if name.ends_with("-macos.dmg") {
+                Some(asset.get("browser_download_url")?.as_str()?.to_string())
+            } else {
+                None
+            }
+        })
+    });
     Some(Available { version, dmg_url, html_url })
 }
 

@@ -252,13 +252,21 @@ mod tests {
         };
         assert_eq!(source_of("is_admin"), "cast", "provenance survives storage");
         assert_eq!(source_of("secret"), "guarded", "a guard implies the column");
-        assert_eq!(source_of("full_name"), "accessor", "an accessor is a property, not a table column — the badge is the difference");
+        assert_eq!(
+            source_of("full_name"),
+            "accessor",
+            "an accessor is a property, not a table column — the badge is the difference"
+        );
 
         let relations = relations_for_model(conn, "User").unwrap();
         assert_eq!(relations, [("posts".to_string(), "hasMany".into(), "Post".into())]);
 
         let scopes = scopes_for_model(conn, "User").unwrap();
-        assert_eq!(scopes, ["active"], "the call name, not scopeActive — completion is the consumer");
+        assert_eq!(
+            scopes,
+            ["active"],
+            "the call name, not scopeActive — completion is the consumer"
+        );
 
         // Post's columns attach through its *declared* table (`articles`), not the
         // convention (`posts`) — the assertion that makes declared-wins falsifiable.

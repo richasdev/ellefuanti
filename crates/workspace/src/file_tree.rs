@@ -467,8 +467,7 @@ mod tests {
         // agree.
         let dir = fixture();
         let mut tree = FileTree::new(dir.path()).unwrap();
-        let root_only: Vec<String> =
-            tree.entries().iter().map(|e| e.name.clone()).collect();
+        let root_only: Vec<String> = tree.entries().iter().map(|e| e.name.clone()).collect();
 
         let app = tree.entries().iter().position(|e| e.name == "app").unwrap();
         tree.toggle(app).unwrap();

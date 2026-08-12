@@ -122,7 +122,11 @@ jobs:
         # backstop for when billing is fixed.
         #
         # NOT continue-on-error: this one is meant to fail the build. The numbers it blocks
-        # on are deterministic; the wall-clock one it only reports.
+        # on are deterministic; the wall-clock one it only reports. But the script's own
+        # "cannot measure" refusal (exit 2 — e.g. a shared runner at load 20, where the
+        # gate's numbers would be noise) is neutral here rather than red: a measurement
+        # that never happened is not evidence of a regression, and a gate that fails on
+        # the runner's weather gets ignored, which is worse than not gating.
         #
         # One caveat that has to be said rather than discovered: a headless runner has no
         # display, so if the window fails to open the process measured here is not the same
@@ -132,4 +136,14 @@ jobs:
         # half is display-independent and exact, and an RSS *floor* crossing the limit is
         # unambiguous evidence of a regression even when staying under it proves nothing.
         timeout-minutes: 5
-        run: scripts/perf-gate.sh
+        run: |
+          if scripts/perf-gate.sh; then
+            exit 0
+          else
+            code=$?
+            if [ "$code" = "2" ]; then
+              echo "perf gate could not measure (exit 2) — neutral, not a regression"
+              exit 0
+            fi
+            exit "$code"
+          fi

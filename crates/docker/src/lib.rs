@@ -96,11 +96,7 @@ mod tests {
         let merged = services_from("app\ndb\nredis\n", "db\n");
         assert_eq!(
             merged,
-            [
-                ("app".to_string(), false),
-                ("db".to_string(), true),
-                ("redis".to_string(), false)
-            ]
+            [("app".to_string(), false), ("db".to_string(), true), ("redis".to_string(), false)]
         );
         assert!(services_from("", "").is_empty());
     }

@@ -217,10 +217,8 @@ pub fn log(root: &Path, limit: usize) -> anyhow::Result<Vec<LogEntry>> {
     // %x1f is the ASCII unit separator — it cannot appear in a hash, and a subject
     // containing one is pathological enough to accept a mis-split over quoting.
     let format = "--pretty=format:%h%x1f%s";
-    let out = run_git(
-        root,
-        &["log", "--graph", "--decorate", &format!("--max-count={limit}"), format],
-    )?;
+    let out =
+        run_git(root, &["log", "--graph", "--decorate", &format!("--max-count={limit}"), format])?;
     Ok(out.lines().map(parse_log_line).collect())
 }
 
@@ -342,7 +340,14 @@ mod write_tests {
         let remote = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             assert!(
-                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success(),
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
                 "git {args:?}"
             );
         };
@@ -376,7 +381,14 @@ mod write_tests {
         let dir = repo();
         let run = |args: &[&str]| {
             assert!(
-                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success()
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
             );
         };
         std::fs::write(dir.path().join("b.php"), "<?php\n").unwrap();
@@ -404,7 +416,14 @@ mod write_tests {
         let dir = repo();
         let run = |args: &[&str]| {
             assert!(
-                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success()
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
             );
         };
         run(&["branch", "-M", "main"]);
@@ -419,14 +438,25 @@ mod write_tests {
         let dir = repo();
         let run = |args: &[&str]| {
             assert!(
-                Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success()
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
             );
         };
         run(&["branch", "-M", "main"]);
         run(&["branch", "feature"]);
 
-        std::fs::write(dir.path().join("a.php"), "<?php // edited
-").unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "<?php // edited
+",
+        )
+        .unwrap();
         let refused = switch_branch(dir.path(), "feature");
         assert!(refused.is_err(), "dirty tree must refuse — stricter than git, on purpose");
         assert!(porcelain(dir.path()).contains("a.php"), "and the change is untouched");

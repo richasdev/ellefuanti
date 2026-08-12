@@ -39,9 +39,7 @@ pub fn resolve(root: &Path, current: &Path, reference: &Reference) -> Option<Tar
         ReferenceKind::View => view_target(root, &reference.name).map(file),
         ReferenceKind::Component => component_target(root, &reference.name).map(file),
         ReferenceKind::WireAction => wire_member_target(root, current, &reference.name, true),
-        ReferenceKind::WireProperty => {
-            wire_member_target(root, current, &reference.name, false)
-        }
+        ReferenceKind::WireProperty => wire_member_target(root, current, &reference.name, false),
     }
 }
 
@@ -52,19 +50,11 @@ pub fn resolve(root: &Path, current: &Path, reference: &Reference) -> Option<Tar
 /// place. Falling back to the file with no line when the member is not found keeps the
 /// jump useful for a member the scan cannot see (a trait's, say) — the file is certain,
 /// the line is not, and `None` says so (RISKS #4).
-fn wire_member_target(
-    root: &Path,
-    current: &Path,
-    name: &str,
-    action: bool,
-) -> Option<Target> {
+fn wire_member_target(root: &Path, current: &Path, name: &str, action: bool) -> Option<Target> {
     let class_path = crate::livewire::livewire_class_path(root, current)?;
     let source = std::fs::read_to_string(&class_path).ok()?;
-    let needle =
-        if action { format!("function {name}(") } else { format!("${name}") };
-    let line = source
-        .find(&needle)
-        .map(|at| source[..at].matches('\n').count() + 1);
+    let needle = if action { format!("function {name}(") } else { format!("${name}") };
+    let line = source.find(&needle).map(|at| source[..at].matches('\n').count() + 1);
     Some(Target { path: class_path, line })
 }
 
@@ -286,20 +276,14 @@ mod wire_tests {
         .unwrap();
         let view = root.join("resources/views/livewire/user-table.blade.php");
 
-        let action = Reference {
-            kind: ReferenceKind::WireAction,
-            name: "sortBy".into(),
-            range: 0..0,
-        };
+        let action =
+            Reference { kind: ReferenceKind::WireAction, name: "sortBy".into(), range: 0..0 };
         let target = resolve(root, &view, &action).expect("resolves");
         assert!(target.path.ends_with("app/Livewire/UserTable.php"));
         assert_eq!(target.line, Some(4), "1-based line of the function declaration");
 
-        let property = Reference {
-            kind: ReferenceKind::WireProperty,
-            name: "search".into(),
-            range: 0..0,
-        };
+        let property =
+            Reference { kind: ReferenceKind::WireProperty, name: "search".into(), range: 0..0 };
         let target = resolve(root, &view, &property).expect("resolves");
         assert_eq!(target.line, Some(3));
 

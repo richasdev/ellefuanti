@@ -320,8 +320,16 @@ mod tests {
     /// each answer loads turns every one of those into a compile-time-ish failure.
     #[test]
     fn every_named_path_is_in_the_table() {
-        let mut paths =
-            vec![CHEVRON_DOWN, CHEVRON_RIGHT, FOLDER, FOLDER_OPENED, FILE, EXPAND_ALL, COLLAPSE_ALL, REVEAL_FILE];
+        let mut paths = vec![
+            CHEVRON_DOWN,
+            CHEVRON_RIGHT,
+            FOLDER,
+            FOLDER_OPENED,
+            FILE,
+            EXPAND_ALL,
+            COLLAPSE_ALL,
+            REVEAL_FILE,
+        ];
 
         for name in [
             "User.php",

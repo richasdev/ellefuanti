@@ -132,10 +132,7 @@ impl Folds {
 /// last consecutive line that is blank or more indented than the header. Blanks inside
 /// a block fold with it; trailing blanks after the block do not (they belong to the
 /// gap between blocks, and hiding them makes two neighbours look glued together).
-pub fn foldable_block_at(
-    text: &str,
-    line: usize,
-) -> Option<(usize, std::ops::Range<usize>)> {
+pub fn foldable_block_at(text: &str, line: usize) -> Option<(usize, std::ops::Range<usize>)> {
     let lines: Vec<&str> = text.split('\n').collect();
     let header = line;
     let header_indent = indent_of(lines.get(header)?)?;

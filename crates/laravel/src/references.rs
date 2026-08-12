@@ -233,8 +233,7 @@ fn char_boundary_at_or_below(source: &str, offset: usize) -> usize {
 fn wire_at(source: &str, offset: usize) -> Option<Reference> {
     let (target, range) = crate::livewire::wire_context_at(source, offset)?;
     let value = &source[range.clone()];
-    let name: String =
-        value.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    let name: String = value.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
     if name.is_empty() {
         return None;
     }
