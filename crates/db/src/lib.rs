@@ -49,8 +49,19 @@ pub fn env_database(root: &Path) -> Option<PathBuf> {
         if line.starts_with('#') {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
+        // `export KEY=val` is shell-sourceable and common; strip it before the split.
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((key, raw)) = line.split_once('=') {
+            let raw = raw.trim();
+            // A quoted value is literal to its closing quote — a `#` inside is data. An
+            // unquoted value ends at the first `#`, which dotenv treats as a comment.
+            let value = if let Some(inner) = raw.strip_prefix('"').and_then(|r| r.split('"').next()) {
+                inner
+            } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.split('\'').next()) {
+                inner
+            } else {
+                raw.split('#').next().unwrap_or(raw).trim()
+            };
             match key.trim() {
                 "DB_CONNECTION" => connection = Some(value.to_string()),
                 "DB_DATABASE" => database = Some(value.to_string()),
@@ -207,6 +218,21 @@ mod tests {
 
         let dir = project_with_env("DB_CONNECTION=mysql\nDB_DATABASE=app\nDB_PASSWORD=secret\n");
         assert_eq!(env_database(dir.path()), None, "slice 1 says nothing about MySQL");
+    }
+
+    #[test]
+    fn the_export_prefix_and_inline_comments_are_handled() {
+        // Real .env files: `export KEY=val` (shell-sourceable) and a trailing comment on
+        // an unquoted value. dotenv strips both; the panel must too or it reads the wrong
+        // connection.
+        let dir = project_with_env("export DB_CONNECTION=sqlite\n");
+        assert!(env_database(dir.path()).is_some(), "the export prefix must not hide the key");
+
+        let dir = project_with_env("DB_CONNECTION=sqlite # local dev\n");
+        assert!(
+            env_database(dir.path()).is_some(),
+            "an inline comment must not become part of the value"
+        );
     }
 
     #[test]
