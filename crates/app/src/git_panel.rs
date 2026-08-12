@@ -42,6 +42,7 @@ use gpui::{
     Window, div, prelude::*, px, uniform_list,
 };
 
+use crate::actions::{PushToRemote, ShowGitLog, SwitchBranch};
 use crate::fonts::Fonts;
 use crate::theme::{Metrics, Theme, Themed};
 
@@ -117,6 +118,17 @@ impl PanelState {
             PanelState::Repo(status) => status.branch.as_deref(),
             _ => None,
         }
+    }
+
+    /// Whether a git repository is open, in any state (clean or dirty).
+    ///
+    /// The commit controls and the branch/push toolbar key off this rather than off "has
+    /// changes": the owner reported the input and button only appearing after staging, and
+    /// the fix is that being *in a repo* is what makes those controls meaningful, not having
+    /// something staged. `NoFolder`/`Loading`/`NotARepo` still hide them, because there is no
+    /// repository to commit to or push from.
+    pub fn is_repo(&self) -> bool {
+        matches!(self, PanelState::Repo(_))
     }
 }
 
@@ -225,10 +237,17 @@ impl GitPanel {
         &self.commit_message
     }
 
-    /// The commit box (#64 item 4): message line, button, both live only when a
-    /// repository is showing.
+    /// The commit box (#64 item 4): message line, button, both live whenever a repository is
+    /// open — clean or dirty.
+    ///
+    /// The gate is `is_repo`, not "has changes". The owner reported the input and Commit
+    /// button only appearing after the first stage, which left the box invisible until you
+    /// already knew where it would be. Showing the controls the moment a repo opens tells the
+    /// user where to type; the button stays disabled (and says why below) until there is
+    /// something staged and a message. Non-repo states still return `None` — nothing to
+    /// commit to.
     fn render_commit_box(&self, theme: &Theme, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        if self.state.files().is_empty() && self.state.empty_message().is_some() {
+        if !self.state.is_repo() {
             return None;
         }
         let staged_anything = self.state.files().iter().any(|file| file.staged);
@@ -412,6 +431,7 @@ impl Render for GitPanel {
             .track_focus(&self.focus_handle(cx))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_header(&theme))
+            .children(self.render_toolbar(&theme))
             .child(self.render_rows(&theme, cx))
             .children(self.render_commit_box(&theme, cx))
     }
@@ -440,6 +460,58 @@ impl GitPanel {
                     n => format!("{n} changes"),
                 }))
             })
+    }
+
+    /// The Branch / Push / History toolbar row, shown only inside a repository.
+    ///
+    /// The owner asked for a change-branch button and a push button in the panel. Each button
+    /// `dispatch_action`s an existing workspace action rather than emitting a `GitEvent`: the
+    /// button handler is the only place here with a `Window`, and `SwitchBranch`/`ShowGitLog`/
+    /// `PushToRemote` all need one (they open a palette or run the same handler ⇧⌥P does). This
+    /// keeps every ounce of git logic in the workspace's existing handlers — the panel only
+    /// points at them. History rides along because it shares the "reach an existing palette"
+    /// shape and the owner reached for git history in the same breath.
+    fn render_toolbar(&self, theme: &Theme) -> Option<gpui::AnyElement> {
+        if !self.state.is_repo() {
+            return None;
+        }
+
+        // A pointer-route button: a bordered pill that dispatches `action` on click. Dispatch
+        // (not a direct call) so the click travels the same keymap path the chord does and
+        // lands on the workspace's registered handler.
+        let button = |id: &'static str, label: &'static str, action: fn() -> Box<dyn gpui::Action>| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(theme.border)
+                .text_color(theme.text)
+                .cursor_pointer()
+                .hover(|el| el.bg(theme.hover))
+                .active(|el| el.bg(theme.pressed))
+                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    window.dispatch_action(action(), cx);
+                })
+                .child(label)
+        };
+
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(button("git-branch", "Branch", || Box::new(SwitchBranch)))
+                .child(button("git-push", "Push", || Box::new(PushToRemote)))
+                .child(button("git-log", "History", || Box::new(ShowGitLog)))
+                .into_any_element(),
+        )
     }
 
     fn render_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -975,6 +1047,19 @@ mod tests {
 
         file.hunks[0].lines.push(line(LineKind::Added, "x", None, Some(12345)));
         assert_eq!(gutter_width(&file), 5);
+    }
+
+    /// The predicate the commit controls and the branch/push toolbar gate on. A *clean* repo
+    /// still counts as a repo — that is the whole point of the owner's report, that the
+    /// controls must not wait for the first stage. The render itself is unverifiable
+    /// headlessly (#112); this pins the state logic that decides whether it draws.
+    #[test]
+    fn a_clean_repo_still_counts_as_a_repo() {
+        assert!(!PanelState::NoFolder.is_repo());
+        assert!(!PanelState::Loading.is_repo());
+        assert!(!PanelState::NotARepo.is_repo());
+        // Clean: a repo with no changes. The commit box and toolbar must still show here.
+        assert!(PanelState::Repo(RepoStatus::default()).is_repo());
     }
 
     /// Empty-state wording, which is the part a user reads. "Not a repository" and "no
