@@ -255,9 +255,24 @@ impl Overlay {
             {
                 // Newlines would make a one-line field render as one long line with
                 // invisible breaks in it; a key pasted from a terminal often carries a
-                // trailing one.
-                text.push_str(pasted.trim());
-                cx.notify();
+                // trailing one. Shared with every other one-line field in the app so the
+                // semantics cannot drift between them.
+                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                if !pasted.is_empty() {
+                    text.push_str(&pasted);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        // ⌘C copies the prompt whole — except a secret, which must not be handed to the
+        // clipboard by a chord the user may have meant for something else. The masking in
+        // `prompt_display` would be worthless if ⌘C exported the key in the clear.
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            if let Mode::Prompt { text, secret: false, .. } = &self.mode
+                && !text.is_empty()
+            {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
             }
             return;
         }
@@ -433,6 +448,8 @@ impl Render for Overlay {
                         .child(
                             div()
                                 .w_full()
+                                .flex()
+                                .items_center()
                                 .px_2()
                                 .py_1()
                                 .bg(theme.status_bar)
@@ -440,7 +457,32 @@ impl Render for Overlay {
                                 .border_color(theme.accent)
                                 .rounded(px(4.0))
                                 .when(text.is_empty(), |el| el.text_color(theme.text_muted))
-                                .child(shown),
+                                // The palette's caret (#164). No focus test: this overlay
+                                // owns the keyboard for as long as it is on screen, so if
+                                // it is drawn at all the caret is where typing lands.
+                                // Solid, not blinking — the palette's reason, and this
+                                // overlay is even shorter-lived.
+                                .when(text.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .w(px(2.0))
+                                            .h(px(16.0))
+                                            .mr_1()
+                                            .flex_none()
+                                            .bg(theme.cursor),
+                                    )
+                                })
+                                .child(shown)
+                                .when(!text.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .w(px(2.0))
+                                            .h(px(16.0))
+                                            .ml(px(1.0))
+                                            .flex_none()
+                                            .bg(theme.cursor),
+                                    )
+                                }),
                         )
                         .child(
                             div()

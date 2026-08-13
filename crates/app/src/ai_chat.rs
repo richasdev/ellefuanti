@@ -553,6 +553,32 @@ impl AiChatPanel {
     /// keys and named keys belong to actions, `key_char` is what typing means.
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // ⌘V and ⌘C before the modifier guard below, which drops every ⌘ chord — the
+        // reason pasting into the chat box silently did nothing. This is the field where
+        // paste matters most: nobody retypes a stack trace to ask about it.
+        if keystroke.modifiers.platform && keystroke.key == "v" {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                // Collapsed to one line like every other field here, because this box *is*
+                // one line: `enter` sends (see `confirm`), so there is no way to type a
+                // newline into it and nothing that would render one. When it grows into a
+                // real multi-line composer this is the call site that should keep the
+                // breaks — a pasted stack trace is the reason it will.
+                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                if !pasted.is_empty() {
+                    self.input.push_str(&pasted);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        // ⌘C copies the draft whole: no selection model in this field, and one is out of
+        // scope (`palette::on_key_down`'s reasoning).
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            if !self.input.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.input.clone()));
+            }
+            return;
+        }
         if keystroke.modifiers.platform
             || keystroke.modifiers.control
             || keystroke.modifiers.function
@@ -1035,7 +1061,7 @@ impl Focusable for AiChatPanel {
 }
 
 impl Render for AiChatPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
         let settings = crate::settings::current(cx);
@@ -1112,7 +1138,7 @@ impl Render for AiChatPanel {
                     div().px_2().py_1().text_color(theme.error).text_size(px(11.0)).child(note)
                 }))
                 .child(self.render_chips(&theme, cx))
-                .child(self.render_input(&theme, cx))
+                .child(self.render_input(&theme, window, cx))
             })
     }
 }
@@ -1282,8 +1308,14 @@ impl AiChatPanel {
             .into_any_element()
     }
 
-    fn render_input(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_input(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let empty = self.input.is_empty();
+        let focused = self.focus_handle.is_focused(window);
         let entity = cx.entity();
         let action_button = if self.streaming {
             let entity = entity.clone();
@@ -1322,8 +1354,12 @@ impl AiChatPanel {
             .px_2()
             .py_1()
             .child(
-                // The find bar's field: no caret, focus shown by the border. Same
-                // honesty — gpui has no text input element, and this does not fake one.
+                // The find bar's field, now with the palette's caret (#164): a bar before
+                // the placeholder and after typed text, so the box reads as an input
+                // either way. Only when focused — the panel can sit open beside a focused
+                // editor, and a caret there would claim the keyboard it does not have.
+                // Solid, not blinking, for the palette's reason: a steady bar says "type
+                // here" without buying a timer per open panel.
                 div()
                     .flex_1()
                     .min_w(px(80.0))
@@ -1336,11 +1372,19 @@ impl AiChatPanel {
                     .border_1()
                     .border_color(theme.accent)
                     .when(empty, |el| el.text_color(theme.text_muted))
+                    .when(focused && empty, |el| {
+                        el.child(div().w(px(2.0)).h(px(14.0)).mr_1().flex_none().bg(theme.cursor))
+                    })
                     .child(SharedString::from(if empty {
                         "Ask — Enter sends".to_string()
                     } else {
                         self.input.clone()
-                    })),
+                    }))
+                    .when(focused && !empty, |el| {
+                        el.child(
+                            div().w(px(2.0)).h(px(14.0)).ml(px(1.0)).flex_none().bg(theme.cursor),
+                        )
+                    }),
             )
             .child(action_button)
             .into_any_element()

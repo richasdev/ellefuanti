@@ -177,6 +177,26 @@ impl GitPanel {
     /// staged. No text-input widget — one line does not buy a framework.
     fn on_key_down(&mut self, event: &gpui::KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // ⌘V and ⌘C before the modifier guard below, which drops every ⌘ chord — the
+        // reason pasting an issue number or a ticket title into the commit box silently
+        // did nothing.
+        if keystroke.modifiers.platform && keystroke.key == "v" {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                if !pasted.is_empty() {
+                    self.typed(&pasted, cx);
+                }
+            }
+            return;
+        }
+        // ⌘C copies the message whole: no selection model here, and one is out of scope
+        // (`palette::on_key_down`'s reasoning).
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            if !self.commit_message.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.commit_message.clone()));
+            }
+            return;
+        }
         if keystroke.modifiers.platform
             || keystroke.modifiers.control
             || keystroke.modifiers.function

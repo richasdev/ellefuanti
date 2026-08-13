@@ -4874,3 +4874,59 @@ async fn revealing_the_active_file_expands_the_tree_to_it(cx: &mut TestAppContex
 
     draw(cx);
 }
+
+/// Every small text field draws, focused and unfocused, empty and with text.
+///
+/// The caret is an extra child appended inside a `flex` row that previously held exactly
+/// one. That is precisely the shape that panics at layout time rather than at compile time
+/// — a zero-width element in a row with no room, or a `flex_none` child in a container that
+/// did not expect one — so the assertion worth making is that all four still lay out and
+/// paint. `draw` runs it under every compiled-in theme, which also proves `theme.cursor`
+/// resolves in each (it is the newest colour these fields reference).
+///
+/// Focus cannot be satisfied under gpui's test platform — its window hardcodes
+/// `is_active() -> false` (`platform/test/window.rs`), the same limitation
+/// `an_unfocused_editor_runs_no_blink_timer` documents. So this covers the *unfocused*
+/// branch of each field for real, and the focused branch only as far as the code path
+/// being exercised; the two-carets-at-once rule is enforced by construction (one
+/// `has_focus` flag per view, ANDed with the per-field selection) rather than by this test.
+#[gpui::test]
+async fn every_small_text_field_lays_out_with_and_without_text(cx: &mut TestAppContext) {
+    use crate::ai_chat::AiChatPanel;
+    use crate::find_bar::FindBar;
+    use crate::git_panel::GitPanel;
+    use crate::search_panel::SearchPanel;
+
+    install_theme(cx);
+
+    // `replacing: true` so both fields of the bar are on screen — the replace row is where
+    // a second caret would appear if the selection flag were ever dropped from the test.
+    let (find, find_cx) = cx.add_window_view(|_window, cx| FindBar::new(true, cx));
+    draw(find_cx);
+    find.update(find_cx, |bar, cx| {
+        bar.seed("Controller");
+        cx.notify();
+    });
+    draw(find_cx);
+
+    let (search, search_cx) = cx.add_window_view(|_window, cx| SearchPanel::new(cx));
+    draw(search_cx);
+    search.update(search_cx, |panel, cx| {
+        panel.seed("handle");
+        cx.notify();
+    });
+    draw(search_cx);
+
+    // An empty snapshot: this test never sends, so there is no editor to describe.
+    let (chat, chat_cx) = cx.add_window_view(|_window, cx| {
+        AiChatPanel::new(Box::new(|_| Default::default()), None, cx)
+    });
+    draw(chat_cx);
+    chat.update(chat_cx, |panel, cx| panel.type_input_for_test("why is this null?", cx));
+    draw(chat_cx);
+
+    let (git, git_cx) = cx.add_window_view(|_window, cx| GitPanel::new(cx));
+    draw(git_cx);
+    git.update(git_cx, |panel, cx| panel.type_for_test("fix: paste", cx));
+    draw(git_cx);
+}
