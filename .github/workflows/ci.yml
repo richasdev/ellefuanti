@@ -23,7 +23,13 @@ jobs:
     # a Linux runner cannot compile this project at all today.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      # v5 é a major que passou a Node 24; a v4 corre em Node 20, que o GitHub
+      # deprecou e já força para 24 com um aviso em cada run. A v5 não muda a
+      # interface — só o runtime e um mínimo de versão de runner que os runners
+      # hospedados já cumprem. Ficamos na v5 em vez da v7 de propósito: é a
+      # mudança mais pequena que resolve o aviso, e uma major é decisão
+      # deliberada (RELEASE.md, secção de deprecations).
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -61,7 +67,7 @@ jobs:
   release-build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
