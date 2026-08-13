@@ -3,35 +3,54 @@
 A native, GPU-accelerated IDE that aims for **Zed's speed with PhpStorm's understanding of
 Laravel** — written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
 
-> **v0.3.2 is out.** Editor, LSP intelligence, Eloquent/route/Livewire awareness, Git /
+> **v0.4.0 is out.** Editor, LSP intelligence, Eloquent/route/Livewire awareness, Git /
 > Database / Docker / Composer / test panels, an opt-in AI chat panel with Ask and Agent
-> modes, inline AI autocomplete, and LSP inlay hints. 1466 tests, clippy clean.
+> modes, inline AI autocomplete, LSP inlay hints, an embedded browser preview, and proper
+> IME / dead-key composition. 1506 tests, clippy clean.
 > [Changelog](CHANGELOG.md) · [Latest release](https://github.com/richasdev/ellefuanti/releases/latest)
 
 ---
 
 ## Download
 
-**[⬇ Download ellefuanti for macOS (.dmg)](https://github.com/richasdev/ellefuanti/releases/latest)**
+### Homebrew — the one that just works
 
-Then open the `.dmg`, drag **ellefuanti** onto **Applications**, and open it with
-**right-click → Open → Open**.
+```sh
+brew tap richasdev/ellefuanti
+brew install --cask ellefuanti
+```
 
-That middle gesture matters. **Double-clicking the first time shows a warning with no way
-past it** — macOS offers only "Move to Trash". Right-click → Open is the same act with an
-Open button attached, and you only do it once: macOS remembers the choice.
+`brew upgrade` keeps it current afterwards. This is the recommended path because it avoids
+both of macOS's annoyances at once: **no Gatekeeper warning**, and **no disk image left
+mounted** for the Finder to trip over later.
 
-### Or paste one line and skip all of it
-
-This downloads the current release, installs it, clears the quarantine flag and opens the
-app — no warning at any point:
+### Or one line, without Homebrew
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/richasdev/ellefuanti/main/scripts/install.sh | sh
 ```
 
+Downloads the current release, installs it, clears the quarantine flag, opens the app. No
+warning at any point.
+
+### Or the .dmg, by hand
+
+**[⬇ Download ellefuanti for macOS (.dmg)](https://github.com/richasdev/ellefuanti/releases/latest)**
+
+Open it, drag **ellefuanti** onto **Applications**, then open it with
+**right-click → Open → Open**.
+
+That middle gesture matters. **Double-clicking the first time shows a warning with no way
+past it** — macOS offers only "Move to Trash". Right-click → Open is the same act with an
+Open button attached, and you only do it once.
+
+Afterwards, **eject the disk image** (the ⏏ next to it in the Finder's sidebar). Leaving it
+mounted is what produces the later, confusing _"can't be moved to the Trash because it can't
+be deleted"_ — that is the mounted copy, not your installed app. The two paths above unmount
+it for you, which is most of why they are listed first.
+
 <details>
-<summary><b>What that script does, step by step</b></summary>
+<summary><b>What the one-line installer does, step by step</b></summary>
 
 Nothing hidden — it is the same commands you would type, and you can
 [read it here](scripts/install.sh) before running it:
@@ -62,8 +81,17 @@ xattr -dr com.apple.quarantine /Applications/ellefuanti.app
 
 Because the build carries no Apple Developer certificate — that needs a paid account
 (US$ 99/year) — so Gatekeeper treats it as an unidentified developer and warns about anything
-downloaded from the internet. The two steps above are the standard way past that warning, and
-you only do it once.
+downloaded from the internet.
+
+**Homebrew and the one-line installer avoid the warning entirely**, and it is worth knowing
+why, because it is neither magic nor a signature. macOS stamps `com.apple.quarantine` on
+files a _browser_ downloads, and Gatekeeper only blocks apps carrying that flag. `curl` never
+stamps it, and both paths strip it anyway. The app is still unsigned either way — `spctl`
+still answers `rejected`, and a `.dmg` you download in a browser will still warn. What
+changes is the flag, not the trust.
+
+This is how most unsigned open-source Mac apps stay pleasant to install. The ones that show
+no warning at all have simply paid Apple — including the free and open-source ones.
 
 Two different warnings exist and they are worth telling apart. **"Unidentified developer"**
 is the one you should see: annoying, but right-click → Open gets through it. **"Is damaged
@@ -155,7 +183,9 @@ a SQLite project index over models, migrations and routes; Artisan command palet
 Blade and Livewire awareness with `wire:` completion.
 
 **Panels** — Git (status, diff, branches, log, push), database explorer (schema browser and
-row editing), Docker, Composer, test runner, log viewer, and an integrated terminal.
+row editing), Docker, Composer, test runner, log viewer, an integrated terminal, and an
+embedded browser preview so the edit→refresh loop stays in one window. The preview is loaded
+lazily: never open it and it costs nothing at startup.
 
 **AI, entirely opt-in** — a chat panel (⌘⇧A) and inline ghost-text autocomplete. You choose
 the provider: an Anthropic API key, your `ant` CLI login, or any OpenAI-compatible endpoint
@@ -289,6 +319,9 @@ Shipped:
 | **0.2.0** | Drag & drop, tree auto-refresh, active-file indicator, no file-size limit   |
 | **0.2.1** | Self-update from within the app                                             |
 | **0.3.0** | AI chat panel and inline autocomplete, PHP smart typing, zen mode, 8 themes |
+| **0.3.1** | Auto-import, quick-fix lightbulb, subscription chat, resizable panels       |
+| **0.3.2** | Inlay hints, chat Agent mode with per-file diff approval, chat attachments  |
+| **0.4.0** | IME and dead-key composition, embedded browser preview, universal binary    |
 
 Next, roughly in order:
 
@@ -296,10 +329,13 @@ Next, roughly in order:
 | ---------------- | ----------------------------------------------------------- |
 | Debugging        | Xdebug via DAP                                              |
 | Extensibility    | Plugin system                                               |
-| Preview          | Embedded browser preview                                    |
 | Distribution     | Code signing and notarization                               |
 | **Beyond PHP**   | More first-class languages once the Laravel core is settled |
 | **Beyond macOS** | Linux, when GPUI's support makes it worth doing             |
+
+**Intel Macs:** the binary is universal from v0.4.0, but the x86_64 slice has not yet been
+run on real Intel hardware — the development machine is Apple Silicon. Treat Intel support as
+untested until someone confirms it.
 
 Every tool integration is a leaf in the dependency graph: a broken Docker daemon cannot break
 the editor, and a broken LSP cannot stop you typing.
