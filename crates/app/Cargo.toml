@@ -39,6 +39,7 @@ elle-index.workspace = true
 elle-db.workspace = true
 elle-docker.workspace = true
 elle-lsp.workspace = true
+elle-plugin.workspace = true
 elle-settings.workspace = true
 elle-terminal.workspace = true
 elle-test-runner.workspace = true

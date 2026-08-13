@@ -19,6 +19,7 @@ mod lsp_session;
 mod menu;
 mod palette;
 mod perf;
+mod plugin_host;
 mod preview;
 mod preview_view;
 mod preview_webview;
