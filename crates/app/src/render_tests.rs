@@ -639,6 +639,42 @@ async fn the_test_panel_renders_in_every_state(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn the_preview_pane_opens_closes_and_paints(cx: &mut TestAppContext) {
+    // #31 through the real action handler, in a real window that actually paints.
+    //
+    // The webview is an AppKit sibling of GPUI's view, so the interesting failure is not a
+    // wrong colour — it is a panic, or a pane that draws over the editor because nothing
+    // took the native view away. This paints with the pane open, closes it, and paints
+    // again; both passes must survive, and the entity must be gone after the toggle.
+    //
+    // What it does **not** prove is that a page renders. That needs a live HTTP server and
+    // a screen, and no headless harness can see it — see the module docs in `preview_view`.
+    install_theme(cx);
+    let registry = registry();
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry, cx));
+
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_preview_for_test(window, cx))
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(workspace.preview_for_test().is_some(), "the toggle must open the pane");
+    });
+    cx.draw(gpui::point(px(0.), px(0.)), size(px(1180.), px(760.)), |_window, _cx| gpui::div());
+
+    // Closing drops the entity, which is what removes the native view from the window.
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_preview_for_test(window, cx))
+    });
+    workspace.read_with(cx, |workspace, _cx| {
+        assert!(
+            workspace.preview_for_test().is_none(),
+            "closing must drop the pane, or the WKWebView outlives it and keeps drawing"
+        );
+    });
+    cx.draw(gpui::point(px(0.), px(0.)), size(px(1180.), px(760.)), |_window, _cx| gpui::div());
+}
+
+#[gpui::test]
 async fn switching_the_theme_at_runtime_repaints_every_surface(cx: &mut TestAppContext) {
     // #48's second "done when": switching updates every surface, including the terminal.
     //

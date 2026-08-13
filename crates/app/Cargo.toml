@@ -62,6 +62,23 @@ regex.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The preview pane (#31), and nowhere else — see ADR-0011 for why a webview is allowed
+# here and refused everywhere else.
+#
+# WebKit is a system framework, dynamically linked, so these three cost approximately
+# nothing in the binary: measured 18.86 MB → 18.85 MB with a real WKWebView constructed.
+# Only the bindings are linked; the engine already lives on the machine.
+objc2 = "0.6.4"
+objc2-web-kit = { version = "0.3.2", features = ["WKWebViewConfiguration", "WKNavigation"] }
+objc2-foundation = { version = "0.3.2", features = ["NSURL", "NSURLRequest"] }
+# CGRect/CGPoint/CGSize, which is where the frame arithmetic lands.
+objc2-core-foundation = { version = "0.3.2", features = ["CFCGTypes"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSView", "NSWindow", "NSResponder"] }
+# The one public seam GPUI 0.2.2 offers onto its NSView (it implements HasWindowHandle but
+# does not re-export the crate, so the version must match gpui's own 0.6 or the trait will
+# not resolve). Already in the lock via gpui — this declares what is already compiled.
+raw-window-handle = "0.6"
+
 [dev-dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
 # gpui's own test harness, which can open a window and run a full layout/paint pass with no
