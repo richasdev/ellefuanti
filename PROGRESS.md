@@ -10,9 +10,16 @@ anteriores no histórico git deste ficheiro.
 
 ## Trabalho em curso — o que está a acontecer agora
 
-**Nada em curso.** Toda a fila que o dono nomeou está entregue e em `main`. A ronda fechou
-com inlay hints (#226), modo agente (#227) e anexos no chat (#228), e a v0.3.2 passou as
-quatro fases da skill de release.
+**Em curso:** painel de preview embutido (#31), na branch `feat/preview-pane`, com a
+**[ADR-0011](docs/adr/0011-webview-for-preview-pane-only.md)** já commitada a fixar a
+fronteira. O custo em binário foi **medido antes de escrever funcionalidade**: 18.86 →
+18.85 MB com uma `WKWebView` real construída — o motor é framework do sistema, só os
+bindings são ligados. (Medir com a dependência declarada e _não_ usada teria dado zero
+enganador: o linker descarta-a.)
+
+O problema por resolver é de composição, não de tamanho: o GPUI desenha com Metal na sua
+janela e uma `WKWebView` é uma `NSView`. Se o GPUI 0.2.2 não tiver costura para hospedar
+subviews nativas, a resposta certa é **parar e dizer qual é o bloqueio**, não forçar.
 
 **Como retomar um agente parado** (guardado porque volta a ser preciso): as worktrees vivem
 em `.claude/worktrees/agent-<id>/`. Se um agente cair, o trabalho **não se perde** —
@@ -29,12 +36,21 @@ que resolve a discussão**, não o relatório de nenhum dos lados.
 **O que fica na fila:**
 
 1. **Assinatura real + notarização** — US$ 99/ano. É o que remove o aviso do Gatekeeper
-   de vez; ver a secção sobre isso mais abaixo.
-2. **`.dmg` no CI** — hoje é construído e anexado à mão a cada release, e agora são **dois**
-   uploads: `ellefuanti-vX.Y.Z-macos.dmg` e `ellefuanti-macos.dmg`. O segundo é o nome
-   estável que o `scripts/install.sh` procura — **se faltar, o one-liner do README dá 404**.
-3. **Universal binary** — o build é `arm64` puro; um Mac Intel não corre.
-4. **#30 Xdebug**, **#28 plugins**, **#31 browser embutido**, **#18 IME/dead keys**.
+   de vez; ver a secção sobre isso mais abaixo. **É o único item que depende de dinheiro e
+   não de trabalho.**
+2. **Decidir o limite da slice x86_64.** O universal binary saiu (#230), mas a slice Intel
+   mede **20.08 MB** contra os 18.84 MB da arm64 — acima do gate de 19 MB. Binários Intel
+   são maiores para o mesmo código e nenhuma flag corrige. E **o gate nem sequer vê o
+   binário fat**: corre do `ci.yml` sobre o build thin nativo, enquanto o `lipo` vive no
+   `release.yml`, que não invoca o script. Escolha em aberto: limite próprio para x86_64,
+   trabalho de tamanho, ou exceção assumida. Registado no `perf-gate.sh`.
+3. **Testar a slice x86_64 num Mac Intel real.** Nunca foi executada — esta máquina é Apple
+   Silicon sem Rosetta. O `lipo` prova que o código lá está, não que abre janela. **Não
+   anunciar suporte Intel antes disso.**
+4. **#30 Xdebug**, **#28 plugins**. A #31 (browser) está em curso; a #18 (IME) saiu.
+
+**Feito nesta ronda:** `.dmg` no CI com os dois nomes e gate de bundle (#229), universal
+binary (#230), IME e dead-keys (#231).
 
 ## Instalação por uma linha (v0.3.2)
 
