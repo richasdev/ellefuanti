@@ -121,9 +121,13 @@ ls target/ellefuanti.app/Contents/Resources/themes/ | wc -l   # 8 temas
 - [ ] `cargo report future-incompatibilities` — hoje acusa `block v0.1.6` e
       `proc-macro-error2 v2.0.1`, ambos **transitivos via gpui**, nada que possamos corrigir
       aqui. Se aparecer um terceiro, verificar se é nosso antes de ignorar.
-- [ ] Actions do workflow com major pinado (`actions/checkout@v4`,
-      `softprops/action-gh-release@v2`) — um major novo é uma mudança deliberada, nunca
-      automática.
+- [ ] Actions do workflow com major pinado (`actions/checkout@v5`,
+      `actions/upload-artifact@v5`, `softprops/action-gh-release@v2`) — um major novo é uma
+      mudança deliberada, nunca automática. **O aviso a vigiar é o do runtime:** o GitHub
+      deprecou o Node 20 e mostra "forced to run on Node.js 24" em cada run enquanto uma
+      action estiver numa major antiga. É aviso, não erro, por isso não parte nada — e é
+      exatamente por isso que passa despercebido até alguém olhar para o separador
+      Annotations.
 - [ ] Modelos de IA em `crates/settings/src/file.rs` (`ai.chat_model`,
       `ai.completion_model`): os defaults apontam para modelos que existem hoje. Modelo
       retirado = 404 no primeiro pedido do utilizador.
