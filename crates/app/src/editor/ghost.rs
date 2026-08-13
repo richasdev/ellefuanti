@@ -195,13 +195,8 @@ pub async fn fetch_completion(
     // completion already has, and this string is for the log, not the user.
     let wire = provider.wire().ok_or("the Codex provider does not do ghost completions")?;
     let auth = ai::resolve_auth(provider, &base_url)?;
-    let body = ai::chat_body(
-        wire,
-        &model,
-        SYSTEM_PROMPT,
-        &[Turn { role: "user", content: user_turn }],
-        MAX_TOKENS,
-    );
+    let body =
+        ai::chat_body(wire, &model, SYSTEM_PROMPT, &[Turn::text("user", user_turn)], MAX_TOKENS);
 
     let mut child = smol::process::Command::new("curl")
         .args(ai::curl_args(&auth))

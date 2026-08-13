@@ -180,12 +180,33 @@ pub struct Turn {
     /// `"user"` or `"assistant"` — both wires use the same two words.
     pub role: &'static str,
     pub content: String,
+    /// Images riding along with this turn's text. Empty for every turn that is not a
+    /// send carrying attachments, which is why `content` stays the primary field: a turn
+    /// with no images serialises to exactly the string form it always did.
+    pub images: Vec<Image>,
+}
+
+impl Turn {
+    /// The common case — a turn that is only words.
+    pub fn text(role: &'static str, content: String) -> Turn {
+        Turn { role, content, images: Vec::new() }
+    }
+}
+
+/// An image attachment, already read and encoded, ready for either wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// An IANA type both providers accept: `image/png`, `image/jpeg`, `image/gif`,
+    /// `image/webp`.
+    pub media_type: String,
+    /// Standard base64, no line breaks — what both wires want inside JSON.
+    pub data: String,
 }
 
 /// The streaming request body for either wire.
 pub fn chat_body(wire: Wire, model: &str, system: &str, turns: &[Turn], max_tokens: u32) -> String {
     let turn_values: Vec<Value> =
-        turns.iter().map(|t| json!({"role": t.role, "content": t.content})).collect();
+        turns.iter().map(|t| json!({"role": t.role, "content": turn_content(wire, t)})).collect();
     match wire {
         Wire::Anthropic => json!({
             "model": model,
@@ -205,6 +226,50 @@ pub fn chat_body(wire: Wire, model: &str, system: &str, turns: &[Turn], max_toke
                 "messages": messages,
             })
             .to_string()
+        }
+    }
+}
+
+/// One turn's `content` field, in whichever shape the wire needs.
+///
+/// A turn with no images stays a plain JSON string. That is not an optimisation — it is
+/// the compatibility guarantee: every provider on either wire accepts the string form,
+/// while the block form is a newer spelling that a local Ollama or an older OpenAI-shaped
+/// gateway may not parse. Attachments are opt-in, and so is the risk of the richer body.
+fn turn_content(wire: Wire, turn: &Turn) -> Value {
+    if turn.images.is_empty() {
+        return Value::String(turn.content.clone());
+    }
+    match wire {
+        // Anthropic: text first, then one `image` block per attachment, each carrying its
+        // own base64 source. Text leads because the prompt is what frames the images.
+        Wire::Anthropic => {
+            let mut blocks = vec![json!({"type": "text", "text": turn.content})];
+            blocks.extend(turn.images.iter().map(|image| {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type,
+                        "data": image.data,
+                    },
+                })
+            }));
+            Value::Array(blocks)
+        }
+        // OpenAI: the same idea with different nouns — `image_url` whose url is a `data:`
+        // URI rather than a fetchable address, which is how the format carries bytes.
+        Wire::OpenAi => {
+            let mut blocks = vec![json!({"type": "text", "text": turn.content})];
+            blocks.extend(turn.images.iter().map(|image| {
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", image.media_type, image.data),
+                    },
+                })
+            }));
+            Value::Array(blocks)
         }
     }
 }
@@ -420,6 +485,141 @@ pub fn deny_reason(path: &Path) -> Option<&'static str> {
     None
 }
 
+// --- attachments --------------------------------------------------------------------
+
+/// The largest file that may ride along, before encoding.
+///
+/// Chosen against the failure mode rather than a provider limit: base64 inflates by 4/3,
+/// so 5 MB of pixels is ~6.7 MB of JSON in one request body that `curl` must buffer and
+/// the provider must accept. Anthropic's own ceiling for an image block is 5 MB encoded,
+/// which this stays under for anything a screenshot actually weighs. A refusal names this
+/// number (see [`attachment_too_large`]) so the limit is a fact on screen, not a mystery.
+pub const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// The refusal for a file over [`MAX_ATTACHMENT_BYTES`], worded like the denylist's: what
+/// happened and why, no apology and no "try again".
+pub fn attachment_too_large(name: &str, bytes: u64) -> String {
+    format!(
+        "{name} is {:.1} MB — over the {} MB attachment limit",
+        bytes as f64 / (1024.0 * 1024.0),
+        MAX_ATTACHMENT_BYTES / (1024 * 1024)
+    )
+}
+
+/// The image media type for these bytes, or `None` when they are not an image we can
+/// send.
+///
+/// Magic bytes, not the extension: a `.png` that is really a JPEG would be rejected by the
+/// provider with an unhelpful error, and a screenshot dragged out of a browser can arrive
+/// with any name at all. The four types are exactly the four both wires accept — anything
+/// else (BMP, TIFF, HEIC, SVG) is not an image *for this purpose* even though it is one
+/// for a human, so it falls through to `None` and gets refused by name.
+pub fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    // RIFF....WEBP — the size field sits between the two markers, so both are checked.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// Whether these bytes are text a model can read, as opposed to a binary blob that would
+/// arrive as mojibake.
+///
+/// Valid UTF-8 is most of the answer, but not all of it: a small binary can be accidentally
+/// valid UTF-8, and a NUL byte is the oldest and most reliable tell that a file is not
+/// text. Both checks are cheap and both are needed.
+pub fn looks_like_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// What an attached file turned out to be, once its bytes were read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentKind {
+    /// An image, base64'd for a content block.
+    Image(Image),
+    /// Text, which rides in the prompt as a fenced block like the Current-file chip's —
+    /// base64 would only cost tokens and hide the content from the transcript.
+    Text(String),
+}
+
+/// Reads a file and decides what it can be attached as, or refuses with a reason meant
+/// for the user's eyes.
+///
+/// Every refusal path in this function is a sentence that gets rendered next to the chip.
+/// The order matters: the denylist first, because a secret must be refused *as* a secret
+/// even when it would also be too large or binary, and the reason the user sees should be
+/// the one that outranks the others.
+pub fn read_attachment(path: &Path) -> Result<AttachmentKind, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+
+    if let Some(reason) = deny_reason(path) {
+        return Err(format!("{name} stays local — {reason}"));
+    }
+
+    // The size check reads metadata rather than the file: refusing a 400 MB video should
+    // not mean reading 400 MB first.
+    let metadata =
+        std::fs::metadata(path).map_err(|err| format!("could not read {name}: {err}"))?;
+    if metadata.is_dir() {
+        return Err(format!("{name} is a folder — attach files, not directories"));
+    }
+    if metadata.len() > MAX_ATTACHMENT_BYTES {
+        return Err(attachment_too_large(&name, metadata.len()));
+    }
+
+    let bytes = std::fs::read(path).map_err(|err| format!("could not read {name}: {err}"))?;
+    if let Some(media_type) = image_media_type(&bytes) {
+        return Ok(AttachmentKind::Image(Image {
+            media_type: media_type.to_string(),
+            data: base64_encode(&bytes),
+        }));
+    }
+    if looks_like_text(&bytes) {
+        return Ok(AttachmentKind::Text(String::from_utf8_lossy(&bytes).into_owned()));
+    }
+    // A binary that is not one of the four image types: refused by name rather than sent
+    // as mojibake, which is the failure mode that wastes a request and confuses the model.
+    Err(format!("{name} is binary and not a PNG, JPEG, GIF or WebP — nothing to send"))
+}
+
+/// Standard base64 (RFC 4648) with padding and no line breaks.
+///
+/// Hand-rolled because a crate for twenty lines is not affordable: #99 measured an HTTP
+/// client against the binary limit and declined, and the same arithmetic applies to an
+/// encoder. The tests below pin it against the RFC's own vectors, which is the whole
+/// reason it is safe to write this by hand.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // Exact: four output characters per three input bytes, rounded up.
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        // The three bytes as one 24-bit number, short chunks zero-filled on the right.
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 0x3F] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 0x3F] as char);
+        // The padding: a one-byte tail encodes two characters, a two-byte tail three.
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 0x3F] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 { ALPHABET[triple as usize & 0x3F] as char } else { '=' });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,7 +718,7 @@ mod tests {
 
     #[test]
     fn the_two_bodies_carry_the_system_prompt_their_own_way() {
-        let turns = [Turn { role: "user", content: "hi".to_string() }];
+        let turns = [Turn::text("user", "hi".to_string())];
         let anthropic: Value =
             serde_json::from_str(&chat_body(Wire::Anthropic, "m", "sys", &turns, 100)).unwrap();
         assert_eq!(anthropic["system"], "sys");
@@ -569,5 +769,198 @@ mod tests {
         for fine in ["UserController.php", "web.php", "composer.json", "app.blade.php", ".envoy"] {
             assert!(deny_reason(&PathBuf::from(fine)).is_none(), "{fine} is ordinary source");
         }
+    }
+
+    // --- attachments ------------------------------------------------------------------
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        // The RFC's own table, which is why hand-rolling this is defensible: every tail
+        // length and both padding cases are pinned against a published answer.
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "encoding {input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_covers_the_whole_alphabet_including_the_high_bytes() {
+        // A PNG is mostly non-ASCII, so the `+` and `/` end of the alphabet is the part
+        // that actually runs in production — an off-by-one there would corrupt an image
+        // silently rather than failing loudly.
+        assert_eq!(base64_encode(&[0xFB, 0xFF, 0xFE]), "+//+");
+        assert_eq!(base64_encode(&[0x00, 0x00, 0x00]), "AAAA");
+        assert_eq!(base64_encode(&[0xFF; 3]), "////");
+        // Length is exactly 4/3 rounded up to a multiple of four, for every tail.
+        for len in 0..16usize {
+            let encoded = base64_encode(&vec![0xA5; len]);
+            assert_eq!(encoded.len(), len.div_ceil(3) * 4, "length for {len} bytes");
+        }
+    }
+
+    #[test]
+    fn images_are_recognised_by_their_magic_bytes_not_their_names() {
+        assert_eq!(
+            image_media_type(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some("image/png")
+        );
+        assert_eq!(image_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(image_media_type(b"GIF89a....."), Some("image/gif"));
+
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]); // the size field between markers
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(image_media_type(&webp), Some("image/webp"));
+
+        // Not the four the wires accept, and not images at all: both are `None`, and the
+        // caller turns that into a named refusal rather than a guess.
+        assert_eq!(image_media_type(b"<?php echo 1;"), None);
+        assert_eq!(image_media_type(b"BM\x00\x00"), None, "BMP is an image, but not one we send");
+        assert_eq!(image_media_type(b"RIFF____AVI "), None, "a RIFF that is not a WebP");
+        assert_eq!(image_media_type(b""), None);
+    }
+
+    #[test]
+    fn text_and_binary_are_told_apart_by_nul_and_utf8() {
+        assert!(looks_like_text(b"<?php\nclass User {}\n"));
+        assert!(looks_like_text("acentuação — em UTF-8".as_bytes()));
+        assert!(looks_like_text(b""));
+        assert!(!looks_like_text(b"has a \x00 nul"), "a NUL is the oldest tell of a binary");
+        assert!(!looks_like_text(&[0xFF, 0xFE, 0xFD]), "invalid UTF-8 is not text");
+    }
+
+    #[test]
+    fn a_turn_without_images_still_serialises_as_a_plain_string() {
+        // The compatibility guarantee: nothing about the existing body changed, so a
+        // local Ollama that never saw a content block keeps working.
+        let turns = [Turn::text("user", "hi".to_string())];
+        for wire in [Wire::Anthropic, Wire::OpenAi] {
+            let body: Value =
+                serde_json::from_str(&chat_body(wire, "m", "sys", &turns, 100)).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            let user = messages.last().unwrap();
+            assert_eq!(user["content"], "hi", "{wire:?} keeps the string form");
+        }
+    }
+
+    #[test]
+    fn an_image_turn_becomes_the_block_form_each_wire_understands() {
+        let turns = [Turn {
+            role: "user",
+            content: "what is this?".to_string(),
+            images: vec![Image { media_type: "image/png".to_string(), data: "Zm9v".to_string() }],
+        }];
+
+        let anthropic: Value =
+            serde_json::from_str(&chat_body(Wire::Anthropic, "m", "sys", &turns, 100)).unwrap();
+        let blocks = anthropic["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text", "the prompt leads, it frames the image");
+        assert_eq!(blocks[0]["text"], "what is this?");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "Zm9v");
+
+        let openai: Value =
+            serde_json::from_str(&chat_body(Wire::OpenAi, "m", "sys", &turns, 100)).unwrap();
+        // [0] is the system message; the user turn follows it.
+        let blocks = openai["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(
+            blocks[1]["image_url"]["url"], "data:image/png;base64,Zm9v",
+            "OpenAI carries bytes as a data: URI"
+        );
+    }
+
+    #[test]
+    fn several_images_all_ride_along_in_order() {
+        let turns = [Turn {
+            role: "user",
+            content: "compare".to_string(),
+            images: vec![
+                Image { media_type: "image/png".to_string(), data: "AAAA".to_string() },
+                Image { media_type: "image/jpeg".to_string(), data: "BBBB".to_string() },
+            ],
+        }];
+        let body: Value =
+            serde_json::from_str(&chat_body(Wire::Anthropic, "m", "sys", &turns, 100)).unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3, "one text block plus both images");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[2]["source"]["media_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn reading_an_attachment_refuses_secrets_before_anything_else() {
+        // The denylist outranks every other refusal, and it does so without the file
+        // needing to exist — the name alone is the answer, which is what makes it cheap
+        // and unforgeable.
+        let refusal = read_attachment(&PathBuf::from("/nowhere/.env")).unwrap_err();
+        assert!(refusal.contains("stays local"), "{refusal}");
+        assert!(refusal.contains("credentials"), "the reason travels with it: {refusal}");
+    }
+
+    #[test]
+    fn reading_an_attachment_classifies_text_images_and_binaries() {
+        let dir = std::env::temp_dir().join(format!("elle-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let php = dir.join("User.php");
+        std::fs::write(&php, "<?php\nclass User {}\n").unwrap();
+        assert_eq!(
+            read_attachment(&php),
+            Ok(AttachmentKind::Text("<?php\nclass User {}\n".to_string())),
+            "source attaches as text, never base64 — it would only cost tokens"
+        );
+
+        let png = dir.join("shot.png");
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(b"rest");
+        std::fs::write(&png, &bytes).unwrap();
+        match read_attachment(&png).unwrap() {
+            AttachmentKind::Image(image) => {
+                assert_eq!(image.media_type, "image/png");
+                assert_eq!(image.data, base64_encode(&bytes));
+            }
+            other => panic!("a PNG must attach as an image, got {other:?}"),
+        }
+
+        // A binary that is not one of the four types is refused out loud rather than sent
+        // as mojibake — the requirement that a wasted request never happens quietly.
+        let blob = dir.join("compiled.bin");
+        std::fs::write(&blob, [0x00, 0x01, 0x02, 0xFF]).unwrap();
+        let refusal = read_attachment(&blob).unwrap_err();
+        assert!(refusal.contains("binary"), "{refusal}");
+        assert!(refusal.contains("compiled.bin"), "the refusal names the file: {refusal}");
+
+        // A folder dragged in from Finder is a plausible gesture with no meaning here.
+        let refusal = read_attachment(&dir).unwrap_err();
+        assert!(refusal.contains("folder"), "{refusal}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_oversized_attachment_is_refused_with_the_number_on_screen() {
+        let dir = std::env::temp_dir().join(format!("elle-attach-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("huge.png");
+        std::fs::write(&big, vec![0u8; (MAX_ATTACHMENT_BYTES + 1) as usize]).unwrap();
+
+        let refusal = read_attachment(&big).unwrap_err();
+        assert!(refusal.contains("huge.png"), "{refusal}");
+        assert!(refusal.contains("5 MB"), "the limit is a fact on screen: {refusal}");
+        // And the message is the shared one, so the chip and this path cannot disagree.
+        assert_eq!(refusal, attachment_too_large("huge.png", MAX_ATTACHMENT_BYTES + 1));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
