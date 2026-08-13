@@ -274,3 +274,32 @@ dispara sob `--all-targets` é invisível a quem não o corre com `--all-targets
 **Correção.** `cfg_attr(test, allow(dead_code))` com a razão escrita ao lado, e o comando
 completo do CI promovido a passo obrigatório deste checklist. **Lição: uma verificação que
 não é a do CI não é uma verificação.**
+
+### 8. O binário universal não compilava no CI — e o workflow já pedia o target
+
+**Sintoma.** A primeira run da v0.4.0 morreu no passo `Build release (x86_64)` com
+`error[E0463]: can't find crate for \`core\``, seguido do mesmo para `std`.
+
+**Causa raiz.** O target `x86_64-apple-darwin` não estava instalado no runner na altura de
+compilar. O que torna isto digno de registo é que o workflow **já** o pedia: o passo
+`dtolnay/rust-toolchain` recebeu `targets: aarch64-apple-darwin, x86_64-apple-darwin`,
+reportou `success`, e o log mostra `info: downloading component rust-std` a acontecer. A
+causa mais provável é o `Swatinem/rust-cache`, que corre logo a seguir, restaurar por cima
+do toolchain acabado de instalar.
+
+**Porque não foi apanhado.** Porque o binário universal foi validado numa máquina onde
+alguém já tinha corrido `rustup target add x86_64-apple-darwin` à mão. É a lição da falha 7
+noutra roupagem: ali a diferença estava no **comando**, aqui está no **ambiente**. Um build
+que só funciona porque a máquina foi preparada antes não é um build reproduzível, e a
+preparação não estava escrita em lado nenhum.
+
+**Correção.** Um passo explícito depois do cache: `rustup target add` para ambos
+(idempotente, portanto grátis quando a ação fez o seu trabalho), `rustup target list
+--installed` impresso, e um `grep -qx` que falha ali — não 200 linhas dentro de um `cargo
+build`. Não fui atrás da causa raiz dentro da ação de terceiros: afirmar o pré-requisito é
+mais barato e mais duradouro do que descobrir de quem é a culpa.
+
+**O que correu bem, e vale registar.** A release **não chegou a ser publicada** e o
+`releases/latest` continuou a servir a v0.3.2. Nenhum utilizador viu nada partido. O gate
+falhou antes de publicar, que é exatamente o comportamento que os gates existem para ter —
+ao contrário das falhas 1 a 4, que só se descobriram porque alguém instalou e reclamou.

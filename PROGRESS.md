@@ -173,7 +173,7 @@ Nunca dizer ao utilizador que o aviso desapareceu. Dizer qual é a saída.
 
 ## Onde estão as coisas
 
-- `RELEASE.md` — checklist executável e o registo de **sete** falhas de release, cada uma
+- `RELEASE.md` — checklist executável e o registo de **oito** falhas de release, cada uma
   com causa raiz e porque não foi apanhada.
 - `docs/RISKS.md` — §9 é o egress de dados da IA.
 - `docs/superpowers/specs/` e `plans/` — specs e planos por entrega.
