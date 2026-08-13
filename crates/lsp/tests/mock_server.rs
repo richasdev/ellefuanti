@@ -1385,3 +1385,93 @@ fn a_server_that_declines_inlay_hints_is_not_an_error() {
         client.await_response(&id, Duration::from_secs(5)).unwrap();
     assert!(hints.is_none(), "a null reply is 'nothing to say', not a failure");
 }
+
+
+// --- poisoning -------------------------------------------------------------------
+
+/// A writer that panics once, then works. Panicking inside `write` is what poisons the
+/// connection's `writer` mutex for real: `Connection::send` holds that lock across
+/// `write_message`, so the unwind happens with the lock held — the exact shape of #43.
+struct PanicsOnceWriter {
+    panicked: Arc<AtomicBool>,
+    inner: Box<dyn Write + Send>,
+}
+
+impl Write for PanicsOnceWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("a write panicked while the connection held its writer lock");
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn a_poisoned_writer_lock_does_not_kill_the_connection() {
+    // The bug this keeps fixed: issue #43 ended a session because one panic poisoned a
+    // mutex and every later `lock().unwrap()` re-panicked on it. The condvar that caused
+    // the original panic was fixed; the amplifier was left, so the next panic anywhere
+    // near this state would do the same again.
+    //
+    // Poisoning is provoked for real rather than simulated — an earlier version of this
+    // test wrapped the *client* in its own mutex and poisoned that, which passed with the
+    // old `unwrap()` still in place and therefore proved nothing.
+    let Pipes { client_reader, client_writer, server_reader: _s, server_writer: _w } =
+        Pipes::new();
+
+    let panicked = Arc::new(AtomicBool::new(false));
+    let writer =
+        PanicsOnceWriter { panicked: Arc::clone(&panicked), inner: Box::new(client_writer) };
+    let connection = Connection::new(client_reader, writer, "poison".into());
+
+    // First send panics inside `write`, while `writer` is locked. `catch_unwind` keeps
+    // the harness alive; the poisoned lock is what is under test.
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        connection.notify("initialized", json!({}))
+    }));
+    assert!(first.is_err(), "the write must actually have panicked");
+    assert!(panicked.load(Ordering::SeqCst), "the panicking branch must have run");
+
+    // The writer mutex is now poisoned. With `lock().unwrap()` this second call panics
+    // again — one bad write would have cost the whole session. It must instead go through.
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        connection.notify("textDocument/didChange", json!({}))
+    }));
+    assert!(
+        second.is_ok(),
+        "a poisoned writer lock must not turn the previous panic into this caller's panic"
+    );
+}
+
+#[test]
+fn no_lock_unwrap_creeps_back_into_the_connection() {
+    // `lock().unwrap()` is how one panic became a dead session in #43: it turns another
+    // thread's panic into this thread's. `connection.rs` now routes every lock through the
+    // poison-tolerant `lock` helper, and this keeps it that way — the alternative is
+    // noticing at the next crash report, which is how the last one was found.
+    //
+    // Reading the source rather than linting: the repo has no clippy config, and a test
+    // that fails with the offending line in the message is a shorter path than adding one.
+    let source = include_str!("../src/connection.rs");
+
+    let offenders: Vec<_> = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let code = line.split("//").next().unwrap_or("");
+            code.contains(".lock().unwrap()") || code.contains(".lock().expect(")
+        })
+        .map(|(i, line)| format!("  {}: {}", i + 1, line.trim()))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "these locks panic when another thread already panicked — use `lock(&mutex)` \
+         instead, which recovers the guard:\n{}",
+        offenders.join("\n")
+    );
+}
