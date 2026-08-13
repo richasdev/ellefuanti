@@ -14,18 +14,18 @@ Laravel** — written in Rust on [GPUI](https://gpui.rs). No Electron, no webvie
 
 **[⬇ Download ellefuanti for macOS (.dmg)](https://github.com/richasdev/ellefuanti/releases/latest)**
 
-Then, in a terminal, run this **once** — it clears the download quarantine flag that makes
-macOS claim the app "is damaged":
+Three steps:
+
+1. Open the `.dmg` and drag **ellefuanti** onto **Applications**.
+2. **Right-click** the app → **Open** → **Open**. (Double-clicking the first time shows a
+   warning with no way past it; right-click → Open is the same gesture with an Open button.)
+3. That's the last time you'll see it — macOS remembers the choice.
+
+Prefer the terminal? One command does the same thing:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/ellefuanti.app
 ```
-
-That's it. Three steps, in full:
-
-1. Open the `.dmg` and drag **ellefuanti** onto **Applications**.
-2. Run the `xattr` command above.
-3. Open the app.
 
 <details>
 <summary><b>Prefer to do the whole thing from the terminal?</b></summary>
@@ -43,12 +43,21 @@ open /Applications/ellefuanti.app
 </details>
 
 <details>
-<summary><b>Why does macOS say the app is damaged?</b></summary>
+<summary><b>Why does macOS warn about this app?</b></summary>
 
-It isn't. The build is not code-signed with an Apple Developer certificate (that requires a
-paid account), so Gatekeeper flags anything downloaded from the internet. The `xattr` command
-removes the download flag. Right-click → **Open** → **Open** works too, the first time.
-Signing and notarization are on the roadmap.
+Because the build carries no Apple Developer certificate — that needs a paid account
+(US$ 99/year) — so Gatekeeper treats it as an unidentified developer and warns about anything
+downloaded from the internet. The two steps above are the standard way past that warning, and
+you only do it once.
+
+Two different warnings exist and they are worth telling apart. **"Unidentified developer"**
+is the one you should see: annoying, but right-click → Open gets through it. **"Is damaged
+and can't be opened"** is a different thing — it means the app bundle itself is broken, and
+no amount of clicking helps. Releases up to v0.3.0 showed that second message because the
+bundle was genuinely malformed; that is fixed, and every release is now checked against a
+real download before it ships (see [RELEASE.md](RELEASE.md)).
+
+Signing and notarisation would remove the warning entirely and are on the roadmap.
 
 </details>
 
