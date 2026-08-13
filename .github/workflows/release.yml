@@ -74,9 +74,49 @@ jobs:
           this release — see the release notes.
           EOF
 
+          # The .dmg is what the README and the installer actually hand people; the .zip
+          # is the archive. Built here rather than by hand after the fact, because "by
+          # hand after the fact" is how a release ships without one.
+          scripts/dmg-macos.sh "${VERSION}" "dist/${NAME}"
+
+          # TWO names, deliberately. The versioned one is what release notes link. The
+          # stable one is what scripts/install.sh fetches through
+          # /releases/latest/download/ — a URL that cannot carry a version, or the
+          # installer would rot the moment the next release ships. Miss this copy and the
+          # README's one-line install 404s for everyone.
+          cp "target/ellefuanti-v${VERSION}-macos.dmg" "dist/ellefuanti-macos.dmg"
+          cp "target/ellefuanti-v${VERSION}-macos.dmg" "dist/ellefuanti-v${VERSION}-macos.dmg"
+
+          # Prove the bundle is well-formed *before* publishing it — "damaged and can't be
+          # opened" shipped three times, and every instance was invisible to cargo test.
+          #
+          # Each line below was checked against a deliberately broken bundle, so none of
+          # them is decoration:
+          #
+          #   - Contents/_CodeSignature/ deleted → `-dv` prints "Sealed Resources=none" and
+          #     --verify exits 1 with "invalid resource directory". Both catch it; the
+          #     explicit `test -d` leads anyway because it names the fault in one line
+          #     instead of making the next reader decode a codesign message.
+          #   - a resource edited after signing → --verify: "a sealed resource is missing or
+          #     invalid". This is what enforces bundle-macos.sh's sign-LAST rule.
+          #
+          # One piece of local folklore did NOT reproduce on macOS 15: `cp -R` preserved
+          # _CodeSignature/ here. `ditto` stays in dmg-macos.sh — it is still the right tool
+          # for xattrs and resource forks — but cp is not proven to be the mechanism behind
+          # the "damaged" bundles that shipped, and the comment there overstates the case.
+          test -d "dist/${NAME}/ellefuanti.app/Contents/_CodeSignature" \
+            || { echo "no _CodeSignature/ — macOS will call this bundle damaged" >&2; exit 1; }
+          codesign -dv --verbose=2 "dist/${NAME}/ellefuanti.app" 2>&1 | grep -q "Info.plist entries=" \
+            || { echo "Info.plist not bound — malformed bundle, refusing to publish" >&2; exit 1; }
+          codesign -dv --verbose=2 "dist/${NAME}/ellefuanti.app" 2>&1 | grep -q "Sealed Resources version=" \
+            || { echo "resources not sealed — malformed bundle, refusing to publish" >&2; exit 1; }
+          # Catches a resource changed after signing — the "sign last" rule's enforcement.
+          codesign --verify --deep --strict "dist/${NAME}/ellefuanti.app"
+
           cd dist && zip -r "${NAME}.zip" "${NAME}" >/dev/null
           echo "artifact=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -89,7 +129,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package.outputs.artifact }}
+          files: |
+            ${{ steps.package.outputs.artifact }}
+            dist/ellefuanti-macos.dmg
+            dist/ellefuanti-v${{ steps.package.outputs.version }}-macos.dmg
           body_path: CHANGELOG.md
           # NOT a prerelease, and this is load-bearing rather than cosmetic. GitHub
           # excludes prereleases when it resolves `releases/latest`, and that URL is

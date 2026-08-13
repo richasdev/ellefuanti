@@ -7,11 +7,16 @@
 # /Applications, so the user drags one onto the other.
 #
 # Run scripts/bundle-macos.sh first — this packages whatever .app it produced.
+#
+# Usage: scripts/dmg-macos.sh [version] [dir-containing-the-.app]
+#
+# The second argument exists for CI, which bundles into dist/<name>/ rather than target/.
+# Defaulting it to target/ keeps the local invocation a bare `scripts/dmg-macos.sh`.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/target/ellefuanti.app"
 VERSION="${1:-$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')}"
+APP="${2:-$ROOT/target}/ellefuanti.app"
 DMG="$ROOT/target/ellefuanti-v${VERSION}-macos.dmg"
 STAGING="$ROOT/target/dmg-staging"
 
