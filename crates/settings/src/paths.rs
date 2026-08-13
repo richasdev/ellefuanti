@@ -34,3 +34,16 @@ pub fn support_dir() -> Option<PathBuf> {
 pub fn settings_path() -> Option<PathBuf> {
     Some(support_dir()?.join("settings.json"))
 }
+
+/// `~/Library/Application Support/ellefuanti/crash.log`.
+///
+/// Beside `settings.json` because it is written for the same reason: a human will be asked
+/// to find it and read it. A crash report inside the index directory is one `rm -rf` of a
+/// cache away from being gone exactly when it is needed.
+///
+/// A file rather than the tracing subscriber, because `detach_from_terminal` points stderr
+/// at `/dev/null` — every panic the app has ever hit was written somewhere nobody could
+/// read. See `install_panic_logger` in the app crate.
+pub fn crash_log_path() -> Option<PathBuf> {
+    Some(support_dir()?.join("crash.log"))
+}

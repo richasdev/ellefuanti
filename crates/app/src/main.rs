@@ -139,7 +139,101 @@ fn detach_from_terminal() {
     }
 }
 
+/// Formats one crash report. Split from the hook so it can be tested without panicking.
+///
+/// Deliberately not `Display` on a struct: there is one caller and one format, and the
+/// thing that matters is that the text answers the two questions asked of a crash report —
+/// where it broke and which build it was.
+fn crash_report(
+    payload: &str,
+    location: Option<String>,
+    thread: &str,
+    when: std::time::SystemTime,
+) -> String {
+    let secs = when
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!(
+        "\n===== ellefuanti panic =====\n\
+         when:     {secs} (unix seconds)\n\
+         version:  {}\n\
+         thread:   {thread}\n\
+         location: {}\n\
+         message:  {payload}\n",
+        env!("CARGO_PKG_VERSION"),
+        location.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// Sends panics to a file, because nothing else can see them.
+///
+/// # Why this exists
+///
+/// The owner's report was "crasha do nada" — crashes out of nowhere. There was no
+/// "nowhere": `detach_from_terminal` re-execs with `.stderr(Stdio::null())` so closing the
+/// terminal cannot kill the window, and `main` installed no panic hook. Every panic in a
+/// gpui event handler therefore took the window down and wrote its message, its location
+/// and its backtrace straight to `/dev/null`. Months of crash reports were unactionable
+/// not because the panics were mysterious but because the evidence was discarded by
+/// design.
+///
+/// The default hook is kept and called after ours: when someone runs in the foreground
+/// (`ELLE_FOREGROUND=1`, or piped to a log, which is how #125 was debugged) stderr is a
+/// real stream and the familiar message should still appear there.
+///
+/// Appends rather than truncates. The interesting crash is often the *second* one — the
+/// first is the trigger, the second is what the broken state does next — and a log that
+/// keeps only the newest report throws away the pair. It is one file with no rotation:
+/// panics are rare enough that a size limit would be a guess at a problem nobody has.
+///
+/// ponytail: `RUST_BACKTRACE` is not forced on. A backtrace here costs a symbolised
+/// unwind on a process that is already dying, and the location line has been enough for
+/// every panic in this repo so far. Set it in the environment when it is not.
+fn install_panic_logger() {
+    let Some(path) = elle_settings::crash_log_path() else { return };
+    let previous = std::panic::take_hook();
+
+    std::panic::set_hook(Box::new(move |info| {
+        // Both shapes `panic!` produces. Anything else is a payload no formatter can read.
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+
+        let report = crash_report(
+            &payload,
+            info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())),
+            std::thread::current().name().unwrap_or("unnamed"),
+            std::time::SystemTime::now(),
+        );
+
+        // Best-effort by design: this runs while the process is dying, and a hook that
+        // panics on its own error would replace a readable crash with an abort. A missing
+        // parent directory is the normal case on a first run.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) =
+            std::fs::OpenOptions::new().create(true).append(true).open(&path)
+        {
+            use std::io::Write as _;
+            let _ = file.write_all(report.as_bytes());
+            let _ = file.flush();
+        }
+
+        previous(info);
+    }));
+}
+
 fn main() {
+    // Before `detach_from_terminal`, so a panic in the detach path is captured too — that
+    // code re-execs and touches libc, and it is the one place that runs before there is
+    // any other way to see a failure.
+    install_panic_logger();
+
     detach_from_terminal();
 
     // First statement, so the startup clock includes everything — including the runtime
@@ -251,4 +345,79 @@ fn main() {
         startup.phase("window");
         startup.ready();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The report has to answer "where did it break" and "which build was it", because a
+    /// crash log that says only "panicked" costs another round-trip with the person who
+    /// hit it.
+    #[test]
+    fn a_crash_report_names_the_place_and_the_build() {
+        let report = crash_report(
+            "index out of bounds",
+            Some("crates/app/src/workspace_view.rs:4210:9".to_string()),
+            "main",
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000),
+        );
+
+        assert!(report.contains("index out of bounds"), "{report}");
+        assert!(report.contains("workspace_view.rs:4210:9"), "{report}");
+        assert!(report.contains("main"), "{report}");
+        assert!(report.contains(env!("CARGO_PKG_VERSION")), "{report}");
+        assert!(report.contains("1760000000"), "{report}");
+    }
+
+    /// A panic with no location still has to produce a readable report — `panic_any` and
+    /// panics from foreign frames both reach the hook that way, and a hook that assumed a
+    /// location would itself panic while the process was already dying.
+    #[test]
+    fn a_report_without_a_location_is_still_readable() {
+        let report = crash_report("boom", None, "unnamed", std::time::UNIX_EPOCH);
+        assert!(report.contains("location: unknown"), "{report}");
+        assert!(report.contains("boom"), "{report}");
+    }
+
+    /// The end-to-end property that matters: a real panic, caught, reaches the file.
+    ///
+    /// Written against a temp path rather than `install_panic_logger` itself because the
+    /// panic hook is process-global — installing one here would swallow the reports of
+    /// every other test in this binary and make their failures unreadable.
+    #[test]
+    fn the_hook_writes_a_real_panic_to_the_file() {
+        let path = std::env::temp_dir().join(format!("elle-crash-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let sink = path.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .unwrap_or_default();
+            let report = crash_report(
+                &payload,
+                info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())),
+                "test",
+                std::time::UNIX_EPOCH,
+            );
+            use std::io::Write as _;
+            let mut file =
+                std::fs::OpenOptions::new().create(true).append(true).open(&sink).unwrap();
+            file.write_all(report.as_bytes()).unwrap();
+        }));
+
+        let caught = std::panic::catch_unwind(|| panic!("a deliberate test panic"));
+        std::panic::set_hook(previous);
+
+        assert!(caught.is_err(), "the panic must actually have fired");
+        let written = std::fs::read_to_string(&path).expect("the hook must have created the file");
+        assert!(written.contains("a deliberate test panic"), "{written}");
+        assert!(written.contains("main.rs:"), "the location must point at this file: {written}");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
