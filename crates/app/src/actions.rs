@@ -230,9 +230,20 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // chord, and macOS's symbolic-hotkey table (read for the ⌥⌘I decision above)
         // does not either.
         KeyBinding::new("cmd-shift-a", ToggleAiChat, Some(context::WORKSPACE)),
-        // ⌘⇧P. Not ⌘P (quick open) and not ⌘⇧O (route search); ⌘⇧P is free here because this
-        // app puts the command palette on ⌘K.
-        KeyBinding::new("cmd-shift-p", TogglePreview, Some(context::WORKSPACE)),
+        // ⌘⇧V, VS Code's markdown-preview chord.
+        //
+        // This was ⌘⇧P until it was found to be the command palette's chord, fourteen lines
+        // above, in the same `WORKSPACE` context. The comment here claimed "⌘⇧P is free
+        // because this app puts the command palette on ⌘K" — it does not, and never did.
+        // gpui resolves the later binding, so shipping the preview pane silently took the
+        // palette away: pressing ⌘⇧P opened a WKWebView. The lesson is not "check twice"
+        // but that a keymap this size cannot be checked by reading, which is why
+        // `no_duplicate_bindings_within_a_context` now fails the build instead.
+        //
+        // ⌘⇧V checked the way ⌥⌘I was, against `com.apple.symbolichotkeys` rather than by
+        // eye: no system hotkey binds keycode 9 (`v`) under any modifier mask, and nothing
+        // in this keymap claims it.
+        KeyBinding::new("cmd-shift-v", TogglePreview, Some(context::WORKSPACE)),
         // #82 stage 1: ⌘D grows a cursor per occurrence; Escape (the editor's existing
         // Cancel) collapses back to one.
         KeyBinding::new("cmd-d", SelectNextOccurrence, Some(context::EDITOR)),
@@ -816,6 +827,62 @@ mod tests {
                  ships the popup unreachable by keyboard: {binding}"
             );
         }
+    }
+
+    #[test]
+    fn no_duplicate_bindings_within_a_context() {
+        // The bug this exists to keep fixed: the preview pane (#31) bound ⌘⇧P in
+        // `WORKSPACE`, which the command palette had already claimed fourteen lines above.
+        // gpui resolves the later binding, so the palette became unreachable and ⌘⇧P opened
+        // a WKWebView instead. It shipped, and the owner reported it as "⌘⇧P agora abre o
+        // navegador".
+        //
+        // Nothing caught it: 1661 tests passed, the build was clean, and the binding's own
+        // comment asserted the chord was free. That is the real finding — a keymap with 135
+        // bindings is past the size where reading it proves anything, so the check has to be
+        // mechanical.
+        //
+        // Same chord in *different* contexts is correct and common: `enter` confirms in the
+        // palette and inserts a newline in the editor. Only a collision within one context
+        // is a bug, because only then does one binding silently shadow the other.
+        use std::collections::HashMap;
+
+        let source = keymap_source();
+        let mut seen: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+
+        for line in source.lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("KeyBinding::new(\"") else { continue };
+            let Some((chord, rest)) = rest.split_once("\", ") else { continue };
+            let Some((action, rest)) = rest.split_once(',') else { continue };
+            // `Some(context::WORKSPACE)),` -> `WORKSPACE`. Trimming to the identifier rather
+            // than stripping known suffixes: the trailing punctuation varies with
+            // formatting, and a context key that silently carries `)),` would compare
+            // unequal to the same context written differently — a collision this test
+            // exists to catch would slip through as two distinct keys.
+            let Some(context) = rest
+                .split("context::")
+                .nth(1)
+                .map(|c| c.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+            else {
+                continue;
+            };
+            seen.entry((chord, context)).or_default().push(action.trim());
+        }
+
+        assert!(seen.len() > 100, "the keymap parser matched only {} bindings — it has drifted from the source it reads", seen.len());
+
+        let collisions: Vec<_> = seen
+            .iter()
+            .filter(|(_, actions)| actions.len() > 1)
+            .map(|((chord, context), actions)| format!("  {chord} in {context} -> {actions:?}"))
+            .collect();
+
+        assert!(
+            collisions.is_empty(),
+            "one chord cannot mean two things in the same context — the later binding wins \
+             and the earlier one silently stops working:\n{}",
+            collisions.join("\n")
+        );
     }
 
     #[test]
