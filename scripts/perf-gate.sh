@@ -84,10 +84,17 @@ CPU_LIMIT_PCT=2
 #   1. The x86_64 slice does NOT fit. Measured on 2026-08-13: arm64 18.84 MB, x86_64
 #      **20.08 MB** — over this limit. Intel binaries are simply larger for the same source
 #      (denser instruction encoding is an arm64 property, not something a flag fixes), so
-#      the fat build cannot pass a 19 MB per-slice gate as it stands. Whoever ships Intel
-#      support has to decide: a higher limit for x86_64 specifically, real size work, or
-#      accepting that Intel is the slice that gets an exception. This is a product call,
+#      the fat build could not pass the 19 MB per-slice gate as it stood. Whoever ships
+#      Intel support has to decide: a higher limit for x86_64 specifically, real size work,
+#      or accepting that Intel is the slice that gets an exception. This is a product call,
 #      not something to nudge quietly.
+#
+#      **Raising the limit to 20 MB did not settle this**, and it is worth saying so
+#      explicitly because it looks like it should have. That measurement predates the
+#      debugger and the plugin host, which together add ~160 KB to *every* slice — so the
+#      x86_64 slice is now around 20.2 MB and still over. The question is open, and the
+#      answer is not "raise it again": at some point Intel either gets its own number or
+#      gets real size work.
 #   2. This gate never sees the fat binary anyway. It runs from `ci.yml` against the
 #      ordinary `cargo build --release` (thin, native), while `release.yml` is where `lipo`
 #      merges the slices — and release.yml does not invoke this script. So the per-slice
@@ -108,7 +115,20 @@ CPU_LIMIT_PCT=2
 # same code you want. Measure before believing it — the probe is cheap: add the dep, call
 # it for real (a declared-but-unused dep is dropped by the linker and measures a misleading
 # zero), and build.
-BIN_LIMIT_MB=19
+# 19 -> 20 with #30 and #28, by an explicit decision rather than a nudge.
+#
+# The gate exists to catch *accidental* growth — the kind where twenty PRs each add a little
+# and nobody measures the aggregate (#79). It is not meant to veto a feature whose cost is
+# known, attributed, and worth paying. Two arrived together and did not fit: the DBGp
+# debugger (+93 KB, ~2,500 lines, spread rather than concentrated — removing its whole panel
+# render recovers only 20 KB) and the plugin host (+69 KB). Both had already been measured
+# down: the debugger dropped `roxmltree` for a ~200-line reader, and the plugin host ruled
+# out a WASM runtime that would have cost 9.83 MB.
+#
+# So the number moved, and the reason is recorded here rather than in a commit message
+# nobody reads. What has NOT changed is the rule: the next feature measures itself against
+# 20 and, if it does not fit, that is a release decision too — not something to nudge.
+BIN_LIMIT_MB=20
 
 # How long to let the process settle before believing its memory. Measured: footprint is
 # still climbing for the first several seconds after launch, so reading it immediately

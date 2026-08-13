@@ -39,7 +39,7 @@ que resolve a discussão**, não o relatório de nenhum dos lados.
    de vez; ver a secção sobre isso mais abaixo. **É o único item que depende de dinheiro e
    não de trabalho.**
 2. **Decidir o limite da slice x86_64.** O universal binary saiu (#230), mas a slice Intel
-   mede **20.08 MB** contra os 18.84 MB da arm64 — acima do gate de 19 MB. Binários Intel
+   mede **20.08 MB** contra os 18.84 MB da arm64 — acima até do gate novo de 20 MB. Binários Intel
    são maiores para o mesmo código e nenhuma flag corrige. E **o gate nem sequer vê o
    binário fat**: corre do `ci.yml` sobre o build thin nativo, enquanto o `lipo` vive no
    `release.yml`, que não invoca o script. Escolha em aberto: limite próprio para x86_64,
@@ -180,7 +180,7 @@ Nunca dizer ao utilizador que o aviso desapareceu. Dizer qual é a saída.
 - Skill `/ellefuanti-release` (em `~/.claude/skills/`) — corre os checks do CI, verifica a
   assinatura e testa o download com quarentena.
 
-**Atenção ao binário:** 18.73 de 19 MB. A próxima dependência não cabe sem decisão
+**Atenção ao binário:** o gate é 20 MB desde a v0.5.0. A próxima dependência pesada não cabe sem decisão
 explícita — foi por isso que a camada de IA usa o `curl` e o `security` do sistema em vez
 de um cliente HTTP e de um keyring.
 
