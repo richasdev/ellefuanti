@@ -235,6 +235,28 @@ impl Palette {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // ⌘V and ⌘C before the modifier guard below, which drops every ⌘ chord — the
+        // reason pasting a path or a symbol name in here silently did nothing. The palette
+        // owns the keyboard while it is open, so one arm each is cheaper than a key
+        // context for two chords (`context_menu::on_key_down`'s reasoning).
+        if keystroke.modifiers.platform && keystroke.key == "v" {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                if !pasted.is_empty() {
+                    self.typed(&pasted, cx);
+                }
+            }
+            return;
+        }
+        // ⌘C copies the whole query: these fields have no selection model, and building one
+        // inside a one-line overlay is a much larger change than this. Copying everything
+        // is the honest reading of "copy" when everything is what the field holds.
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            if !self.query.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.query.clone()));
+            }
+            return;
+        }
         if keystroke.modifiers.platform
             || keystroke.modifiers.control
             || keystroke.modifiers.function

@@ -574,9 +574,64 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
     }
 }
 
+/// What clipboard text becomes when it lands in a one-line field.
+///
+/// Every small text field in this app — the palette, the find and replace boxes, the chat
+/// box, the commit message, the project-search query, the file-name prompt — is a `String`
+/// rendered as a single `div` child. A `\n` in one of those does not wrap: it renders as an
+/// invisible break, so the field silently shows less than it holds and the user cannot see
+/// why. Anything pasted from a terminal or an editor carries one, usually trailing.
+///
+/// So newlines and tabs collapse to spaces and the result is trimmed. A free function
+/// because this is the whole decision worth testing — the rest of a paste is one
+/// `push_str` inside a `Context` that needs a window to build.
+pub fn pasted_into_single_line(clipboard: &str) -> String {
+    // Every run of whitespace — including the CRLF pair and a tab-indented line — becomes
+    // one space, so a pasted block reads as one line of words rather than losing its
+    // breaks silently. `split_whitespace` handles the trimming on both ends for free.
+    clipboard.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pasted_newline_never_reaches_a_one_line_field() {
+        // The reported shape: a key or path copied from a terminal carries a trailing
+        // newline, which renders as an invisible break rather than as nothing.
+        assert_eq!(pasted_into_single_line("sk-ant-api03-abc\n"), "sk-ant-api03-abc");
+        assert_eq!(pasted_into_single_line("first\nsecond"), "first second");
+        assert_eq!(pasted_into_single_line("crlf\r\nline"), "crlf line");
+    }
+
+    #[test]
+    fn tabs_and_runs_of_space_collapse() {
+        // Pasting an indented line out of a file must not push the text off the right of a
+        // 120px box with whitespace nobody can see.
+        assert_eq!(pasted_into_single_line("\tindented"), "indented");
+        assert_eq!(pasted_into_single_line("a\t\tb"), "a b");
+        assert_eq!(pasted_into_single_line("wide    gap"), "wide gap");
+    }
+
+    #[test]
+    fn surrounding_space_is_trimmed() {
+        assert_eq!(pasted_into_single_line("  padded  "), "padded");
+    }
+
+    #[test]
+    fn whitespace_only_and_empty_paste_to_nothing() {
+        // Guards the callers: an empty result must stay empty rather than become a lone
+        // space that makes a placeholder disappear for no visible reason.
+        assert_eq!(pasted_into_single_line(""), "");
+        assert_eq!(pasted_into_single_line("   \n\t "), "");
+    }
+
+    #[test]
+    fn ordinary_text_survives_untouched() {
+        assert_eq!(pasted_into_single_line("UserController.php"), "UserController.php");
+        assert_eq!(pasted_into_single_line("ação — não"), "ação — não");
+    }
 
     /// The shipped body of `init`, which is where every binding is declared.
     ///

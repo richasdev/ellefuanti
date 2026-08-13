@@ -193,6 +193,25 @@ impl SearchPanel {
         // rather than rewritten: modified chords are actions, named keys are actions, and
         // only `key_char` is text.
         let keystroke = &event.keystroke;
+        // ⌘V and ⌘C before the modifier guard below, which drops every ⌘ chord — the
+        // reason pasting a symbol name into the project search silently did nothing.
+        if keystroke.modifiers.platform && keystroke.key == "v" {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                if !pasted.is_empty() {
+                    self.typed(&pasted, cx);
+                }
+            }
+            return;
+        }
+        // ⌘C copies the pattern whole: no selection model here, and one is out of scope
+        // (`palette::on_key_down`'s reasoning).
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            if !self.query.pattern.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.query.pattern.clone()));
+            }
+            return;
+        }
         if keystroke.modifiers.platform
             || keystroke.modifiers.control
             || keystroke.modifiers.function
@@ -210,6 +229,12 @@ impl SearchPanel {
             return;
         }
 
+        self.typed(text, cx);
+    }
+
+    /// The shared tail of text reaching the pattern, from a keystroke or a paste — the
+    /// palette's `typed` seam, for the palette's reason.
+    fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
         self.query.pattern.push_str(text);
         cx.emit(SearchPanelEvent::QueryChanged);
         cx.notify();
@@ -283,7 +308,7 @@ impl Focusable for SearchPanel {
 }
 
 impl Render for SearchPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
 
@@ -303,16 +328,22 @@ impl Render for SearchPanel {
             .overflow_hidden()
             .text_size(fonts.ui_size)
             .text_color(theme.text)
-            .child(self.render_query_row(&theme, cx))
+            .child(self.render_query_row(&theme, window, cx))
             .child(self.render_summary(&theme))
             .child(self.render_rows(&theme, cx))
     }
 }
 
 impl SearchPanel {
-    fn render_query_row(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_query_row(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let empty = self.query.pattern.is_empty();
         let text = if empty { "Search".to_string() } else { self.query.pattern.clone() };
+        let focused = self.focus_handle.is_focused(window);
 
         div()
             .flex()
@@ -322,10 +353,12 @@ impl SearchPanel {
             .px_2()
             .py_1()
             .child(
-                // No caret and no selection, the same admission `find_bar::text_field`
-                // makes: gpui has no text input element, and faking one with a blinking
-                // block that cannot be clicked into would be worse than a field that is
-                // honest about being append-and-backspace only.
+                // No selection, the same admission `find_bar::text_field` makes: gpui has
+                // no text input element. There is a caret though, the palette's (#164) —
+                // a bar before the placeholder and after typed text — drawn only while
+                // this panel holds focus, since it sits open beside a focused editor and a
+                // caret there would claim a keyboard it does not have. Solid, not
+                // blinking, for the palette's reason: no timer per open panel.
                 div()
                     .h(px(22.0))
                     .flex()
@@ -336,7 +369,15 @@ impl SearchPanel {
                     .border_1()
                     .border_color(theme.accent)
                     .when(empty, |el| el.text_color(theme.text_muted))
-                    .child(SharedString::from(text)),
+                    .when(focused && empty, |el| {
+                        el.child(div().w(px(2.0)).h(px(14.0)).mr_1().flex_none().bg(theme.cursor))
+                    })
+                    .child(SharedString::from(text))
+                    .when(focused && !empty, |el| {
+                        el.child(
+                            div().w(px(2.0)).h(px(14.0)).ml(px(1.0)).flex_none().bg(theme.cursor),
+                        )
+                    }),
             )
             .child(
                 div()

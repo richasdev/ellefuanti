@@ -180,6 +180,31 @@ impl FindBar {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // ⌘V and ⌘C before the modifier guard below, which drops every ⌘ chord — the
+        // reason pasting a search term in here silently did nothing. Both act on whichever
+        // of the two fields has focus, so ⌘V into the replace box does not overwrite the
+        // pattern that found the matches.
+        if keystroke.modifiers.platform && keystroke.key == "v" {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                if !pasted.is_empty() {
+                    self.typed(&pasted, cx);
+                }
+            }
+            return;
+        }
+        // ⌘C copies the focused field whole: no selection model here, and one is out of
+        // scope for a two-field bar (`palette::on_key_down`'s reasoning).
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            let text = match self.field {
+                Field::Find => self.query.pattern.clone(),
+                Field::Replace => self.replacement.clone(),
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+            return;
+        }
         if keystroke.modifiers.platform
             || keystroke.modifiers.control
             || keystroke.modifiers.function
@@ -197,6 +222,14 @@ impl FindBar {
             return;
         }
 
+        self.typed(text, cx);
+    }
+
+    /// The shared tail of text reaching the focused field, from a keystroke or a paste.
+    ///
+    /// One place so the rescan rule cannot drift between the two: only the pattern is
+    /// searched for, so only the pattern emits.
+    fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
         match self.field {
             Field::Find => {
                 self.query.pattern.push_str(text);
@@ -310,9 +343,10 @@ impl Focusable for FindBar {
 }
 
 impl Render for FindBar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let fonts = Fonts::get(cx);
+        let has_focus = self.focus_handle.is_focused(window);
 
         div()
             .key_context(context::FIND)
@@ -340,13 +374,22 @@ impl Render for FindBar {
             .border_color(theme.border)
             .text_size(fonts.ui_size)
             .text_color(theme.text)
-            .child(self.render_find_row(&theme, cx))
-            .when(self.replacing, |el| el.child(self.render_replace_row(&theme, cx)))
+            // Whether the bar itself holds the keyboard. The caret is gated on this as
+            // well as on which field is selected: the bar stays on screen while the editor
+            // is focused, and a caret in a bar the keyboard has left would claim typing
+            // lands here when it lands in the document.
+            .child(self.render_find_row(&theme, has_focus, cx))
+            .when(self.replacing, |el| el.child(self.render_replace_row(&theme, has_focus, cx)))
     }
 }
 
 impl FindBar {
-    fn render_find_row(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_find_row(
+        &self,
+        theme: &Theme,
+        has_focus: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (status, is_problem) = self.status.label();
 
         div()
@@ -354,7 +397,13 @@ impl FindBar {
             .items_center()
             .gap_2()
             .h(px(26.0))
-            .child(text_field(&self.query.pattern, "Find", self.field == Field::Find, theme))
+            .child(text_field(
+                &self.query.pattern,
+                "Find",
+                self.field == Field::Find,
+                has_focus,
+                theme,
+            ))
             .child(
                 div()
                     .flex()
@@ -432,13 +481,24 @@ impl FindBar {
             .child(SharedString::from(label))
     }
 
-    fn render_replace_row(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_replace_row(
+        &self,
+        theme: &Theme,
+        has_focus: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .items_center()
             .gap_2()
             .h(px(26.0))
-            .child(text_field(&self.replacement, "Replace", self.field == Field::Replace, theme))
+            .child(text_field(
+                &self.replacement,
+                "Replace",
+                self.field == Field::Replace,
+                has_focus,
+                theme,
+            ))
             .child(button("Replace", theme, {
                 let entity = cx.entity();
                 move |cx| entity.update(cx, |_, cx| cx.emit(FindEvent::ReplaceOne))
@@ -452,13 +512,28 @@ impl FindBar {
 
 /// One text field: the typed text, or a muted placeholder.
 ///
-/// No caret and no text selection. gpui has no text input element and the editor's own
-/// caret is a background highlight on a character (see `editor/view.rs`); a real input
-/// needs the same custom `Element` that unlocks IME. The focused field is marked by its
-/// border instead, which is legible in all five themes and does not fake a control that
-/// does not work.
-fn text_field(text: &str, placeholder: &str, focused: bool, theme: &Theme) -> impl IntoElement {
+/// No text selection — gpui has no text input element, and a real one needs the custom
+/// `Element` that also unlocks IME. There *is* a caret, the palette's (#164): a bar before
+/// the placeholder and after typed text, so the field reads as an input either way.
+///
+/// The caret is drawn only in the selected field *and* only while the bar holds the
+/// keyboard. Two carets in a two-field bar would say typing lands in both places at once,
+/// and a caret in a bar the user has clicked away from would say it lands here when it
+/// lands in the document — both worse than no caret. Solid, not blinking, for the
+/// palette's reason: a steady bar says "type here" without buying a timer per open bar.
+fn text_field(
+    text: &str,
+    placeholder: &str,
+    selected: bool,
+    has_focus: bool,
+    theme: &Theme,
+) -> impl IntoElement {
     let empty = text.is_empty();
+    // `selected` alone marks the border — which field Tab would type into, worth showing
+    // even when the bar is not holding the keyboard. The caret needs both: it says
+    // "typing lands *here*", which is only true when the bar actually has focus.
+    let focused = selected && has_focus;
+    let caret = |height: f32| div().w(px(2.0)).h(px(height)).flex_none().bg(theme.cursor);
     div()
         .flex_1()
         .min_w(px(120.0))
@@ -469,9 +544,11 @@ fn text_field(text: &str, placeholder: &str, focused: bool, theme: &Theme) -> im
         .rounded_sm()
         .bg(theme.background)
         .border_1()
-        .border_color(if focused { theme.accent } else { theme.border })
+        .border_color(if selected { theme.accent } else { theme.border })
         .when(empty, |el| el.text_color(theme.text_muted))
+        .when(focused && empty, |el| el.child(caret(14.0).mr_1()))
         .child(SharedString::from(if empty { placeholder.to_string() } else { text.to_string() }))
+        .when(focused && !empty, |el| el.child(caret(14.0).ml(px(1.0))))
 }
 
 fn button(
