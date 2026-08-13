@@ -9,6 +9,21 @@
 //! override — #99's rule, enforced where the user can see it refuse. The chips are visible
 //! while attached, so what a send will carry is never a surprise.
 //!
+//! # Attachments are chips too, for exactly that reason
+//!
+//! Files and images arrive by dragging them onto the panel, and each becomes its own
+//! removable chip *before* the send — never a silent pickup. [`ai::read_attachment`] reads
+//! and classifies at the drop, so a denied, oversized or unreadable file is refused at the
+//! gesture that earned the refusal rather than three minutes later. Images ride the wire as
+//! content blocks; everything else rides as fenced prose, and a binary that is neither is
+//! refused by name instead of being sent as mojibake.
+//!
+//! The denylist runs **twice**: once at the drop (the UX) and again in
+//! [`build_attachment_context`] at send (the guarantee), because a path can become a secret
+//! between the two and #99 allows no override at either end. Attachments clear after a
+//! send — they described *that* question, and re-sending them silently would be the opt-in
+//! rule read backwards.
+//!
 //! # The transport is `crate::ai`'s, not this file's
 //!
 //! Everything wire-shaped — auth, body, curl argv, SSE parsing, the denylist — lives in
@@ -269,6 +284,13 @@ pub struct AiChatPanel {
     /// The context chips (#99): off by default, explicit, visible.
     attach_selection: bool,
     attach_file: bool,
+    /// Files and images the user dropped or picked. Each is a visible, removable chip
+    /// before send, and nothing lands here without a gesture — the same rule the two
+    /// booleans above follow, extended to a list because attachments are countable.
+    attachments: Vec<Attachment>,
+    /// Whether a Finder drag is currently over the panel, for the drop highlight. Purely
+    /// visual: the drop handler does not consult it.
+    drag_over: bool,
     /// A transient line above the input: a deny reason, "no file open", and the like.
     note: Option<SharedString>,
     scroll: ScrollHandle,
@@ -327,6 +349,8 @@ impl AiChatPanel {
             stream_task: None,
             attach_selection: false,
             attach_file: false,
+            attachments: Vec::new(),
+            drag_over: false,
             note: None,
             scroll: ScrollHandle::new(),
             snapshot,
@@ -451,7 +475,28 @@ impl AiChatPanel {
             .take()
             .map(|report| format!("[editor] {report}\n\n"))
             .unwrap_or_default();
-        let message = format!("{report}{context_blocks}{prompt}");
+
+        // The attachments' second deny pass, and the split into prose and image blocks.
+        // A refusal here abandons the send with the draft intact: the user has a note
+        // naming the file, and can remove that chip and press send again.
+        let (attachment_blocks, images) = match build_attachment_context(&self.attachments) {
+            Ok(built) => built,
+            Err(refusal) => {
+                self.note = Some(refusal.into());
+                cx.notify();
+                return;
+            }
+        };
+        if !images.is_empty() && !attachments_supported(provider) {
+            // Unreachable through the UI — the attach button is not rendered for Codex —
+            // but a provider switched *after* attaching would otherwise drop the images
+            // silently, which is the one thing this panel must never do.
+            self.note = Some(CODEX_NO_ATTACHMENTS.into());
+            cx.notify();
+            return;
+        }
+
+        let message = format!("{report}{context_blocks}{attachment_blocks}{prompt}");
         self.input.clear();
         self.note = None;
         // Last turn's proposals belong to last turn. Anything still pending is declined on
@@ -463,15 +508,22 @@ impl AiChatPanel {
         // The body carries the history *up to and including* the new user turn; the empty
         // assistant turn below is a UI placeholder the wire must not see. Codex has no
         // body at all — the CLI holds the conversation, so a turn is just the new text.
+        //
+        // The images hang off that newest turn only. Re-sending them with every later
+        // question would re-upload the same pixels for the rest of the conversation; the
+        // model has already read them, and the transcript keeps the words about them.
+        let mut wire_turns = self.wire_turns();
+        if let Some(last) = wire_turns.last_mut() {
+            last.images = images;
+        }
         let body = provider.wire().map(|wire| {
-            ai::chat_body(
-                wire,
-                settings.ai_chat_model(),
-                SYSTEM_PROMPT,
-                &self.wire_turns(),
-                MAX_TOKENS,
-            )
+            ai::chat_body(wire, settings.ai_chat_model(), SYSTEM_PROMPT, &wire_turns, MAX_TOKENS)
         });
+
+        // The chips are spent: they described *this* send. Leaving them up would attach
+        // the same screenshot to the next question without a second gesture, which is
+        // exactly the "nothing leaves without an explicit act" rule read backwards.
+        self.attachments.clear();
 
         self.turns.push(ChatTurn { role: Role::Assistant, text: String::new() });
         self.streaming = true;
@@ -499,9 +551,11 @@ impl AiChatPanel {
         self.turns
             .iter()
             .filter(|turn| turn.role != Role::Note && !turn.text.is_empty())
-            .map(|turn| ai::Turn {
-                role: if turn.role == Role::User { "user" } else { "assistant" },
-                content: turn.text.clone(),
+            .map(|turn| {
+                ai::Turn::text(
+                    if turn.role == Role::User { "user" } else { "assistant" },
+                    turn.text.clone(),
+                )
             })
             .collect()
     }
@@ -1006,9 +1060,58 @@ impl AiChatPanel {
         cx.notify();
     }
 
+    // --- attachments -----------------------------------------------------------------
+
+    /// Takes a batch of paths — a Finder drop, or the picker's result — and attaches the
+    /// ones that pass.
+    ///
+    /// Per-path rather than all-or-nothing: dropping a folder of screenshots with one
+    /// `.env` among them should attach the screenshots and say why the `.env` did not,
+    /// because refusing the whole gesture would teach the user nothing about which file
+    /// was the problem. The note carries the first refusal — the one the user is most
+    /// likely to be looking for — and a count when several failed.
+    fn attach_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let mut refusals: Vec<String> = Vec::new();
+        for path in paths {
+            // Attaching the same file twice is a no-op rather than an error: a double
+            // drop is a slip, not a request for two copies on the wire.
+            if self.attachments.iter().any(|existing| existing.path == *path) {
+                continue;
+            }
+            match ai::read_attachment(path) {
+                Ok(kind) => self.attachments.push(Attachment { path: path.clone(), kind }),
+                Err(reason) => refusals.push(reason),
+            }
+        }
+        self.note = match refusals.len() {
+            0 => None,
+            1 => Some(refusals.remove(0).into()),
+            n => Some(format!("{} (and {} more refused)", refusals[0], n - 1).into()),
+        };
+        cx.notify();
+    }
+
+    /// The × on a chip. Removal is unconditional and needs no confirmation: taking
+    /// something *back* before it is sent is never the dangerous direction.
+    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.attachments.len() {
+            self.attachments.remove(index);
+            self.note = None;
+            cx.notify();
+        }
+    }
+
+    /// A Finder drag entering or leaving the panel. Visual only — see [`Self::drag_over`].
+    fn set_drag_over(&mut self, over: bool, cx: &mut Context<Self>) {
+        if self.drag_over != over {
+            self.drag_over = over;
+            cx.notify();
+        }
+    }
+
     // ponytail: no "+ file" picker chip in this pass (#99 lists one). It needs a file
-    // palette wired into a sibling entity, and the two chips above establish the
-    // attach/deny mechanics it will reuse.
+    // palette wired into a sibling entity, and the chips above establish the attach/deny
+    // mechanics it will reuse — `attach_paths` is already the seam it would call.
 
     // --- keyboard --------------------------------------------------------------------
 
@@ -1146,6 +1249,24 @@ impl AiChatPanel {
     pub fn set_streaming_for_test(&mut self, streaming: bool) {
         self.streaming = streaming;
     }
+
+    /// Drops paths onto the panel the way a Finder drag would, so the attach path is
+    /// exercised whole — read, classify, refuse — without a window or a drag event.
+    pub fn attach_paths_for_test(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        self.attach_paths(paths, cx);
+    }
+
+    pub fn remove_attachment_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.remove_attachment(index, cx);
+    }
+
+    pub fn attachments_for_test(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
+    pub fn note_for_test(&self) -> Option<&str> {
+        self.note.as_ref().map(|note| note.as_ref())
+    }
 }
 
 // --- pure logic ------------------------------------------------------------------------
@@ -1156,6 +1277,36 @@ impl AiChatPanel {
 enum Chip {
     Selection,
     CurrentFile,
+}
+
+/// One attached file, read at attach time and held until send or removal.
+///
+/// The bytes are read *at attach*, not at send, for a reason that shows on screen: the
+/// user must learn immediately that a file is too large, binary, or denied — a refusal
+/// that arrives three minutes later attached to a send is a refusal nobody can act on.
+/// The price is that an attachment is a snapshot: a file edited after attaching sends its
+/// old contents. That is the same bargain the Current-file chip makes in reverse, and it
+/// is the honest one here, because what the chip showed as accepted is what gets sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub path: PathBuf,
+    pub kind: ai::AttachmentKind,
+}
+
+impl Attachment {
+    /// The chip's label: the file name, plus a marker for images so a screenshot is
+    /// visibly different from a source file at a glance.
+    pub fn label(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.display().to_string());
+        match self.kind {
+            ai::AttachmentKind::Image(_) => format!("🖼 {name}"),
+            ai::AttachmentKind::Text(_) => name,
+        }
+    }
 }
 
 /// A piece of an assistant reply: prose, or the inside of a ``` fence.
@@ -1379,6 +1530,54 @@ fn parse_hunk_start(line: &str) -> Option<usize> {
     let start = old.split(',').next()?;
     start.parse().ok()
 }
+
+/// Turns the attached files into the two things a send needs: prose blocks for the text
+/// ones, and image values for the wire.
+///
+/// **This is where the second deny check lives.** The chip already refused at attach time
+/// — that is the UX — and this is the guarantee: a path that became a secret between the
+/// attach and the send (renamed to `.env`, or a symlink repointed) is refused here, with
+/// the bytes already in hand and about to be serialised. The check is on the path because
+/// that is what [`ai::deny_reason`] judges, and the path is what the user attached.
+///
+/// Images are *not* described in the prose. Their bytes go on the wire as blocks; naming
+/// them in the text too would tell the model a file exists twice.
+pub fn build_attachment_context(
+    attachments: &[Attachment],
+) -> Result<(String, Vec<ai::Image>), String> {
+    let mut prose = String::new();
+    let mut images = Vec::new();
+    for attachment in attachments {
+        if let Some(reason) = ai::deny_reason(&attachment.path) {
+            return Err(deny_note(&attachment.path, reason));
+        }
+        match &attachment.kind {
+            ai::AttachmentKind::Text(text) => prose.push_str(&format!(
+                "Context — attached file {}:\n```\n{}\n```\n\n",
+                attachment.path.display(),
+                text.trim_end_matches('\n')
+            )),
+            ai::AttachmentKind::Image(image) => images.push(image.clone()),
+        }
+    }
+    Ok((prose, images))
+}
+
+/// Whether this provider can carry attachments at all.
+///
+/// Codex is the odd one out for the reason it is always the odd one out (#99): the panel
+/// hands the CLI a string of text over JSON-RPC and the CLI owns the conversation, so
+/// there is no content-block seam to put an image into. Text attachments *would* fit —
+/// they are just prose — but shipping half a feature whose chips silently mean different
+/// things per provider is worse than saying so, which is what Agent mode did here too.
+pub fn attachments_supported(provider: ai::Provider) -> bool {
+    provider.wire().is_some()
+}
+
+/// The line the chip row shows instead of an attach button when the provider cannot
+/// carry attachments — the "say so rather than half-build it" half of the above.
+pub const CODEX_NO_ATTACHMENTS: &str =
+    "Codex carries no attachments — it runs your CLI, which owns the conversation";
 
 /// The refusal, worded as a statement rather than an apology: there is no override (#99).
 fn deny_note(path: &Path, reason: &str) -> String {
@@ -1798,6 +1997,32 @@ impl Render for AiChatPanel {
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            // Finder drops land on the *whole panel*, the workspace's own reasoning
+            // (`external_drop`) applied here: there is no wrong place to drop a file onto
+            // a chat you are about to ask a question about. The panel is painted over the
+            // workspace, so this handler wins for drops inside it and the workspace's
+            // opens-a-file handler still owns everywhere else.
+            //
+            // Registered whatever the provider: a drop that cannot be carried is refused
+            // with a sentence, which is more use than a drag that mysteriously does
+            // nothing over one provider and works over another.
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                this.set_drag_over(false, cx);
+                let paths = paths.paths().to_vec();
+                if attachments_supported(ai::Provider::from_setting(
+                    crate::settings::current(cx).ai_chat_provider(),
+                )) {
+                    this.attach_paths(&paths, cx);
+                } else {
+                    this.note = Some(CODEX_NO_ATTACHMENTS.into());
+                    cx.notify();
+                }
+            }))
+            .on_drag_move(cx.listener(
+                |this, _ev: &gpui::DragMoveEvent<gpui::ExternalPaths>, _w, cx| {
+                    this.set_drag_over(true, cx);
+                },
+            ))
             .flex()
             .flex_col()
             // Fills the wrapper the workspace sizes, rather than declaring its own
@@ -2195,8 +2420,49 @@ impl AiChatPanel {
                 }))
         };
 
+        // Codex has no seam to carry an attachment through, so the row says so instead of
+        // offering chips that would mean something different there (#99's house pattern).
+        let provider = ai::Provider::from_setting(crate::settings::current(cx).ai_chat_provider());
+        let can_attach = attachments_supported(provider);
+
+        // The attached files, each removable. `flex_wrap` because five screenshots must
+        // push the row taller rather than off the side of a narrow panel.
+        let attachment_chips: Vec<gpui::AnyElement> = self
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                let entity = cx.entity();
+                div()
+                    .id(("ai-attachment", index))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(9.0))
+                    .border_1()
+                    .border_color(theme.accent)
+                    .bg(theme.selected)
+                    .child(SharedString::from(attachment.label()))
+                    .child(
+                        div()
+                            .id(("ai-attachment-remove", index))
+                            .cursor_pointer()
+                            .text_color(theme.text_muted)
+                            .hover(|el| el.text_color(theme.error))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                entity.update(cx, |this, cx| this.remove_attachment(index, cx));
+                            })
+                            .child("×"),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .px_2()
@@ -2206,6 +2472,20 @@ impl AiChatPanel {
             .text_size(px(11.0))
             .child(chip("ai-chip-selection", "Selection", self.attach_selection, Chip::Selection))
             .child(chip("ai-chip-file", "Current file", self.attach_file, Chip::CurrentFile))
+            .when(can_attach, |el| {
+                // The affordance, not a button: there is no file picker in this pass, so
+                // the row teaches the gesture that does work rather than offering one
+                // that would open nothing.
+                el.child(div().text_color(theme.text_muted).child(if self.drag_over {
+                    "Drop to attach"
+                } else {
+                    "or drop files here"
+                }))
+            })
+            .when(!can_attach, |el| {
+                el.child(div().text_color(theme.text_muted).child(CODEX_NO_ATTACHMENTS))
+            })
+            .children(attachment_chips)
             .into_any_element()
     }
 
@@ -2451,6 +2731,80 @@ mod tests {
     fn no_attachments_build_an_empty_prefix() {
         assert_eq!(build_context(None, None).unwrap(), "");
         assert_eq!(build_context(None, Some("")).unwrap(), "", "an empty selection is nothing");
+    }
+
+    #[test]
+    fn attachment_context_fences_text_and_hands_images_to_the_wire() {
+        let attachments = vec![
+            Attachment {
+                path: PathBuf::from("app/Http/Kernel.php"),
+                kind: ai::AttachmentKind::Text("<?php\nclass Kernel {}\n".to_string()),
+            },
+            Attachment {
+                path: PathBuf::from("shot.png"),
+                kind: ai::AttachmentKind::Image(ai::Image {
+                    media_type: "image/png".to_string(),
+                    data: "Zm9v".to_string(),
+                }),
+            },
+        ];
+        let (prose, images) = build_attachment_context(&attachments).unwrap();
+        assert!(prose.contains("Context — attached file app/Http/Kernel.php:"), "{prose}");
+        assert!(prose.contains("class Kernel {}"), "{prose}");
+        assert!(
+            !prose.contains("shot.png"),
+            "an image's bytes go on the wire; naming it in the prose too says it twice: {prose}"
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+
+        assert_eq!(build_attachment_context(&[]).unwrap(), (String::new(), Vec::new()));
+    }
+
+    /// The second deny pass — the guarantee half, as opposed to the chip's UX half.
+    #[test]
+    fn attachment_context_refuses_a_file_that_became_a_secret_after_it_was_attached() {
+        // The bytes were read and accepted at attach time under an innocent name; by send
+        // time the path is a `.env`. #99 allows no override, so the refusal holds here
+        // even though the content is already in hand.
+        let renamed = vec![Attachment {
+            path: PathBuf::from("config/.env"),
+            kind: ai::AttachmentKind::Text("APP_KEY=oops".to_string()),
+        }];
+        let refusal = build_attachment_context(&renamed).unwrap_err();
+        assert!(refusal.contains(".env"), "{refusal}");
+        assert!(refusal.contains("credentials"), "{refusal}");
+    }
+
+    #[test]
+    fn codex_carries_no_attachments_and_says_so() {
+        // The house pattern: a provider that cannot express a feature says so rather than
+        // offering chips that would quietly mean something else there.
+        assert!(!attachments_supported(ai::Provider::Codex));
+        for http in [ai::Provider::Anthropic, ai::Provider::AntCli, ai::Provider::Custom] {
+            assert!(attachments_supported(http), "{http:?} has a content-block seam");
+        }
+        assert!(CODEX_NO_ATTACHMENTS.contains("Codex"));
+    }
+
+    #[test]
+    fn an_attachment_chip_is_labelled_by_its_file_name() {
+        let image = Attachment {
+            path: PathBuf::from("/Users/me/Desktop/Screenshot 2026.png"),
+            kind: ai::AttachmentKind::Image(ai::Image {
+                media_type: "image/png".to_string(),
+                data: String::new(),
+            }),
+        };
+        // The name, not the path: a chip is one line in a narrow panel.
+        assert!(image.label().ends_with("Screenshot 2026.png"), "{}", image.label());
+        assert!(image.label().starts_with('🖼'), "an image reads as one at a glance");
+
+        let text = Attachment {
+            path: PathBuf::from("app/Models/User.php"),
+            kind: ai::AttachmentKind::Text(String::new()),
+        };
+        assert_eq!(text.label(), "User.php");
     }
 
     #[test]

@@ -2805,6 +2805,148 @@ async fn ai_chat_send_builds_the_body_and_spawns_nothing(cx: &mut TestAppContext
     draw(cx);
 }
 
+/// A dropped image becomes a visible chip and then an image block on the wire — the whole
+/// attachment path, from the Finder gesture to the JSON, with no network.
+#[gpui::test]
+async fn ai_chat_attaches_a_dropped_image_and_sends_it_as_a_block(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = tempfile::tempdir().unwrap();
+    let shot = dir.path().join("screenshot.png");
+    // A real PNG signature: the classifier reads magic bytes, not the extension.
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(b"pixels");
+    std::fs::write(&shot, &bytes).unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| panel.attach_paths_for_test(std::slice::from_ref(&shot), cx));
+    panel.read_with(cx, |panel, _cx| {
+        let attached = panel.attachments_for_test();
+        assert_eq!(attached.len(), 1, "the drop attached exactly one file");
+        assert!(attached[0].label().contains("screenshot.png"), "{}", attached[0].label());
+        assert_eq!(panel.note_for_test(), None, "an accepted image says nothing");
+    });
+    // The chip row draws with an attachment on it.
+    draw(cx);
+
+    panel.update(cx, |panel, cx| {
+        panel.type_input_for_test("what is wrong here?", cx);
+        panel.send_for_test(cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let body = &panel.sent_bodies_for_test()[0];
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let content = &value["messages"][0]["content"];
+        let blocks = content.as_array().expect("an image turn is the block form: {content}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(
+            blocks[1]["source"]["data"],
+            crate::ai::base64_encode(&bytes),
+            "the bytes on the wire are the bytes on disk"
+        );
+        // The pixels are not described in the prose as well — that would name the file twice.
+        assert!(!blocks[0]["text"].as_str().unwrap().contains("screenshot.png"));
+
+        assert!(
+            panel.attachments_for_test().is_empty(),
+            "the chip is spent: the next question must not re-send the same screenshot"
+        );
+    });
+    draw(cx);
+}
+
+/// A dropped text file rides as a fenced block, not base64 — and a binary that is not an
+/// image is refused by name rather than sent as mojibake.
+#[gpui::test]
+async fn ai_chat_attaches_text_as_prose_and_refuses_binaries_out_loud(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = tempfile::tempdir().unwrap();
+    let php = dir.path().join("UserController.php");
+    std::fs::write(&php, "<?php\nclass UserController {}\n").unwrap();
+    let blob = dir.path().join("cache.bin");
+    std::fs::write(&blob, [0x00, 0x01, 0x02, 0xFF, 0xFE]).unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    // Both dropped at once: the good one attaches, the bad one explains itself. Refusing
+    // the whole gesture would teach the user nothing about which file was the problem.
+    panel.update(cx, |panel, cx| panel.attach_paths_for_test(&[php.clone(), blob.clone()], cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.attachments_for_test().len(), 1, "the PHP file attached");
+        let note = panel.note_for_test().expect("the binary refusal is on screen");
+        assert!(note.contains("cache.bin"), "the refusal names the file: {note}");
+        assert!(note.contains("binary"), "and says why: {note}");
+    });
+    draw(cx);
+
+    panel.update(cx, |panel, cx| {
+        panel.type_input_for_test("explain this", cx);
+        panel.send_for_test(cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let body = &panel.sent_bodies_for_test()[0];
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let content = &value["messages"][0]["content"];
+        // No images, so the turn stays the plain string form every provider accepts.
+        let text = content.as_str().expect("a text-only turn is still a string: {content}");
+        assert!(text.contains("Context — attached file"), "{text}");
+        assert!(text.contains("class UserController {}"), "the source rides as prose: {text}");
+        assert!(text.contains("explain this"));
+    });
+}
+
+/// The denylist refuses a dropped secret at the gesture, and the × takes an attachment
+/// back before it can be sent.
+#[gpui::test]
+async fn ai_chat_refuses_dropped_secrets_and_lets_a_chip_be_removed(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "DB_PASSWORD=hunter2\n").unwrap();
+    let ok = dir.path().join("routes.php");
+    std::fs::write(&ok, "<?php\n").unwrap();
+
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| panel.attach_paths_for_test(std::slice::from_ref(&env), cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.attachments_for_test().is_empty(), "a .env never becomes a chip");
+        let note = panel.note_for_test().expect("the refusal is on screen at the gesture");
+        assert!(note.contains(".env"), "{note}");
+        assert!(note.contains("credentials"), "the reason travels with the refusal: {note}");
+    });
+    draw(cx);
+
+    // An accepted file can be taken back before send — the safe direction, no confirmation.
+    panel.update(cx, |panel, cx| panel.attach_paths_for_test(std::slice::from_ref(&ok), cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.attachments_for_test().len(), 1);
+    });
+    panel.update(cx, |panel, cx| panel.remove_attachment_for_test(0, cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.attachments_for_test().is_empty(), "the × removed it");
+    });
+
+    // Dropping the same file twice is a slip, not a request for two copies on the wire.
+    panel.update(cx, |panel, cx| {
+        panel.attach_paths_for_test(&[ok.clone(), ok.clone()], cx);
+    });
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.attachments_for_test().len(), 1, "attached once, not twice");
+    });
+    draw(cx);
+}
+
 /// The status bar's update cell exists only while there is something to do, and its
 /// label follows the updater's state (owner request: "restart to update").
 #[gpui::test]
