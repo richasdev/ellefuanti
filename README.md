@@ -3,9 +3,9 @@
 A native, GPU-accelerated IDE that aims for **Zed's speed with PhpStorm's understanding of
 Laravel** — written in Rust on [GPUI](https://gpui.rs). No Electron, no webview, no Monaco.
 
-> **v0.3.0 is out.** Editor, LSP intelligence, Eloquent/route/Livewire awareness, Git /
-> Database / Docker / Composer / test panels, and now an opt-in AI chat panel and inline
-> AI autocomplete. 1369 tests, clippy clean.
+> **v0.3.2 is out.** Editor, LSP intelligence, Eloquent/route/Livewire awareness, Git /
+> Database / Docker / Composer / test panels, an opt-in AI chat panel with Ask and Agent
+> modes, inline AI autocomplete, and LSP inlay hints. 1466 tests, clippy clean.
 > [Changelog](CHANGELOG.md) · [Latest release](https://github.com/richasdev/ellefuanti/releases/latest)
 
 ---
@@ -14,33 +14,48 @@ Laravel** — written in Rust on [GPUI](https://gpui.rs). No Electron, no webvie
 
 **[⬇ Download ellefuanti for macOS (.dmg)](https://github.com/richasdev/ellefuanti/releases/latest)**
 
-Three steps:
+Then open the `.dmg`, drag **ellefuanti** onto **Applications**, and open it with
+**right-click → Open → Open**.
 
-1. Open the `.dmg` and drag **ellefuanti** onto **Applications**.
-2. **Right-click** the app → **Open** → **Open**. (Double-clicking the first time shows a
-   warning with no way past it; right-click → Open is the same gesture with an Open button.)
-3. That's the last time you'll see it — macOS remembers the choice.
+That middle gesture matters. **Double-clicking the first time shows a warning with no way
+past it** — macOS offers only "Move to Trash". Right-click → Open is the same act with an
+Open button attached, and you only do it once: macOS remembers the choice.
 
-Prefer the terminal? One command does the same thing:
+### Or paste one line and skip all of it
+
+This downloads the current release, installs it, clears the quarantine flag and opens the
+app — no warning at any point:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/ellefuanti.app
+curl -fsSL https://raw.githubusercontent.com/richasdev/ellefuanti/main/scripts/install.sh | sh
 ```
 
 <details>
-<summary><b>Prefer to do the whole thing from the terminal?</b></summary>
+<summary><b>What that script does, step by step</b></summary>
+
+Nothing hidden — it is the same commands you would type, and you can
+[read it here](scripts/install.sh) before running it:
 
 ```sh
-curl -L -o ellefuanti.dmg \
-  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-v0.3.0-macos.dmg
-hdiutil attach ellefuanti.dmg
-cp -R "/Volumes/ellefuanti 0.3.0/ellefuanti.app" /Applications/
-hdiutil detach "/Volumes/ellefuanti 0.3.0"
+# The URL carries no version number, so it always resolves to the current release.
+curl -fL -o /tmp/ellefuanti.dmg \
+  https://github.com/richasdev/ellefuanti/releases/latest/download/ellefuanti-macos.dmg
+hdiutil attach /tmp/ellefuanti.dmg -nobrowse -quiet
+# `ditto`, never `cp -R`: cp drops the bundle's _CodeSignature/ directory, and macOS
+# calls a bundle with a broken signature "damaged" — the exact failure this avoids.
+ditto "/Volumes/ellefuanti/ellefuanti.app" /Applications/ellefuanti.app
+hdiutil detach "/Volumes/ellefuanti" -quiet
 xattr -dr com.apple.quarantine /Applications/ellefuanti.app
 open /Applications/ellefuanti.app
 ```
 
 </details>
+
+Already installed and just want the warning gone? This one line is the whole fix:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/ellefuanti.app
+```
 
 <details>
 <summary><b>Why does macOS warn about this app?</b></summary>
