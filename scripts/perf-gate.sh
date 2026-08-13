@@ -93,6 +93,21 @@ CPU_LIMIT_PCT=2
 #      merges the slices — and release.yml does not invoke this script. So the per-slice
 #      logic below is correct and currently *unreached in CI*. Wiring it into release.yml
 #      is what would make point 1 fail loudly instead of silently.
+#
+# "IT IS ALREADY IN Cargo.lock, SO IT IS FREE" IS NOT TRUE, AND IT HAS BEEN BELIEVED HERE.
+#
+# The reasoning that justifies `regex` and `serde_json` — already pulled in transitively,
+# so the code is in the binary anyway — does NOT generalise. Measured while building the
+# debugger: `roxmltree` is in the lock via `gpui → resvg → usvg`, and adding it as a direct
+# dependency still cost **0.18 MB** (18.91 → 19.09). usvg only calls the SVG-relevant part
+# and the linker drops the rest; a new caller that uses more of the crate pays for what it
+# newly reaches.
+#
+# The rule that actually holds: being in the dependency *graph* is not being in the
+# *binary*. A transitive crate is free only where the existing user already exercises the
+# same code you want. Measure before believing it — the probe is cheap: add the dep, call
+# it for real (a declared-but-unused dep is dropped by the linker and measures a misleading
+# zero), and build.
 BIN_LIMIT_MB=19
 
 # How long to let the process settle before believing its memory. Measured: footprint is
