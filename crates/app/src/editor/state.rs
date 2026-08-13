@@ -4417,3 +4417,46 @@ $ação = 1;
         assert_eq!(d.search.matches().len(), 2);
     }
 }
+
+#[cfg(test)]
+mod utf8_robustness_tests {
+    use super::*;
+
+    /// Text that has broken editors before: accents, CJK, emoji with a ZWJ sequence, a
+    /// combining mark, and an RTL run. Every one is multi-byte, so any code that treats a
+    /// byte offset as a character offset panics somewhere in here.
+    const HOSTILE: &str = "<?php\n$café = 'ação';\n// 日本語のコメント\n$x = '👨‍👩‍👧‍👦';\n$e\u{0301} = 1;\n// مرحبا\n";
+
+    /// Every byte offset, including the ones inside a character, on every API that takes
+    /// one. A user reaches these by clicking, and a click lands wherever it lands.
+    #[test]
+    fn byte_offsets_inside_characters_never_panic() {
+        let mut doc = Document::new(None, HOSTILE, false).expect("plain text parses");
+
+        for offset in 0..=HOSTILE.len() + 4 {
+            // Read-only queries first: these run on hover and on render.
+            let _ = doc.word_span_at(offset);
+
+            // Then the mutating ones, on a fresh document so each is independent.
+            let mut probe = Document::new(None, HOSTILE, false).expect("plain text parses");
+            probe.move_to(offset, false);
+            probe.select_word_at(offset);
+            probe.add_cursor_at(offset);
+        }
+
+        // The document must still be intact after all that.
+        assert_eq!(doc.text_for_save(), HOSTILE, "probing must not have mutated the document");
+    }
+
+    /// Inserting at a boundary that is *inside* a multi-byte character is the same class of
+    /// bug as reading at one, and it is reachable by paste with a stale cursor.
+    #[test]
+    fn inserting_at_every_offset_never_panics() {
+        for offset in 0..=HOSTILE.len() + 4 {
+            let mut doc = Document::new(None, HOSTILE, false).expect("plain text parses");
+            doc.move_to(offset, false);
+            doc.insert("ç");
+            assert!(doc.text_for_save().contains('ç'), "the insert must have landed at offset {offset}");
+        }
+    }
+}
