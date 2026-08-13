@@ -29,6 +29,26 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Belt and braces, added because v0.4.0's first release run failed here.
+      #
+      # `dtolnay/rust-toolchain` was given both targets and reported success — the log even
+      # shows it downloading x86_64's rust-std — and the x86_64 build then failed with
+      # "can't find crate for `core`". Whatever the cause (the cache step restoring over the
+      # toolchain is the likeliest), the fix is not to argue with it: assert the target is
+      # present, install it if not, and print the list so the next failure is diagnosable
+      # from the log alone rather than by re-running with extra echoes.
+      #
+      # `rustup target add` is idempotent, so this costs nothing when the action did its job.
+      - name: Ensure both targets are installed
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          echo "installed targets:"
+          rustup target list --installed
+          # Fail here, loudly, rather than 200 lines into a cargo build.
+          rustup target list --installed | grep -qx x86_64-apple-darwin \
+            || { echo "x86_64-apple-darwin missing after install" >&2; exit 1; }
+
       # Gate the release on the tests. A tag is not a promise that something compiles.
       - name: Test
         run: cargo test --workspace
