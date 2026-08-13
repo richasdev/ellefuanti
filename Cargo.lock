@@ -1670,6 +1670,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-plugin"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "elle-settings"
 version = "0.4.0"
 dependencies = [
@@ -1759,6 +1769,7 @@ dependencies = [
  "elle-index",
  "elle-laravel",
  "elle-lsp",
+ "elle-plugin",
  "elle-settings",
  "elle-syntax",
  "elle-terminal",

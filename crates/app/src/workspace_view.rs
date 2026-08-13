@@ -558,6 +558,9 @@ impl<T> JobSlots<T> {
 pub struct WorkspaceView {
     focus_handle: FocusHandle,
     registry: Arc<CommandRegistry>,
+    /// Commands contributed by plugins (#28). Loaded once off the main thread; empty on an
+    /// install with no plugins, which is the state that must cost nothing.
+    plugins: crate::plugin_host::SharedRegistry,
     tree: Option<FileTree>,
     /// Scrolls the file tree so a revealed file is on screen (the mira button, #71 cousin).
     tree_scroll: gpui::UniformListScrollHandle,
@@ -814,9 +817,27 @@ impl WorkspaceView {
         cx.subscribe(&git, |this, _panel, event: &GitEvent, cx| this.on_git_event(event, cx))
             .detach();
 
+        // Plugin discovery is a filesystem scan, so it happens off the main thread and the
+        // window opens without waiting for it (ADR-0007). Until it lands the palette shows
+        // the builtins alone, which is what it showed before plugins existed.
+        cx.spawn(async move |this, cx| {
+            let registry = cx.background_spawn(async { crate::plugin_host::Registry::load() });
+            let registry = registry.await;
+            this.update(cx, |this, cx| {
+                for failure in &registry.failures {
+                    tracing::warn!(plugin = %failure, "plugin was not loaded");
+                }
+                this.plugins = Arc::new(registry);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
         Self {
             focus_handle: cx.focus_handle(),
             registry,
+            plugins: crate::plugin_host::SharedRegistry::default(),
             tree: None,
             tree_scroll: gpui::UniformListScrollHandle::new(),
             tab_scroll: gpui::ScrollHandle::new(),
@@ -4460,11 +4481,20 @@ impl WorkspaceView {
         self.cancel_quick_open_walk();
 
         let items = match mode {
+            // Builtins first, then whatever the plugins contributed (#28). A plugin row is
+            // an ordinary palette row: same search, same rendering — only the confirm path
+            // differs, because a plugin id is not `'static`. See `plugin_host`.
             PaletteMode::Commands => self
                 .registry
                 .all()
                 .iter()
                 .map(|command| (command.title.to_string(), command.id.0.to_string()))
+                .chain(
+                    self.plugins
+                        .commands
+                        .iter()
+                        .map(|command| (command.title.clone(), command.id.clone())),
+                )
                 .collect(),
             // Known up front, and short: eleven fixed choices with no IO behind them.
             // The current language is marked rather than filtered out, so the list always
@@ -5008,6 +5038,54 @@ impl WorkspaceView {
         if let Some(palette) = self.palette.clone() {
             palette.update(cx, |palette, cx| palette.preset_query(&word, cx));
         }
+    }
+
+    /// Runs `id` as a plugin command, if any plugin declared it (#28, ADR-0012).
+    ///
+    /// Returns whether the id belonged to a plugin, so the caller knows to stop rather than
+    /// fall through to the builtin dispatch. `false` is the answer on every ordinary
+    /// keystroke of this app's life — an install with no plugins pays one failed lookup
+    /// over an empty vector.
+    ///
+    /// The plugin runs on a background task: spawning a process and waiting for it must
+    /// never happen on the main thread (ADR-0007). The status bar carries the result,
+    /// including the failure — a plugin that is broken says so rather than doing nothing.
+    fn run_plugin_command(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(command) = self.plugins.find(id) else {
+            return false;
+        };
+        let Some(plugin) = self.plugins.plugins.get(command.plugin).cloned() else {
+            return false;
+        };
+
+        let id = id.to_string();
+        let version = env!("CARGO_PKG_VERSION");
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn({
+                    let id = id.clone();
+                    async move { crate::plugin_host::run(&plugin, &id, version) }
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.status = Some(
+                    match outcome {
+                        // A command that simply worked says nothing of its own, so the
+                        // status names what ran rather than inventing a result for it.
+                        Ok(None) => format!("{id} finished"),
+                        Ok(Some(message)) => message,
+                        Err(error) => format!("{id} failed: {error}"),
+                    }
+                    .into(),
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
+        true
     }
 
     /// Sends the rename and applies the server's `WorkspaceEdit` — all files or none.
@@ -6925,6 +7003,13 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                 self.set_active_language(*language, cx);
             }
             Some(PaletteMode::Commands) => {
+                // A plugin command is resolved *before* `dispatch_for` (#28, ADR-0012):
+                // its id is a runtime String and `CommandId` holds a `&'static str`, so
+                // widening the enum would mean leaking a string per plugin command. The
+                // builtin path below is left exactly as it was.
+                if self.run_plugin_command(&id, cx) {
+                    return;
+                }
                 // Dispatch through the same enum the keymap uses, so a palette entry and
                 // a keybinding cannot drift apart.
                 match dispatch_for(elle_core::CommandId(leak_id(&self.registry, &id))) {
