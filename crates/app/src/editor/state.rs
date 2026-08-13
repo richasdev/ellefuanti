@@ -336,6 +336,31 @@ impl Document {
         self.sync_syntax();
     }
 
+    /// Replaces `range` with `text` and reports where it landed, applying no typing rules.
+    ///
+    /// The splice behind IME composition (#18). "Plainly" is the entire specification and
+    /// is a deliberate contrast with [`Self::insert`] and [`Self::insert_with_pairs`]: no
+    /// auto-closing, no `=` → `=>`, no selection wrapping. Text the OS is still composing is
+    /// provisional — the user has not decided it is a `"` yet — and a convenience applied to
+    /// it inserts characters *outside* the marked range, which the next composition step
+    /// then fails to replace, stranding them in the buffer.
+    ///
+    /// Returns the byte offset the text starts at, which is what the caller needs to record
+    /// the new marked range. `Buffer::replace` clamps, so a stale range from a platform
+    /// whose copy of the document is one edit behind splices at the end rather than
+    /// panicking.
+    ///
+    /// The cursor is left at the end of the inserted text; the IME usually moves it again
+    /// immediately, to its own idea of the caret within the composition.
+    pub fn replace_range_plainly(&mut self, range: Range<usize>, text: &str) -> usize {
+        let edit = self.buffer.replace(range, text);
+        let new_range = edit.new_range();
+        self.selection = Selection::at(new_range.end);
+        self.goal_column = None;
+        self.sync_syntax();
+        new_range.start
+    }
+
     /// Backspace: deletes the selection, or one character before the cursor.
     pub fn backspace(&mut self) {
         let range = if self.selection.is_empty() {
@@ -1448,7 +1473,7 @@ impl Document {
     }
 
     /// Selects `range`, with the cursor at its end.
-    fn select_range(&mut self, range: Range<usize>) {
+    pub(crate) fn select_range(&mut self, range: Range<usize>) {
         // `break_undo_group` for the same reason `move_to` does it: a jump ends a typing
         // run so ⌘Z after ⌘G does not merge the two.
         self.buffer.break_undo_group();

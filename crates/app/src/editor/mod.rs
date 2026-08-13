@@ -3,7 +3,9 @@
 mod find;
 pub mod folds;
 pub(crate) mod ghost;
+pub(crate) mod ime;
 pub(crate) mod inlay;
+pub(crate) mod input_element;
 pub(crate) mod line;
 mod project_search;
 mod state;

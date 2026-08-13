@@ -5405,3 +5405,261 @@ async fn every_small_text_field_lays_out_with_and_without_text(cx: &mut TestAppC
     git.update(git_cx, |panel, cx| panel.type_for_test("fix: paste", cx));
     draw(git_cx);
 }
+
+// --- IME and dead-key composition (#18) ------------------------------------------------
+//
+// These drive `EntityInputHandler` directly rather than through a keystroke, and that is
+// the honest shape for them rather than a shortcut. Real composition is a conversation
+// between AppKit and an input source — a dead key produces *no* `key_char` on its first
+// press, so there is no keystroke a headless test could send that would start one. What a
+// machine can check is the half this crate owns: that the trait's UTF-16 offsets are
+// converted before they reach the document, that marked text does not pick up the typing
+// conveniences committed text gets, and that a commit lands where the mark was.
+//
+// **What none of this proves** is that macOS actually drives these methods in the order
+// assumed, or that the candidate window appears where it should. That needs a running
+// window and a real input source, and it stays on issue #35's human list alongside the
+// caret's geometry.
+
+/// The everyday Portuguese case: ⌥N then `a` gives `ã` through two composition steps.
+///
+/// This is the sequence AppKit produces for a dead key. The first press marks a bare `~`
+/// (there is no `key_char` for it, which is why `on_key_down` could never have seen it);
+/// the second replaces the mark with the composed character and commits.
+#[gpui::test]
+async fn a_dead_key_composes_an_accented_character(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(None, "", false).expect("plain text needs no grammar");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        // ⌥N: the accent appears, provisional and underlined.
+        editor.replace_and_mark_text_in_range(None, "~", None, window, cx);
+        assert_eq!(editor.document.buffer.text(), "~", "the dead key shows its accent");
+        assert!(editor.is_composing_for_test(), "and the buffer knows it is provisional");
+
+        // `a`: the composition resolves and commits.
+        editor.replace_text_in_range(None, "ã", window, cx);
+    });
+
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(text, "ã", "the accent must be replaced by the composed character, not joined");
+
+    assert!(
+        !view.read_with(cx, |editor, _cx| editor.is_composing_for_test()),
+        "committing ends the composition"
+    );
+
+    // The cursor sits after a 2-byte character, which is the offset an ASCII-shaped
+    // implementation gets wrong by one.
+    let head = view.read_with(cx, |editor, _cx| editor.document.selection.head);
+    assert_eq!(head, 2, "the caret is past `ã` in bytes, not in characters");
+}
+
+/// A CJK composition: romaji is marked, then replaced wholesale by the chosen candidate.
+#[gpui::test]
+async fn choosing_a_candidate_replaces_the_marked_romaji(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(None, "", false).expect("plain text needs no grammar");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        editor.replace_and_mark_text_in_range(None, "a", None, window, cx);
+        editor.replace_and_mark_text_in_range(None, "ai", None, window, cx);
+        assert_eq!(editor.document.buffer.text(), "ai", "romaji accumulates in the mark");
+
+        // Picking 愛 from the candidate window.
+        editor.replace_text_in_range(None, "愛", window, cx);
+    });
+
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(text, "愛", "the candidate replaces the romaji rather than appending to it");
+}
+
+/// Composition must not trigger PHP's typing conveniences.
+///
+/// The rule the issue names: marked text is not committed text. An auto-closed quote lands
+/// *outside* the marked range, so the next composition step replaces the wrong bytes and
+/// strands the orphan — and on a Brazilian layout `"` is a dead key, so this is reachable
+/// by typing rather than a contrived case.
+#[gpui::test]
+async fn marked_text_does_not_auto_pair(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(Some(std::path::PathBuf::from("pairs.php")), "<?php\n", true)
+            .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        let end = editor.document.buffer.len_bytes();
+        editor.document.move_to(end, false);
+
+        // A quote as *marked* text. Committed, this would auto-close into `""`.
+        editor.replace_and_mark_text_in_range(None, "\"", None, window, cx);
+    });
+
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(
+        text, "<?php\n\"",
+        "a composing quote must stay a single character — auto-closing it would put the \
+         closer outside the marked range, where the next composition step cannot replace it"
+    );
+}
+
+/// The same character, committed rather than marked, still auto-closes.
+///
+/// The other half of the rule above: standing down during composition must not have
+/// disabled the feature for ordinary typing, which is the regression a composing flag that
+/// never cleared would cause.
+#[gpui::test]
+async fn committed_text_still_auto_pairs(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(Some(std::path::PathBuf::from("pairs.php")), "<?php\n", true)
+            .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        let end = editor.document.buffer.len_bytes();
+        editor.document.move_to(end, false);
+        editor.replace_text_in_range(None, "\"", window, cx);
+    });
+
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(text, "<?php\n\"\"", "an ordinary typed quote still auto-closes");
+}
+
+/// Abandoning a composition leaves the text in place.
+///
+/// `unmarkText` means "stop treating this as provisional", not "undo it" — deleting here is
+/// what would make a half-typed candidate vanish on a click elsewhere.
+#[gpui::test]
+async fn unmarking_keeps_the_text_and_ends_the_composition(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(None, "", false).expect("plain text needs no grammar");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        editor.replace_and_mark_text_in_range(None, "ai", None, window, cx);
+        editor.unmark_text(window, cx);
+    });
+
+    view.read_with(cx, |editor, _cx| {
+        assert_eq!(editor.document.buffer.text(), "ai", "unmarking must not delete anything");
+        assert!(!editor.is_composing_for_test(), "but the composition is over");
+    });
+}
+
+/// The platform's offsets are UTF-16, and the document's are bytes.
+///
+/// This is the conversion the issue calls the most likely source of bugs, asserted through
+/// the trait rather than only through `editor::ime`'s unit tests: the ranges here are the
+/// ones AppKit would send, and an implementation that passed them straight through would
+/// slice the buffer in the wrong place — or panic on a non-boundary index.
+#[gpui::test]
+async fn the_platform_is_answered_in_utf16_offsets(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    // `ação` is 6 bytes and 4 UTF-16 units; the emoji is 4 bytes and 2 units. Every offset
+    // below therefore differs between the two counts.
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(None, "ação 🎉", false).expect("plain text needs no grammar");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        // The selection, reported to the platform. Byte 6 is the end of `ação`, which is
+        // UTF-16 offset 4.
+        editor.document.select_range_for_test(0..6);
+        let selection = editor
+            .selected_text_range(false, window, cx)
+            .expect("an editor always has a selection to report");
+        assert_eq!(selection.range, 0..4, "6 bytes of `ação` is 4 UTF-16 units");
+
+        // And a lookup in the other direction: UTF-16 0..4 must slice `ação`, not the
+        // first four *bytes* (`aç`).
+        let mut adjusted = None;
+        let text = editor.text_for_range(0..4, &mut adjusted, window, cx);
+        assert_eq!(text.as_deref(), Some("ação"), "the range must be read as UTF-16 units");
+
+        // The emoji is a surrogate pair: UTF-16 5..7 is one character, 4 bytes.
+        let mut adjusted = None;
+        let emoji = editor.text_for_range(5..7, &mut adjusted, window, cx);
+        assert_eq!(emoji.as_deref(), Some("🎉"), "a surrogate pair is one character");
+    });
+}
+
+/// Committing replaces the marked range even when the platform names no range at all.
+///
+/// `None` means "the marked text if composing, otherwise the selection". Getting that
+/// default wrong is how a chosen candidate ends up appended *after* the romaji instead of
+/// replacing it — which is the visible symptom users report as doubled text.
+#[gpui::test]
+async fn a_commit_with_no_range_replaces_the_mark(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document = Document::new(None, "olá ", false).expect("plain text needs no grammar");
+        EditorView::new(document, cx)
+    });
+
+    view.update_in(cx, |editor, window, cx| {
+        let end = editor.document.buffer.len_bytes();
+        editor.document.move_to(end, false);
+
+        editor.replace_and_mark_text_in_range(None, "nihon", None, window, cx);
+        assert_eq!(editor.document.buffer.text(), "olá nihon");
+
+        editor.replace_text_in_range(None, "日本", window, cx);
+    });
+
+    let text = view.read_with(cx, |editor, _cx| editor.document.buffer.text());
+    assert_eq!(text, "olá 日本", "the commit replaces the marked romaji, leaving `olá ` alone");
+}
+
+/// An editor mid-composition still paints, with the marked text on screen.
+///
+/// The panic this guards against is the ordinary one for this codebase: a byte offset used
+/// where a character index belongs, surfacing during layout of a multibyte line.
+#[gpui::test]
+async fn an_editor_renders_while_composing(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("compose.php")), "<?php\n$m = '", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    draw(cx);
+
+    view.update_in(cx, |editor, window, cx| {
+        let end = editor.document.buffer.len_bytes();
+        editor.document.move_to(end, false);
+        editor.replace_and_mark_text_in_range(None, "ação", None, window, cx);
+    });
+
+    draw(cx);
+}
