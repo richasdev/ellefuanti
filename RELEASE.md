@@ -18,8 +18,8 @@ instalação — prerelease, assinatura, cópia — são todas invisíveis a `ca
 - [ ] `git checkout main && git pull` — a tag sai do main, nunca de uma branch.
 - [ ] `cargo test --workspace` verde. **Ler o número**, não só o "ok": uma suite que deixou
       de compilar desaparece silenciosamente da contagem.
-- [ ] `cargo clippy --workspace` sem avisos novos. Cuidado: o output do `rtk` agrega e pode
-      esconder avisos — em caso de dúvida, `rtk proxy cargo clippy` para output cru.
+- [ ] **Clippy exatamente como o CI o corre** (comando abaixo, fora da lista) — um
+      `cargo clippy -p ellefuanti` limpo diz muito pouco.
 - [ ] `cargo fmt --all --check` limpo.
 - [ ] **Binário dentro do gate**: `cargo build --release` e comparar com `BIN_LIMIT_MB` em
       `scripts/perf-gate.sh`. Está em **18.69 MB de 19 MB (98.4%)** — qualquer dependência
@@ -27,6 +27,19 @@ instalação — prerelease, assinatura, cópia — são todas invisíveis a `ca
 - [ ] CHANGELOG com uma secção `## [x.y.z] — data` (não deixar em `[Unreleased]`).
 - [ ] `version` em `Cargo.toml` bumpado, e `cargo check` corrido depois para o `Cargo.lock`
       apanhar o novo número.
+
+**O clippy do CI, na íntegra:**
+
+```sh
+RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
+```
+
+As três partes importam. `--all-targets` compila o harness de teste, onde um método chamado
+só atrás de `cfg(not(test))` fica sem chamadores e passa a código morto; `--all-features`
+liga código que de outra forma nem compila; e `-D warnings` (definido no workflow)
+transforma qualquer aviso em erro. Correr só `cargo clippy -p ellefuanti` foi o que deixou
+quatro runs vermelhos passarem por verificados (§7). Cuidado também com o `rtk`, que agrega
+o output e pode esconder o texto do aviso: em caso de dúvida, `rtk proxy cargo clippy`.
 
 ### Taggar
 
@@ -230,3 +243,21 @@ fácil de esquecer.
 
 **Binário a 98.4% do gate** (18.69 de 19 MB). A próxima dependência não cabe sem decisão
 explícita.
+
+### 7. Quatro runs de CI vermelhos por um lint que localmente não aparecia
+
+**Sintoma.** Quatro runs consecutivos falharam no passo Clippy, com o trabalho verde na
+máquina de quem o escreveu.
+
+**Causa raiz.** Duas coisas ao mesmo tempo. O código: `probe_codex` só é chamado atrás de
+`cfg(not(test))` — um teste nunca pode lançar um CLI — por isso quando o clippy compila o
+harness de teste o método fica sem chamadores e é código morto. E a verificação local:
+corria-se `cargo clippy -p ellefuanti`, que **não** compila os targets de teste e **não**
+tem `-D warnings`, por isso mostrava "1 warning" e passava por limpo.
+
+**Porque não foi apanhado.** Porque o comando local não era o comando do CI. Um lint que só
+dispara sob `--all-targets` é invisível a quem não o corre com `--all-targets`.
+
+**Correção.** `cfg_attr(test, allow(dead_code))` com a razão escrita ao lado, e o comando
+completo do CI promovido a passo obrigatório deste checklist. **Lição: uma verificação que
+não é a do CI não é uma verificação.**
