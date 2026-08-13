@@ -1784,7 +1784,17 @@ fn codex_turn(
         state.session = None;
     }
 
-    let mut command = std::process::Command::new("codex");
+    // Resolved rather than bare, for the reason in `ai_codex::binary`: a Finder launch has
+    // an empty `PATH` and a bare name finds nothing. `availability` has already run and
+    // uses the same resolver, so a `None` here means the CLI vanished between the check and
+    // the spawn — reported rather than turned into a confusing "broken pipe" downstream.
+    let Some(binary) = crate::ai_codex::binary() else {
+        let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
+            "Codex CLI not found — install it and run `codex login`".to_string(),
+        )));
+        return;
+    };
+    let mut command = std::process::Command::new(&binary);
     command
         .arg("app-server")
         .stdin(Stdio::piped())

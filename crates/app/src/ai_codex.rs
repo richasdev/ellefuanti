@@ -318,7 +318,10 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
 /// The two failures are deliberately distinct: an uninstalled CLI and a logged-out one
 /// need different commands, and "AI chat is broken" would be neither.
 pub fn availability() -> Result<(), String> {
-    let installed = std::process::Command::new("codex")
+    let Some(binary) = binary() else {
+        return Err("Codex CLI not found — install it and run `codex login`".to_string());
+    };
+    let installed = std::process::Command::new(&binary)
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success());
@@ -331,6 +334,24 @@ pub fn availability() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The `codex` executable, looked up the same way language servers are.
+///
+/// # Why not `Command::new("codex")`
+///
+/// That is #123 again, in the other feature. `open ellefuanti.app` hands the process
+/// **launchd's** environment, whose `PATH` is empty on a normal macOS install, so a bare
+/// command name resolves only when the app was started from a terminal. The owner's own
+/// machine is the case: `codex` sits in `~/.local/bin`, which their shell puts on `PATH`
+/// and the Dock does not. Logged in, CLI installed, and the panel still reported "Codex
+/// CLI not found" — from the Dock only.
+///
+/// `search_dirs` already covers this for language servers and already lists `.local/bin`;
+/// the Codex path simply never used it. Sharing the resolver rather than copying the list
+/// is also what keeps the two from drifting when the next installer prefix is added.
+pub(crate) fn binary() -> Option<std::path::PathBuf> {
+    crate::lsp_session::resolve_binary("codex", &crate::lsp_session::search_dirs())
 }
 
 /// Where the CLI keeps its login. Only ever asked whether it *exists* — reading it would
@@ -571,6 +592,60 @@ mod tests {
         assert_eq!(
             parse_line(captured),
             Some(CodexEvent::TurnFailed("invalid params".to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod binary_resolution_tests {
+    /// The Finder-launch case, which is how the owner hit it: logged in, CLI installed,
+    /// and the panel still reported "Codex CLI not found".
+    ///
+    /// `open ellefuanti.app` inherits launchd's environment, whose `PATH` is empty on a
+    /// normal macOS install, so `Command::new("codex")` resolves nothing — while the
+    /// binary sits in `~/.local/bin`, one of the prefixes `search_dirs` already searches
+    /// for language servers (#123). The LSP was fixed for this; the Codex path still used
+    /// a bare name.
+    ///
+    /// `resolve_binary` is called with explicit directories rather than through the
+    /// environment: this suite shares a process, and `set_var` would make it
+    /// order-dependent — the rule `the_default_command_is_used_when_the_variable_is_unset`
+    /// states in `lsp_session`.
+    #[test]
+    fn a_binary_is_found_in_a_fallback_directory_that_path_would_not_have() {
+        let dir = std::env::temp_dir().join(format!("elle-codex-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let fake = dir.join("codex-probe");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write probe");
+
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // The empty slice is the Finder launch: no PATH entries at all.
+        assert_eq!(
+            crate::lsp_session::resolve_binary("codex-probe", &[]),
+            None,
+            "with no directories to search there is nothing to find — the old behaviour"
+        );
+
+        // With the fallback directory supplied, exactly as `search_dirs` supplies it.
+        assert_eq!(
+            crate::lsp_session::resolve_binary("codex-probe", &[dir.clone()]),
+            Some(fake.clone()),
+            "the resolver must find a CLI that PATH does not mention"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `search_dirs` must actually include the prefix the owner's CLI lives under,
+    /// otherwise the resolver is correct and still finds nothing on their machine.
+    #[test]
+    fn the_search_path_covers_local_bin_where_codex_installs() {
+        let dirs = crate::lsp_session::search_dirs();
+        assert!(
+            dirs.iter().any(|dir| dir.ends_with(".local/bin")),
+            "~/.local/bin is where `codex` installs; it must be searched: {dirs:?}"
         );
     }
 }
