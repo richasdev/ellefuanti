@@ -5,6 +5,46 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-08-13
+
+### Added
+
+- **Inlay hints do LSP** — tipos e nomes de parâmetros desenhados no meio da linha, ao
+  estilo do PhpStorm e do Zed. As fatias são aplicadas por coluna descendente, que é o que
+  permite emendar no meio da linha sem recalcular o que já foi desenhado; uma dica que caia
+  fora da sua linha é **ignorada, não encostada** à borda. Tipos com a cor de comentário,
+  parâmetros com a de texto esbatido.
+- **Modo agente no chat** — o painel passa a ter dois modos: Ask (só lê, o de sempre) e
+  Agent, que propõe edições com diff e aprovação **por ficheiro**.
+
+  O desenho é o inverso do óbvio, e a sondagem contra o `codex-cli` 0.146.0 é a razão: num
+  sandbox `workspace-write` a CLI **escreve sem pedir nada**, enquanto em `read-only` emite
+  `item/fileChange/requestApproval` e **espera**. Pedir permissão de escrita _removia_ o
+  passo de consentimento em vez de o acrescentar. Por isso o sandbox fica `read-only` nos
+  dois modos, e "nada chega ao disco sem aprovação" passa a ser propriedade do protocolo em
+  vez de promessa do painel.
+
+  `ai::deny_reason` corre duas vezes — à chegada e no momento de escrever. `acceptForSession`
+  não é oferecido. Um patch que já não encaixa é recusado, não forçado. Apagar ficheiros é
+  mostrado mas não aplicado neste pass. `ai.chat_mode` cai para `"ask"` em valor inválido:
+  falha para o modo que não escreve.
+
+- **Anexos no chat** — arrastar ficheiros e imagens para o painel, cada um com o seu chip
+  removível. Imagens seguem em blocos na wire (base64 para a Anthropic, URI `data:` para a
+  compatível com OpenAI); um turno sem imagens serializa **exatamente** para a mesma string
+  de antes, para não partir um Ollama local que não perceba a forma em blocos.
+
+  O tipo vem dos _magic bytes_, não da extensão. Limite de 5 MB verificado por `stat` antes
+  de ler — recusar um vídeo de 400 MB não deve significar lê-lo primeiro. `deny_reason`
+  outra vez em dois sítios. Ficheiro binário não-imagem é recusado pelo nome em vez de
+  enviado como mojibake. O Codex recusa anexos e diz porquê: entrega uma string à CLI, que
+  é dona da conversa, e não há costura de blocos onde pôr uma imagem.
+
+### Notas
+
+- Sem crate nova: o base64 é ~20 linhas fixadas contra os vetores do RFC 4648. O binário
+  está a 18.84 MB de 19 MB, e era essa a alternativa.
+
 ## [0.3.1] — 2026-08-13
 
 ### Added
