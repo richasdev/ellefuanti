@@ -144,6 +144,18 @@ actions!(
         // focuses its query field; pressing it again with the panel already open returns
         // to the file tree, which is what the activity bar's Search icon does too.
         FindInProject,
+        // The Xdebug debugger (#30). `ToggleBreakpoint` is the only one that does anything
+        // without a session: breakpoints are set before the page is loaded, which is how
+        // debugging usually starts. The rest are no-ops unless execution is paused, and the
+        // panel shows its controls as unavailable to match (§24).
+        ToggleDebugPanel,
+        StartDebugging,
+        StopDebugging,
+        ToggleBreakpoint,
+        DebugContinue,
+        DebugStepOver,
+        DebugStepInto,
+        DebugStepOut,
     ]
 );
 
@@ -165,6 +177,12 @@ pub mod context {
     /// The test results panel (#25). Its own context so a rerun key means "rerun" only
     /// while the panel has focus, and does not shadow anything in the editor.
     pub const TESTS: &str = "Tests";
+    /// The debugger panel (#30). Its own context for the test panel's reason, though the
+    /// step keys are deliberately bound in `WORKSPACE` rather than here: F5 and F10 must
+    /// work while the caret is in the editor, which is where someone stepping through code
+    /// actually is. This context exists for keys that only make sense with the panel
+    /// focused, and to keep the panel's element consistent with every other one.
+    pub const DEBUG: &str = "Debug";
     /// The completion popup (#61). **Its own context is the entire reason arrows are not
     /// stolen from the document**: `up` and `down` are bound here and in `Editor`, and gpui
     /// dispatches to the innermost context that has a binding. With no popup open there is
@@ -301,6 +319,21 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("ctrl-shift-t", ToggleTestPanel, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-r", RunTests, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-f", RunTestsInFile, Some(context::WORKSPACE)),
+        //
+        // The debugger (#30). F5/F8/F7/⇧F8 and ⌘F8 are PhpStorm's; F5/F10/F11/⇧F11 and F9
+        // are VS Code's. The F-keys chosen here are the ones the two agree on or leave
+        // free, so neither audience has to unlearn a reflex: F5 continues in both, and
+        // F9 toggles a breakpoint in VS Code while PhpStorm's ⌘F8 is bound alongside it.
+        //
+        // All of them are `WORKSPACE`-scoped, not `DEBUG`-scoped: someone stepping through
+        // code has the caret in the editor, and a step key that only works while the panel
+        // has focus is a step key nobody can reach without the mouse.
+        KeyBinding::new("f5", DebugContinue, Some(context::WORKSPACE)),
+        KeyBinding::new("f10", DebugStepOver, Some(context::WORKSPACE)),
+        KeyBinding::new("f11", DebugStepInto, Some(context::WORKSPACE)),
+        KeyBinding::new("shift-f11", DebugStepOut, Some(context::WORKSPACE)),
+        KeyBinding::new("f9", ToggleBreakpoint, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-f8", ToggleBreakpoint, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-e", RerunFailedTests, Some(context::WORKSPACE)),
         // `ToggleTheme` is deliberately unbound: it reaches the user through the palette.
         // Every obvious chord (cmd-k, cmd-t) is a prefix or a tab command elsewhere, and
@@ -509,6 +542,10 @@ pub enum Dispatch {
     RunTestsInFile,
     RerunFailedTests,
     FindInProject,
+    ToggleDebugPanel,
+    StartDebugging,
+    StopDebugging,
+    ToggleBreakpoint,
     Artisan,
     FormatDocument,
     GoToWorkspaceSymbol,
@@ -566,6 +603,10 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "tests.run_file" => Dispatch::RunTestsInFile,
         "tests.rerun_failed" => Dispatch::RerunFailedTests,
         "editor.find_in_project" => Dispatch::FindInProject,
+        "debug.toggle_panel" => Dispatch::ToggleDebugPanel,
+        "debug.start" => Dispatch::StartDebugging,
+        "debug.stop" => Dispatch::StopDebugging,
+        "debug.toggle_breakpoint" => Dispatch::ToggleBreakpoint,
         "laravel.artisan" => Dispatch::Artisan,
         "editor.format" => Dispatch::FormatDocument,
         "navigate.workspace_symbol" => Dispatch::GoToWorkspaceSymbol,

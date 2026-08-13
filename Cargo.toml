@@ -9,6 +9,7 @@ members = [
     "crates/terminal",
     "crates/lsp",
     "crates/plugin",
+    "crates/debug",
     "crates/index",
     "crates/db",
     "crates/docker",
@@ -35,6 +36,7 @@ elle-workspace = { path = "crates/workspace" }
 elle-terminal = { path = "crates/terminal" }
 elle-lsp = { path = "crates/lsp" }
 elle-plugin = { path = "crates/plugin" }
+elle-debug = { path = "crates/debug" }
 elle-index = { path = "crates/index" }
 elle-db = { path = "crates/db" }
 elle-docker = { path = "crates/docker" }
