@@ -23,7 +23,9 @@ instalação — prerelease, assinatura, cópia — são todas invisíveis a `ca
 - [ ] `cargo fmt --all --check` limpo.
 - [ ] **Binário dentro do gate**: `cargo build --release` e comparar com `BIN_LIMIT_MB` em
       `scripts/perf-gate.sh`. Está em **18.69 MB de 19 MB (98.4%)** — qualquer dependência
-      nova é uma decisão de release, não de implementação.
+      nova é uma decisão de release, não de implementação. O limite vale **por slice**: o
+      release é universal e o ficheiro pesa a soma dos dois, mas o que o gate mede é uma
+      cópia do programa (o script extrai cada slice com `lipo -thin`).
 - [ ] CHANGELOG com uma secção `## [x.y.z] — data` (não deixar em `[Unreleased]`).
 - [ ] `version` em `Cargo.toml` bumpado, e `cargo check` corrido depois para o `Cargo.lock`
       apanhar o novo número.
@@ -243,10 +245,17 @@ também funciona, coisa que com o bundle malformado não era fiável.
 construído e anexado à mão a cada release. Automatizá-lo no workflow eliminaria o passo mais
 fácil de esquecer.
 
-**Universal binary.** O build é `arm64` puro. Um Mac Intel não corre isto.
+**Universal binary — o slice x86_64 nunca correu.** O release passou a ser universal
+(`arm64` + `x86_64`, unidos com `lipo`), por isso um Mac Intel já consegue abrir isto. Mas
+só uma máquina Intel — ou um Mac com Rosetta — pode confirmar que o slice x86_64 _funciona_:
+quem o construiu não tinha nenhuma das duas, e `lipo -info` prova que o código lá está, não
+que ele desenha uma janela. **O primeiro release universal precisa de um teste manual num
+Intel antes de se anunciar suporte a Intel.**
 
 **Binário a 98.4% do gate** (18.69 de 19 MB). A próxima dependência não cabe sem decisão
-explícita.
+explícita. O limite é **por slice**, não pelo ficheiro: um universal pesa a soma dos dois
+(~37 MB) e medir o ficheiro obrigaria a duplicar o limite, o que voltaria a admitir ~18 MB
+de crescimento acidental sem ninguém reparar. Ver o comentário em `scripts/perf-gate.sh`.
 
 ### 7. Quatro runs de CI vermelhos por um lint que localmente não aparecia
 

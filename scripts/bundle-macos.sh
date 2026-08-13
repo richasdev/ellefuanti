@@ -32,6 +32,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$ROOT/assets/macos/Info.plist" "$APP/Contents/"
+# Whatever Mach-O it is handed, thin or fat. The release binary is universal (arm64 +
+# x86_64, merged with `lipo` in release.yml); nothing here needs to know that, but the
+# merge has to happen BEFORE this script rather than after, because the ad-hoc signature
+# applied at the end seals this executable and `lipo` would invalidate it.
 cp "$BIN" "$APP/Contents/MacOS/ellefuanti"
 
 # Stamp the real version over the committed plist's placeholder. Cargo.toml is the one

@@ -21,6 +21,10 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both slices of the universal binary. macos-latest runners are arm64, so
+          # x86_64 is a cross-compile and its std has to be installed explicitly.
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -32,8 +36,38 @@ jobs:
       # --no-default-features drops runtime_shaders, so shaders are compiled here rather
       # than on the user's machine at every launch. This runner has full Xcode; that is the
       # whole reason the release build differs from the local one (ADR-0002).
-      - name: Build release
-        run: cargo build --release -p ellefuanti --no-default-features
+      #
+      # Built once per architecture and merged below, so the release runs on Intel Macs as
+      # well as Apple Silicon. Each target is named explicitly rather than relying on the
+      # host default, because `--target` changes the output path and a bare build would
+      # land in target/release/ where the merge step could mistake it for a slice.
+      - name: Build release (arm64)
+        run: cargo build --release -p ellefuanti --no-default-features --target aarch64-apple-darwin
+
+      - name: Build release (x86_64)
+        run: cargo build --release -p ellefuanti --no-default-features --target x86_64-apple-darwin
+
+      # `lipo` merges the two Mach-O files into one fat binary that macOS picks the right
+      # slice from at launch. It must happen BEFORE bundle-macos.sh, because that script
+      # ad-hoc-signs the bundle last and signing seals the executable as it is — lipo-ing
+      # afterwards would invalidate the signature and reproduce the "damaged app" failure
+      # the signing exists to prevent.
+      - name: Merge into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/ellefuanti \
+            target/x86_64-apple-darwin/release/ellefuanti \
+            -output target/release/ellefuanti
+
+          # Assert rather than trust: a lipo that silently produced one slice would ship an
+          # arm64-only app named "universal", which is worse than shipping it named arm64.
+          lipo -info target/release/ellefuanti
+          for arch in arm64 x86_64; do
+            lipo -info target/release/ellefuanti | grep -q "$arch" \
+              || { echo "the $arch slice is missing from the universal binary" >&2; exit 1; }
+          done
 
       - name: Package
         id: package
@@ -45,7 +79,11 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="dev-${GITHUB_SHA::7}"
           fi
-          NAME="ellefuanti-${VERSION}-macos-$(uname -m)"
+          # "universal", not `uname -m`: the runner's own architecture says nothing about
+          # what is in the artifact now that it carries both. `uname -m` would have named a
+          # universal build "arm64" and told Intel users the one thing that would stop them
+          # downloading the release that finally runs for them.
+          NAME="ellefuanti-${VERSION}-macos-universal"
 
           mkdir -p "dist/${NAME}"
           # Ship the .app, not the bare binary: it is what carries the icon, and it is what
@@ -115,8 +153,46 @@ jobs:
 
           cd dist && zip -r "${NAME}.zip" "${NAME}" >/dev/null
           echo "artifact=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "appdir=dist/${NAME}" >> "$GITHUB_OUTPUT"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # Verify the .app that actually ships, not the loose binary lipo produced. The two
+      # can differ: bundle-macos.sh copies the executable and then signs the bundle, and a
+      # signature that failed to seal is invisible until a user downloads it and macOS
+      # calls the app damaged. Checking here is the only place that failure is cheap.
+      - name: Verify the bundled app
+        run: |
+          set -euo pipefail
+          APP="${{ steps.package.outputs.appdir }}/ellefuanti.app"
+          EXE="$APP/Contents/MacOS/ellefuanti"
+
+          # Both slices survived the copy into the bundle.
+          file "$EXE"
+          lipo -info "$EXE"
+          for arch in arm64 x86_64; do
+            lipo -info "$EXE" | grep -q "$arch" \
+              || { echo "the $arch slice did not survive bundling" >&2; exit 1; }
+          done
+
+          codesign --verify --deep --strict "$APP"
+
+          # Per-slice, because macOS only validates the slice it is about to run: an
+          # unsigned x86_64 slice inside an otherwise-valid bundle would pass every check
+          # above and then show as "damaged" on Intel Macs and nowhere else — invisible to
+          # anyone verifying the release on Apple Silicon.
+          for arch in arm64 x86_64; do
+            codesign -dv --verbose=2 --arch "$arch" "$APP" 2>&1 | grep -q 'Signature=adhoc' \
+              || { echo "the $arch slice is not signed" >&2; exit 1; }
+          done
+
+          # `Info.plist=not bound` / `Sealed Resources=none` is the malformed state that
+          # makes macOS say "damaged" — assert the positive rather than eyeball the log.
+          codesign -dv --verbose=2 "$APP" 2>&1 | tee /tmp/codesign.txt
+          grep -q 'Info.plist entries=' /tmp/codesign.txt \
+            || { echo "Info.plist is not bound into the signature" >&2; exit 1; }
+          grep -q 'Sealed Resources version=' /tmp/codesign.txt \
+            || { echo "Resources are not sealed" >&2; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
