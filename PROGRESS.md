@@ -1,7 +1,7 @@
 # PROGRESS — estado atual (2026-08-13)
 
-**v0.3.1 lançada e a servir como `latest`.** Suite em **1406 testes, 41 suites**, clippy
-limpo sob os flags do CI, binário **18.73 MB de 19 MB (98.6% do gate)**. Ledger das rondas
+**v0.3.2 lançada e a servir como `latest`.** Suite em **1466 testes, 41 suites**, clippy
+limpo sob os flags do CI, binário **18.84 MB de 19 MB (99.2% do gate)**. Ledger das rondas
 anteriores no histórico git deste ficheiro.
 
 > **Antes de cortar qualquer versão:** correr a skill `/ellefuanti-release`, e ler
@@ -10,30 +10,45 @@ anteriores no histórico git deste ficheiro.
 
 ## Trabalho em curso — o que está a acontecer agora
 
-Dois agentes a correr em worktrees isoladas, cada um numa branch própria. Se o contexto
-desta sessão se perder, é aqui que se retoma:
+**Nada em curso.** Toda a fila que o dono nomeou está entregue e em `main`. A ronda fechou
+com inlay hints (#226), modo agente (#227) e anexos no chat (#228), e a v0.3.2 passou as
+quatro fases da skill de release.
 
-| Branch             | O quê                                                                         | Estado             |
-| ------------------ | ----------------------------------------------------------------------------- | ------------------ |
-| `feat/inlay-hints` | Inlay hints do LSP (tipos e nomes de parâmetros, estilo PhpStorm/Zed)         | Agente a trabalhar |
-| `feat/agent-mode`  | Modo Ask/Agent no chat: propostas de edição com diff e aprovação por ficheiro | Agente a trabalhar |
+**Como retomar um agente parado** (guardado porque volta a ser preciso): as worktrees vivem
+em `.claude/worktrees/agent-<id>/`. Se um agente cair, o trabalho **não se perde** —
+verificar `git -C .claude/worktrees/agent-<id> log --oneline -2` e `git status`, porque
+costuma estar commitado ou pelo menos escrito. Depois: `git worktree remove <path> --force`,
+`git checkout <branch>`, `git rebase main`, correr os testes, e só então PR.
 
-**Como retomar um agente parado:** as worktrees vivem em `.claude/worktrees/agent-<id>/`.
-Se um agente cair (limite de sessão acontece), o trabalho **não se perde** — verificar
-`git -C .claude/worktrees/agent-<id> log --oneline -2` e `git status`, porque costuma estar
-commitado ou pelo menos escrito. Depois: `git worktree remove <path> --force`, `git checkout
-<branch>`, `git rebase main`, correr os testes, e só então PR.
+**Uma armadilha nova, desta ronda:** um agente que branche antes de outro PR fazer merge
+reporta números da _base dele_, não da `main`. O agente dos anexos reportou três
+"contradições" ao briefing (um ficheiro que não existia, 1427 testes, 18.76 MB) — as três
+eram o mesmo facto: base velha. `apply_proposal` existia, em `ai_chat.rs:858`. **O rebase é
+que resolve a discussão**, não o relatório de nenhum dos lados.
 
-**O que fica na fila depois destes dois:**
+**O que fica na fila:**
 
-1. **Anexos ricos no chat** — imagens, prints, drag & drop para o painel. Fundação já
-   existe: `ExternalPaths` (drag & drop desde a v0.2.0) e o gpui renderiza imagens
-   nativamente.
-2. **Assinatura real + notarização** — US$ 99/ano. É o que remove o aviso do Gatekeeper
+1. **Assinatura real + notarização** — US$ 99/ano. É o que remove o aviso do Gatekeeper
    de vez; ver a secção sobre isso mais abaixo.
-3. **`.dmg` no CI** — hoje é construído e anexado à mão a cada release.
-4. **Universal binary** — o build é `arm64` puro; um Mac Intel não corre.
-5. **#30 Xdebug**, **#28 plugins**, **#31 browser embutido**, **#18 IME/dead keys**.
+2. **`.dmg` no CI** — hoje é construído e anexado à mão a cada release, e agora são **dois**
+   uploads: `ellefuanti-vX.Y.Z-macos.dmg` e `ellefuanti-macos.dmg`. O segundo é o nome
+   estável que o `scripts/install.sh` procura — **se faltar, o one-liner do README dá 404**.
+3. **Universal binary** — o build é `arm64` puro; um Mac Intel não corre.
+4. **#30 Xdebug**, **#28 plugins**, **#31 browser embutido**, **#18 IME/dead keys**.
+
+## Instalação por uma linha (v0.3.2)
+
+`scripts/install.sh`, servido de `raw.githubusercontent.com/.../main/scripts/install.sh`.
+Descarrega a release atual, instala com `ditto`, limpa a quarentena e abre — **sem aviso
+nenhum**, porque a quarentena sai antes do primeiro arranque.
+
+Três coisas que o README fazia mal e que isto corrige: URL com versão fixa (partia a cada
+release), `cp -R` (come o `_CodeSignature/` e produz o "danificado" que o próprio README
+tentava evitar) e o `xattr` — a correção real — escondido num `<details>`.
+
+**O ponto de montagem é lido do `hdiutil`, nunca adivinhado.** Duas ciladas, ambas
+descobertas a correr: `-quiet` suprime as linhas que é preciso parsear, e o `hdiutil` separa
+colunas por **tabs** — cortar em espaços trunca `ellefuanti 0.3.2` no espaço.
 
 ## Onde está o projeto
 
@@ -44,8 +59,25 @@ commitado ou pelo menos escrito. Depois: `git worktree remove <path> --force`, `
 | **0.2.1** | Auto-update in-app                                                                       |
 | **0.3.0** | Chat IA + ghost text, smart typing PHP, zen/fullscreen, 8 temas, settings com secções    |
 | **0.3.1** | Auto-import, lâmpada de quick fix, chat por assinatura (Codex), painéis redimensionáveis |
+| **0.3.2** | Inlay hints, modo agente com diff e aprovação por ficheiro, anexos no chat, install.sh   |
 
 **Issues #29 (AI autocomplete) e #99 (AI chat) fechadas.**
+
+## O arco da v0.3.2
+
+| PR   | Entrega                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------- |
+| #226 | Inlay hints do LSP — fatias por coluna descendente; dica fora da linha é ignorada, não encostada     |
+| #227 | Modo agente: sandbox fica `read-only` nos **dois** modos, e é isso que torna a aprovação obrigatória |
+| #228 | Anexos no chat: imagens em blocos na wire, base64 à mão, `deny_reason` em dois sítios                |
+
+**O achado da #227, que inverteu o desenho.** Sondagem contra o `codex-cli` 0.146.0: em
+`workspace-write` a CLI **escreve sem pedir nada**; em `read-only` emite
+`item/fileChange/requestApproval` e **espera**. Pedir permissão de escrita _removia_ o passo
+de consentimento. Por isso o sandbox fica `read-only` nos dois modos — "nada chega ao disco
+sem aprovação" é propriedade do protocolo, não promessa do painel. O painel responde sempre
+`decline`, mesmo ao que o utilizador aplicou: quem escreve é o editor, e `accept` faria a
+Codex reaplicar o patch por cima de bytes já mudados.
 
 ## O arco da v0.3.1
 
