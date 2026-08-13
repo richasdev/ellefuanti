@@ -218,6 +218,13 @@ impl AiChatPanel {
     }
 
     /// Resolves Codex availability off the main thread and caches the answer.
+    ///
+    /// The only caller sits behind `cfg(not(test))` — a test must never spawn a CLI —
+    /// so under `cargo clippy --all-targets` (which builds the test harness) this reads
+    /// as dead code and `-D warnings` fails the build. That is the CI break, and the
+    /// honest fix is to say so here rather than to give the tests a call they do not
+    /// want just to keep the lint quiet.
+    #[cfg_attr(test, allow(dead_code))]
     fn probe_codex(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let status = cx.background_spawn(async { crate::ai_codex::availability() }).await;
