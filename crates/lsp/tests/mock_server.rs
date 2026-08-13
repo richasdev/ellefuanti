@@ -182,6 +182,7 @@ fn full_capabilities() -> Value {
         "documentSymbolProvider": true,
         "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
         "renameProvider": true,
+        "inlayHintProvider": true,
     })
 }
 
@@ -1304,4 +1305,83 @@ fn code_actions_reach_the_server_with_range_and_context_diagnostics() {
     // decide what to offer *from* them, so an empty context is a quieter server.
     assert_eq!(params[0]["range"]["start"]["line"], json!(1));
     assert_eq!(params[0]["context"]["diagnostics"][0]["message"], json!("Undefined type"));
+}
+
+#[test]
+fn the_inlay_hint_capability_is_read_not_assumed() {
+    // The gate that keeps a server without hints from being asked on every scroll for the
+    // life of the session — a `MethodNotFound` round trip per viewport change otherwise.
+    let (client, _server) = open_client(full_capabilities(), |_, _| Reply::Silence);
+    assert!(client.capabilities().inlay_hints);
+
+    let mut without = full_capabilities();
+    without.as_object_mut().unwrap().remove("inlayHintProvider");
+    let (client, _server) = open_client(without, |_, _| Reply::Silence);
+    assert!(!client.capabilities().inlay_hints, "an absent provider is a declined feature");
+}
+
+#[test]
+fn inlay_hints_reach_the_server_as_a_range_and_come_back_in_both_label_shapes() {
+    // Both shapes in one reply on purpose: the protocol allows either, servers use both,
+    // and the client must not care which arrives.
+    let (mut client, server) = open_client(full_capabilities(), |method, _| match method {
+        "textDocument/inlayHint" => Reply::Result(json!([
+            {
+                "position": { "line": 1, "character": 2 },
+                "label": ": int",
+                "kind": 1,
+                "paddingLeft": false,
+                "paddingRight": false
+            },
+            {
+                "position": { "line": 1, "character": 5 },
+                "label": [{ "value": "name" }, { "value": ":" }],
+                "kind": 2,
+                "paddingRight": true
+            }
+        ])),
+        _ => Reply::Silence,
+    });
+
+    // The same unopened-document guard every other request has: asking about a file the
+    // server was never told of is a caller mistake, not something to send.
+    assert!(client.request_inlay_hints(&uri(), 0..10).is_err());
+
+    client.did_open(uri(), "php", "<?php\n$x = f(1);\n").unwrap();
+    let id = client.request_inlay_hints(&uri(), 6..15).unwrap();
+    let hints: Option<Vec<lsp_types::InlayHint>> =
+        client.await_response(&id, Duration::from_secs(5)).unwrap();
+    let hints = hints.expect("hints arrive");
+    assert_eq!(hints.len(), 2);
+
+    // A plain string label, and a parts label — the client accepts both off the wire.
+    assert!(matches!(&hints[0].label, lsp_types::InlayHintLabel::String(text) if text == ": int"));
+    assert!(
+        matches!(&hints[1].label, lsp_types::InlayHintLabel::LabelParts(parts) if parts.len() == 2)
+    );
+    assert_eq!(hints[0].kind, Some(lsp_types::InlayHintKind::TYPE));
+    assert_eq!(hints[1].kind, Some(lsp_types::InlayHintKind::PARAMETER));
+
+    // The byte range became a position range: this is what makes the request cost the
+    // visible rows rather than the whole file.
+    let params = server.params_for("textDocument/inlayHint");
+    assert_eq!(params[0]["range"]["start"]["line"], json!(1));
+    assert_eq!(params[0]["range"]["start"]["character"], json!(0));
+    assert_eq!(params[0]["range"]["end"]["line"], json!(1));
+}
+
+#[test]
+fn a_server_that_declines_inlay_hints_is_not_an_error() {
+    // RISKS #4: `null` means the server chose not to answer. Reporting that as a failure
+    // would put an error on screen for a file that simply has nothing to annotate.
+    let (mut client, _server) = open_client(full_capabilities(), |method, _| match method {
+        "textDocument/inlayHint" => Reply::Result(Value::Null),
+        _ => Reply::Silence,
+    });
+
+    client.did_open(uri(), "php", "<?php\n$x = 1;\n").unwrap();
+    let id = client.request_inlay_hints(&uri(), 0..12).unwrap();
+    let hints: Option<Vec<lsp_types::InlayHint>> =
+        client.await_response(&id, Duration::from_secs(5)).unwrap();
+    assert!(hints.is_none(), "a null reply is 'nothing to say', not a failure");
 }
