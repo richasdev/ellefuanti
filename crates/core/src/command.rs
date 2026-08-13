@@ -214,6 +214,14 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     Command::new("tests.run", "Run All Tests"),
     Command::new("tests.run_file", "Run Tests in Current File"),
     Command::new("tests.rerun_failed", "Rerun Failed Tests"),
+    // The Xdebug debugger (#30). "Listen for Xdebug" rather than "Start Debugging",
+    // because that is literally what it does: this IDE opens a port and waits, and the
+    // thing that starts is a request the user makes elsewhere. A command promising to
+    // start something would leave people waiting for a run that never comes.
+    Command::new("debug.toggle_panel", "Toggle Debug Panel"),
+    Command::new("debug.start", "Listen for Xdebug"),
+    Command::new("debug.stop", "Stop Debugging"),
+    Command::new("debug.toggle_breakpoint", "Toggle Breakpoint"),
     Command::new("theme.toggle", "Switch Theme"),
     Command::new("view.fullscreen", "Toggle Full Screen"),
     Command::new("view.zen", "Toggle Zen Mode"),

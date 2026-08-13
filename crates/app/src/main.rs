@@ -7,6 +7,8 @@ mod ai_codex;
 mod artisan;
 mod completion;
 mod context_menu;
+mod debug_session;
+mod debug_view;
 mod editor;
 mod file_cache;
 mod file_icons;

@@ -76,6 +76,21 @@ pub struct EditorView {
     /// handed cannot go stale in a way that matters — it is simply the last thing the
     /// server said, and an empty one is the correct rendering when there is no server.
     diagnostics: Vec<(Range<usize>, Severity, SharedString)>,
+    /// Rows carrying a breakpoint, pushed in by the workspace (#30).
+    ///
+    /// Rows rather than byte offsets, because a breakpoint is a *line* — that is the unit
+    /// DBGp addresses, and an offset would need remapping on every edit to answer a
+    /// question the protocol only ever asks in line numbers.
+    ///
+    /// Pushed for the same reason diagnostics are: the workspace owns the debug session and
+    /// the breakpoint store, and an editor reaching into either would make "the session
+    /// died" something every open tab has to cope with.
+    breakpoints: Vec<usize>,
+    /// The row execution is stopped on, if it is in *this* file.
+    ///
+    /// `Option` rather than a flag on the row, because only one row in one file can be the
+    /// current statement, and letting each editor decide would eventually show two arrows.
+    debug_row: Option<usize>,
     /// True between a left mouse-down on a row and its release: drag-selection (#82).
     dragging: bool,
     /// An ⌥-drag in progress: the anchor's window-x and row, plus the offset to fall
@@ -210,6 +225,8 @@ impl EditorView {
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
             diagnostics: Vec::new(),
+            breakpoints: Vec::new(),
+            debug_row: None,
             link_hint: None,
             dragging: false,
             alt_drag: None,
@@ -284,6 +301,26 @@ impl EditorView {
         // mouse move rebuilds it against the new list. Keeping it would show a message
         // about bytes that no longer carry it.
         self.hover_diagnostic = None;
+    }
+
+    /// Replaces the breakpoint rows drawn in the gutter (#30).
+    ///
+    /// Called by the workspace whenever the store changes, and with an empty vector for a
+    /// file that has none — clearing matters for the reason `set_diagnostics` documents.
+    pub fn set_breakpoints(&mut self, rows: Vec<usize>, cx: &mut Context<Self>) {
+        self.breakpoints = rows;
+        cx.notify();
+    }
+
+    /// Marks the row execution is stopped on, or `None` when it is not in this file.
+    pub fn set_debug_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        self.debug_row = row;
+        cx.notify();
+    }
+
+    /// The cursor's row, for the actions that operate on a line rather than a selection.
+    pub fn cursor_row(&self) -> usize {
+        self.document.cursor_point().row
     }
 
     /// Replaces the inlay hints drawn over this document (#93 follow-up).
@@ -2059,6 +2096,10 @@ impl EditorView {
                     .collect();
 
                 let is_cursor_row = line_index == cursor.row;
+                // Both are lookups over lists that hold at most a handful of entries for
+                // this file, done per visible row — a screenful, not the document.
+                let has_breakpoint = self.breakpoints.contains(&line_index);
+                let is_debug_row = self.debug_row == Some(line_index);
                 // Each selection's slice of this row, in line-local bytes, for precise
                 // painting (#82). The old full-row tint made a word selection look like a
                 // line selection — and on themes where hover and selected share a value
@@ -2182,7 +2223,28 @@ impl EditorView {
                             // to draw it, which would be a request per cursor move. See
                             // `row_diagnostics` above: the editor is told about
                             // diagnostics, so this costs nothing.
-                            .child(if is_cursor_row && !row_diagnostics.is_empty() {
+                            //
+                            // A breakpoint and the current statement replace the number for
+                            // the same reason, and they outrank the bulb: while stopped,
+                            // where execution *is* matters more than an offer to rewrite the
+                            // line. The arrow wins over the dot when a breakpoint is the
+                            // thing that stopped us, because the arrow is the transient fact
+                            // and the dot is still readable from the panel.
+                            //
+                            // Both are glyphs, not colours: a red dot alone says nothing to
+                            // anyone who cannot see red, and this is the one margin mark
+                            // that changes what the program does.
+                            .child(if is_debug_row {
+                                div()
+                                    .text_color(theme.warning)
+                                    .child(SharedString::from("▶"))
+                                    .into_any_element()
+                            } else if has_breakpoint {
+                                div()
+                                    .text_color(theme.error)
+                                    .child(SharedString::from("●"))
+                                    .into_any_element()
+                            } else if is_cursor_row && !row_diagnostics.is_empty() {
                                 quick_fix_bulb(&theme, &entity).into_any_element()
                             } else {
                                 // The buffer line's own number — after a fold, rows are
