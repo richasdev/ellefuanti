@@ -5,6 +5,76 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-13
+
+Menor, não correção: três das quatro entregas são funcionalidades visíveis.
+
+### Added
+
+- **IME e composição por dead-key.** `ã`, `ç`, `õ`, `é` passam a compor — e com eles o CJK
+  e a paleta de caracteres do macOS.
+
+  O desenho é ditado por uma descoberta: o macOS despacha o `KeyDown` **primeiro** e só
+  entrega o evento ao IME se ninguém o consumir, e o listener `on_key_down` de um `div` não
+  trava a propagação. O evento chega aos dois. Manter a inserção no `on_key_down` faria cada
+  caracter entrar **duas vezes** no instante em que existisse um input handler; por isso a
+  inserção mudou-se para `replace_text_in_range`. Há teste de mutação a provar que a escrita
+  normal passa pelo caminho novo.
+
+  Os offsets do `EntityInputHandler` são **UTF-16** e o resto do código usa bytes: a
+  conversão está numa fronteira só, e texto em composição nunca dispara auto-pairing nem o
+  `=` → `=>`.
+
+- **Painel de preview embutido.** Uma `WKWebView` ao lado do editor, para ver a página sem
+  trocar de janela. Carregado tardiamente — quem nunca o abre não paga nada no arranque nem
+  em memória (64.2 MB de footprint com o painel fechado, contra um limite de 95).
+
+  O GPUI não tem API para embeber vistas nativas e o `paint_surface` só aceita
+  `CVPixelBuffer`, que uma `WKWebView` não produz. A costura é o `Window` implementar
+  `HasWindowHandle`: a webview entra **por cima** da vista do GPUI, como irmã dela. Por
+  baixo não serviria — a camada Metal é não-opaca mas não abre buracos.
+
+  Decisão registada na **ADR-0011**, escrita antes do código porque a ADR-0001 exclui
+  webviews: o que se rejeita ali é a webview como _substrato do editor_; um painel que mostra
+  o site do utilizador é outra coisa, e nunca desenha a UI da IDE.
+
+- **Binário universal (arm64 + x86_64).** Um Mac Intel deixa de não correr de todo. O `lipo`
+  funde as fatias **antes** do bundle, porque assinar sela o executável como está.
+
+### Fixed
+
+- **O preview em zen mode.** O zen esconde painéis não os renderizando — e é o paint que move
+  a `NSView` nativa. A página teria continuado desenhada por cima do editor.
+- **O preview numa janela com titlebar.** O flip de coordenadas media pela altura do
+  superview, mas o rect do painel é medido dentro da vista do GPUI. Quando as duas divergem,
+  a página fica deslocada por exatamente esse recuo — e continua a desenhar, portanto nada
+  estoira e nada parece partido.
+
+### Distribuição
+
+- **O `.dmg` passa a sair do CI**, com **dois** nomes: o versionado e um estável. O segundo é
+  o que o `scripts/install.sh` busca através de `/releases/latest/download/`; sem ele, o
+  one-liner do README dá 404. Era um passo manual com essa consequência.
+- **Gate de bundle antes de publicar**, verificado contra bundles partidos de propósito.
+  Apagar `Contents/_CodeSignature/` dá `Sealed Resources=none` e `--verify` sai 1; alterar um
+  recurso depois de assinar dá `a sealed resource is missing or invalid`.
+- **Tap de Homebrew** em `richasdev/homebrew-ellefuanti`: `brew install --cask ellefuanti`,
+  e depois `brew upgrade`. Evita as duas chatices do macOS de uma vez — sem aviso do
+  Gatekeeper, e sem imagem de disco esquecida montada. Não substitui assinatura: remove a
+  flag de quarentena, que é o que o Gatekeeper avalia.
+
+### Notas
+
+- A fatia **x86_64 mede 20.08 MB** contra os 18.84 MB da arm64, acima do gate de 19 MB.
+  Binários Intel são maiores para o mesmo código. O gate por fatia existe mas corre do
+  `ci.yml` sobre o build nativo, portanto não vê o binário fat. Decisão em aberto, registada
+  no `perf-gate.sh`.
+- **A fatia x86_64 nunca foi executada** — a máquina de desenvolvimento é Apple Silicon sem
+  Rosetta. Não anunciar suporte Intel antes de a testar num Mac real.
+- **Nenhuma página foi vista a renderizar no painel de preview.** Todo o caminho objc compila
+  e é type-correct, mas abrir o painel exige clique e a máquina nega Acessibilidade ao
+  osascript. A aritmética está testada; a execução não.
+
 ## [0.3.2] — 2026-08-13
 
 ### Added
