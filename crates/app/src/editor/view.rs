@@ -9,7 +9,7 @@ use std::ops::Range;
 use elle_syntax::HighlightSpan;
 use elle_text::Point;
 use gpui::{
-    App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+    App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
     HighlightStyle as GpuiHighlight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
     ScrollStrategy, SharedString, TextRun, UniformListScrollHandle, Window, div, prelude::*, px,
     svg, uniform_list,
@@ -25,7 +25,9 @@ use crate::actions::{
     ToggleComment, Undo, UnfoldBlock, context,
 };
 use crate::editor::ghost::{self, GhostSuggestion};
+use crate::editor::ime;
 use crate::editor::inlay::{HintKind, ResolvedHint, hints_on_line};
+use crate::editor::input_element::InputHandlerElement;
 use crate::editor::line::Line;
 use crate::editor::state::{Document, Selection};
 use crate::fonts::Fonts;
@@ -159,6 +161,12 @@ pub struct EditorView {
     /// rather than fetched during render for `diagnostics`' reason: these are painted every
     /// frame and the offset conversion happens once, when the response lands.
     hints: Vec<ResolvedHint>,
+    /// Where the OS is currently composing, if it is (#18).
+    ///
+    /// Non-`None` between `setMarkedText:` and the commit — the accent floating over `a`
+    /// after ⌥N on a US layout, the underlined romaji before a Japanese candidate is
+    /// chosen. See `editor::ime` for why this holds a *range* and not the text.
+    marked: crate::editor::ime::Marked,
 }
 
 /// Half the blink period: the caret is shown for this long, then hidden for this long.
@@ -217,6 +225,7 @@ impl EditorView {
             ghost_request: None,
             ghost_epoch: 0,
             hints: Vec::new(),
+            marked: crate::editor::ime::Marked::default(),
         }
     }
 
@@ -349,6 +358,16 @@ impl EditorView {
     #[cfg(test)]
     pub fn after_edit_for_test(&mut self, cx: &mut Context<Self>) {
         self.after_edit(cx);
+    }
+
+    /// Whether the OS is composing into this editor right now (#18).
+    ///
+    /// The one piece of IME state a test cannot read off the buffer: marked text *is* the
+    /// buffer's text, so "is this provisional?" is invisible from the outside — which is
+    /// the whole reason `Marked` exists as a separate field.
+    #[cfg(test)]
+    pub fn is_composing_for_test(&self) -> bool {
+        self.marked.is_composing()
     }
 
     /// Where the text column starts, as measured at prepaint.
@@ -491,23 +510,25 @@ impl EditorView {
         }
     }
 
-    /// Handles a raw keypress, for characters the action system does not cover.
+    /// Filters a raw keypress down to the literal text it means, or `None`.
     ///
-    /// Everything with a command/control modifier, and every navigation key, is left to
-    /// the keymap in `actions.rs`. What remains is literal text insertion.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Split out of [`Self::on_key_down`] as a pure decision so the "is this text?" rule can
+    /// be tested without a window, and so the one caller left is obviously a filter plus a
+    /// call. Everything with a command/control modifier, and every navigation key, is left
+    /// to the keymap in `actions.rs`.
+    fn typed_text(event: &KeyDownEvent) -> Option<&str> {
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
 
         // `platform` is cmd on macOS. Chords are keybindings, not text.
         if modifiers.platform || modifiers.control || modifiers.function {
-            return;
+            return None;
         }
 
         // `key_char` is the literal character *after* the layout applies shift and dead
         // keys ("ß" for option-s), and is None for command chords. `key` is the
         // layout-independent label — right for bindings, wrong for insertion.
-        let Some(text) = keystroke.key_char.as_deref() else { return };
+        let text = keystroke.key_char.as_deref()?;
 
         // Navigation and editing keys arrive with a key_char in some cases; they are
         // handled by actions, so ignore them here to avoid inserting control characters.
@@ -527,13 +548,61 @@ impl EditorView {
                 | "pageup"
                 | "pagedown"
         ) {
-            return;
+            return None;
         }
 
         if text.is_empty() || text.chars().all(|c| c.is_control()) {
+            return None;
+        }
+
+        Some(text)
+    }
+
+    /// Handles a raw keypress, for characters the action system does not cover.
+    ///
+    /// # Why this no longer inserts anything on macOS (#18)
+    ///
+    /// It used to, and that was correct while nothing else could. Now that the editor
+    /// registers an [`EntityInputHandler`], insertion has to happen in exactly one place,
+    /// and gpui's key path makes it clear which: `handle_key_event` in
+    /// `gpui/src/platform/mac/window.rs` dispatches `KeyDown` **first** and only hands the
+    /// event to the IME if the callback reports it unhandled. Since a `div`'s
+    /// `on_key_down` listener does not stop propagation, the event reaches *both* — so a
+    /// handler that still inserted here would type every character twice the moment an
+    /// input handler existed.
+    ///
+    /// Letting the IME own it is not merely the way to avoid the double: it is the whole
+    /// feature. A dead key (⌥N, then `a`) produces **no `key_char` at all** on the first
+    /// press — the layout is holding a combining state that only `NSTextInputClient` can
+    /// see. There is nothing for this function to insert, which is exactly why `ã` was
+    /// unreachable before.
+    ///
+    /// What remains here is the platforms-without-an-IME fallback. `handle_input` only
+    /// registers a handler while this editor is focused, and gpui's test platform reaches
+    /// the input handler through the same two-step path, so this branch fires only when
+    /// nothing else will take the keystroke — never in addition to it.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = Self::typed_text(event) else { return };
+
+        // The `!` of the double-insert rule above. When the platform will route this
+        // keystroke to `replace_text_in_range`, doing anything here is the bug; when it
+        // will not, doing nothing here loses the character. `window.is_focused` on this
+        // editor's handle is the same condition `handle_input` gates registration on, so
+        // the two answers cannot drift.
+        if self.focus_handle.is_focused(window) {
             return;
         }
 
+        self.insert_text(text, cx);
+    }
+
+    /// Puts typed text into the buffer and runs everything a keystroke owes afterwards.
+    ///
+    /// The single insertion tail, shared by [`Self::on_key_down`] and the platform's
+    /// `replace_text_in_range`. It exists as one function precisely because those two must
+    /// not diverge: a character typed through the IME has to auto-close its bracket, re-arm
+    /// the ghost debounce, and emit [`EditorEvent::Typed`] identically to one that did not.
+    fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         // Brackets and quotes first: wrapping a selection, typing over a closer, and
         // auto-closing all replace the plain insert. `insert_with_pairs` reports whether it
         // handled the keystroke rather than deciding here, because what counts as a pair is
@@ -1012,6 +1081,14 @@ impl EditorView {
         if !self.document.selection.is_empty() || self.document.has_multiple_cursors() {
             return;
         }
+        // Mid-composition the buffer holds provisional text — half-typed romaji, an `a`
+        // that is about to become `ã`. Completing *that* is asking a model to continue a
+        // word the user has not finished spelling, and the suggestion would be invalidated
+        // by the very next composition step. The debounce is 400ms and a composition
+        // outlives it easily, so this is reached in practice rather than theoretically.
+        if self.marked.is_composing() {
+            return;
+        }
         let settings = crate::settings::current(cx);
         if !settings.ai_autocomplete_enabled() {
             return; // switched off during the debounce
@@ -1471,6 +1548,204 @@ impl Focusable for EditorView {
     }
 }
 
+/// The OS's side of text input: marked text, candidate windows, the character palette (#18).
+///
+/// # The one rule
+///
+/// **Every offset in this trait is a UTF-16 code-unit offset, and every offset below it is a
+/// byte offset.** The conversion happens in `editor::ime` and nowhere else; a method here
+/// that passed a `range_utf16` straight to `Document` would compile, pass every ASCII test,
+/// and corrupt the first line containing `ã`. Each method converts at its first statement,
+/// which is why they all read the same way.
+///
+/// # Why this is worth having beyond CJK
+///
+/// The candidate window is the visible half of the feature; dead keys are the half used
+/// daily here. On a US layout ⌥N then `a` gives `ã`, and the first press produces no
+/// `key_char` at all — the layout is holding combining state that only `NSTextInputClient`
+/// can observe. Without this trait implemented, that first press is simply lost and the
+/// second inserts a bare `a`. That is the bug, and it is why the issue calls dead-key
+/// composition the everyday case rather than an edge case.
+impl gpui::EntityInputHandler for EditorView {
+    /// The current selection, as the platform counts.
+    ///
+    /// `ignore_disabled_input` is about read-only fields, which this editor does not have —
+    /// every open document is editable — so there is nothing to decline.
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        let selection = self.document.selection;
+        let range = ime::byte_range_to_utf16(&self.document.buffer, selection.range());
+        Some(gpui::UTF16Selection {
+            range,
+            // `reversed` means the *head* is at the low end — a selection made by dragging
+            // backwards. The platform uses it to decide which end an arrow key collapses to,
+            // so reporting it wrong makes shift-selection feel inverted inside a composition.
+            reversed: selection.head < selection.anchor,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let range = self.marked.range()?;
+        Some(ime::byte_range_to_utf16(&self.document.buffer, range))
+    }
+
+    /// The text behind a range the platform is asking about.
+    ///
+    /// `adjusted_range` reports back the range actually served, which matters when the
+    /// request lands mid-character: the platform asked in UTF-16 units that may split a
+    /// surrogate pair, and it needs to know the answer covers slightly different ground
+    /// rather than assuming a 1:1 correspondence it can index into.
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let bytes = ime::utf16_range_to_bytes(&self.document.buffer, range_utf16);
+        *adjusted_range = Some(ime::byte_range_to_utf16(&self.document.buffer, bytes.clone()));
+        Some(self.document.buffer.slice(bytes))
+    }
+
+    /// A commit: the composition is over and this text is now ordinary buffer content.
+    ///
+    /// This is also the path *every plain keystroke* takes on macOS — `insertText:` is what
+    /// AppKit calls for an unaccented `a` just as much as for a chosen kanji — which is why
+    /// it funnels into [`EditorView::insert_text`], the same tail `on_key_down` used to run
+    /// inline. Committed text gets auto-pairing and the `Typed` event because it *is* typed
+    /// text; that is the difference between here and `replace_and_mark_text_in_range`.
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The range to replace, in bytes. `None` means "the marked text if composing,
+        // otherwise the selection" — the platform's own default, and getting it wrong is
+        // how a committed candidate ends up appended after the romaji instead of replacing
+        // it.
+        let target = replacement_range
+            .map(|range| ime::utf16_range_to_bytes(&self.document.buffer, range))
+            .or_else(|| self.marked.range());
+
+        if let Some(target) = target {
+            self.document.select_range(target);
+        }
+        self.marked.clear();
+
+        self.insert_text(text, cx);
+    }
+
+    /// A composition step: text is in the buffer but the user has not committed to it.
+    ///
+    /// # Why this deliberately avoids `insert_text`
+    ///
+    /// Marked text is **not typed text**, and the difference is the whole reason this is a
+    /// separate method rather than a flag on the one above. Composing `"` on a Brazilian
+    /// layout must not auto-close into `""`, and a `=` mid-composition must not become
+    /// `=>` — those conveniences fire on a decision the user has not made yet, and the
+    /// pairs they insert are outside the marked range, so the next composition step
+    /// replaces the wrong bytes and leaves the orphan behind. The same reasoning excludes
+    /// the `Typed` event: a completion popup opened on a half-composed character would be
+    /// filtering on text that is about to be replaced.
+    ///
+    /// So this splices plainly and records where. Everything a commit owes gets paid by
+    /// `replace_text_in_range` when the user actually commits.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = range_utf16
+            .map(|range| ime::utf16_range_to_bytes(&self.document.buffer, range))
+            .or_else(|| self.marked.range())
+            .unwrap_or_else(|| self.document.selection.range());
+
+        let start = self.document.replace_range_plainly(target, new_text);
+        let marked = start..start + new_text.len();
+        self.marked.set(marked.clone());
+
+        // The caret inside the composition — where the IME says the user is within the
+        // romaji, not necessarily its end. Offsets are relative to `new_text`, so they are
+        // converted against the text just spliced rather than against the whole buffer.
+        let caret = new_selected_range
+            .map(|range| {
+                let local = ime::utf16_range_to_bytes(&self.document.buffer, range);
+                marked.start + local.end.min(new_text.len())
+            })
+            .unwrap_or(marked.end);
+        self.document.select_range(caret..caret);
+
+        self.scroll_cursor_into_view();
+        self.restart_blink(cx);
+        cx.notify();
+    }
+
+    /// The composition was abandoned — Escape, or a click elsewhere.
+    ///
+    /// The text stays where it is. That is the platform's contract: `unmarkText` means
+    /// "stop treating this as provisional", not "undo it". Deleting it here is what makes a
+    /// half-typed candidate vanish when the user clicks away, which is not what any other
+    /// editor does.
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.range().is_some() {
+            self.marked.clear();
+            cx.notify();
+        }
+    }
+
+    /// Where to put the candidate window, in window coordinates.
+    ///
+    /// Anchored to the caret rather than to the requested range's own start. The range is
+    /// almost always the marked text, whose start is where the composition *began* — put
+    /// the palette there and it drifts left of the text as the user keeps typing. The
+    /// height is one line so the popup clears the row it belongs to.
+    ///
+    /// `None` before the first prepaint, and `None` while the cursor's row is scrolled out
+    /// of view, for the reason [`EditorView::cursor_position`] documents: there is no
+    /// on-screen caret to anchor to.
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let origin = self.cursor_position(window, cx)?;
+        let line_height = Fonts::get(cx).line_height();
+        Some(Bounds::new(origin, gpui::size(px(1.0), line_height)))
+    }
+
+    /// Which character a screen point is over, for the palette's own hit-testing.
+    ///
+    /// Not implemented: mapping a *window* point to an offset needs the row under it, and
+    /// the row grid lives inside `uniform_list`, which does not expose a point-to-row query
+    /// outside its render callback — the same reason `on_row_mouse_down` is registered per
+    /// row rather than once on the editor. `None` is a legal answer here (AppKit falls back
+    /// to not offering the lookup), and the feature it degrades is dragging *within* the
+    /// candidate window, not composition itself.
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -1625,6 +1900,12 @@ impl Render for EditorView {
             // the indent guides paint as tall grey blocks spanning two rows.
             .line_height(fonts.line_height())
             .text_color(theme.text)
+            // The OS's input handler, registered during this element's paint (#18). A
+            // zero-sized sibling of the row list rather than something inside it: the
+            // registration is per *editor*, and `uniform_list`'s callback runs per visible
+            // row. See `editor::input_element` for why paint is the only phase this can
+            // happen in.
+            .child(InputHandlerElement::new(cx.entity(), self.focus_handle.clone()))
             .child(
                 // uniform_list calls back only for visible rows, so a 50k-line file costs
                 // the same per frame as a 50-line one.
