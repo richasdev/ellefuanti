@@ -5,6 +5,36 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-08-13
+
+### Added
+
+- **Auto-import de classes.** Aceitar uma classe do popup insere o `use` que falta, num
+  único passo de undo. O servidor já mandava o import em `additionalTextEdits` de cada
+  completion; o editor lia o identificador e deitava o resto fora.
+- **Lâmpada de quick fix** no gutter das linhas com diagnóstico, abrindo a mesma lista
+  que o ⌘. já abria — que até aqui era preciso adivinhar que existia.
+- **Chat por assinatura**, via o `codex` que o utilizador já instalou e onde já fez
+  login. O editor nunca vê o token: só pergunta se o ficheiro de auth existe. Modo
+  leitura — lê o projeto para responder, não escreve. Sem login, diz que comando correr.
+  Login Claude.ai não é oferecido porque a política da Anthropic o reserva às
+  aplicações dela.
+- **`ai.chat_provider`**, para o chat e o autocomplete usarem contas diferentes — o
+  autocomplete numa chave de API por latência, o chat na assinatura. Sem a chave
+  definida, nada muda.
+- **Painéis redimensionáveis:** a sidebar e o painel de chat ganham divisória
+  arrastável, com limites nos dois extremos (um painel arrastado até zero levaria a
+  própria divisória).
+- **Botão de IA na titlebar** — o painel só tinha ⌘⇧A, invisível para quem não leu o
+  keymap.
+
+### Fixed
+
+- **A caixa da chave de API não aceitava colar.** Partilhava o handler do prompt de
+  nome de ficheiro, que descarta toda a tecla com ⌘ premido — e ninguém digita uma
+  chave de ~100 caracteres à mão. A mesma caixa mostrava a chave em texto claro; passa
+  a bullets.
+
 ## [0.3.0] — 2026-08-12
 
 ### Added
