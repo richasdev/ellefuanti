@@ -1,8 +1,8 @@
 # PROGRESS — estado atual (2026-08-13)
 
-**v0.3.2 lançada e a servir como `latest`.** Suite em **1466 testes, 41 suites**, clippy
-limpo sob os flags do CI, binário **18.84 MB de 19 MB (99.2% do gate)**. Ledger das rondas
-anteriores no histórico git deste ficheiro.
+**v0.3.2 lançada e a servir como `latest`.** A `main` já traz a ronda seguinte por lançar:
+suite em **1485 testes, 41 suites**, clippy limpo sob os flags do CI, binário **18.86 MB de
+19 MB (99.3% do gate)**. Ledger das rondas anteriores no histórico git deste ficheiro.
 
 > **Antes de cortar qualquer versão:** correr a skill `/ellefuanti-release`, e ler
 > **[RELEASE.md](RELEASE.md)**. Não é opcional — cada release desde a v0.1.0 partiu de uma
