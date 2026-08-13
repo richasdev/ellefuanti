@@ -64,6 +64,20 @@ CPU_LIMIT_PCT=2
 # from their rlibs — the same "price of the language at all" trade the bash grammar set
 # the precedent for. The gate's job is catching *accidental* growth; a deliberate,
 # attributed cost moves the line and says so here.
+#
+# THIS LIMIT IS PER ARCHITECTURE SLICE, NOT PER FILE, and that distinction is the whole
+# reason the number did not move when the release became a universal binary.
+#
+# A universal binary is two complete copies of the same program in one file, so a fat
+# arm64+x86_64 build weighs ~37 MB against an 18.84 MB arm64 slice. Measuring the *file*
+# would mean either failing every release or roughly doubling the limit — and doubling it
+# would silently re-admit ~18 MB of accidental growth in the thing the gate actually
+# watches, which is our code. The limit is the size of one copy of ellefuanti; the number
+# of copies stapled together is a packaging decision, not bloat.
+#
+# So each slice is extracted with `lipo -thin` and measured on its own, and every slice has
+# to fit. A thin (single-arch) binary has no slices to extract and is measured directly,
+# which is what a local `cargo build --release` produces.
 BIN_LIMIT_MB=19
 
 # How long to let the process settle before believing its memory. Measured: footprint is
@@ -133,18 +147,54 @@ failed=0
 # --- Binary size -----------------------------------------------------------------------
 # Deterministic and free to measure, and it moved 7.63 → 14.53 MB in one session with no
 # single change owning more than a fraction of it. Reported always, so a jump is a decision.
-bin_bytes=$(wc -c <"$BIN" | tr -d ' ')
 # Compared in *bytes*, printed in MiB to two decimals. Comparing truncated whole MiB is the
 # obvious version and it is wrong: `$((bytes / 1048576))` makes a 14.53 MB binary read as 14,
 # which passes a 14 MB limit. That was not a hypothetical — the first run of this gate with
 # the limit deliberately lowered to 14 reported 14.53 MB and did not fail, so nearly a whole
 # megabyte of growth could land under any limit before the check noticed.
 bin_limit_bytes=$((BIN_LIMIT_MB * 1048576))
-printf 'binary       %6s MB   (limit %s MB)\n' \
-	"$(awk -v b="$bin_bytes" 'BEGIN { printf "%.2f", b / 1048576 }')" "$BIN_LIMIT_MB"
-if [ "$bin_bytes" -gt "$bin_limit_bytes" ]; then
-	echo "FAIL: binary is $bin_bytes bytes, over the ${BIN_LIMIT_MB} MB limit" >&2
-	failed=1
+
+# Which architectures are in there. `lipo -archs` prints them space-separated for a fat
+# file; for a thin one it prints the single arch, which makes the two cases the same loop.
+# Failure is not fatal — lipo is macOS-only and this gate already is, but a missing lipo
+# should degrade to measuring the file rather than crashing the release.
+archs=$(lipo -archs "$BIN" 2>/dev/null || true)
+
+# One slice: measure the file. Extracting it would produce a byte-identical copy.
+if [ -z "$archs" ] || [ "$(echo "$archs" | wc -w | tr -d ' ')" -le 1 ]; then
+	bin_bytes=$(wc -c <"$BIN" | tr -d ' ')
+	printf 'binary       %6s MB   (limit %s MB, %s)\n' \
+		"$(awk -v b="$bin_bytes" 'BEGIN { printf "%.2f", b / 1048576 }')" \
+		"$BIN_LIMIT_MB" "${archs:-thin}"
+	if [ "$bin_bytes" -gt "$bin_limit_bytes" ]; then
+		echo "FAIL: binary is $bin_bytes bytes, over the ${BIN_LIMIT_MB} MB limit" >&2
+		failed=1
+	fi
+else
+	# Fat: the limit applies to each slice on its own — see BIN_LIMIT_MB above for why the
+	# file's total is the wrong number to gate on. Every slice is printed, so a build where
+	# one architecture grew and the other did not is visible rather than averaged away.
+	slice_dir=$(mktemp -d)
+	for arch in $archs; do
+		lipo -thin "$arch" "$BIN" -output "$slice_dir/$arch" 2>/dev/null || {
+			echo "could not extract the $arch slice with lipo" >&2
+			rm -rf "$slice_dir"
+			exit 2
+		}
+		slice_bytes=$(wc -c <"$slice_dir/$arch" | tr -d ' ')
+		printf 'binary       %6s MB   (limit %s MB, %s slice)\n' \
+			"$(awk -v b="$slice_bytes" 'BEGIN { printf "%.2f", b / 1048576 }')" \
+			"$BIN_LIMIT_MB" "$arch"
+		if [ "$slice_bytes" -gt "$bin_limit_bytes" ]; then
+			echo "FAIL: the $arch slice is $slice_bytes bytes, over the ${BIN_LIMIT_MB} MB limit" >&2
+			failed=1
+		fi
+	done
+	rm -rf "$slice_dir"
+	# The file total is reported so the download size stays visible, but never gated: it is
+	# the sum of the slices and moves whenever an architecture is added or dropped.
+	printf 'binary       %6s MB   (universal file total, reported not gated)\n' \
+		"$(awk -v b="$(wc -c <"$BIN" | tr -d ' ')" 'BEGIN { printf "%.2f", b / 1048576 }')"
 fi
 
 # --- Idle memory, idle CPU and startup ---------------------------------------------------
