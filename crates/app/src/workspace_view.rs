@@ -1334,10 +1334,57 @@ impl WorkspaceView {
             }
         });
 
+        // How an approved edit lands (#99 agent mode). The workspace writes this for the
+        // same reason it writes `snapshot`: it owns the tabs, so it is the only party that
+        // can tell an open buffer from a file on disk — and those need different writes.
+        let workspace = cx.entity().downgrade();
+        let apply: crate::ai_chat::ApplyFn = Box::new(move |path, patch, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return Err("the workspace went away".to_string());
+            };
+            workspace.update(cx, |workspace, cx| {
+                // An open tab takes the edit through the document, so it is one undo step
+                // and the user's cursor survives — the same path Format Document and
+                // Rename Symbol use. Writing its file behind its back would leave the tab
+                // showing stale text over changed bytes.
+                let open = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.path.as_deref() == Some(path))
+                    .map(|tab| tab.editor.clone());
+                if let Some(editor) = open {
+                    return editor.update(cx, |editor, cx| {
+                        // The **buffer** is the base, not the file: an open tab may hold
+                        // unsaved edits, and patching the disk copy would apply the change
+                        // to a version the user is not looking at.
+                        let current = editor.document.buffer.text();
+                        let updated = patch(&current)?;
+                        // One edit spanning the whole buffer: `apply_edits` makes it a
+                        // single undo step, which is what "undo the AI's change" has to
+                        // mean for it to be usable.
+                        editor.document.apply_edits(vec![(0..current.len(), updated)]);
+                        cx.notify();
+                        Ok(true)
+                    });
+                }
+                // No tab: the file on disk is the base. A path that does not exist yet is
+                // a new file the proposal is creating, which patches from nothing.
+                let current = match elle_workspace::read_file(path) {
+                    Ok(file) => file.text,
+                    Err(_) if !path.exists() => String::new(),
+                    Err(err) => return Err(format!("could not read it: {err}")),
+                };
+                let updated = patch(&current)?;
+                elle_workspace::write_file(path, &updated)
+                    .map(|()| false)
+                    .map_err(|err| format!("could not write it: {err}"))
+            })
+        });
+
         // The open folder, so a Codex thread can be rooted at the project the user is
         // looking at (#99) — that is how the CLI gets to read the code it is asked about.
         let project_root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
-        let panel = cx.new(|cx| AiChatPanel::new(snapshot, project_root, cx));
+        let panel = cx.new(|cx| AiChatPanel::new(snapshot, apply, project_root, cx));
         window.focus(&panel.read(cx).focus_handle(cx));
         self.ai_chat = Some(panel);
         cx.notify();

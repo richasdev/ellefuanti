@@ -187,6 +187,7 @@ has a sensible default.
 | `ai.provider`         | string | `"anthropic"`        | `anthropic`, `ant`, or `custom`                 |
 | `ai.base_url`         | string | `""`                 | For `custom` — e.g. `http://localhost:11434/v1` |
 | `ai.chat`             | bool   | `false`              | The chat panel                                  |
+| `ai.chat_mode`        | string | `"ask"`              | `ask` (read-only) or `agent` (proposes edits)   |
 | `ai.autocomplete`     | bool   | `false`              | Inline ghost text                               |
 | `ai.chat_model`       | string | `"claude-opus-5"`    | Model for the chat panel                        |
 | `ai.completion_model` | string | `"claude-haiku-4-5"` | Model for autocomplete (latency matters here)   |

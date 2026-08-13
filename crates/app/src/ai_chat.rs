@@ -42,6 +42,34 @@
 //! The Codex child outlives a single turn on purpose — one thread is one conversation, so
 //! history lives in the CLI rather than being re-sent as a message array. It dies with the
 //! panel or with a cancel.
+//!
+//! # Ask and Agent, and the rule that outranks the feature
+//!
+//! Ask is this panel as it was: a conversation, and nothing else. Agent lets the model
+//! propose file changes — and **nothing it proposes reaches disk without the user seeing a
+//! diff and pressing Apply.** That is the mirror of [`ai::deny_reason`], which decides what
+//! may leave the machine; this decides what may enter the user's files.
+//!
+//! The guarantee is not a promise this panel makes, it is a property of how the Codex
+//! thread is opened. The sandbox stays `read-only` in *both* modes, which makes every
+//! attempted write a sandbox escape, which makes it a question the CLI has to ask before
+//! it can act (see [`crate::ai_codex`] for the probe that established this — asking for
+//! write access would have *removed* the consent step, not added one). So:
+//!
+//! - a proposal arrives as a diff, already rendered, before anything is written;
+//! - each file is approved or rejected on its own — a turn touching five files is five
+//!   decisions, not one;
+//! - a rejection is *told to the model*, so it can adapt rather than re-propose blindly;
+//! - a proposal for a path [`ai::deny_reason`] refuses is blocked, with the reason shown;
+//! - a cancel discards everything still pending rather than half-applying it.
+//!
+//! Approvals are answered on the same stdin the turn is running on, from the foreground,
+//! while the background reader is parked on `read_line` — the one place the two threads
+//! touch the same child, and why the write goes through the shared [`CodexState`] lock.
+//!
+//! Agent mode is Codex-only in this pass. The HTTP providers would need a full tool-use
+//! loop (a second request shape, a tool-result protocol per wire, an agent turn state
+//! machine); the honest limit is stated in the UI rather than half-built here.
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -55,7 +83,7 @@ use gpui::{
 };
 
 use crate::actions::{Backspace, Cancel, Confirm, context};
-use crate::ai::{self, StreamEvent, Wire};
+use crate::ai::{self, AgentEvent, StreamEvent, Wire};
 use crate::fonts::Fonts;
 use crate::theme::{Theme, Themed};
 
@@ -89,6 +117,79 @@ pub struct ChatTurn {
     pub text: String,
 }
 
+/// Which mode the panel is in (`ai.chat_mode`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ChatMode {
+    /// Read-only conversation: today's behaviour, and the default.
+    #[default]
+    Ask,
+    /// The model may propose file changes, which arrive as diffs to approve per file.
+    Agent,
+}
+
+impl ChatMode {
+    /// Anything unrecognised is Ask. A settings file with a typo in it must not silently
+    /// put the panel in the mode that can propose writes.
+    pub fn from_setting(value: &str) -> ChatMode {
+        match value {
+            "agent" => ChatMode::Agent,
+            _ => ChatMode::Ask,
+        }
+    }
+
+    pub fn setting_name(self) -> &'static str {
+        match self {
+            ChatMode::Ask => "ask",
+            ChatMode::Agent => "agent",
+        }
+    }
+}
+
+/// What has happened to one proposed file change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProposalState {
+    /// Shown, with Apply and Reject buttons, and nothing written.
+    Pending,
+    /// Applied to the buffer or the file. Terminal.
+    Applied,
+    /// Turned down by the user. Terminal, and reported to the model.
+    Rejected,
+    /// Refused before it could be offered: [`ai::deny_reason`] says this path holds
+    /// secrets. Terminal, and never approvable — the string is the reason, shown in place
+    /// of the buttons.
+    Blocked(&'static str),
+}
+
+/// One file a turn wants to change, as the panel tracks it.
+///
+/// Keyed by `item_id` + `path` rather than by position: approvals arrive for an item id,
+/// and one item can carry several files that are each decided separately.
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    /// The Codex item this change belongs to — what an approval reply is addressed to.
+    pub item_id: String,
+    /// Absolute path of the file to change.
+    pub path: PathBuf,
+    /// `"add"`, `"update"` or `"delete"`.
+    pub kind: String,
+    /// The unified diff, as the CLI produced it.
+    pub diff: String,
+    pub state: ProposalState,
+}
+
+/// A turn's proposals plus the JSON-RPC id its approval is waiting at.
+///
+/// The id arrives *after* the changes (the CLI sends the item, then asks), and the answer
+/// may only be sent once every file in the item has been decided — which is why the two
+/// halves live together rather than as parallel maps that could disagree.
+#[derive(Default)]
+struct PendingApproval {
+    /// `None` until `item/fileChange/requestApproval` lands for this item.
+    request_id: Option<u64>,
+    /// Whether the reply has gone, so a second decision cannot answer the same id twice.
+    answered: bool,
+}
+
 /// What the workspace can tell the panel about the active editor, gathered at send or
 /// attach time — never earlier, because a snapshot taken at panel-open describes a tab
 /// the user has since left.
@@ -107,6 +208,24 @@ pub struct EditorSnapshot {
 /// the selection *now*, and an event round-trip would answer a frame late. The workspace
 /// already owns the tabs, so it is the only party that can write this closure.
 pub type SnapshotFn = Box<dyn Fn(&App) -> EditorSnapshot + 'static>;
+
+/// How the panel writes an approved change: the workspace's closure, for the mirror of
+/// [`SnapshotFn`]'s reason — the workspace owns the tabs, so only it can tell whether a
+/// path is open in one and edit that buffer instead of the file.
+///
+/// The closure is handed a *patcher* rather than finished text, because only the workspace
+/// knows the right base to patch: for an open tab that is the **buffer**, unsaved edits and
+/// all, and reading the file from disk instead would patch a version the user is not
+/// looking at. The panel supplies the transformation; the workspace supplies the input and
+/// decides where the result goes.
+///
+/// Returns `Ok(true)` when an open buffer took the edit (one undo step, cursor preserved),
+/// `Ok(false)` when the file was written on disk instead, and `Err` with a sentence for
+/// the user when the patch did not fit or the write failed.
+pub type ApplyFn = Box<
+    dyn Fn(&Path, &dyn Fn(&str) -> Result<String, String>, &mut App) -> Result<bool, String>
+        + 'static,
+>;
 
 /// A live `codex app-server` child and the thread it opened (#99).
 ///
@@ -154,6 +273,9 @@ pub struct AiChatPanel {
     note: Option<SharedString>,
     scroll: ScrollHandle,
     snapshot: SnapshotFn,
+    /// How an approved change reaches the buffer or the file. The workspace's closure, for
+    /// the same reason as `snapshot`: only it knows which paths are open in tabs.
+    apply: ApplyFn,
     /// The open folder, so a Codex thread can be rooted at the project the user is
     /// actually looking at. `None` when nothing is open — then the thread gets no `cwd`
     /// rather than one pointing wherever the app was launched from.
@@ -164,6 +286,18 @@ pub struct AiChatPanel {
     /// Codex availability, resolved off the main thread once per panel and cached: the
     /// check spawns `codex --version`, which a render must never do.
     codex_status: Option<Result<(), String>>,
+    /// Ask or Agent. Read from settings at construction so the panel opens in the mode
+    /// the user left it in, and written back when the switch is clicked.
+    mode: ChatMode,
+    /// The file changes this turn has proposed, in arrival order. Cleared at the start of
+    /// every send and by a cancel — a pending proposal belongs to the turn that produced
+    /// it, and outliving that turn is how a stale diff gets applied to a changed file.
+    proposals: Vec<Proposal>,
+    /// Per Codex item: the approval id, and whether it has been answered.
+    approvals: std::collections::HashMap<String, PendingApproval>,
+    /// What the user decided about the last turn's proposals, waiting to be told to the
+    /// model on the next send. See [`Self::report_outcome`] for why it waits.
+    pending_report: Option<String>,
     /// Stops `send` just before the curl spawn, recording the body instead. What lets a
     /// test exercise the whole send path — settings read, context build, turn pushed,
     /// body built — with no network and no child process.
@@ -180,6 +314,7 @@ pub struct AiChatPanel {
 impl AiChatPanel {
     pub fn new(
         snapshot: SnapshotFn,
+        apply: ApplyFn,
         project_root: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -195,9 +330,25 @@ impl AiChatPanel {
             note: None,
             scroll: ScrollHandle::new(),
             snapshot,
+            apply,
             project_root,
             codex: Arc::default(),
             codex_status: None,
+            // The mode the user left the panel in. Read once here rather than per render:
+            // the switch below is what changes it, and it writes both places at once.
+            mode: {
+                #[cfg(test)]
+                {
+                    ChatMode::Ask
+                }
+                #[cfg(not(test))]
+                {
+                    ChatMode::from_setting(crate::settings::current(cx).ai_chat_mode())
+                }
+            },
+            proposals: Vec::new(),
+            approvals: std::collections::HashMap::new(),
+            pending_report: None,
             #[cfg(test)]
             transport_disabled: false,
             #[cfg(test)]
@@ -291,9 +442,22 @@ impl AiChatPanel {
         let provider = ai::Provider::from_setting(settings.ai_chat_provider());
         let base_url = settings.ai_base_url().to_string();
 
-        let message = format!("{context_blocks}{prompt}");
+        // What the user decided about the previous turn's proposals leads the message, so
+        // the model hears "you proposed X, the user took A and refused B" before the new
+        // question. Not shown as part of the user's turn — they did not type it — which is
+        // why it is prepended to `message` rather than pushed into the transcript.
+        let report = self
+            .pending_report
+            .take()
+            .map(|report| format!("[editor] {report}\n\n"))
+            .unwrap_or_default();
+        let message = format!("{report}{context_blocks}{prompt}");
         self.input.clear();
         self.note = None;
+        // Last turn's proposals belong to last turn. Anything still pending is declined on
+        // the way out — leaving it on screen would let a diff computed against an older
+        // file be applied after a newer answer has arrived.
+        self.discard_proposals(true);
         self.turns.push(ChatTurn { role: Role::User, text: message.clone() });
 
         // The body carries the history *up to and including* the new user turn; the empty
@@ -353,7 +517,7 @@ impl AiChatPanel {
         body: String,
         cx: &mut Context<Self>,
     ) {
-        let (tx, rx) = smol::channel::unbounded::<StreamEvent>();
+        let (tx, rx) = smol::channel::unbounded::<AgentEvent>();
         let kill: Arc<Mutex<Option<Child>>> = Arc::default();
         self.kill = kill.clone();
 
@@ -388,7 +552,7 @@ impl AiChatPanel {
     /// [`StreamEvent`], one batched drain — so everything downstream (the placeholder,
     /// the ellipsis, cancel, the note rows) is shared rather than reimplemented.
     fn start_codex_stream(&mut self, message: String, cx: &mut Context<Self>) {
-        let (tx, rx) = smol::channel::unbounded::<StreamEvent>();
+        let (tx, rx) = smol::channel::unbounded::<AgentEvent>();
         let codex = self.codex.clone();
         let kill: Arc<Mutex<Option<Child>>> = Arc::default();
         self.kill = kill.clone();
@@ -418,19 +582,36 @@ impl AiChatPanel {
     }
 
     /// Applies one batch of stream events. Returns whether the reply is over.
-    fn apply_events(&mut self, batch: Vec<StreamEvent>, cx: &mut Context<Self>) -> bool {
+    fn apply_events(&mut self, batch: Vec<AgentEvent>, cx: &mut Context<Self>) -> bool {
         let mut finished = false;
         for event in batch {
             match event {
-                StreamEvent::Delta(text) => {
+                AgentEvent::Stream(StreamEvent::Delta(text)) => {
                     if let Some(turn) =
                         self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
                     {
                         turn.text.push_str(&text);
                     }
                 }
-                StreamEvent::Done => finished = true,
-                StreamEvent::Error(message) => {
+                AgentEvent::Stream(StreamEvent::Done) => finished = true,
+                // Agent mode only. Both are ignored in Ask mode rather than trusted: the
+                // thread is opened read-only either way, so a proposal arriving in Ask
+                // mode would be a CLI that changed its mind about the sandbox, and the
+                // safe reading of that is to show nothing and approve nothing.
+                AgentEvent::Proposed { item_id, changes } => {
+                    if self.mode == ChatMode::Agent {
+                        self.add_proposals(item_id, changes);
+                    }
+                }
+                AgentEvent::ApprovalRequested { request_id, item_id } => {
+                    if self.mode == ChatMode::Agent {
+                        self.note_approval_request(request_id, item_id);
+                    } else {
+                        // Nothing was offered, so nothing can be approved.
+                        self.answer_codex(request_id, false);
+                    }
+                }
+                AgentEvent::Stream(StreamEvent::Error(message)) => {
                     // A reply that never started leaves no empty bubble behind; one that
                     // half-arrived keeps its words, with the error after them.
                     if self
@@ -477,6 +658,10 @@ impl AiChatPanel {
         // Dropping the drain stops the await; the producer ends when its send fails.
         self.stream_task = None;
         self.streaming = false;
+        // A cancel mid-proposal discards what was pending rather than half-applying it.
+        // Nothing is told to the CLI: `interrupt_codex` above already dropped the session
+        // and the child is being killed, so a reply would be written into a closed pipe.
+        self.discard_proposals(false);
         if let Some(turn) = self.turns.last_mut().filter(|turn| turn.role == Role::Assistant) {
             if turn.text.is_empty() {
                 turn.text = "(cancelled)".to_string();
@@ -503,6 +688,284 @@ impl AiChatPanel {
             let _ = session.stdin.flush();
         }
         state.model = None;
+    }
+
+    // --- agent mode: proposals -------------------------------------------------------
+
+    /// Flips Ask ↔ Agent and remembers it (`ai.chat_mode`).
+    ///
+    /// Leaving Agent discards anything still pending: those proposals were offered by a
+    /// mode the user has just stepped out of, and an Apply button surviving into Ask mode
+    /// would be the one way a read-only mode could write a file.
+    fn set_mode(&mut self, mode: ChatMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        if mode == ChatMode::Ask {
+            self.discard_proposals(false);
+        }
+        // The one mutation door (#100), the same path the enable button uses.
+        crate::settings::update_settings(cx, |settings| {
+            settings.set_ai_chat_mode(mode.setting_name());
+        });
+        cx.notify();
+    }
+
+    /// Records the files a turn wants to change, checking each against the denylist.
+    ///
+    /// The deny check happens *here*, at arrival, so a refused path is visibly refused
+    /// with its reason instead of quietly missing from the list — and so it is already
+    /// terminal before any button exists to approve it.
+    fn add_proposals(&mut self, item_id: String, changes: Vec<ai::ProposedFileChange>) {
+        for change in changes {
+            let path = PathBuf::from(&change.path);
+            let state = match ai::deny_reason(&path) {
+                Some(reason) => ProposalState::Blocked(reason),
+                None => ProposalState::Pending,
+            };
+            self.proposals.push(Proposal {
+                item_id: item_id.clone(),
+                path,
+                kind: change.kind,
+                diff: change.diff,
+                state,
+            });
+        }
+        self.approvals.entry(item_id).or_default();
+    }
+
+    /// Notes the id an item's approval is waiting at, and answers immediately if every
+    /// file in it has already been decided.
+    ///
+    /// The question can arrive after the user has clicked (the diff is shown as soon as
+    /// the item does, which is before the CLI asks), so the decision and the question meet
+    /// in whichever order they happen to arrive.
+    fn note_approval_request(&mut self, request_id: u64, item_id: String) {
+        let entry = self.approvals.entry(item_id.clone()).or_default();
+        entry.request_id = Some(request_id);
+        self.settle_item(&item_id);
+    }
+
+    /// Answers the CLI once every file of `item_id` has been decided.
+    ///
+    /// **Always `decline`, even for files the user applied.** That reads backwards and is
+    /// the crux of the design: this panel writes the file itself, through the open buffer
+    /// (one undo step) or through the atomic `fs::write_file`. Answering `accept` would
+    /// ask the CLI to apply *its* copy of the patch as well — to a file the panel has
+    /// already changed — which either fails as a stale patch or applies twice. Declining
+    /// leaves the sandbox exactly as it was: nothing written by Codex, everything written
+    /// by the editor, one writer and one undo story.
+    ///
+    /// The model is not left guessing. `decline` keeps the turn alive — that is the
+    /// protocol's own wording — so the CLI learns the patch did not go in and can react
+    /// within the same turn. What it cannot learn from a bare decline is *why*, or that
+    /// the editor applied some of it, so [`Self::report_outcome`] sends that as the next
+    /// turn's input; the note pushed here is the user's copy of the same sentence.
+    fn settle_item(&mut self, item_id: &str) {
+        let Some(entry) = self.approvals.get(item_id) else { return };
+        let Some(request_id) = entry.request_id else { return };
+        if entry.answered {
+            return;
+        }
+        let files: Vec<(String, ProposalState)> = self
+            .proposals
+            .iter()
+            .filter(|proposal| proposal.item_id == item_id)
+            .map(|proposal| {
+                let name = proposal
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| proposal.path.display().to_string());
+                (name, proposal.state)
+            })
+            .collect();
+        if files.iter().any(|(_, state)| *state == ProposalState::Pending) {
+            return; // still waiting on the user for at least one file
+        }
+
+        self.answer_codex(request_id, false);
+        if let Some(entry) = self.approvals.get_mut(item_id) {
+            entry.answered = true;
+        }
+
+        // What the user did, as a note in the transcript. A rejection the model is never
+        // told about is a rejection it will make again.
+        let applied: Vec<&str> = files
+            .iter()
+            .filter(|(_, state)| *state == ProposalState::Applied)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let refused: Vec<&str> = files
+            .iter()
+            .filter(|(_, state)| *state != ProposalState::Applied)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let mut summary = String::new();
+        if !applied.is_empty() {
+            summary.push_str(&format!("Applied by the editor: {}.", applied.join(", ")));
+        }
+        if !refused.is_empty() {
+            if !summary.is_empty() {
+                summary.push(' ');
+            }
+            summary.push_str(&format!("Rejected, left unchanged: {}.", refused.join(", ")));
+        }
+        if !summary.is_empty() {
+            self.turns.push(ChatTurn { role: Role::Note, text: summary.clone() });
+            self.report_outcome(summary);
+        }
+    }
+
+    /// Carries the decision back to the model.
+    ///
+    /// Held until the user's next message rather than sent as a turn of its own: a
+    /// `turn/start` while the current turn is still running is a second concurrent turn on
+    /// one thread, and the panel's whole streaming model (one placeholder, one drain, one
+    /// cancel) assumes exactly one. Prepending it to the next send costs nothing and
+    /// arrives before the model's next chance to act on it.
+    fn report_outcome(&mut self, summary: String) {
+        self.pending_report = Some(match self.pending_report.take() {
+            Some(existing) => format!("{existing} {summary}"),
+            None => summary,
+        });
+    }
+
+    /// Writes one approval reply on the Codex child's stdin.
+    ///
+    /// The background reader is parked on `read_line` while this runs, which is safe
+    /// because they touch different halves of the child — but both reach it through the
+    /// same lock, so this is where a reply and a cancel serialise.
+    fn answer_codex(&self, request_id: u64, approve: bool) {
+        let mut state = self.codex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = state.session.as_mut() {
+            let reply = crate::ai_codex::approval_response(request_id, approve);
+            // A failed write means the child is gone, which is the outcome a decline
+            // wanted anyway and which a cancel has already handled.
+            let _ = session.stdin.write_all(reply.as_bytes());
+            let _ = session.stdin.flush();
+        }
+    }
+
+    /// Apply, on one file. **The only path in this panel that writes anything.**
+    ///
+    /// Two ways in, because a file open in a tab and a file that is not are different
+    /// objects: the open buffer is edited through `Document::apply_edits` so the change is
+    /// one undo step and the user's cursor survives, and a closed file goes through the
+    /// atomic `fs::write_file`. Writing the buffer's file behind its back would leave the
+    /// tab showing stale text over changed bytes.
+    fn apply_proposal(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(proposal) = self.proposals.get(index) else { return };
+        if proposal.state != ProposalState::Pending {
+            return; // already decided; a double click must not write twice
+        }
+        // The denylist, again, at the moment of writing. The check at arrival is the UX;
+        // this is the guarantee, and it is the one that holds if a path became a secret
+        // in between (the same belt-and-braces rule `build_context` follows for egress).
+        if let Some(reason) = ai::deny_reason(&proposal.path) {
+            let note = deny_note(&proposal.path, reason);
+            let item_id = proposal.item_id.clone();
+            self.proposals[index].state = ProposalState::Blocked(reason);
+            self.note = Some(note.into());
+            self.settle_item(&item_id);
+            cx.notify();
+            return;
+        }
+
+        // Build the new text here, on the main thread, from the text that is there *now*.
+        // A patch that no longer fits is refused rather than forced: the file has changed
+        // since the model read it, and the user keeps their version.
+        let path = proposal.path.clone();
+        let diff = proposal.diff.clone();
+        let item_id = proposal.item_id.clone();
+        let is_delete = proposal.kind == "delete";
+
+        let outcome = if is_delete {
+            // Deleting a file is a different act with a different undo story, and this
+            // pass does not do it: the proposal is shown, and refused out loud rather
+            // than silently skipped.
+            Err("deleting files is not something Agent mode applies in this pass".to_string())
+        } else {
+            self.apply_file_change(&path, &diff, cx)
+        };
+
+        match outcome {
+            Ok(()) => {
+                self.proposals[index].state = ProposalState::Applied;
+                self.note = None;
+            }
+            Err(message) => {
+                // Not applied, so not `Applied`: the state stays honest, the item is
+                // settled as a refusal, and the reason is on screen.
+                self.proposals[index].state = ProposalState::Rejected;
+                self.note = Some(
+                    format!(
+                        "{} was not changed — {message}",
+                        path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+                    )
+                    .into(),
+                );
+            }
+        }
+        self.settle_item(&item_id);
+        cx.notify();
+    }
+
+    /// Patches the file's current text and writes the result.
+    ///
+    /// The patch is handed over as a closure rather than applied here, because "current
+    /// text" depends on where the change is going: an open tab's buffer (unsaved edits
+    /// included — that is what the user is looking at) or the bytes on disk. The workspace
+    /// picks the base and calls this back with it; a patch that does not fit that base
+    /// comes back as `Err` and nothing is written.
+    fn apply_file_change(
+        &self,
+        path: &Path,
+        diff: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let patch = |current: &str| apply_unified_diff(current, diff);
+        // The buffer edit needs an `&mut App`, which a `Context<Self>` derefs to; the
+        // closure is the workspace's, so this is the moment the panel hands the write to
+        // the only party that can do it in the right place.
+        (self.apply)(path, &patch, cx)?;
+        Ok(())
+    }
+
+    /// Reject, on one file: nothing is written, and the model is told so it can adapt.
+    fn reject_proposal(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(proposal) = self.proposals.get(index) else { return };
+        if proposal.state != ProposalState::Pending {
+            return;
+        }
+        let item_id = proposal.item_id.clone();
+        self.proposals[index].state = ProposalState::Rejected;
+        self.settle_item(&item_id);
+        cx.notify();
+    }
+
+    /// Drops every proposal, declining any the CLI is still waiting on.
+    ///
+    /// `tell_codex` is false when the child is about to be killed anyway (a cancel): the
+    /// reply would race the kill, and an unanswered request dies with the process.
+    fn discard_proposals(&mut self, tell_codex: bool) {
+        if tell_codex {
+            let pending: Vec<(u64, String)> = self
+                .approvals
+                .iter()
+                .filter(|(_, entry)| !entry.answered)
+                .filter_map(|(item, entry)| entry.request_id.map(|id| (id, item.clone())))
+                .collect();
+            for (request_id, item) in pending {
+                self.answer_codex(request_id, false);
+                if let Some(entry) = self.approvals.get_mut(&item) {
+                    entry.answered = true;
+                }
+            }
+        }
+        self.proposals.clear();
+        self.approvals.clear();
     }
 
     // --- chips -----------------------------------------------------------------------
@@ -644,6 +1107,45 @@ impl AiChatPanel {
         self.turns = turns;
         cx.notify();
     }
+
+    /// Puts the panel in Agent mode without touching settings — a test has no
+    /// `LiveSettings` global, and this is the mode flag only, exactly like `force_enabled`.
+    pub fn set_mode_for_test(&mut self, mode: ChatMode) {
+        self.mode = mode;
+    }
+
+    /// Feeds events through the real drain, so a test exercises the same `apply_events`
+    /// the transport does rather than a parallel path that could drift from it.
+    pub fn apply_events_for_test(
+        &mut self,
+        batch: Vec<AgentEvent>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.apply_events(batch, cx)
+    }
+
+    pub fn proposals_for_test(&self) -> &[Proposal] {
+        &self.proposals
+    }
+
+    pub fn apply_proposal_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.apply_proposal(index, cx);
+    }
+
+    pub fn reject_proposal_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.reject_proposal(index, cx);
+    }
+
+    pub fn cancel_for_test(&mut self, cx: &mut Context<Self>) {
+        self.cancel_stream(cx);
+    }
+
+    /// Marks the panel as streaming so `cancel_stream` takes its real path — cancel
+    /// returns early otherwise, and a test of "cancel discards proposals" that never
+    /// entered the function would pass for the wrong reason.
+    pub fn set_streaming_for_test(&mut self, streaming: bool) {
+        self.streaming = streaming;
+    }
 }
 
 // --- pure logic ------------------------------------------------------------------------
@@ -728,10 +1230,176 @@ pub fn build_context(
     Ok(out)
 }
 
+/// Parses a unified diff into the [`elle_git::DiffFile`] the diff renderer eats (#64).
+///
+/// This is the bridge that lets a proposed change be drawn by the *same* renderer as a
+/// git diff — syntax-highlighted, `+`/`-` in the gutter, themed — instead of a second diff
+/// UI existing in this panel. `relative` is only used for display and for picking the
+/// highlighter.
+///
+/// Anything that is not a hunk header or a body line is skipped, so the `---`/`+++`
+/// preamble a fuller diff carries costs nothing here.
+pub fn diff_file_from_unified(relative: &str, diff: &str) -> elle_git::DiffFile {
+    let mut file =
+        elle_git::DiffFile { relative: relative.to_string(), hunks: Vec::new(), binary: false };
+    let (mut old_no, mut new_no) = (0u32, 0u32);
+
+    for line in diff.split('\n') {
+        if let Some((old_start, new_start)) = parse_hunk_header(line) {
+            old_no = old_start;
+            new_no = new_start;
+            file.hunks
+                .push(elle_git::Hunk { header: line.trim_end().to_string(), lines: Vec::new() });
+            continue;
+        }
+        let Some(hunk) = file.hunks.last_mut() else { continue };
+        if line.is_empty() {
+            continue;
+        }
+        let (marker, text) = line.split_at(1);
+        let (kind, old_line, new_line) = match marker {
+            "+" => (elle_git::LineKind::Added, None, Some(new_no)),
+            "-" => (elle_git::LineKind::Removed, Some(old_no), None),
+            " " => (elle_git::LineKind::Context, Some(old_no), Some(new_no)),
+            // `\ No newline at end of file` and any other annotation.
+            _ => continue,
+        };
+        match kind {
+            elle_git::LineKind::Added => new_no += 1,
+            elle_git::LineKind::Removed => old_no += 1,
+            elle_git::LineKind::Context => {
+                old_no += 1;
+                new_no += 1;
+            }
+        }
+        hunk.lines.push(elle_git::Line { kind, text: text.to_string(), old_line, new_line });
+    }
+
+    file
+}
+
+/// The `(old_start, new_start)` of an `@@ -a,b +c,d @@` header.
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let new = rest.split(' ').next()?;
+    let start = |spec: &str| spec.split(',').next()?.parse::<u32>().ok();
+    // A `0,0` side (a pure add or delete) starts numbering at 1, which is what git's own
+    // renderer shows and what keeps the gutter from displaying a 0th line.
+    Some((start(old)?.max(1), start(new)?.max(1)))
+}
+
+/// Applies a unified diff to `original`, returning the new text.
+///
+/// This is the step between "the model proposed a patch" and "bytes go to a file", so it
+/// is deliberately strict: every context and removed line must match the text it claims to
+/// be replacing, and any mismatch returns `Err` rather than a best-effort merge. A patch
+/// that does not fit the file it was written against is a patch built from a stale read,
+/// and applying it anywhere near where it *nearly* fits is how an editor corrupts source.
+///
+/// Only the `@@` hunk bodies are read; the `---`/`+++` file headers carry no content and
+/// the CLI's diffs for a single file omit them anyway.
+pub fn apply_unified_diff(original: &str, diff: &str) -> Result<String, String> {
+    let original_lines: Vec<&str> = original.split('\n').collect();
+    let mut out: Vec<String> = Vec::new();
+    // 0-based cursor into `original_lines`: everything before it is already in `out`.
+    let mut cursor = 0usize;
+    let mut saw_hunk = false;
+
+    let mut lines = diff.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with("---") || line.starts_with("+++") {
+            continue;
+        }
+        let Some(start) = parse_hunk_start(line) else { continue };
+        saw_hunk = true;
+
+        // Copy everything between the last hunk and this one, unchanged.
+        let start = start.saturating_sub(1);
+        if start < cursor {
+            return Err("the patch's hunks are out of order".to_string());
+        }
+        if start > original_lines.len() {
+            return Err("the patch starts past the end of the file".to_string());
+        }
+        out.extend(original_lines[cursor..start].iter().map(|line| (*line).to_string()));
+        cursor = start;
+
+        // The hunk body, until the next `@@` or the end.
+        while let Some(body) = lines.peek() {
+            if parse_hunk_start(body).is_some() {
+                break;
+            }
+            let body = lines.next().expect("peeked");
+            // An empty trailing line is the split artefact of a diff ending in `\n`, not
+            // a context line for an empty line (which arrives as a single space).
+            if body.is_empty() {
+                continue;
+            }
+            let (marker, text) = body.split_at(1);
+            match marker {
+                "+" => out.push(text.to_string()),
+                " " | "-" => {
+                    let actual = original_lines.get(cursor).ok_or_else(|| {
+                        "the patch expects more lines than the file has".to_string()
+                    })?;
+                    if *actual != text {
+                        return Err(format!(
+                            "the patch does not match the file at line {}: expected {:?}, \
+                             found {:?}",
+                            cursor + 1,
+                            text,
+                            actual
+                        ));
+                    }
+                    if marker == " " {
+                        out.push(text.to_string());
+                    }
+                    cursor += 1;
+                }
+                // `\ No newline at end of file`, and anything else a diff writer adds as
+                // annotation rather than content.
+                _ => {}
+            }
+        }
+    }
+
+    if !saw_hunk {
+        return Err("the patch carries no hunks".to_string());
+    }
+    out.extend(original_lines[cursor..].iter().map(|line| (*line).to_string()));
+    Ok(out.join("\n"))
+}
+
+/// The 1-based start line on the *old* side of an `@@ -a,b +c,d @@` header, or `None` for
+/// any other line.
+fn parse_hunk_start(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, _) = rest.split_once(' ')?;
+    let start = old.split(',').next()?;
+    start.parse().ok()
+}
+
 /// The refusal, worded as a statement rather than an apology: there is no override (#99).
 fn deny_note(path: &Path, reason: &str) -> String {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     format!("{name} stays local — {reason}")
+}
+
+/// The one-line notice for a mode the current provider cannot actually do, or `None`.
+///
+/// Agent mode is Codex-only in this pass: the HTTP providers would need a full tool-use
+/// loop to propose edits, which is a larger piece of work than the diff-and-approval half
+/// this pass is about. Saying so plainly beats a mode that is selectable and silently
+/// behaves like Ask — the user would send an instruction to edit a file and get prose.
+pub fn mode_notice(mode: ChatMode, provider: ai::Provider) -> Option<String> {
+    (mode == ChatMode::Agent && provider != ai::Provider::Codex).then(|| {
+        format!(
+            "Agent mode needs the Codex provider — {} answers in Ask mode. \
+             Provider lives in Settings (⌘,) → AI.",
+            provider.setting_name()
+        )
+    })
 }
 
 /// What stands in the conversation area before the panel can work: which provider is
@@ -787,14 +1455,14 @@ fn stream_reply(
     base_url: &str,
     body: &str,
     kill: &Arc<Mutex<Option<Child>>>,
-    tx: &smol::channel::Sender<StreamEvent>,
+    tx: &smol::channel::Sender<AgentEvent>,
 ) {
     // Keychain and `ant` CLI subprocesses — the reason this whole function is off the
     // main thread. The error strings are already user-facing (resolve_auth's contract).
     let auth = match ai::resolve_auth(provider, base_url) {
         Ok(auth) => auth,
         Err(message) => {
-            let _ = tx.send_blocking(StreamEvent::Error(message));
+            let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(message)));
             return;
         }
     };
@@ -811,7 +1479,9 @@ fn stream_reply(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
-            let _ = tx.send_blocking(StreamEvent::Error(format!("could not run curl: {err}")));
+            let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(format!(
+                "could not run curl: {err}"
+            ))));
             return;
         }
     };
@@ -842,7 +1512,7 @@ fn stream_reply(
             }
             // A closed channel means the drain was dropped — a cancel — and the kill
             // that caused it is also about to end this read.
-            if tx.send_blocking(event).is_err() || stream_ended {
+            if tx.send_blocking(AgentEvent::Stream(event)).is_err() || stream_ended {
                 break;
             }
         }
@@ -863,12 +1533,12 @@ fn stream_reply(
         Some(status) if !status.success() && !saw_delta => {
             let message = ai::parse_error_body(&raw)
                 .unwrap_or_else(|| format!("the request failed ({status})"));
-            let _ = tx.send_blocking(StreamEvent::Error(message));
+            let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(message)));
         }
         // EOF without a terminal event (a custom server that just closes): the reply is
         // whatever arrived, and it is over.
         _ => {
-            let _ = tx.send_blocking(StreamEvent::Done);
+            let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Done));
         }
     }
 }
@@ -887,12 +1557,12 @@ fn codex_turn(
     kill: &Arc<Mutex<Option<Child>>>,
     root: Option<&Path>,
     message: &str,
-    tx: &smol::channel::Sender<StreamEvent>,
+    tx: &smol::channel::Sender<AgentEvent>,
 ) {
     // Availability first, so "not installed" and "not logged in" arrive as the sentence
     // that names the command to run, rather than as a spawn error nobody can act on.
     if let Err(reason) = crate::ai_codex::availability() {
-        let _ = tx.send_blocking(StreamEvent::Error(reason));
+        let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(reason)));
         return;
     }
 
@@ -931,15 +1601,17 @@ fn codex_turn(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
-            let _ = tx.send_blocking(StreamEvent::Error(format!(
+            let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(format!(
                 "could not run the Codex CLI: {err} — install it and run `codex login`"
-            )));
+            ))));
             return;
         }
     };
 
     let Some(mut stdin) = child.stdin.take() else {
-        let _ = tx.send_blocking(StreamEvent::Error("the Codex CLI gave no stdin".to_string()));
+        let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
+            "the Codex CLI gave no stdin".to_string(),
+        )));
         return;
     };
     let stdout = child.stdout.take();
@@ -948,14 +1620,16 @@ fn codex_turn(
     let handshake = crate::ai_codex::initialize_request(env!("CARGO_PKG_VERSION"))
         + &crate::ai_codex::thread_start_request(root);
     if stdin.write_all(handshake.as_bytes()).and_then(|()| stdin.flush()).is_err() {
-        let _ = tx.send_blocking(StreamEvent::Error(
+        let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
             "the Codex CLI closed before the handshake finished".to_string(),
-        ));
+        )));
         return;
     }
 
     let Some(stdout) = stdout else {
-        let _ = tx.send_blocking(StreamEvent::Error("the Codex CLI gave no stdout".to_string()));
+        let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
+            "the Codex CLI gave no stdout".to_string(),
+        )));
         return;
     };
     let mut stdout = BufReader::new(stdout);
@@ -970,9 +1644,9 @@ fn codex_turn(
         line.clear();
         match stdout.read_line(&mut line) {
             Ok(0) | Err(_) => {
-                let _ = tx.send_blocking(StreamEvent::Error(
+                let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
                     "the Codex CLI closed before the thread opened — try `codex login`".to_string(),
-                ));
+                )));
                 return;
             }
             Ok(_) => {}
@@ -985,7 +1659,7 @@ fn codex_turn(
             // A refusal during the handshake (a bad param, a logged-out CLI) is the
             // user's answer, not a hang.
             Some(crate::ai_codex::CodexEvent::TurnFailed(message)) => {
-                let _ = tx.send_blocking(StreamEvent::Error(message));
+                let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(message)));
                 return;
             }
             _ => {}
@@ -995,9 +1669,9 @@ fn codex_turn(
 
     let request = crate::ai_codex::turn_start_request(&thread_id, message);
     if stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush()).is_err() {
-        let _ = tx.send_blocking(StreamEvent::Error(
+        let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
             "the Codex CLI closed before the turn started".to_string(),
-        ));
+        )));
         return;
     }
 
@@ -1011,7 +1685,7 @@ fn codex_turn(
 /// Returns at `turn/completed` / `turn/failed` — and *only* then — leaving the reader
 /// parked mid-stream for the next turn. That is why the reader lives in the session: the
 /// next turn's bytes may already be in this `BufReader`'s buffer.
-fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<StreamEvent>) {
+fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<AgentEvent>) {
     let mut line = String::new();
     loop {
         line.clear();
@@ -1019,23 +1693,46 @@ fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<Stream
             // EOF: the CLI exited (killed by a cancel, crashed, logged out mid-turn).
             // Whatever arrived is the reply, and it is over.
             Ok(0) | Err(_) => {
-                let _ = tx.send_blocking(StreamEvent::Done);
+                let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Done));
                 return;
             }
             Ok(_) => {}
         }
         match crate::ai_codex::parse_line(&line) {
             Some(crate::ai_codex::CodexEvent::Delta(text)) => {
-                if tx.send_blocking(StreamEvent::Delta(text)).is_err() {
+                if tx.send_blocking(AgentEvent::Stream(StreamEvent::Delta(text))).is_err() {
                     return; // the drain went away: a cancel, and the kill is coming
                 }
             }
+            // Agent mode: the proposal and then the question about it, both forwarded on
+            // the same channel as the text so the panel keeps one drain and one cancel.
+            // The reader does not answer the approval — the *user* does, from the
+            // foreground, which is the whole point.
+            Some(crate::ai_codex::CodexEvent::Proposed { item_id, changes }) => {
+                let changes = changes
+                    .into_iter()
+                    .map(|change| ai::ProposedFileChange {
+                        path: change.path,
+                        kind: change.kind,
+                        diff: change.diff,
+                    })
+                    .collect();
+                if tx.send_blocking(AgentEvent::Proposed { item_id, changes }).is_err() {
+                    return;
+                }
+            }
+            Some(crate::ai_codex::CodexEvent::ApprovalRequested { request_id, item_id }) => {
+                if tx.send_blocking(AgentEvent::ApprovalRequested { request_id, item_id }).is_err()
+                {
+                    return;
+                }
+            }
             Some(crate::ai_codex::CodexEvent::TurnCompleted) => {
-                let _ = tx.send_blocking(StreamEvent::Done);
+                let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Done));
                 return;
             }
             Some(crate::ai_codex::CodexEvent::TurnFailed(message)) => {
-                let _ = tx.send_blocking(StreamEvent::Error(message));
+                let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(message)));
                 return;
             }
             _ => {}
@@ -1123,7 +1820,14 @@ impl Render for AiChatPanel {
                     .py_1()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child("AI Chat")
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child("AI Chat")
+                            .child(self.render_mode_switch(&theme, cx)),
+                    )
                     .child(div().text_color(theme.text_muted).text_size(px(11.0)).child(
                         SharedString::from(format!("{} · {model}", provider.setting_name())),
                     )),
@@ -1134,11 +1838,28 @@ impl Render for AiChatPanel {
                 None => self.render_conversation(&theme, &fonts),
             })
             .when(ready, |el| {
-                el.children(self.note.clone().map(|note| {
-                    div().px_2().py_1().text_color(theme.error).text_size(px(11.0)).child(note)
-                }))
-                .child(self.render_chips(&theme, cx))
-                .child(self.render_input(&theme, window, cx))
+                el
+                    // Agent selected on a provider that cannot do it: said out loud, and
+                    // above the input where the send is about to happen.
+                    .children(mode_notice(self.mode, provider).map(|notice| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_color(theme.text_muted)
+                            .text_size(px(11.0))
+                            .child(SharedString::from(notice))
+                    }))
+                    // The review list sits directly above the input: it is a pending
+                    // action, not history, and it must not scroll away with the
+                    // transcript.
+                    .when(!self.proposals.is_empty(), |el| {
+                        el.child(self.render_proposals(&theme, cx))
+                    })
+                    .children(self.note.clone().map(|note| {
+                        div().px_2().py_1().text_color(theme.error).text_size(px(11.0)).child(note)
+                    }))
+                    .child(self.render_chips(&theme, cx))
+                    .child(self.render_input(&theme, window, cx))
             })
     }
 }
@@ -1266,6 +1987,186 @@ impl AiChatPanel {
             .into_any_element()
     }
 
+    /// The Ask | Agent switch. A segmented pair, styled like the context chips so the two
+    /// controls in this panel that change what a send *does* look like one family.
+    fn render_mode_switch(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let segment = |id: &'static str, label: &'static str, mode: ChatMode| {
+            let entity = cx.entity();
+            let active = self.mode == mode;
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .cursor_pointer()
+                // Active is a fill *and* a text colour, never colour alone — the find
+                // bar's rule, and the same one the chips follow.
+                .when(active, |el| el.bg(theme.selected).text_color(theme.text))
+                .when(!active, |el| el.text_color(theme.text_muted))
+                .hover(|el| el.bg(theme.hover))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    entity.update(cx, |this, cx| this.set_mode(mode, cx));
+                })
+                .child(label)
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .rounded(px(4.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(segment("ai-mode-ask", "Ask", ChatMode::Ask))
+                    .child(segment("ai-mode-agent", "Agent", ChatMode::Agent)),
+            )
+            .into_any_element()
+    }
+
+    /// The review list: one card per proposed file, each with its own decision.
+    ///
+    /// Rendered above the input rather than inside the transcript because these are not
+    /// conversation — they are a pending action, and burying them in a scrolled history
+    /// is how an Apply button gets missed.
+    fn render_proposals(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cards: Vec<gpui::AnyElement> = self
+            .proposals
+            .iter()
+            .enumerate()
+            .map(|(index, proposal)| self.render_proposal(index, proposal, theme, cx))
+            .collect();
+
+        div()
+            .id("ai-proposals")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(div().text_size(px(10.0)).text_color(theme.text_muted).child(
+                SharedString::from(format!(
+                    "{} proposed change{} — nothing is written until you apply it",
+                    self.proposals.len(),
+                    if self.proposals.len() == 1 { "" } else { "s" }
+                )),
+            ))
+            .children(cards)
+            .into_any_element()
+    }
+
+    fn render_proposal(
+        &self,
+        index: usize,
+        proposal: &Proposal,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let name = proposal
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| proposal.path.display().to_string());
+
+        // The decision row: buttons while pending, a settled word once it is not.
+        let controls: gpui::AnyElement = match proposal.state {
+            ProposalState::Pending => {
+                let apply_entity = cx.entity();
+                let reject_entity = cx.entity();
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(("ai-proposal-apply", index))
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_color(theme.accent)
+                            .hover(|el| el.bg(theme.hover))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                apply_entity.update(cx, |this, cx| this.apply_proposal(index, cx));
+                            })
+                            .child("Apply"),
+                    )
+                    .child(
+                        div()
+                            .id(("ai-proposal-reject", index))
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_color(theme.text_muted)
+                            .hover(|el| el.bg(theme.hover))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                reject_entity
+                                    .update(cx, |this, cx| this.reject_proposal(index, cx));
+                            })
+                            .child("Reject"),
+                    )
+                    .into_any_element()
+            }
+            ProposalState::Applied => div()
+                .text_size(px(10.0))
+                .text_color(theme.diff_added())
+                .child("applied")
+                .into_any_element(),
+            ProposalState::Rejected => div()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted)
+                .child("rejected")
+                .into_any_element(),
+            // The denylist's refusal, with the reason, where the buttons would have been.
+            ProposalState::Blocked(reason) => div()
+                .text_size(px(10.0))
+                .text_color(theme.error)
+                .child(SharedString::from(format!("blocked — {reason}")))
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .py_0p5()
+                    .child(
+                        div().flex().items_center().gap_1().child(SharedString::from(name)).child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(proposal.kind.clone())),
+                        ),
+                    )
+                    .child(controls),
+            )
+            .child(render_proposal_diff(
+                index,
+                &proposal.path.to_string_lossy(),
+                &proposal.diff,
+                theme,
+                cx,
+            ))
+            .into_any_element()
+    }
+
     fn render_chips(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let chip = |id: &'static str, label: &'static str, active: bool, which: Chip| {
             let entity = cx.entity();
@@ -1389,6 +2290,32 @@ impl AiChatPanel {
             .child(action_button)
             .into_any_element()
     }
+}
+
+/// One proposal's diff, drawn by the git panel's renderer (#64) rather than a second one.
+///
+/// `DiffRenderer::new` runs tree-sitter, which is why the git panel builds it on the
+/// background executor. Here it is built in the render pass on purpose: a proposal's diff
+/// is a handful of hunks of one file, the parse is microseconds at that size, and the
+/// alternative — a background task per proposal writing a renderer back into the panel —
+/// is a lot of machinery for a pane that appears a few times a session. If proposals ever
+/// arrive with whole-file diffs, this is the call that should move.
+fn render_proposal_diff(
+    index: usize,
+    relative: &str,
+    diff: &str,
+    theme: &Theme,
+    cx: &App,
+) -> gpui::AnyElement {
+    let file = diff_file_from_unified(relative, diff);
+    let renderer = crate::git_panel::DiffRenderer::new(&file);
+    div()
+        .id(("ai-proposal-diff", index))
+        .max_h(px(180.0))
+        .overflow_y_scroll()
+        .text_size(px(11.0))
+        .child(crate::git_panel::render_diff(&file, &renderer, theme, cx))
+        .into_any_element()
 }
 
 /// Prose renders line by line so blank lines survive; a plain multi-line string child
@@ -1539,6 +2466,109 @@ mod tests {
             setup_guidance(true, ai::Provider::Custom, "http://localhost:11434", None),
             None
         );
+    }
+
+    // --- agent mode: the pure parts ---------------------------------------------------
+
+    #[test]
+    fn a_mode_setting_falls_back_to_the_one_that_cannot_write() {
+        assert_eq!(ChatMode::from_setting("agent"), ChatMode::Agent);
+        assert_eq!(ChatMode::from_setting("ask"), ChatMode::Ask);
+        // The load-bearing default: a typo, an empty string, or a future value must not
+        // put the panel in the mode that can propose writes.
+        for wrong in ["", "Agent", "agentic", "gibberish", "true"] {
+            assert_eq!(ChatMode::from_setting(wrong), ChatMode::Ask, "{wrong:?}");
+        }
+        assert_eq!(ChatMode::default(), ChatMode::Ask);
+        // Round-trips, or the switch cannot persist what it just set.
+        for mode in [ChatMode::Ask, ChatMode::Agent] {
+            assert_eq!(ChatMode::from_setting(mode.setting_name()), mode);
+        }
+    }
+
+    #[test]
+    fn agent_mode_says_so_when_the_provider_cannot_do_it() {
+        // Codex is the only agent-capable provider this pass; the others say so rather
+        // than silently answering in Ask mode.
+        for provider in [ai::Provider::Anthropic, ai::Provider::AntCli, ai::Provider::Custom] {
+            let notice = mode_notice(ChatMode::Agent, provider).expect("a notice");
+            assert!(notice.contains("Codex"), "{notice}");
+            assert!(notice.contains("Ask mode"), "and what still works: {notice}");
+        }
+        assert_eq!(mode_notice(ChatMode::Agent, ai::Provider::Codex), None);
+        // Ask mode works everywhere, so it never carries a notice.
+        for provider in [ai::Provider::Anthropic, ai::Provider::Codex, ai::Provider::Custom] {
+            assert_eq!(mode_notice(ChatMode::Ask, provider), None);
+        }
+    }
+
+    #[test]
+    fn a_unified_diff_becomes_the_shape_the_diff_renderer_draws() {
+        // The captured shape from a real `codex-cli` turn.
+        let diff = "@@ -2,3 +2,3 @@\n function hello() {\n-    return 'hi';\n+    return 'hello world';\n }\n";
+        let file = diff_file_from_unified("app/hello.php", diff);
+        assert_eq!(file.relative, "app/hello.php");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.counts(), (1, 1), "one added, one removed");
+
+        let lines = &file.hunks[0].lines;
+        assert_eq!(lines[0].kind, elle_git::LineKind::Context);
+        assert_eq!(lines[1].kind, elle_git::LineKind::Removed);
+        assert_eq!(lines[1].text, "    return 'hi';");
+        assert_eq!(lines[2].kind, elle_git::LineKind::Added);
+        assert_eq!(lines[2].text, "    return 'hello world';");
+
+        // The gutter numbers each side of the change.
+        assert_eq!(lines[1].old_line, Some(3), "removed lines number on the old side");
+        assert_eq!(lines[1].new_line, None);
+        assert_eq!(lines[2].new_line, Some(3));
+        assert_eq!(lines[2].old_line, None);
+    }
+
+    #[test]
+    fn a_patch_that_matches_the_file_produces_the_new_text() {
+        let original = "<?php\nfunction hello() {\n    return 'hi';\n}\n";
+        let diff = "@@ -2,3 +2,3 @@\n function hello() {\n-    return 'hi';\n+    return 'hello world';\n }\n";
+        assert_eq!(
+            apply_unified_diff(original, diff).unwrap(),
+            "<?php\nfunction hello() {\n    return 'hello world';\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_patch_that_does_not_match_the_file_is_refused_rather_than_forced() {
+        // The user edited the file after the model read it. Applying "nearly" here is how
+        // an editor corrupts source, so the patch is refused whole and the file is kept.
+        let edited = "<?php\nfunction hello() {\n    return 'something else';\n}\n";
+        let stale = "@@ -2,3 +2,3 @@\n function hello() {\n-    return 'hi';\n+    return 'hello world';\n }\n";
+        let refusal = apply_unified_diff(edited, stale).unwrap_err();
+        assert!(refusal.contains("does not match"), "{refusal}");
+
+        // And a patch with no hunks at all changes nothing.
+        assert!(apply_unified_diff(edited, "not a diff").is_err());
+    }
+
+    #[test]
+    fn a_patch_with_several_hunks_applies_all_of_them() {
+        // A real refactor touches a file in more than one place, and the untouched lines
+        // between the hunks have to survive verbatim.
+        let original: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        // Copied from `git diff -U1` on exactly this change: the header names the line the
+        // hunk *starts* at, so the first body line is line 1, not line 2.
+        let diff = "@@ -1,3 +1,3 @@\n line 1\n-line 2\n+line TWO\n line 3\n\
+                    @@ -16,3 +16,3 @@ line 15\n line 16\n-line 17\n+line SEVENTEEN\n line 18\n";
+        let patched = apply_unified_diff(&original, diff).unwrap();
+        assert!(patched.contains("line TWO"), "first hunk applied");
+        assert!(patched.contains("line SEVENTEEN"), "second hunk applied");
+        assert!(patched.contains("line 10"), "the untouched middle survived");
+        assert!(!patched.contains("line 2\n"), "the old first line is gone");
+        assert_eq!(patched.lines().count(), 20, "no lines gained or lost");
+    }
+
+    #[test]
+    fn an_added_file_patches_from_nothing() {
+        let diff = "@@ -0,0 +1,2 @@\n+<?php\n+return 1;\n";
+        assert_eq!(apply_unified_diff("", diff).unwrap(), "<?php\nreturn 1;\n");
     }
 
     /// An unavailable Codex must say the command that fixes it, never fail silently (#99).

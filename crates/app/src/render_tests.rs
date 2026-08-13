@@ -2441,6 +2441,332 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
     draw(cx);
 }
 
+// --- agent mode (#99) -------------------------------------------------------------------
+//
+// None of these spawn an agent, touch the network, or write outside a tempdir. They drive
+// the panel's real `apply_events` with events shaped exactly like the ones captured from
+// `codex-cli 0.146.0`, which is what makes them a check of the shipped path rather than of
+// a parallel test-only one.
+
+/// Builds the two events one proposed file arrives as: the change, then the question.
+fn proposal_events(item: &str, path: &std::path::Path, diff: &str) -> Vec<crate::ai::AgentEvent> {
+    vec![
+        crate::ai::AgentEvent::Proposed {
+            item_id: item.to_string(),
+            changes: vec![crate::ai::ProposedFileChange {
+                path: path.display().to_string(),
+                kind: "update".to_string(),
+                diff: diff.to_string(),
+            }],
+        },
+        crate::ai::AgentEvent::ApprovalRequested { request_id: 0, item_id: item.to_string() },
+    ]
+}
+
+const HELLO_BEFORE: &str = "<?php\nfunction hello() {\n    return 'hi';\n}\n";
+const HELLO_DIFF: &str =
+    "@@ -2,3 +2,3 @@\n function hello() {\n-    return 'hi';\n+    return 'hello world';\n }\n";
+const HELLO_AFTER: &str = "<?php\nfunction hello() {\n    return 'hello world';\n}\n";
+
+/// The rule that outranks the feature: a proposal is visible, and the file is untouched
+/// until Apply is pressed.
+#[gpui::test]
+async fn ai_agent_a_proposal_writes_nothing_until_it_is_applied(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let proposals = panel.proposals_for_test();
+        assert_eq!(proposals.len(), 1, "the proposal is on screen");
+        assert_eq!(proposals[0].state, ProposalState::Pending);
+    });
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        HELLO_BEFORE,
+        "seeing a diff must not change the file"
+    );
+    // The review UI draws.
+    draw(cx);
+
+    panel.update(cx, |panel, cx| panel.apply_proposal_for_test(0, cx));
+
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Applied);
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER, "and only Apply writes it");
+}
+
+/// Rejecting leaves the file alone, and a second click cannot revive the decision.
+#[gpui::test]
+async fn ai_agent_rejecting_leaves_the_file_exactly_as_it_was(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.reject_proposal_for_test(0, cx);
+        // A rejected proposal is terminal: Apply afterwards must not write it.
+        panel.apply_proposal_for_test(0, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Rejected);
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE);
+}
+
+/// Per-file approval: a turn touching two files is two decisions, not one.
+#[gpui::test]
+async fn ai_agent_approval_is_per_file_not_all_or_nothing(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let kept = dir.path().join("kept.php");
+    let changed = dir.path().join("changed.php");
+    std::fs::write(&kept, HELLO_BEFORE).expect("write");
+    std::fs::write(&changed, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    // One item carrying two files, which is how a multi-file edit arrives.
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![crate::ai::AgentEvent::Proposed {
+                item_id: "item-1".to_string(),
+                changes: vec![
+                    crate::ai::ProposedFileChange {
+                        path: kept.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    },
+                    crate::ai::ProposedFileChange {
+                        path: changed.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    },
+                ],
+            }],
+            cx,
+        );
+        // Reject the first, apply the second.
+        panel.reject_proposal_for_test(0, cx);
+        panel.apply_proposal_for_test(1, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let proposals = panel.proposals_for_test();
+        assert_eq!(proposals.len(), 2, "two files, two rows");
+        assert_eq!(proposals[0].state, ProposalState::Rejected);
+        assert_eq!(proposals[1].state, ProposalState::Applied);
+    });
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), HELLO_BEFORE, "the rejected one is intact");
+    assert_eq!(std::fs::read_to_string(&changed).unwrap(), HELLO_AFTER, "the applied one changed");
+}
+
+/// The denylist decides what may *enter* the user's files too, not only what leaves.
+#[gpui::test]
+async fn ai_agent_a_proposal_for_a_secret_path_is_blocked_with_its_reason(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "APP_KEY=original\n").expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    let diff = "@@ -1 +1 @@\n-APP_KEY=original\n+APP_KEY=stolen\n";
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &env, diff), cx);
+        // Even pressing Apply cannot write it: blocked is terminal, with no override.
+        panel.apply_proposal_for_test(0, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let state = panel.proposals_for_test()[0].state;
+        assert!(
+            matches!(state, ProposalState::Blocked(reason) if reason.contains("credentials")),
+            "the reason travels with the refusal: {state:?}"
+        );
+    });
+    assert_eq!(std::fs::read_to_string(&env).unwrap(), "APP_KEY=original\n");
+    // The blocked row renders, reason and all.
+    draw(cx);
+}
+
+/// A cancel mid-proposal discards what was pending rather than half-applying it.
+#[gpui::test]
+async fn ai_agent_cancel_discards_pending_proposals(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        // `cancel_stream` returns early unless a reply is in flight, which is the state a
+        // cancel-mid-proposal really happens in.
+        panel.set_streaming_for_test(true);
+        panel.cancel_for_test(cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(
+            panel.proposals_for_test().is_empty(),
+            "a cancelled turn leaves no Apply button behind"
+        );
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE, "and nothing was written");
+}
+
+/// A file open in a tab is patched through its **buffer**, so unsaved edits are the base
+/// and the change is one undo step.
+#[gpui::test]
+async fn ai_agent_an_open_tab_is_patched_through_its_buffer(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.open_path(file.clone(), window, cx));
+    cx.run_until_parked();
+
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.apply_proposal_for_test(0, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Applied);
+    });
+
+    // The buffer carries the change; the file on disk is untouched until a save, which is
+    // exactly how every other edit in this editor behaves.
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the tab is open");
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(editor.document.buffer.text(), HELLO_AFTER);
+    });
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        HELLO_BEFORE,
+        "an open tab's edit lives in the buffer until saved"
+    );
+}
+
+/// A rejection reaches the model, so it can adapt instead of re-proposing the same edit.
+#[gpui::test]
+async fn ai_agent_a_rejection_is_reported_to_the_model_on_the_next_send(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.reject_proposal_for_test(0, cx);
+        // The next question carries the verdict on the last one.
+        panel.type_input_for_test("try something else", cx);
+        panel.send_for_test(cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        let body = &panel.sent_bodies_for_test()[0];
+        assert!(body.contains("hello.php"), "the model is told which file: {body}");
+        assert!(body.contains("Rejected"), "and that it was rejected: {body}");
+        assert!(body.contains("try something else"), "alongside the new question: {body}");
+    });
+
+    // The user sees the same verdict as a note in the transcript.
+    panel.read_with(cx, |panel, _cx| {
+        assert!(
+            panel
+                .turns_for_test()
+                .iter()
+                .any(|turn| turn.role == crate::ai_chat::Role::Note
+                    && turn.text.contains("Rejected")),
+            "the decision is on screen too"
+        );
+    });
+}
+
+/// Ask mode is the panel as it was: a proposal arriving there is shown to nobody and
+/// approved by nothing.
+#[gpui::test]
+async fn ai_ask_mode_never_offers_a_proposal_to_apply(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Ask);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "Ask mode proposes nothing");
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE);
+}
+
 /// The send path runs to the edge of the transport and stops there — the whole pipeline
 /// (settings read, turn push, body build) without a network or a curl child (#99).
 #[gpui::test]
@@ -4917,9 +5243,16 @@ async fn every_small_text_field_lays_out_with_and_without_text(cx: &mut TestAppC
     });
     draw(search_cx);
 
-    // An empty snapshot: this test never sends, so there is no editor to describe.
+    // An empty snapshot: this test never sends, so there is no editor to describe. The
+    // apply closure refuses everything — a render test must never write a file, and
+    // nothing here approves a proposal anyway.
     let (chat, chat_cx) = cx.add_window_view(|_window, cx| {
-        AiChatPanel::new(Box::new(|_| Default::default()), None, cx)
+        AiChatPanel::new(
+            Box::new(|_| Default::default()),
+            Box::new(|_, _, _| Err("render tests never write".to_string())),
+            None,
+            cx,
+        )
     });
     draw(chat_cx);
     chat.update(chat_cx, |panel, cx| panel.type_input_for_test("why is this null?", cx));
