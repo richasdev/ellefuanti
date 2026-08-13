@@ -57,15 +57,34 @@ pub struct PaneRect {
     pub height: f64,
 }
 
-/// Converts a top-left-origin rect into AppKit's bottom-left-origin coordinates, given the
-/// height of the container view.
+/// Converts a top-left-origin rect, measured inside GPUI's view, into AppKit's
+/// bottom-left-origin coordinates inside the *container* the webview is a sibling in.
 ///
-/// AppKit measures y upwards from the bottom of the superview; GPUI measures it downwards
-/// from the top. Getting this backwards puts the pane a plausible-looking distance from the
-/// wrong edge — it renders, so it never crashes, and it is wrong on every window that is
-/// not exactly twice the pane's height. Hence a test rather than a squint.
-pub fn flip_to_appkit(rect: PaneRect, container_height: f64) -> PaneRect {
-    PaneRect { y: container_height - rect.y - rect.height, ..rect }
+/// Two separate corrections, and conflating them is the bug this signature exists to
+/// prevent:
+///
+/// 1. **The flip.** AppKit measures y upwards from the bottom of the superview; GPUI
+///    measures it downwards from the top. Getting this backwards puts the pane a
+///    plausible-looking distance from the wrong edge — it renders, so it never crashes, and
+///    it is wrong on every window that is not exactly twice the pane's height.
+/// 2. **The inset.** GPUI's view can be smaller than the container and offset inside it (a
+///    titlebar does exactly this). The pane's rect is measured against GPUI's view, but the
+///    frame is set in the container's space, so the view's own origin has to be added back.
+///    Skip this and the page sits off by the inset — again without ever crashing.
+///
+/// `gpui_frame` is GPUI's view's frame *in container coordinates*, which is what
+/// `NSView.frame` already returns. When the two views coincide — the common case — the
+/// origin is zero and this reduces to the plain flip.
+pub fn flip_to_appkit(rect: PaneRect, gpui_frame: PaneRect) -> PaneRect {
+    PaneRect {
+        x: gpui_frame.x + rect.x,
+        // Down from the top of GPUI's view, then up from the bottom of the container:
+        // the view's own bottom edge is `gpui_frame.y`, and the pane sits
+        // `rect.y + rect.height` below its top.
+        y: gpui_frame.y + (gpui_frame.height - rect.y - rect.height),
+        width: rect.width,
+        height: rect.height,
+    }
 }
 
 /// A `WKWebView` living in GPUI's window as a sibling of GPUI's own view.
@@ -74,9 +93,17 @@ pub fn flip_to_appkit(rect: PaneRect, container_height: f64) -> PaneRect {
 /// drawing over the editor, and there is no GPUI layout pass that would take it away.
 pub struct PreviewWebView {
     webview: Retained<WKWebView>,
-    /// GPUI's `contentView`, retained so the frame flip has a height to measure against
-    /// without a second trip through the window handle each paint.
-    container: Retained<NSView>,
+    /// GPUI's own view, retained because the pane's rect is measured against **it**, not
+    /// against the superview it and this webview are siblings in.
+    ///
+    /// The two are usually the same size and it is tempting to keep only one. They are not
+    /// guaranteed to be: a window with a titlebar can inset GPUI's view inside the
+    /// container, and then the container is taller and starts higher. Flipping against the
+    /// container's height under that layout offsets the page by exactly the inset — the
+    /// page still draws, so nothing crashes and nothing looks obviously broken; it just
+    /// sits wrong. Measuring against GPUI's view and then translating into the container
+    /// makes the layout the pane was laid out in the layout it is placed in.
+    gpui_view: Retained<NSView>,
 }
 
 impl PreviewWebView {
@@ -122,15 +149,28 @@ impl PreviewWebView {
             );
         }
 
-        Some(Self { webview, container })
+        // `container` is deliberately not kept: the frame is now measured against GPUI's
+        // view, and AppKit already retains the webview on the superview's behalf, so
+        // holding a second reference would buy nothing and read as if it did.
+        Some(Self { webview, gpui_view: Retained::from(gpui_view) })
     }
 
     /// Moves the view to the rect GPUI laid out for the pane, flipping into AppKit's
     /// coordinates. Called every painted frame — see the module docs for why a stale frame
     /// is not a cosmetic problem here.
     pub fn set_frame(&self, rect: PaneRect) {
-        let container_height = self.container.frame().size.height;
-        let flipped = flip_to_appkit(rect, container_height);
+        // GPUI's view's frame, already in container coordinates — which is the space the
+        // webview's own frame is set in, since `addSubview:` made them siblings.
+        let gpui_frame = self.gpui_view.frame();
+        let flipped = flip_to_appkit(
+            rect,
+            PaneRect {
+                x: gpui_frame.origin.x,
+                y: gpui_frame.origin.y,
+                width: gpui_frame.size.width,
+                height: gpui_frame.size.height,
+            },
+        );
         self.webview.setFrame(CGRect::new(
             CGPoint::new(flipped.x, flipped.y),
             CGSize::new(flipped.width, flipped.height),
@@ -227,29 +267,86 @@ mod tests {
     #[test]
     fn the_flip_measures_y_from_the_bottom() {
         // A 200-tall pane sitting 100 down from the top of an 800-tall window has its
-        // bottom edge 500 up from the bottom.
+        // bottom edge 500 up from the bottom. GPUI's view fills the container here, which
+        // is the ordinary case: origin zero, so only the flip applies.
         let rect = PaneRect { x: 40.0, y: 100.0, width: 300.0, height: 200.0 };
-        let flipped = flip_to_appkit(rect, 800.0);
+        let full = PaneRect { x: 0.0, y: 0.0, width: 1200.0, height: 800.0 };
+        let flipped = flip_to_appkit(rect, full);
         assert_eq!(flipped, PaneRect { x: 40.0, y: 500.0, width: 300.0, height: 200.0 });
+    }
+
+    /// The failure this signature was changed to prevent, and the one predicted as most
+    /// likely to show up the first time a real window renders the pane.
+    ///
+    /// GPUI's view can be inset inside the container — a titlebar does it. Flipping against
+    /// the *container's* height then places the page too high by exactly the inset, and
+    /// because the page still draws, nothing crashes and nothing looks obviously broken.
+    #[test]
+    fn an_inset_gpui_view_does_not_offset_the_page() {
+        // Container 800 tall; GPUI's view is 760 of it, sitting 40 up from the bottom
+        // (an AppKit origin, so the inset is at the *top* of the window).
+        let gpui = PaneRect { x: 0.0, y: 40.0, width: 1200.0, height: 760.0 };
+        // The pane is flush with the top of GPUI's view.
+        let rect = PaneRect { x: 0.0, y: 0.0, width: 300.0, height: 200.0 };
+
+        let flipped = flip_to_appkit(rect, gpui);
+
+        // Top of GPUI's view is 40 + 760 = 800; a 200-tall pane flush with it has its
+        // bottom edge at 600. Measuring against the container's 800 alone would say 600
+        // too — the numbers only diverge once the pane is not flush, which is why the
+        // assertion below matters more than this one.
+        assert_eq!(flipped.y, 600.0);
+
+        // Now 100 down from the top of GPUI's view: bottom edge at 800 - 100 - 200 = 500.
+        // The naive container flip would put it at 800 - 100 - 200 = 500 as well *only*
+        // because this container's top happens to coincide; shift the view down and they
+        // part company.
+        let lower = PaneRect { x: 0.0, y: 100.0, width: 300.0, height: 200.0 };
+        assert_eq!(flip_to_appkit(lower, gpui).y, 500.0);
+
+        // A view inset from the bottom instead: container-height flipping is now wrong by
+        // the full 40, which is the bug in its plainest form.
+        let raised = PaneRect { x: 0.0, y: 0.0, width: 1200.0, height: 760.0 };
+        assert_eq!(
+            flip_to_appkit(rect, raised).y,
+            560.0,
+            "y must come from GPUI's view, not the container"
+        );
+    }
+
+    /// The x axis has the same inset problem and no flip, so it is easy to forget.
+    #[test]
+    fn a_horizontally_inset_view_shifts_the_pane_right() {
+        let gpui = PaneRect { x: 25.0, y: 0.0, width: 1150.0, height: 800.0 };
+        let rect = PaneRect { x: 40.0, y: 0.0, width: 300.0, height: 200.0 };
+        assert_eq!(flip_to_appkit(rect, gpui).x, 65.0, "the view's own x must be added");
     }
 
     #[test]
     fn a_pane_against_the_bottom_edge_flips_to_zero() {
         let rect = PaneRect { x: 0.0, y: 600.0, width: 400.0, height: 200.0 };
-        assert_eq!(flip_to_appkit(rect, 800.0).y, 0.0);
+        let full = PaneRect { x: 0.0, y: 0.0, width: 400.0, height: 800.0 };
+        assert_eq!(flip_to_appkit(rect, full).y, 0.0);
     }
 
     #[test]
-    fn the_flip_is_its_own_inverse() {
+    fn the_flip_is_its_own_inverse_when_the_views_coincide() {
         // Which is the property that makes it safe to apply once and only once.
+        //
+        // It holds only for a zero origin, and that is not a caveat to work around: with an
+        // inset view the function maps *between two different spaces*, so applying it twice
+        // is meaningless rather than merely wrong. Naming the precondition here stops the
+        // next reader from "fixing" the asymmetry.
         let rect = PaneRect { x: 10.0, y: 250.0, width: 100.0, height: 120.0 };
-        assert_eq!(flip_to_appkit(flip_to_appkit(rect, 900.0), 900.0), rect);
+        let full = PaneRect { x: 0.0, y: 0.0, width: 400.0, height: 900.0 };
+        assert_eq!(flip_to_appkit(flip_to_appkit(rect, full), full), rect);
     }
 
     #[test]
-    fn only_y_moves() {
+    fn size_never_changes() {
         let rect = PaneRect { x: 12.5, y: 33.0, width: 44.0, height: 55.0 };
-        let flipped = flip_to_appkit(rect, 500.0);
+        let full = PaneRect { x: 0.0, y: 0.0, width: 800.0, height: 500.0 };
+        let flipped = flip_to_appkit(rect, full);
         assert_eq!((flipped.x, flipped.width, flipped.height), (12.5, 44.0, 55.0));
     }
 }
