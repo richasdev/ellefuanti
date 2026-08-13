@@ -34,11 +34,34 @@
 //! ← item/agentMessage/delta ×N, then turn/completed
 //! ```
 //!
-//! # Read-only, by default and on purpose
+//! # Read-only, in both modes, and that is what makes Agent mode safe
 //!
 //! `thread/start` defaults to `sandbox: readOnly` with `approvalPolicy: on-request`, and
-//! this pass sends nothing to change that. A chat panel that could write files is a
-//! different feature with a different consent story; "ask mode" is what #99 scoped.
+//! **this stays true in Agent mode**. That is the opposite of the obvious implementation,
+//! so the probe that settled it is worth recording:
+//!
+//! | `sandbox`         | what the CLI does when it wants to edit a file          |
+//! |-------------------|---------------------------------------------------------|
+//! | `workspace-write` | writes it. No approval request, no patch notification.  |
+//! | `read-only`       | emits `item/fileChange/requestApproval` and **waits**.  |
+//!
+//! Asking for write access would therefore *remove* the consent step rather than add one:
+//! inside a `workspace-write` sandbox a write is not an escape, so nothing escalates and
+//! the file is already changed by the time the panel hears about it. Under `read-only`
+//! every write is an escape, which is exactly the interception point Agent mode needs —
+//! declining leaves the file byte-for-byte untouched (verified against the real CLI).
+//!
+//! The content arrives *before* the question, as an `item/started` whose item is a
+//! `fileChange` carrying the path and a ready-made unified diff, correlated to the
+//! approval by `itemId`:
+//!
+//! ```text
+//! ← item/started {"item":{"type":"fileChange","id":"exec-10e2…",
+//!                  "changes":[{"path":"…/hello.php","kind":{"type":"update"},
+//!                              "diff":"@@ -2,3 +2,3 @@\n…"}]}}
+//! ← item/fileChange/requestApproval {"id":0,"params":{"itemId":"exec-10e2…"}}
+//! → {"id":0,"result":{"decision":"accept"|"decline"}}
+//! ```
 //!
 //! The `cwd` param is verified accepted — the returned thread echoes it back, and the
 //! spawned child's own working directory is set to the same root as a belt-and-braces
@@ -76,8 +99,20 @@ pub fn initialize_request(client_version: &str) -> String {
 /// `cwd` is how Codex gets to read the open project for context. Omitted when no folder
 /// is open, because a thread rooted at wherever the app happened to launch would let it
 /// read a directory the user never opened.
+///
+/// `sandbox` and `approvalPolicy` are sent explicitly rather than left to the CLI's
+/// defaults — in **both** modes, and both to the same values. They are the settings that
+/// decide whether a write can happen without being asked about (see the module docs), so
+/// they are stated here where they can be read, not inherited from whatever a future CLI
+/// version or a user's `~/.codex/config.toml` happens to default to.
 pub fn thread_start_request(cwd: Option<&Path>) -> String {
-    let mut params = json!({});
+    let mut params = json!({
+        // Every write is a sandbox escape, and an escape is a question. This is what
+        // makes "nothing reaches disk unapproved" a property of the protocol rather than
+        // a promise the panel makes.
+        "sandbox": "read-only",
+        "approvalPolicy": "on-request",
+    });
     if let Some(cwd) = cwd {
         params["cwd"] = json!(cwd.to_string_lossy());
     }
@@ -114,6 +149,37 @@ pub fn interrupt_request(thread_id: &str) -> String {
     }))
 }
 
+/// The answer to an `item/fileChange/requestApproval`, addressed to the request's own id.
+///
+/// This is the one message in the protocol that can let bytes reach the user's disk, so
+/// it is only ever built from a click on Apply — never from a timer, a default, or a
+/// "the user probably meant yes". `accept` writes; `decline` leaves the file untouched
+/// and lets the turn continue, so the model can adapt instead of silently retrying.
+///
+/// `acceptForSession` is deliberately **not** offered: it is the "trust this session"
+/// escape hatch, and the whole point of Agent mode here is that every file is seen before
+/// it is written.
+pub fn approval_response(request_id: u64, approve: bool) -> String {
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"decision": if approve { "accept" } else { "decline" }},
+    }))
+}
+
+/// One file a turn wants to change, as the CLI describes it.
+///
+/// The `diff` is the CLI's own unified diff for this file — already in the `@@` format the
+/// diff renderer reads, which is why the panel does not recompute one for the Codex path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposedChange {
+    /// Absolute path, as the CLI reports it.
+    pub path: String,
+    /// `"add"`, `"update"` or `"delete"` — what the change does to the file.
+    pub kind: String,
+    pub diff: String,
+}
+
 /// Serialises one JSON-RPC message as exactly one line: the framing *is* the newline.
 fn line(value: Value) -> String {
     format!("{value}\n")
@@ -132,6 +198,12 @@ pub enum CodexEvent {
     TurnCompleted,
     /// The turn failed; the string is for the user.
     TurnFailed(String),
+    /// A turn wants to change files, and has said which and how. Arrives *before* the
+    /// approval request, which is why the panel can show a diff when the question lands.
+    Proposed { item_id: String, changes: Vec<ProposedChange> },
+    /// The CLI is blocked on the user: may it write the files of `item_id`? Nothing is on
+    /// disk yet, and nothing will be until [`approval_response`] says `accept`.
+    ApprovalRequested { request_id: u64, item_id: String },
     /// A line that is well-formed and deliberately carries nothing: lifecycle chatter,
     /// rate-limit updates, MCP startup noise. Distinct from `None` (unparseable) so a
     /// reader can tell "understood and skipped" from "not JSON at all".
@@ -147,6 +219,19 @@ pub enum CodexEvent {
 /// user's own words never come back as the assistant's.
 pub fn parse_line(text: &str) -> Option<CodexEvent> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
+
+    // A *server request* carries both `id` and `method` — it is the CLI asking us
+    // something and waiting for an answer at that id. It has to be matched before the
+    // reply branch below, which would otherwise read the id and treat it as an ack.
+    if let (Some(id), Some("item/fileChange/requestApproval")) =
+        (value.get("id").and_then(Value::as_u64), value.get("method").and_then(Value::as_str))
+    {
+        let item_id = value.get("params")?.get("itemId")?.as_str()?;
+        return Some(CodexEvent::ApprovalRequested {
+            request_id: id,
+            item_id: item_id.to_string(),
+        });
+    }
 
     // A reply carries `id`; a notification carries `method`. Replies first, because the
     // handshake is the only thing that waits on one.
@@ -179,6 +264,35 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
             let delta = params?.get("delta")?.as_str()?;
             Some(CodexEvent::Delta(delta.to_string()))
         }
+        // The proposal itself. Only `item/started` is read, never `item/completed`: the
+        // completed copy repeats the same changes with a final `status`, and acting on
+        // both would show every proposed file twice.
+        "item/started" => {
+            let item = params?.get("item")?;
+            if item.get("type")?.as_str()? != "fileChange" {
+                return Some(CodexEvent::Ignored);
+            }
+            let item_id = item.get("id")?.as_str()?.to_string();
+            let changes = item
+                .get("changes")?
+                .as_array()?
+                .iter()
+                .filter_map(|change| {
+                    Some(ProposedChange {
+                        path: change.get("path")?.as_str()?.to_string(),
+                        kind: change.get("kind")?.get("type")?.as_str()?.to_string(),
+                        // A change with no diff is nothing the user could review, so it is
+                        // dropped rather than rendered as an empty pane with an Apply
+                        // button under it.
+                        diff: change.get("diff")?.as_str()?.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if changes.is_empty() {
+                return Some(CodexEvent::Ignored);
+            }
+            Some(CodexEvent::Proposed { item_id, changes })
+        }
         "turn/completed" => Some(CodexEvent::TurnCompleted),
         "turn/failed" => {
             let message = params
@@ -189,7 +303,7 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
             Some(CodexEvent::TurnFailed(message.to_string()))
         }
         // Everything else is lifecycle or telemetry: thread/started, turn/started,
-        // item/started, item/completed, remoteControl/status/changed,
+        // item/completed, remoteControl/status/changed,
         // mcpServer/startupStatus/updated, account/rateLimits/updated,
         // thread/tokenUsage/updated, thread/status/changed.
         _ => Some(CodexEvent::Ignored),
@@ -333,7 +447,11 @@ mod tests {
         assert_eq!(parse_line(user_item), Some(CodexEvent::Ignored));
 
         let agent_started = r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg_0157b6","text":"","phase":"final_answer"},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
-        assert_eq!(parse_line(agent_started), Some(CodexEvent::Ignored));
+        assert_eq!(
+            parse_line(agent_started),
+            Some(CodexEvent::Ignored),
+            "only a fileChange item/started carries a proposal"
+        );
 
         let agent_completed = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg_0157b6","text":"OK","phase":"final_answer"},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
         assert_eq!(
@@ -356,6 +474,87 @@ mod tests {
         ] {
             assert_eq!(parse_line(captured), Some(CodexEvent::Ignored), "{captured}");
         }
+    }
+
+    // --- agent mode ------------------------------------------------------------------
+    //
+    // The fixtures below were captured from `codex-cli 0.146.0` running a real turn under
+    // `sandbox: read-only`, asked to edit a PHP file. The file on disk was **unchanged**
+    // afterwards, because the probe answered `decline` — that run is what these encode.
+
+    #[test]
+    fn a_thread_pins_the_sandbox_that_makes_a_write_ask_first() {
+        // The load-bearing line of the whole feature. `workspace-write` was measured
+        // writing files with no approval request at all, so this must not drift to it.
+        let value: Value = serde_json::from_str(&thread_start_request(None)).unwrap();
+        assert_eq!(value["params"]["sandbox"], "read-only", "a write must stay an escape");
+        assert_eq!(value["params"]["approvalPolicy"], "on-request");
+    }
+
+    #[test]
+    fn a_file_change_item_carries_the_path_and_the_diff_before_the_question() {
+        let captured = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"exec-10e21aa1","changes":[{"path":"/tmp/corr/hello.php","kind":{"type":"update","move_path":null},"diff":"@@ -2,3 +2,3 @@\n function hello() {\n-    return 'hi';\n+    return 'hello world';\n }\n"}],"status":"inProgress"},"threadId":"019ff8c2","turnId":"019ff8c2"}}"#;
+        let Some(CodexEvent::Proposed { item_id, changes }) = parse_line(captured) else {
+            panic!("expected a proposal, got {:?}", parse_line(captured));
+        };
+        assert_eq!(item_id, "exec-10e21aa1", "the id the approval will name");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "/tmp/corr/hello.php");
+        assert_eq!(changes[0].kind, "update");
+        assert!(changes[0].diff.starts_with("@@ -2,3 +2,3 @@"), "{}", changes[0].diff);
+        assert!(changes[0].diff.contains("+    return 'hello world';"));
+    }
+
+    #[test]
+    fn the_approval_request_is_a_question_with_an_id_to_answer_at() {
+        // It carries `id` *and* `method`: parsed as a server request, not as the ack of
+        // some request of ours, which is what the id would otherwise look like.
+        let captured = r#"{"method":"item/fileChange/requestApproval","id":0,"params":{"threadId":"019ff8c2","turnId":"019ff8c2","itemId":"exec-10e21aa1","startedAtMs":1786584955278,"reason":null,"grantRoot":null}}"#;
+        assert_eq!(
+            parse_line(captured),
+            Some(CodexEvent::ApprovalRequested {
+                request_id: 0,
+                item_id: "exec-10e21aa1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_approval_answers_at_the_requests_id_and_offers_no_blanket_yes() {
+        let accept: Value = serde_json::from_str(&approval_response(0, true)).unwrap();
+        assert_eq!(accept["id"], 0, "answered at the id that asked");
+        assert_eq!(accept["result"]["decision"], "accept");
+
+        let decline: Value = serde_json::from_str(&approval_response(7, false)).unwrap();
+        assert_eq!(decline["id"], 7);
+        assert_eq!(decline["result"]["decision"], "decline");
+
+        // `acceptForSession` is the "trust this session" hatch the feature deliberately
+        // does not build: every file is seen before it is written.
+        for id in [0, 7] {
+            for approve in [true, false] {
+                assert!(
+                    !approval_response(id, approve).contains("acceptForSession"),
+                    "no blanket approval"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_completed_copy_of_a_proposal_is_ignored_so_nothing_is_offered_twice() {
+        // `item/completed` repeats the whole change with a final status. Acting on it
+        // would show every proposed file a second time, under a stale Apply button.
+        let captured = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"exec-10e21aa1","changes":[{"path":"/tmp/corr/hello.php","kind":{"type":"update","move_path":null},"diff":"@@ -2,3 +2,3 @@\n x\n"}],"status":"declined"},"threadId":"019ff8c2","turnId":"019ff8c2"}}"#;
+        assert_eq!(parse_line(captured), Some(CodexEvent::Ignored));
+    }
+
+    #[test]
+    fn a_file_change_with_nothing_reviewable_is_not_offered_as_a_proposal() {
+        // No `diff` field means nothing to show; an Apply button over an empty pane would
+        // be asking the user to approve something they cannot see.
+        let no_diff = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"exec-1","changes":[{"path":"/tmp/a.php","kind":{"type":"update"}}],"status":"inProgress"}}}"#;
+        assert_eq!(parse_line(no_diff), Some(CodexEvent::Ignored));
     }
 
     #[test]

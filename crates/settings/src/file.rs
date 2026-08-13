@@ -349,6 +349,19 @@ impl Settings {
         self.string_or("ai.completion_model", "claude-haiku-4-5")
     }
 
+    /// Which chat mode the panel opens in: `"ask"` (read-only) or `"agent"` (#99).
+    ///
+    /// Ask is the default and the fallback for anything unrecognised, because Ask is the
+    /// mode that cannot touch the user's files — an unreadable settings value must fail
+    /// towards the harmless mode, never towards the one that can propose writes.
+    pub fn ai_chat_mode(&self) -> &str {
+        self.string_or("ai.chat_mode", "ask")
+    }
+
+    pub fn set_ai_chat_mode(&mut self, mode: &str) {
+        self.document.insert("ai.chat_mode".to_string(), Value::String(mode.to_string()));
+    }
+
     /// The chat panel's master switch. Off by default (#99).
     pub fn ai_chat_enabled(&self) -> bool {
         self.bool_or("ai.chat", false)
@@ -684,6 +697,25 @@ mod tests {
 
         settings.set_theme("light");
         assert!(settings.to_json().contains("Comic Sans"), "{}", settings.to_json());
+    }
+
+    /// The chat mode is a new key, and its default is the mode that cannot write (#99).
+    #[test]
+    fn the_chat_mode_defaults_to_ask_and_survives_a_bad_value() {
+        // Absent: Ask, so every existing settings file keeps behaving exactly as it did.
+        assert_eq!(Settings::parse(&path(), "{}").unwrap().ai_chat_mode(), "ask");
+
+        let agent = Settings::parse(&path(), r#"{"ai.chat_mode": "agent"}"#).unwrap();
+        assert_eq!(agent.ai_chat_mode(), "agent");
+
+        // A wrong type falls back to the harmless mode rather than costing the file — and
+        // it must fall back to *ask*, never to the mode that can propose writes.
+        let wrong = Settings::parse(&path(), r#"{"ai.chat_mode": 7}"#).unwrap();
+        assert_eq!(wrong.ai_chat_mode(), "ask");
+
+        let mut settings = Settings::parse(&path(), "{}").unwrap();
+        settings.set_ai_chat_mode("agent");
+        assert_eq!(settings.ai_chat_mode(), "agent");
     }
 
     /// The chat provider is a *new* key, so its absence must change nothing (#99).

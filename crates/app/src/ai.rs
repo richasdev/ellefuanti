@@ -236,6 +236,12 @@ pub fn curl_args(auth: &Auth) -> Vec<String> {
 }
 
 /// One parsed server-sent event, reduced to what a panel needs.
+///
+/// Deliberately *only* the three things an HTTP wire can say. Agent-mode events live in
+/// [`AgentEvent`] instead: they arrive from the Codex subprocess and can never come off an
+/// SSE stream, so putting them here would force every `parse_sse` caller — including
+/// ghost-text autocomplete, which has no concept of a proposal — to match on cases its
+/// transport cannot produce.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     /// A piece of assistant text to append.
@@ -244,6 +250,41 @@ pub enum StreamEvent {
     Done,
     /// The server said no; the string is for the user.
     Error(String),
+}
+
+/// What a panel's producer sends: reply text, or — Codex only — an agent proposal (#99).
+///
+/// One channel carries both, because the panel has exactly one drain and one cancel: a
+/// second channel for proposals would mean a second batching story and a second way to
+/// cancel half of a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentEvent {
+    /// Anything an HTTP wire could also have said.
+    Stream(StreamEvent),
+    /// The agent wants to change files, and has said which and how. Nothing is written:
+    /// this is the proposal, and the approval below is the question about it.
+    Proposed { item_id: String, changes: Vec<ProposedFileChange> },
+    /// The agent is blocked waiting for a decision on `item_id`, at JSON-RPC `request_id`.
+    ApprovalRequested { request_id: u64, item_id: String },
+}
+
+impl From<StreamEvent> for AgentEvent {
+    fn from(event: StreamEvent) -> Self {
+        AgentEvent::Stream(event)
+    }
+}
+
+/// One file an agent turn proposes to change, transport-neutral.
+///
+/// A copy of the Codex shape rather than a re-export, so [`StreamEvent`] — which every
+/// provider's producer sends — does not drag a CLI-specific type into the HTTP path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposedFileChange {
+    pub path: String,
+    /// `"add"`, `"update"` or `"delete"`.
+    pub kind: String,
+    /// The unified diff for this file.
+    pub diff: String,
 }
 
 /// Parses one line of an SSE stream for the given wire. `None` for lines that carry
