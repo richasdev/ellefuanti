@@ -220,6 +220,9 @@ pub const BUILTIN_COMMANDS: &[Command] = &[
     // The AI chat panel (#99). One command, because the panel is one thing: everything
     // else about it (provider, key, enablement) lives in Settings, not the palette.
     Command::new("ai.chat", "Toggle AI Chat"),
+    // The preview pane (#31). One command for the same reason as the chat above: the pane
+    // is one thing, and the URL it points at is typed into the pane, not chosen here.
+    Command::new("view.preview", "Toggle Preview"),
 ];
 
 #[cfg(test)]

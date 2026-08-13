@@ -182,6 +182,10 @@ fn menu_bar() -> Vec<(&'static str, Vec<Item>)> {
                 Item::command("Toggle AI Chat", "ai.chat", |label| {
                     MenuItem::action(label, crate::actions::ToggleAiChat)
                 }),
+                // The preview pane (#31), under View with the other panels.
+                Item::command("Toggle Preview", "view.preview", |label| {
+                    MenuItem::action(label, crate::actions::TogglePreview)
+                }),
                 Item::command("Toggle Hidden Files", "workspace.toggle_hidden_files", |label| {
                     MenuItem::action(label, ToggleHiddenFiles)
                 }),

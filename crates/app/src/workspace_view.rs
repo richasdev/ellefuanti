@@ -23,8 +23,8 @@ use crate::actions::{
     IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
     OpenSettings, PushToRemote, QuickFix, RenameSymbol, Replace, RerunFailedTests, ResetFontSize,
     RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch, ToggleAiChat, ToggleCommandPalette,
-    ToggleFullscreen, ToggleHiddenFiles, ToggleQuickOpen, ToggleTerminal, ToggleTestPanel,
-    ToggleTheme, ToggleZen, context, dispatch_for,
+    ToggleFullscreen, ToggleHiddenFiles, TogglePreview, ToggleQuickOpen, ToggleTerminal,
+    ToggleTestPanel, ToggleTheme, ToggleZen, context, dispatch_for,
 };
 use crate::ai_chat::AiChatPanel;
 use crate::completion::{
@@ -41,6 +41,7 @@ use crate::icons;
 use crate::lsp_session::{LSP_POLL_INTERVAL, Lsp, LspState};
 use crate::palette::{Palette, PaletteEvent, PaletteMode};
 use crate::perf::FrameTimer;
+use crate::preview_view::PreviewView;
 use crate::search_panel::{SearchPanel, SearchPanelEvent, SearchState};
 use crate::settings_panel::{SettingsPanel, SettingsPanelEvent};
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
@@ -640,6 +641,11 @@ pub struct WorkspaceView {
     /// The Laravel log panel (#25). Same lifecycle as the terminal: an entity while
     /// open, dropped when closed, re-read on refocus while up.
     logs: Option<Entity<crate::log_view::LogView>>,
+    /// The preview pane (#31). `Some` only while it is open, which is what makes ADR-0011's
+    /// laziness real: no entity means no `WKWebView`, so a user who never opens it pays
+    /// nothing in startup or idle memory. Dropping it also removes the native view from the
+    /// window — see [`crate::preview_webview`] for why that is not automatic.
+    preview: Option<Entity<PreviewView>>,
     /// Cancels an in-flight test run. Separate from the task slot for the usual reason
     /// (ADR-0007): dropping the `Task` stops the await, not the PHP process behind it.
     test_cancel: Option<TestCancelFlag>,
@@ -830,6 +836,7 @@ impl WorkspaceView {
             terminal: None,
             tests: None,
             logs: None,
+            preview: None,
             test_cancel: None,
             status: None,
             jobs: Jobs::default(),
@@ -1298,6 +1305,13 @@ impl WorkspaceView {
     /// ⌘K Z (owner request). Chrome off, editor centred; the same chord restores.
     fn toggle_zen(&mut self, _: &ToggleZen, _w: &mut Window, cx: &mut Context<Self>) {
         self.zen = !self.zen;
+        // The preview's webview is an AppKit view GPUI does not own, so "hidden" has to be
+        // said out loud: zen stops rendering the pane, which stops its paint, which is the
+        // only thing that would otherwise move the page off the screen.
+        if let Some(preview) = &self.preview {
+            let zen = self.zen;
+            preview.update(cx, |preview, _cx| preview.set_zen_hidden(zen));
+        }
         self.status = Some(if self.zen { "Zen on — ⌘K Z to leave" } else { "Zen off" }.into());
         cx.notify();
     }
@@ -1509,6 +1523,17 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn toggle_terminal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_terminal(&ToggleTerminal, window, cx);
+    }
+
+    /// The preview pane through its real action handler (#31), for the reason above.
+    #[cfg(test)]
+    pub fn toggle_preview_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_preview(&TogglePreview, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn preview_for_test(&self) -> Option<Entity<PreviewView>> {
+        self.preview.clone()
     }
 
     /// The explicit invoke, through the real action handler, for the same reason (#61).
@@ -2741,6 +2766,29 @@ impl WorkspaceView {
             // Opening the panel already creates a session, so this is the same path.
             None => self.toggle_terminal(&ToggleTerminal, window, cx),
         }
+    }
+
+    // --- preview pane (#31) --------------------------------------------------------
+
+    /// Opens the preview pane, or closes it if it is already open.
+    ///
+    /// Closing *drops* the entity, which drops the `WKWebView`, which removes the native
+    /// view from the window. That last step is the one that matters and the one that is not
+    /// automatic: the webview is an AppKit sibling of GPUI's view, so no GPUI layout pass
+    /// would have taken it away — a pane that merely stopped being rendered would leave a
+    /// web page drawing over the editor. See [`crate::preview_webview`].
+    ///
+    /// Dropping also means a reopened pane starts at the default URL again rather than
+    /// where the user left off. That is the same trade the terminal makes, and for the same
+    /// reason: a closed panel should cost nothing, and here "nothing" includes a live web
+    /// engine holding a page in memory.
+    fn toggle_preview(&mut self, _: &TogglePreview, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_completion(window, cx);
+        match self.preview.take() {
+            Some(_) => self.focus_editor_or_workspace(window, cx),
+            None => self.preview = Some(cx.new(PreviewView::new)),
+        }
+        cx.notify();
     }
 
     // --- test runner (#25) ---------------------------------------------------------
@@ -6908,6 +6956,7 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                     Dispatch::ToggleFullscreen => window.toggle_fullscreen(),
                     Dispatch::ToggleZen => self.toggle_zen(&ToggleZen, window, cx),
                     Dispatch::ToggleAiChat => self.toggle_ai_chat(&ToggleAiChat, window, cx),
+                    Dispatch::TogglePreview => self.toggle_preview(&TogglePreview, window, cx),
                     Dispatch::ToggleHiddenFiles => {
                         self.toggle_hidden_files(&ToggleHiddenFiles, window, cx)
                     }
@@ -7474,6 +7523,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_fullscreen))
             .on_action(cx.listener(Self::toggle_zen))
             .on_action(cx.listener(Self::toggle_ai_chat))
+            .on_action(cx.listener(Self::toggle_preview))
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _w, cx| this.zoom(Some(1.0), cx)))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _w, cx| this.zoom(Some(-1.0), cx)))
             .on_action(cx.listener(|this, _: &ResetFontSize, _w, cx| this.zoom(None, cx)))
@@ -7570,6 +7620,23 @@ impl Render for WorkspaceView {
                             // And the log under those, same column, same reasoning.
                             .children(self.logs.clone()),
                     )
+                    // The preview pane (#31): a right-side column, same slot and same
+                    // reasoning as the AI chat panel below.
+                    //
+                    // Zen needs one extra step the other panels do not. Hiding a GPUI panel
+                    // is just not rendering it, but this pane's webview is an AppKit view
+                    // that GPUI does not own: not rendering the element means its paint
+                    // never runs, so nothing would move or hide the native view and the
+                    // page would keep drawing over a zen-mode editor. The pane is told
+                    // explicitly instead — see `set_zen_hidden`.
+                    .when(!zen && self.preview.is_some(), |el| {
+                        el.child(self.render_divider("divider-preview", -1.0, &theme, cx))
+                    })
+                    .when(!zen, |el| {
+                        el.children(self.preview.clone().map(|pane| {
+                            div().w(self.ai_chat_width).flex_none().h_full().child(pane)
+                        }))
+                    })
                     // The AI chat panel (#99): a right-side column between the editor
                     // and the window edge, full height under the titlebar. Chrome, so
                     // zen hides it with the rest — the conversation survives, hidden,

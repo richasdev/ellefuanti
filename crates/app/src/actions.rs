@@ -80,6 +80,9 @@ actions!(
         // The AI chat panel (#99). Workspace-scoped like the terminal toggle, and for the
         // same reason: the chord must also *close* the panel while the panel has focus.
         ToggleAiChat,
+        // The preview pane (#31). Workspace-scoped for the same reason as the two above:
+        // the chord closes the pane while the pane has focus.
+        TogglePreview,
         // The View menu needs an action for route search; the palette only ever reached
         // route mode through a command id, never a keybinding, so there was none.
         GoToRoute,
@@ -156,6 +159,9 @@ pub mod context {
     /// instead of dismissing an overlay, and the bar has toggles a palette has no
     /// concept of. Sharing the context would have meant a mode check in every handler.
     pub const FIND: &str = "Find";
+    /// The preview pane's address bar (#31). Its own context so Enter means "load this
+    /// URL" only while the bar has focus, and means whatever it usually means elsewhere.
+    pub const PREVIEW: &str = "Preview";
     /// The test results panel (#25). Its own context so a rerun key means "rerun" only
     /// while the panel has focus, and does not shadow anything in the editor.
     pub const TESTS: &str = "Tests";
@@ -206,6 +212,9 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // chord, and macOS's symbolic-hotkey table (read for the ⌥⌘I decision above)
         // does not either.
         KeyBinding::new("cmd-shift-a", ToggleAiChat, Some(context::WORKSPACE)),
+        // ⌘⇧P. Not ⌘P (quick open) and not ⌘⇧O (route search); ⌘⇧P is free here because this
+        // app puts the command palette on ⌘K.
+        KeyBinding::new("cmd-shift-p", TogglePreview, Some(context::WORKSPACE)),
         // #82 stage 1: ⌘D grows a cursor per occurrence; Escape (the editor's existing
         // Cancel) collapses back to one.
         KeyBinding::new("cmd-d", SelectNextOccurrence, Some(context::EDITOR)),
@@ -319,6 +328,11 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // Inside the bar. `enter` advances rather than confirming-and-closing: the find
         // bar is not a modal, and every editor keeps it open so the next press advances
         // again.
+        // The preview address bar (#31): the same three keys a one-field text input needs,
+        // scoped to the pane so they are inert anywhere else.
+        KeyBinding::new("enter", Confirm, Some(context::PREVIEW)),
+        KeyBinding::new("backspace", Backspace, Some(context::PREVIEW)),
+        KeyBinding::new("escape", Cancel, Some(context::PREVIEW)),
         KeyBinding::new("escape", Cancel, Some(context::FIND)),
         KeyBinding::new("enter", FindNext, Some(context::FIND)),
         KeyBinding::new("shift-enter", FindPrev, Some(context::FIND)),
@@ -485,6 +499,7 @@ pub enum Dispatch {
     ToggleFullscreen,
     ToggleZen,
     ToggleAiChat,
+    TogglePreview,
     ToggleHiddenFiles,
     OpenSettings,
     Find,
@@ -541,6 +556,7 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "view.fullscreen" => Dispatch::ToggleFullscreen,
         "view.zen" => Dispatch::ToggleZen,
         "ai.chat" => Dispatch::ToggleAiChat,
+        "view.preview" => Dispatch::TogglePreview,
         "workspace.toggle_hidden_files" => Dispatch::ToggleHiddenFiles,
         "workspace.open_settings" => Dispatch::OpenSettings,
         "editor.find" => Dispatch::Find,

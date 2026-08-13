@@ -19,6 +19,9 @@ mod lsp_session;
 mod menu;
 mod palette;
 mod perf;
+mod preview;
+mod preview_view;
+mod preview_webview;
 #[cfg(test)]
 mod render_tests;
 mod search_panel;
