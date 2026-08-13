@@ -28,9 +28,10 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentSymbolClientCapabilities, DocumentSymbolResponse, GeneralClientCapabilities,
     GotoDefinitionResponse, Hover, HoverClientCapabilities, InitializeParams, InitializeResult,
-    Location, Position, PositionEncodingKind, PublishDiagnosticsParams, ServerCapabilities,
-    SignatureHelp, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri, WindowClientCapabilities,
+    InlayHintClientCapabilities, Location, Position, PositionEncodingKind,
+    PublishDiagnosticsParams, ServerCapabilities, SignatureHelp, SignatureHelpClientCapabilities,
+    TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    WindowClientCapabilities,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -79,6 +80,12 @@ pub struct Capabilities {
     /// follow-up): Intelephense without a licence key does not, and a prompt whose
     /// Enter can only ever do nothing reads as a broken feature, not a missing one.
     pub rename: bool,
+    /// Whether the server offers inlay hints (#93 follow-up).
+    ///
+    /// Checked before every request rather than discovered by failure: hints fire on scroll
+    /// and on edits settling, so a server without them would otherwise earn a
+    /// `MethodNotFound` round trip per viewport change for the life of the session.
+    pub inlay_hints: bool,
     /// Characters that should trigger completion, straight from the server.
     ///
     /// Read from the server rather than hardcoded as `["$", "-", ">", ":"]` — those are
@@ -124,6 +131,7 @@ impl Capabilities {
             document_symbols: capabilities.document_symbol_provider.is_some(),
             signature_help: capabilities.signature_help_provider.is_some(),
             rename: capabilities.rename_provider.is_some(),
+            inlay_hints: capabilities.inlay_hint_provider.is_some(),
             completion_triggers,
             signature_help_triggers,
             raw: capabilities,
@@ -599,6 +607,36 @@ impl Client {
         )
     }
 
+    /// Issues an inlay-hint request for a byte range without waiting.
+    ///
+    /// Range-scoped by protocol design, and that is the whole cost story: the caller asks
+    /// about the rows on screen, so a 10,000-line file costs the same as a 50-line one.
+    /// Without waiting because this fires on scroll — an answer for a viewport the user has
+    /// already left is worth cancelling, exactly as a superseded completion is.
+    ///
+    /// Answers `Option<Vec<InlayHint>>`; `None` means the server declined, which is not an
+    /// error and must not be reported as one (RISKS #4).
+    pub fn request_inlay_hints(
+        &self,
+        uri: &Uri,
+        range: std::ops::Range<usize>,
+    ) -> Result<RequestId> {
+        let Some(document) = self.document(uri) else {
+            bail!("{} is not open on the {} language server", uri.as_str(), self.name);
+        };
+        let encoding = self.capabilities.encoding;
+        self.send_request(
+            lsp_types::request::InlayHintRequest::METHOD,
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": document.position(range.start, encoding),
+                    "end": document.position(range.end, encoding),
+                },
+            }),
+        )
+    }
+
     fn reference_params(
         &self,
         uri: &Uri,
@@ -816,6 +854,12 @@ fn client_capabilities() -> ClientCapabilities {
             hover: Some(HoverClientCapabilities::default()),
             signature_help: Some(SignatureHelpClientCapabilities::default()),
             document_symbol: Some(DocumentSymbolClientCapabilities::default()),
+            // Hints, with `resolve_support` left `None` on purpose: the default announces
+            // only that we accept hints, which is exactly what we do. Claiming resolve
+            // support would invite servers to send bare labels expecting a second round
+            // trip we never make, and the hints would render empty — the "advertising a
+            // capability we do not implement" trap this function opens by naming.
+            inlay_hint: Some(InlayHintClientCapabilities::default()),
             ..Default::default()
         }),
         window: Some(WindowClientCapabilities::default()),

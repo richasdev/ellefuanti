@@ -25,6 +25,7 @@ use crate::actions::{
     ToggleComment, Undo, UnfoldBlock, context,
 };
 use crate::editor::ghost::{self, GhostSuggestion};
+use crate::editor::inlay::{HintKind, ResolvedHint, hints_on_line};
 use crate::editor::line::Line;
 use crate::editor::state::{Document, Selection};
 use crate::fonts::Fonts;
@@ -152,6 +153,12 @@ pub struct EditorView {
     /// discarded. Belt to the version-stamp's braces: the stamp proves the *document*
     /// is unchanged, the epoch proves the user did not dismiss in the meantime.
     ghost_epoch: u64,
+    /// The server's inlay hints for the visible band, in byte offsets (#93 follow-up).
+    ///
+    /// Sorted ascending, which `render_rows` relies on when slicing them per row. Held here
+    /// rather than fetched during render for `diagnostics`' reason: these are painted every
+    /// frame and the offset conversion happens once, when the response lands.
+    hints: Vec<ResolvedHint>,
 }
 
 /// Half the blink period: the caret is shown for this long, then hidden for this long.
@@ -209,6 +216,7 @@ impl EditorView {
             ghost_debounce: None,
             ghost_request: None,
             ghost_epoch: 0,
+            hints: Vec::new(),
         }
     }
 
@@ -267,6 +275,32 @@ impl EditorView {
         // mouse move rebuilds it against the new list. Keeping it would show a message
         // about bytes that no longer carry it.
         self.hover_diagnostic = None;
+    }
+
+    /// Replaces the inlay hints drawn over this document (#93 follow-up).
+    ///
+    /// Called by the workspace when a response lands, and with an empty vector when the
+    /// server goes away or the buffer is edited — see `WorkspaceView::clear_inlay_hints` for
+    /// why clearing on edit is not optional: a hint's offset describes the text it was
+    /// computed against, and after an edit above it, it points at something else.
+    pub fn set_hints(&mut self, hints: Vec<ResolvedHint>) {
+        self.hints = hints;
+    }
+
+    /// Whether any hints are currently drawn.
+    ///
+    /// Exists so a clear can skip its `notify` when there is nothing to clear — an editor
+    /// with no hints must not be repainted by every edit on this feature's account (#93).
+    pub fn has_hints(&self) -> bool {
+        !self.hints.is_empty()
+    }
+
+    /// The rows currently on screen, for the caller deciding what to ask the server about.
+    ///
+    /// `0..0` until the first frame has rendered — a caller must treat that as "nothing to
+    /// ask about yet" rather than as row zero, which is what `request_inlay_hints` does.
+    pub fn visible_rows(&self) -> Range<usize> {
+        self.visible_rows.clone()
     }
 
     /// Puts the cursor at `target` and scrolls it on screen.
@@ -1899,6 +1933,11 @@ impl EditorView {
                             } else {
                                 None
                             };
+                            // This row's hints, rebased to columns within the line. Cheap
+                            // per row — the list holds a screenful, and `hints_on_line` is a
+                            // filter over it rather than a lookup that grows with the file.
+                            let row_hints: Vec<_> =
+                                hints_on_line(&self.hints, line_start..line_end).collect();
                             let rendered = styled_line(
                                 &line,
                                 line_start,
@@ -1909,6 +1948,7 @@ impl EditorView {
                                 brackets,
                                 &row_matches,
                                 ghost,
+                                &row_hints,
                                 &theme,
                                 &fonts,
                             );
@@ -2048,6 +2088,7 @@ fn styled_line(
     brackets: Option<(usize, usize)>,
     matches: &[(Range<usize>, bool)],
     ghost: Option<(usize, &str)>,
+    hints: &[(usize, &ResolvedHint)],
     theme: &Theme,
     fonts: &Fonts,
 ) -> Line {
@@ -2060,6 +2101,14 @@ fn styled_line(
     let mut runs = to_runs(&text, &highlights, theme, fonts);
     let mut text = text;
 
+    // Hints go in **before** the ghost, and the order is load-bearing in both directions.
+    // Both are columns into the *real* line, so whichever goes second is measured against a
+    // string that has already grown. Hints first is the cheaper direction to correct: there
+    // is at most one ghost and its column needs a single adjustment (below), where fixing up
+    // N hint columns for a preceding ghost would be the running arithmetic that
+    // `splice_hint_runs` walks backwards precisely to avoid.
+    splice_hint_runs(&mut text, &mut runs, hints, theme, fonts);
+
     // The ghost's first line, visually inserted at the cursor (#29). Splicing a *run*
     // is what keeps every colour after the cursor honest for free: `TextRun`s are
     // relative lengths, so text after the insertion point shifts with its own colours
@@ -2068,7 +2117,13 @@ fn styled_line(
     if let Some((at, ghost_text)) = ghost
         && !ghost_text.is_empty()
     {
-        let at = floor_boundary(&text, at);
+        // Rebased past every hint spliced at or before the cursor: those bytes are now in
+        // `text` and the ghost's column was measured without them. A hint sitting exactly at
+        // the cursor counts, so the ghost lands after it rather than splitting it — the
+        // cursor is between the hint and the code, which is where the suggestion belongs.
+        let shift: usize =
+            hints.iter().filter(|(column, _)| *column <= at).map(|(_, hint)| hint.text.len()).sum();
+        let at = floor_boundary(&text, at + shift);
         let dim = TextRun {
             len: ghost_text.len(),
             font: fonts.font(),
@@ -2081,6 +2136,78 @@ fn styled_line(
     }
 
     Line::new(text, runs, fonts.size, fonts.line_height()).with_guides(guides, theme.indent_guide)
+}
+
+/// Splices a line's inlay hints into its text and runs (#93 follow-up).
+///
+/// # Why this is the ghost's primitive applied N times, right to left
+///
+/// A hint has the ghost's problem — draw text that is not in the buffer — with two twists:
+/// several land on one line, and they land at arbitrary columns rather than at the cursor.
+/// The first is what dictates the direction. Each splice shifts every byte after it, so
+/// inserting left to right would invalidate all the offsets still to come and each hint after
+/// the first would land further and further right of where the server put it. Walking
+/// **descending** means every insertion happens after the offsets not yet used, so each hint
+/// splices against a prefix it still describes exactly. No running adjustment, nothing to
+/// keep in step — the arithmetic that could drift simply is not performed.
+///
+/// The run splice is [`splice_ghost_run`] unchanged, which is the point: it is already tested
+/// for the mid-run, between-run and past-the-end cases, and a hint hits all three.
+///
+/// # What this does not disturb
+///
+/// Only the *shaped* line. The buffer is untouched, and `line_runs` has already resolved
+/// every real overlay — selections, diagnostics, brackets, search hits — into runs whose
+/// lengths are relative. Text after an insertion therefore shifts carrying its own colours,
+/// which is why hints cannot recolour code the way an offset-based approach would. Click and
+/// selection arithmetic reads the buffer, not this string, so a hint cannot move the caret's
+/// idea of a column either — the property that keeps hints unselectable for free.
+///
+/// `hints` must be sorted ascending by column ([`inlay::resolve`] guarantees it); this walks
+/// them in reverse.
+fn splice_hint_runs(
+    text: &mut String,
+    runs: &mut Vec<TextRun>,
+    hints: &[(usize, &ResolvedHint)],
+    theme: &Theme,
+    fonts: &Fonts,
+) {
+    for (column, hint) in hints.iter().rev() {
+        // A column past the line's end describes text that has moved since the server
+        // answered — the buffer was edited and the response is stale. Skipped rather than
+        // clamped: a hint drawn at a plausible-looking wrong column misattributes a type,
+        // which is worse than the hint simply not appearing until the next response lands.
+        if *column > text.len() {
+            continue;
+        }
+        let at = floor_boundary(text, *column);
+        let run = TextRun {
+            len: hint.text.len(),
+            font: fonts.font(),
+            color: hint_color(hint.kind, theme),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        splice_ghost_run(text, runs, at, &hint.text, run);
+    }
+}
+
+/// The colour for a hint of a given kind.
+///
+/// Both kinds are muted, and a type hint is muted *further*. The distinction was cheap —
+/// `text_muted` already exists and the theme's comment colour sits beside it — and it earns
+/// its keep because the two kinds answer different questions: a parameter name labels an
+/// argument the reader can see, while a type is information from elsewhere in the program.
+/// PhpStorm and Zed both differentiate them. An unknown kind gets the undifferentiated muted
+/// colour rather than a third one invented here.
+fn hint_color(kind: Option<HintKind>, theme: &Theme) -> gpui::Hsla {
+    match kind {
+        // Dimmer than a parameter name: a type annotation is the more repetitive of the two
+        // and the one most worth receding when the eye is scanning code rather than reading it.
+        Some(HintKind::Type) => theme.comment,
+        Some(HintKind::Parameter) | None => theme.text_muted,
+    }
 }
 
 /// Inserts `ghost` into `text` at byte `at` and a matching run into `runs`, splitting
@@ -2640,6 +2767,101 @@ mod tests {
         let mut runs: Vec<TextRun> = Vec::new();
         splice_ghost_run(&mut text, &mut runs, 0, "return;", plain_run(7));
         assert_eq!(text, "return;");
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![7]);
+    }
+
+    // --- inlay hint splice (#93 follow-up) ---------------------------------------------
+    //
+    // Same division as the ghost above: this is the arithmetic half, and it is the half
+    // that can put a hint at the wrong column — the failure worse than no hint at all,
+    // because a misplaced type annotation reads as a fact about the wrong variable.
+
+    /// A resolved hint at `column` with `text`, the two fields the splice reads.
+    fn hint_at(column: usize, text: &str) -> ResolvedHint {
+        ResolvedHint { offset: column, text: text.to_string(), kind: None }
+    }
+
+    /// The theme and fonts the splice needs; neither affects the arithmetic under test.
+    fn splice_hints(text: &mut String, runs: &mut Vec<TextRun>, hints: &[ResolvedHint]) {
+        let pairs: Vec<(usize, &ResolvedHint)> =
+            hints.iter().map(|hint| (hint.offset, hint)).collect();
+        splice_hint_runs(text, runs, &pairs, &Theme::dark(), &Fonts::default());
+    }
+
+    #[test]
+    fn two_hints_on_one_line_both_land_where_the_server_put_them() {
+        // The property the descending walk exists for. Splicing left to right would put the
+        // second hint six bytes (`: int` plus padding) to the right of its column, and the
+        // error would compound with every further hint on the line.
+        let mut text = String::from("$a = f($b);");
+        let mut runs = vec![plain_run(11)];
+        // Columns 2 (after `$a`) and 9 (after `$b`), against the *original* line — both
+        // counted on the untouched string, which is exactly what a server sends.
+        splice_hints(&mut text, &mut runs, &[hint_at(2, ": int"), hint_at(9, ": string")]);
+        assert_eq!(text, "$a: int = f($b: string);");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len(), "runs cover the text");
+    }
+
+    #[test]
+    fn hints_do_not_disturb_the_lengths_of_the_runs_they_sit_between() {
+        // A hint must not recolour code. `TextRun` lengths are relative, so an untouched
+        // run keeps its colour on its own (shifted) bytes — the reason a run splice was
+        // chosen over range arithmetic in the first place.
+        let mut text = String::from("abcdef");
+        let mut runs = vec![plain_run(3), plain_run(3)];
+        splice_hints(&mut text, &mut runs, &[hint_at(3, "|")]);
+        assert_eq!(text, "abc|def");
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![3, 1, 3]);
+    }
+
+    #[test]
+    fn a_hint_past_the_end_of_the_line_is_skipped_not_clamped() {
+        // The stale-response case: the buffer shrank after the server answered. Clamping
+        // would draw the hint at the line end, attaching a type to whatever now sits there.
+        let mut text = String::from("$a;");
+        let mut runs = vec![plain_run(3)];
+        splice_hints(&mut text, &mut runs, &[hint_at(2, ": int"), hint_at(99, ": gone")]);
+        assert_eq!(text, "$a: int;", "the in-range hint still renders");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+    }
+
+    #[test]
+    fn a_hint_at_end_of_line_appends_rather_than_vanishing() {
+        // Where a return-type hint sits: `function f()|` with nothing after it.
+        let mut text = String::from("function f()");
+        let mut runs = vec![plain_run(12)];
+        splice_hints(&mut text, &mut runs, &[hint_at(12, ": void")]);
+        assert_eq!(text, "function f(): void");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+    }
+
+    #[test]
+    fn a_hint_never_splits_a_multibyte_character() {
+        // Portuguese identifiers are ordinary in this codebase's target projects, and a
+        // column landing mid-character would panic in `shape_line`. `floor_boundary` is what
+        // turns that into a hint drawn one character earlier.
+        let mut text = String::from("$ação = 1;");
+        let mut runs = vec![plain_run(text.len())];
+        // Byte 3 is inside the `ç`.
+        splice_hints(&mut text, &mut runs, &[hint_at(3, "?")]);
+        assert!(text.contains('?'), "the hint still rendered");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len(), "runs cover the text");
+        // The real proof: every run boundary is a character boundary, which is what
+        // `shape_line` requires.
+        let mut at = 0usize;
+        for run in &runs {
+            assert!(text.is_char_boundary(at), "run boundary at {at} splits a character");
+            at += run.len;
+        }
+    }
+
+    #[test]
+    fn no_hints_leaves_the_line_exactly_as_it_was() {
+        // The idle path (#93): the common case must cost nothing and change nothing.
+        let mut text = String::from("$a = 1;");
+        let mut runs = vec![plain_run(7)];
+        splice_hints(&mut text, &mut runs, &[]);
+        assert_eq!(text, "$a = 1;");
         assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![7]);
     }
 

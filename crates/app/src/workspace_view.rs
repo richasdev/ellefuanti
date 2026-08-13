@@ -7,7 +7,7 @@ use std::time::Duration;
 use elle_core::CommandRegistry;
 use elle_laravel::{HttpMethod, Resolved, Route, extract_routes};
 use elle_lsp::lsp_types::{
-    CompletionResponse, DocumentSymbolResponse, GotoDefinitionResponse, Location, Uri,
+    CompletionResponse, DocumentSymbolResponse, GotoDefinitionResponse, InlayHint, Location, Uri,
 };
 use elle_test_runner::CancelFlag as TestCancelFlag;
 use elle_text::Point;
@@ -210,6 +210,18 @@ enum Job {
     CompletionRoutes,
     /// The Laravel-column source (#22), its own slot for `CompletionRoutes`'s reason.
     CompletionColumns,
+    /// An inlay-hint request, and the debounce in front of it (#93 follow-up).
+    ///
+    /// **One slot for both**, exactly as `ProjectSearch` argues: the timer and the request it
+    /// starts are the same work at two moments, and a scroll or an edit has to supersede
+    /// whichever is live. Two slots would let a scroll cancel a pending timer while a request
+    /// from the *previous* timer landed with hints for a viewport the user has left — hints
+    /// at wrong rows, which is the one failure mode worse than no hints.
+    ///
+    /// Not `LspQuery`'s slot: that one is for questions the user asked (definition,
+    /// references), and hints are asked on their behalf. Sharing would mean scrolling
+    /// cancelled a find-references sweep somebody is waiting on.
+    InlayHints,
 }
 
 /// One palette row for a route: `GET       /users/{user}  users.show`.
@@ -260,6 +272,16 @@ const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Fast enough that a warm server's reply feels immediate, slow enough that a cold one does
 /// not cost 30 seconds of busy polling. Only one navigation is ever in flight.
 const NAVIGATION_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Extra rows above and below the viewport included in an inlay-hint request.
+///
+/// The request is range-scoped, so the margin is what stops a one-row scroll from being a
+/// fresh round trip: with it, hints for the rows about to come into view are already in hand
+/// and `request_inlay_hints`' band check returns without asking. Twenty rows is roughly a
+/// third of a screenful — enough to absorb ordinary scrolling, small enough that the server
+/// is never asked about much more than is visible, which is the property that keeps this
+/// cheap on a large file.
+const HINT_ROW_MARGIN: usize = 20;
 
 /// How many jumps Back can retrace.
 ///
@@ -763,6 +785,19 @@ pub struct WorkspaceView {
     /// the popup is open must cancel the *previous completion* and nothing else. Sharing the
     /// slot would have made every keystroke in the popup cancel an unrelated navigation.
     completion_query: Option<elle_lsp::RequestId>,
+    /// The inlay-hint request in flight, so a scroll or an edit can cancel it (#93 follow-up).
+    ///
+    /// Its own slot for [`Self::completion_query`]'s reason, one step further out: hints are
+    /// asked on the user's behalf rather than by an act of theirs, so they must never cancel
+    /// something the user is actually waiting for.
+    hints_query: Option<elle_lsp::RequestId>,
+    /// The band of rows the last hint request covered, per tab path.
+    ///
+    /// The whole of the "do not ask again" rule (#93): scrolling within a band we already
+    /// hold hints for issues nothing, so a slow scroll through a file is a handful of
+    /// requests rather than one per frame. Cleared when the buffer changes, because the
+    /// hints it describes are then stale regardless of which rows are showing.
+    hints_band: Option<(std::path::PathBuf, std::ops::Range<usize>)>,
 }
 
 impl WorkspaceView {
@@ -825,6 +860,8 @@ impl WorkspaceView {
             completion_word_start: None,
             completion_focus_out: None,
             completion_query: None,
+            hints_query: None,
+            hints_band: None,
         }
     }
 
@@ -3345,6 +3382,12 @@ impl WorkspaceView {
     ///   number is a fact about walking a directory tree, not a constant, and importing it
     ///   here would be the mistake `BASELINE.md` opens by warning about.
     fn editor_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // The buffer changed, so every hint offset now describes text that has moved. They go
+        // immediately rather than at the next poll: a hint sitting one character off for
+        // 250ms is a wrong claim on screen, and `clear_inlay_hints` costs nothing when there
+        // is nothing to clear. The re-request comes from the poll tick once typing settles,
+        // which is the debounce (#93).
+        self.clear_inlay_hints(cx);
         // Already open: this event cannot fire, because the popup holds focus and the
         // character reaches `completion_typed` instead. Guarded anyway — the two paths
         // narrowing the same popup would double every character in the query.
@@ -6223,6 +6266,13 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                 // from now rather than two. Riding this timer is what gives per-keystroke
                 // sync a 250ms debounce without a debouncer: the tick was already paid for.
                 this.sync_changed_documents(cx);
+                // Hints ride the same tick, and that is the whole of their scheduling (#93).
+                // It gives all three triggers at once — the file just opened, the edits have
+                // settled, the viewport moved — with no timer of this feature's own and no
+                // new debounce constant. `request_inlay_hints` returns immediately when the
+                // visible band is one it has already asked about, so an idle editor pays a
+                // comparison every 250ms and issues nothing.
+                this.request_inlay_hints(cx);
                 this.apply_lsp_events(events, cx)
             });
 
@@ -6358,6 +6408,175 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                 cx.notify();
             });
         }
+    }
+
+    // --- inlay hints (#93 follow-up) ----------------------------------------------------
+
+    /// Asks the server for hints covering the visible rows, if that is not what we already
+    /// hold.
+    ///
+    /// # Why an idle editor costs nothing
+    ///
+    /// Perf #93's rule is that an idle editor must not repaint or hold a timer because of
+    /// this feature, and three gates enforce it. The band check returns before any work when
+    /// the viewport has not moved past what we asked about, so a still editor issues nothing
+    /// however often this is called. There is no timer of its own — the debounce is the
+    /// existing [`AUTOSAVE_DEBOUNCE`] job slot, re-armed by edits that are already arming it.
+    /// And the request itself only exists while the answer is outstanding: the task lives in
+    /// the [`Job::InlayHints`] slot and dropping it is the cancel.
+    ///
+    /// A margin of rows above and below the viewport is included so scrolling by a line or
+    /// two does not re-ask — the same reasoning as the scroll margin, applied to requests
+    /// rather than to the caret.
+    fn request_inlay_hints(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(path) = tab.path.clone() else { return };
+        let Some(uri) = crate::lsp_session::uri_for(&path) else { return };
+
+        // A server that does not offer hints is asked nothing, ever. Without this the
+        // feature would cost a `MethodNotFound` round trip per scroll for the whole session.
+        if !self.lsp.client().is_some_and(|c| c.capabilities().inlay_hints) {
+            return;
+        }
+
+        let editor = tab.editor.read(cx);
+        let visible = editor.visible_rows();
+        // `0..0` is "no frame has rendered yet", not "row zero" — there is no viewport to ask
+        // about, and asking about an empty range would cache an empty band as authoritative.
+        if visible.is_empty() {
+            return;
+        }
+
+        let last_row = editor.document.buffer.len_lines().saturating_sub(1);
+        let band = visible.start.saturating_sub(HINT_ROW_MARGIN)
+            ..(visible.end + HINT_ROW_MARGIN).min(last_row + 1);
+
+        // Already asked about a band containing this viewport: the hints on screen are the
+        // answer, and re-asking would be a request per scrolled row.
+        if let Some((cached_path, cached)) = &self.hints_band
+            && cached_path == &path
+            && cached.start <= visible.start
+            && visible.end <= cached.end
+        {
+            return;
+        }
+
+        let buffer = &editor.document.buffer;
+        let start = buffer.point_to_offset(elle_text::Point { row: band.start, column: 0 });
+        let end_row = band.end.saturating_sub(1);
+        let end = buffer
+            .point_to_offset(elle_text::Point { row: end_row, column: buffer.line_len(end_row) });
+        let text = buffer.text();
+
+        let Some(client) = self.lsp.client_mut() else { return };
+        // Resync first, for `request_lsp_completions`' reason: `did_change` goes to the
+        // server on save, so without this the hints would describe the file as it was last
+        // written and land at offsets the current buffer does not have.
+        if let Err(err) = client.did_change_full(&uri, &text) {
+            tracing::debug!("could not resync before asking for inlay hints: {err:#}");
+        }
+
+        let id = match client.request_inlay_hints(&uri, start..end) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::debug!("could not ask for inlay hints: {err:#}");
+                return;
+            }
+        };
+
+        // Recorded before the answer arrives on purpose: the band records what was *asked*,
+        // so a scroll landing mid-flight does not fire a duplicate request for rows already
+        // covered by the one outstanding.
+        self.hints_band = Some((path.clone(), band));
+        self.hints_query = Some(id.clone());
+
+        let task = cx.spawn(async move |this, cx| {
+            let found = Self::poll_query::<Vec<InlayHint>>(&this, &id, cx).await;
+
+            this.update(cx, |this, cx| {
+                // Compare before clearing, the same trap `request_lsp_completions`
+                // documents: an unconditional clear lets a slow task wipe the slot belonging
+                // to the request that superseded it.
+                if this.hints_query.as_ref() == Some(&id) {
+                    this.hints_query = None;
+                }
+
+                let hints = match found {
+                    Ok(Some(hints)) => hints,
+                    // Nothing to say is an ordinary answer — a file of plain statements has
+                    // no types to infer. It clears rather than keeps: stale hints look current.
+                    Ok(None) => Vec::new(),
+                    Err(err) => {
+                        tracing::debug!("inlay hint request failed: {err:#}");
+                        return;
+                    }
+                };
+                this.apply_inlay_hints(&path, hints, cx);
+            })
+            .ok();
+        });
+
+        self.jobs.start(Job::InlayHints, task);
+    }
+
+    /// Resolves a hint response against the buffer it belongs to and hands it to the editor.
+    ///
+    /// Positions are converted **here**, once, rather than during render — `FileDiagnostics`'
+    /// rule. The conversion goes through the client's own document so it uses the encoding
+    /// that was negotiated, which is the difference between a hint landing on the right
+    /// column and landing several bytes off on any line containing an accented character.
+    fn apply_inlay_hints(
+        &mut self,
+        path: &std::path::Path,
+        hints: Vec<InlayHint>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(uri) = crate::lsp_session::uri_for(path) else { return };
+        // The tab may have been closed, or another file activated, while the server thought.
+        let Some(tab) = self.tabs.iter().find(|tab| tab.path.as_deref() == Some(path)) else {
+            return;
+        };
+        let editor = tab.editor.clone();
+
+        let Some(client) = self.lsp.client() else { return };
+        let resolved = crate::editor::inlay::resolve(&hints, |position| {
+            // `offset` needs the document the server has; a file it never opened yields
+            // nothing, and zero would put every hint at the top of the file.
+            client.offset(&uri, position).unwrap_or(0)
+        });
+
+        editor.update(cx, |editor, cx| {
+            editor.set_hints(resolved);
+            cx.notify();
+        });
+    }
+
+    /// Drops the hints for a document whose text has changed.
+    ///
+    /// Called on every edit, and the reason is the whole correctness story for this feature:
+    /// a hint's offset describes the buffer it was computed against. Insert a line above one
+    /// and it now points at different code — a type annotation attached to the wrong
+    /// variable, which reads as fact and is not. Clearing is the honest state until the
+    /// server answers again; the alternative, shifting them by the edit, would be inventing
+    /// server output.
+    fn clear_inlay_hints(&mut self, cx: &mut Context<Self>) {
+        self.hints_band = None;
+        if let Some(id) = self.hints_query.take()
+            && let Some(client) = self.lsp.client_mut()
+        {
+            // Both halves ADR-0007 asks for: drop the task below, and tell the server to
+            // stop computing an answer that is already stale.
+            client.cancel(&id);
+        }
+        self.jobs.cancel(Job::InlayHints);
+
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        tab.editor.update(cx, |editor, cx| {
+            if editor.has_hints() {
+                editor.set_hints(Vec::new());
+                cx.notify();
+            }
+        });
     }
 
     /// The diagnostic message under the cursor in the active tab, if any.
