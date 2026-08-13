@@ -78,6 +78,21 @@ CPU_LIMIT_PCT=2
 # So each slice is extracted with `lipo -thin` and measured on its own, and every slice has
 # to fit. A thin (single-arch) binary has no slices to extract and is measured directly,
 # which is what a local `cargo build --release` produces.
+#
+# TWO THINGS THAT ARE TRUE TODAY AND SHOULD NOT BE DISCOVERED THE HARD WAY:
+#
+#   1. The x86_64 slice does NOT fit. Measured on 2026-08-13: arm64 18.84 MB, x86_64
+#      **20.08 MB** — over this limit. Intel binaries are simply larger for the same source
+#      (denser instruction encoding is an arm64 property, not something a flag fixes), so
+#      the fat build cannot pass a 19 MB per-slice gate as it stands. Whoever ships Intel
+#      support has to decide: a higher limit for x86_64 specifically, real size work, or
+#      accepting that Intel is the slice that gets an exception. This is a product call,
+#      not something to nudge quietly.
+#   2. This gate never sees the fat binary anyway. It runs from `ci.yml` against the
+#      ordinary `cargo build --release` (thin, native), while `release.yml` is where `lipo`
+#      merges the slices — and release.yml does not invoke this script. So the per-slice
+#      logic below is correct and currently *unreached in CI*. Wiring it into release.yml
+#      is what would make point 1 fail loudly instead of silently.
 BIN_LIMIT_MB=19
 
 # How long to let the process settle before believing its memory. Measured: footprint is
