@@ -1,101 +1,140 @@
-# PROGRESS — estado atual (2026-08-12)
+# PROGRESS — estado atual (2026-08-13)
 
-**v0.3.0 lançada e a servir como `latest`.** Suite em **1369 testes, 41 suites**, clippy
-limpo, binário **18.69 MB de 19 MB (98.4% do gate)**. Ledger das rondas anteriores no
-histórico git deste ficheiro.
+**v0.3.1 lançada e a servir como `latest`.** Suite em **1406 testes, 41 suites**, clippy
+limpo sob os flags do CI, binário **18.73 MB de 19 MB (98.6% do gate)**. Ledger das rondas
+anteriores no histórico git deste ficheiro.
 
-> Para cortar uma versão — e para o registo de tudo o que já partiu num release —
-> ver **[RELEASE.md](RELEASE.md)**. Não é opcional: cada release desde a v0.1.0 partiu de
-> uma forma nova, e **nenhuma foi apanhada pelo CI**.
+> **Antes de cortar qualquer versão:** correr a skill `/ellefuanti-release`, e ler
+> **[RELEASE.md](RELEASE.md)**. Não é opcional — cada release desde a v0.1.0 partiu de uma
+> forma nova e **nenhuma foi apanhada pelo CI**.
+
+## Trabalho em curso — o que está a acontecer agora
+
+Dois agentes a correr em worktrees isoladas, cada um numa branch própria. Se o contexto
+desta sessão se perder, é aqui que se retoma:
+
+| Branch             | O quê                                                                         | Estado             |
+| ------------------ | ----------------------------------------------------------------------------- | ------------------ |
+| `feat/inlay-hints` | Inlay hints do LSP (tipos e nomes de parâmetros, estilo PhpStorm/Zed)         | Agente a trabalhar |
+| `feat/agent-mode`  | Modo Ask/Agent no chat: propostas de edição com diff e aprovação por ficheiro | Agente a trabalhar |
+
+**Como retomar um agente parado:** as worktrees vivem em `.claude/worktrees/agent-<id>/`.
+Se um agente cair (limite de sessão acontece), o trabalho **não se perde** — verificar
+`git -C .claude/worktrees/agent-<id> log --oneline -2` e `git status`, porque costuma estar
+commitado ou pelo menos escrito. Depois: `git worktree remove <path> --force`, `git checkout
+<branch>`, `git rebase main`, correr os testes, e só então PR.
+
+**O que fica na fila depois destes dois:**
+
+1. **Anexos ricos no chat** — imagens, prints, drag & drop para o painel. Fundação já
+   existe: `ExternalPaths` (drag & drop desde a v0.2.0) e o gpui renderiza imagens
+   nativamente.
+2. **Assinatura real + notarização** — US$ 99/ano. É o que remove o aviso do Gatekeeper
+   de vez; ver a secção sobre isso mais abaixo.
+3. **`.dmg` no CI** — hoje é construído e anexado à mão a cada release.
+4. **Universal binary** — o build é `arm64` puro; um Mac Intel não corre.
+5. **#30 Xdebug**, **#28 plugins**, **#31 browser embutido**, **#18 IME/dead keys**.
 
 ## Onde está o projeto
 
-Três versões saíram no mesmo dia, cada uma com um arco próprio:
+| Versão    | O que trouxe                                                                             |
+| --------- | ---------------------------------------------------------------------------------------- |
+| **0.1.0** | Editor, LSP, Laravel/Livewire, painéis Git/DB/Docker/Composer/testes                     |
+| **0.2.0** | Drag & drop, auto-refresh da árvore, ficheiro ativo na árvore, fim do limite de 64 MB    |
+| **0.2.1** | Auto-update in-app                                                                       |
+| **0.3.0** | Chat IA + ghost text, smart typing PHP, zen/fullscreen, 8 temas, settings com secções    |
+| **0.3.1** | Auto-import, lâmpada de quick fix, chat por assinatura (Codex), painéis redimensionáveis |
 
-| Versão    | O que trouxe                                                                          |
-| --------- | ------------------------------------------------------------------------------------- |
-| **0.1.0** | Editor, LSP, Laravel/Livewire, painéis Git/DB/Docker/Composer/testes                  |
-| **0.2.0** | Drag & drop, auto-refresh da árvore, ficheiro ativo na árvore, fim do limite de 64 MB |
-| **0.2.1** | Auto-update in-app (verifica, instala, reinicia)                                      |
-| **0.3.0** | Chat IA + ghost text, smart typing PHP, zen/fullscreen, 8 temas, settings com secções |
+**Issues #29 (AI autocomplete) e #99 (AI chat) fechadas.**
 
-**Issues #29 (AI autocomplete) e #99 (AI chat) fechadas** — eram as duas maiores por fechar
-fora das milestones originais.
+## O arco da v0.3.1
 
-## O arco da v0.3.0
+| PR   | Entrega                                                                                         |
+| ---- | ----------------------------------------------------------------------------------------------- |
+| #217 | Correção do prompt da chave (⌘V era descartado; chave em texto claro) + botão de IA na titlebar |
+| #218 | Painéis redimensionáveis: sidebar e chat com divisória arrastável                               |
+| #219 | Auto-import de classes + lâmpada de quick fix no gutter                                         |
+| #220 | Chat por assinatura via o `codex` do utilizador (modo leitura)                                  |
+| #223 | ⌘C/⌘V e cursor visível em **seis** campos de texto (eram quatro na estimativa)                  |
 
-Sete entregas, executadas em sequência, cada uma com spec → branch → PR → merge:
+## Arquitetura de IA — o mapa
 
-| PR   | Entrega                                                                                                                                                                                                       |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| #204 | Smart typing PHP: aspas auto-fecham **em código** (a árvore sintática protege `don't` em prosa), `=` vira `=>` dentro de array literal, `>` seguinte engolido                                                 |
-| #205 | Fullscreen (⌃⌘F, delega à plataforma) e Zen (⌘K Z, esconde chrome + centra com padding fracionário; session-only para nunca reabrir preso)                                                                    |
-| #206 | 8 temas: Dracula, Nord, Catppuccin Mocha/Latte, Gruvbox, Tokyo Night, Solarized Dark/Light — como disk themes, com o `bundle-macos.sh` a copiá-los para `Contents/Resources/themes`                           |
-| #207 | Settings com secções (Editor/Aparência) e picker de tema em grelha com 4 swatches por tema; `preview()` vive em `theme.rs` porque construir `Theme` é monopólio desse módulo (teste de arquitetura #48 impõe) |
-| #208 | Camada de provider IA: 3 providers × 2 formatos de wire, transporte via `curl` do sistema (zero crates novas contra o gate), chaves no Keychain, **denylist sem override**                                    |
-| #210 | Painel de chat IA (⌘⇧A): streaming com repaint agregado a 50ms (gate #93), cancel mata o filho, chips de contexto explícitos, code blocks com copiar                                                          |
-| #211 | Ghost text: primeira linha inline + overlay para as seguintes, Tab aceita como um undo step, debounce 400ms, uma única request em voo                                                                         |
+Três ficheiros, com fronteiras claras. Quem mexer aqui deve lê-los por esta ordem:
 
-**#210 e #211 foram feitos por dois agentes em paralelo**, cada um em worktree isolada; o do
-ghost text caiu a meio (máquina adormeceu) e foi retomado do ponto exato. O merge do ghost
-text sobre o chat panel foi limpo.
+- **`crates/app/src/ai.rs`** — a camada de provider, pura e testável sem rede.
+  `resolve_auth`, `chat_body`, `curl_args`, `parse_sse`, `deny_reason`. Providers HTTP
+  (Anthropic key, `ant` CLI, base URL compatível com OpenAI) via `curl` do sistema.
+- **`crates/app/src/ai_codex.rs`** — cliente JSON-RPC do `codex app-server`. **O protocolo
+  foi sondado contra o binário, não lido da documentação — que está desatualizada** (fala em
+  `newConversation`, que o binário rejeita pelo nome). Superfície real: `initialize` →
+  `thread/start` → `turn/start`, texto a chegar em `item/agentMessage/delta`. As linhas
+  capturadas são as fixtures dos testes. Script de sondagem em
+  `scratchpad/probe.py` (fora do repo, recriar se preciso).
+- **`crates/app/src/ai_chat.rs`** — o painel. **Dois transportes atrás de uma UI:** HTTP e
+  Codex alimentam o _mesmo_ canal de `StreamEvent`, o mesmo drain com batching de 50ms
+  (#93) e o mesmo kill handle. A UI abaixo dessa costura não distingue os dois.
 
-## Correções de release desta ronda
+**Regra de egress, não negociável:** nada sai da máquina sem ato explícito. Chaves no
+Keychain (nunca no settings JSON), contexto anexado por chips visíveis, e `deny_reason`
+recusa `.env`, chaves SSH, PEMs, bases sqlite e ficheiros com nome de credencial — **sem
+override**. Registado em `docs/RISKS.md` §9.
 
-Quatro PRs que não são features — são a instalação a funcionar. **Detalhe completo em
-[RELEASE.md](RELEASE.md)**, resumo:
+**Login Claude.ai não é oferecido, e não é por dificuldade técnica.** A política da
+Anthropic reserva o OAuth às aplicações dela e proíbe terceiros de encaminhar credenciais
+Pro/Max. É por isso que o PhpStorm tem sign-in ChatGPT para o Codex e só chave de API para
+o Claude. Não reabrir sem a política mudar.
 
-| PR   | O que estava partido                                                                                                                        |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| #201 | Cancelamento de testes matava só o filho direto; o neto segurava os pipes → "cancel" de 30s                                                 |
-| #202 | `cargo fmt --check` vermelho em 28 ficheiros; perf-gate a falhar o build por load do runner                                                 |
-| #214 | Todos os releases marcados `prerelease` → `releases/latest` servia a **v0.1.0**, e o auto-update nunca disparou                             |
-| #215 | Bundle malformado (`Info.plist` não vinculado, recursos não selados) → macOS dizia "damaged"; e `cp -R` no `.dmg` comia o `_CodeSignature/` |
+## Lições que custaram (as desta ronda)
 
-## Arquitetura — o que mudou
+1. **Uma verificação que não é a do CI não é uma verificação.** Quatro runs vermelhos
+   seguidos, todos no mesmo passo, enquanto o `cargo clippy -p ellefuanti` local dizia
+   "limpo". O comando do CI é `RUSTFLAGS="-D warnings" cargo clippy --all-targets
+--all-features` — o `--all-targets` compila o harness de teste, onde um método chamado
+   só atrás de `cfg(not(test))` fica sem chamadores e é código morto.
+2. **Documentar não é o mesmo que garantir.** O codesign estava no RELEASE.md e mesmo
+   assim foi esquecido no release seguinte. Daí a skill `/ellefuanti-release`: o
+   documento explica, a skill executa.
+3. **Sondar o protocolo antes de o codificar.** A documentação do `codex app-server` está
+   desatualizada; descobrir isso numa conversa real de 5 minutos poupou uma implementação
+   inteira contra métodos que não existem.
+4. **Um agente que contesta o briefing costuma ter razão.** No trabalho dos inputs eu
+   inventei um ficheiro que não existia (`editor/caret.rs`) e ignorei que a palette já
+   tinha cursor com uma decisão escrita _contra_ o piscar, pelo mesmo motivo de perf que
+   eu próprio citei. O agente seguiu a casa em vez de mim, e encontrou dois inputs que eu
+   não tinha visto.
+5. **Agentes paralelos em worktrees funcionam**, desde que cada prompt declare fronteiras
+   de ficheiros explícitas ("não toques em `settings_panel.rs`"). Foi o que evitou
+   conflitos entre três branches a mexer na mesma área.
 
-- **`crates/app/src/ai.rs`** — camada de provider, pura e testável sem rede: `resolve_auth`,
-  `chat_body`, `curl_args`, `parse_sse` (dois wires), `deny_reason`. Tudo o que toca rede
-  está atrás de um `curl` filho, o que também dá cancelamento grátis (matar = cancelar).
-- **`crates/app/src/ai_chat.rs`** e **`crates/app/src/editor/ghost.rs`** — as duas
-  superfícies de IA, ambas consumindo `ai.rs` sem duplicar nada.
-- **15 crates** (eram 10 no README antigo): entraram `git`, `db`, `docker`, `test-runner`,
-  `theme`.
-- **`docs/RISKS.md` ganhou a entrada #9** (egress de dados) que a issue #99 exigia — a regra
-  vivia só no corpo da issue, a uma issue fechada de ser esquecida.
+## Instalação no macOS — o estado honesto
 
-## Lições desta ronda (as que custaram)
+**Não há certificado nesta máquina** (`security find-identity -v -p codesigning` → 0). Sem
+conta paga da Apple, o `spctl` responde `rejected` e o macOS avisa e oferece mandar para o
+lixo. Isso **não** é evitável por código.
 
-1. **Um release verde no CI não é um release verificado.** As três falhas que partiram a
-   instalação — prerelease, assinatura, cópia — são todas invisíveis a `cargo test`. O único
-   teste que as apanha é descarregar do GitHub com quarentena e correr `spctl`.
-2. **Uma flag com justificação temporal precisa de data de validade escrita ao lado.** O
-   `prerelease: true` tinha razão legítima na v0.1.0 e sobreviveu a três releases porque a
-   razão estava no comentário mas a validade não.
-3. **`cp -R` não é `ditto`.** Para bundles assinados, `cp` produz um estado _pior_ que não
-   assinar: promete recursos selados que não existem.
-4. **Um teste que só falha em máquina carregada costuma ser bug de concorrência real.** O
-   flaky do test-runner era um process group em falta, não escalonamento azarado.
-5. **Agentes paralelos em worktrees funcionam** para trabalho grande e independente — desde
-   que cada um tenha fronteiras de ficheiros explícitas no prompt (dizer a um "não toques em
-   `settings_panel.rs`" evitou o único conflito possível).
+O que foi corrigido é a diferença entre dois avisos muito diferentes:
 
-## Para quem continua
+- **Bundle malformado** → _"is damaged and can't be opened"_, sem saída. Era o que
+  acontecia até à v0.3.0 (assinatura ad-hoc só do binário, `Info.plist` não vinculado,
+  recursos não selados) e está resolvido.
+- **Bem formado mas sem certificado** → _"programador não identificado"_, e
+  **clique-direito → Abrir → Abrir** passa. É o que acontece agora, e é o que o README
+  ensina em primeiro lugar.
 
-**Por fechar, em ordem de valor:**
+Nunca dizer ao utilizador que o aviso desapareceu. Dizer qual é a saída.
 
-1. **Assinatura real + notarização** — US$ 99/ano; é o que remove o aviso do Gatekeeper de
-   vez e torna o README uma linha em vez de três. Tudo o resto na instalação já está feito.
-2. **`.dmg` no CI** — hoje é construído e anexado à mão a cada release; é o passo mais fácil
-   de esquecer e o que o README recomenda.
-3. **Universal binary** — o build é `arm64` puro, um Mac Intel não corre.
-4. **#30 Xdebug** (decisão por tomar: DBGp nativo vs DAP+bridge), **#28 plugins**
-   (recomendação subprocess+IPC à espera de 👍), **#31 browser embutido** (colide com o gate
-   de binário — spike de medição primeiro), **#18 IME/dead keys** (precisa de teclado real),
-   **#112** (ack do dono).
+## Onde estão as coisas
 
-**Atenção ao binário:** 18.69 de 19 MB. A próxima dependência não cabe sem uma decisão
-explícita — foi por isso que a camada de IA usa o `curl` do sistema em vez de um cliente HTTP.
+- `RELEASE.md` — checklist executável e o registo de **sete** falhas de release, cada uma
+  com causa raiz e porque não foi apanhada.
+- `docs/RISKS.md` — §9 é o egress de dados da IA.
+- `docs/superpowers/specs/` e `plans/` — specs e planos por entrega.
+- Skill `/ellefuanti-release` (em `~/.claude/skills/`) — corre os checks do CI, verifica a
+  assinatura e testa o download com quarentena.
+
+**Atenção ao binário:** 18.73 de 19 MB. A próxima dependência não cabe sem decisão
+explícita — foi por isso que a camada de IA usa o `curl` e o `security` do sistema em vez
+de um cliente HTTP e de um keyring.
 
 Debug: `ELLE_FOREGROUND=1 ellefuanti . > log 2>&1`; wire-tap do LSP via `ELLE_LSP_COMMAND`
 apontado a um script com `tee`.
