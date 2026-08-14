@@ -251,7 +251,13 @@ pub type ApplyFn = Box<
 struct CodexSession {
     /// The child's stdin, for `turn/start` and `turn/interrupt`. Separate from the kill
     /// handle because writing a request must not need the lock that a kill takes.
-    stdin: ChildStdin,
+    ///
+    /// Shared rather than owned, and that is load-bearing: an **approval** must reach this
+    /// stdin while `codex_turn` is holding the state lock and blocking on the reply. Owning
+    /// it here put it behind that lock and froze the window (see `AiChatPanel::codex_stdin`).
+    /// The mutex is only ever held for the length of one `write_all`, by writers that never
+    /// block on anything else, so it cannot itself become the thing a turn waits on.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     /// The child's stdout, mid-stream. It has to live in the session rather than in the
     /// turn that opened it: a `BufReader` owns a buffer, and the bytes of turn two are
     /// routinely already sitting in it when turn one's `turn/completed` is parsed.
@@ -277,6 +283,27 @@ pub struct AiChatPanel {
     streaming: bool,
     /// The curl child, for cancel. `None` between sends and after a kill.
     kill: Arc<Mutex<Option<Child>>>,
+    /// The Codex child's stdin, reachable **without** the turn lock — for approvals.
+    ///
+    /// # Why this is not just `CodexState::session.stdin`
+    ///
+    /// It was, and that deadlocked agent mode. `codex_turn` holds `codex.lock()` for the
+    /// whole turn, and in agent mode the turn blocks inside `read_codex_turn` waiting for
+    /// the user to approve a file change. Answering took the same lock — from the *main
+    /// thread* — so the click that would unblock the turn waited on the turn instead. The
+    /// window froze with no panic and no log: "travou infinito no modo agent".
+    ///
+    /// Its own `Arc<Mutex<…>>`, for exactly the reason `CodexSession::stdin` already gives
+    /// for the kill handle: a message that must reach a *running* turn cannot be behind the
+    /// lock that turn holds. The approval is that kind of message; so is the interrupt.
+    ///
+    /// `None` until a session exists. Writes are best-effort: a dead child means the turn
+    /// is over, which a decline wanted anyway.
+    codex_stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// The live thread id, published out of the turn lock for the same reason as
+    /// `codex_stdin`: an interrupt needs it, and Cancel is the button a user reaches for
+    /// *while* a turn is running — the one moment the turn lock is guaranteed to be held.
+    codex_thread_id: Arc<Mutex<Option<String>>>,
     /// The drain task. Held so it lives; finished tasks are replaced on the next send
     /// rather than cleared mid-poll, because a task must not drop itself from inside
     /// its own `update`.
@@ -346,6 +373,8 @@ impl AiChatPanel {
             input: String::new(),
             streaming: false,
             kill: Arc::default(),
+            codex_stdin: Arc::default(),
+            codex_thread_id: Arc::default(),
             stream_task: None,
             attach_selection: false,
             attach_file: false,
@@ -611,9 +640,21 @@ impl AiChatPanel {
         let kill: Arc<Mutex<Option<Child>>> = Arc::default();
         self.kill = kill.clone();
         let root = self.project_root.clone();
+        // Cloned, not re-created: these are the handles the *panel* answers approvals and
+        // cancels through, so the turn must publish into the same ones the UI reads.
+        let shared_stdin = self.codex_stdin.clone();
+        let shared_thread_id = self.codex_thread_id.clone();
 
         let producer = cx.background_spawn(async move {
-            codex_turn(&codex, &kill, root.as_deref(), &message, &tx);
+            codex_turn(
+                &codex,
+                &kill,
+                &shared_stdin,
+                &shared_thread_id,
+                root.as_deref(),
+                &message,
+                &tx,
+            );
         });
 
         let timer = cx.background_executor().clone();
@@ -734,14 +775,30 @@ impl AiChatPanel {
     ///
     /// A failed write is deliberately ignored — the child may already be dead, and that
     /// is the outcome this method wanted anyway.
+    /// Like [`Self::answer_codex`], this must not touch `self.codex`: Cancel is pressed
+    /// *while* a turn runs, which is exactly when that lock is held — and in agent mode the
+    /// turn may be parked waiting for an approval that will now never come, so a cancel
+    /// that waits for the lock waits forever.
     fn interrupt_codex(&mut self) {
-        let mut state = self.codex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(mut session) = state.session.take() {
-            let request = crate::ai_codex::interrupt_request(&session.thread_id);
-            let _ = session.stdin.write_all(request.as_bytes());
-            let _ = session.stdin.flush();
+        let thread_id = self
+            .codex_thread_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(thread_id) = thread_id {
+            write_to_codex(&self.codex_stdin, &crate::ai_codex::interrupt_request(&thread_id));
         }
-        state.model = None;
+        // The stdin handle goes with the thread: the next turn re-handshakes and installs a
+        // fresh one. Dropping it here also closes the child's stdin, which is what makes a
+        // CLI ignoring the interrupt still exit.
+        *self.codex_stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        // The session itself is cleared by the turn when it notices, or by the next send.
+        // Not taken here, because taking it needs the lock this method exists to avoid.
+        if let Ok(mut state) = self.codex.try_lock() {
+            state.session = None;
+            state.model = None;
+        }
     }
 
     // --- agent mode: proposals -------------------------------------------------------
@@ -888,18 +945,21 @@ impl AiChatPanel {
 
     /// Writes one approval reply on the Codex child's stdin.
     ///
-    /// The background reader is parked on `read_line` while this runs, which is safe
-    /// because they touch different halves of the child — but both reach it through the
-    /// same lock, so this is where a reply and a cancel serialise.
+    /// **Deliberately does not touch `self.codex`.** That lock is held by `codex_turn` for
+    /// the whole turn, and in agent mode the turn is parked inside `read_line` waiting for
+    /// precisely this reply — so taking it here made the click that unblocks the turn wait
+    /// on the turn. This runs on the main thread, so the whole window froze: no panic, no
+    /// crash log, just "travou infinito no modo agent".
+    ///
+    /// The background reader stays parked on `read_line` while this runs, which is safe:
+    /// the reader owns stdout, this owns stdin, and the only shared thing is a mutex held
+    /// for the length of one write.
+    ///
+    /// A failed write means the child is gone, which is the outcome a decline wanted anyway
+    /// and which a cancel has already handled.
     fn answer_codex(&self, request_id: u64, approve: bool) {
-        let mut state = self.codex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(session) = state.session.as_mut() {
-            let reply = crate::ai_codex::approval_response(request_id, approve);
-            // A failed write means the child is gone, which is the outcome a decline
-            // wanted anyway and which a cancel has already handled.
-            let _ = session.stdin.write_all(reply.as_bytes());
-            let _ = session.stdin.flush();
-        }
+        let reply = crate::ai_codex::approval_response(request_id, approve);
+        write_to_codex(&self.codex_stdin, &reply);
     }
 
     /// Apply, on one file. **The only path in this panel that writes anything.**
@@ -1763,6 +1823,21 @@ fn stream_reply(
     }
 }
 
+/// Writes one JSON-RPC line to the Codex child, taking the stdin lock only for the write.
+///
+/// The one way anything reaches the CLI, so the "held briefly, never nested" rule that
+/// makes `AiChatPanel::codex_stdin` safe lives in a single place rather than at four call
+/// sites. Poison-tolerant like the rest of this panel: another thread's panic must not
+/// turn an approval into a second panic.
+///
+/// Returns whether the bytes went out. `false` means the child is gone — which for an
+/// approval is the same outcome as a decline, and for a turn start is a reportable error.
+fn write_to_codex(stdin: &Arc<Mutex<Option<ChildStdin>>>, message: &str) -> bool {
+    let mut guard = stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(stdin) = guard.as_mut() else { return false };
+    stdin.write_all(message.as_bytes()).and_then(|()| stdin.flush()).is_ok()
+}
+
 // --- the Codex producer -----------------------------------------------------------------
 
 /// Runs one Codex turn, spawning and handshaking the child first if there is not one yet.
@@ -1775,6 +1850,11 @@ fn stream_reply(
 fn codex_turn(
     codex: &Arc<Mutex<CodexState>>,
     kill: &Arc<Mutex<Option<Child>>>,
+    // Published out of the turn lock so an approval or a cancel can reach the child while
+    // this function is holding that lock and blocking on the reply. See
+    // `AiChatPanel::codex_stdin` for the deadlock this prevents.
+    shared_stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    shared_thread_id: &Arc<Mutex<Option<String>>>,
     root: Option<&Path>,
     message: &str,
     tx: &smol::channel::Sender<AgentEvent>,
@@ -1795,8 +1875,7 @@ fn codex_turn(
     // question is one `turn/start` on the same thread rather than a fresh handshake.
     if let Some(session) = state.session.as_mut() {
         let request = crate::ai_codex::turn_start_request(&session.thread_id, message);
-        if session.stdin.write_all(request.as_bytes()).and_then(|()| session.stdin.flush()).is_ok()
-        {
+        if write_to_codex(&session.stdin, &request) {
             read_codex_turn(session, tx);
             return;
         }
@@ -1897,8 +1976,13 @@ fn codex_turn(
     }
     let Some(thread_id) = thread_id else { return };
 
+    // Publish before the first turn/start: from this point the turn can block on a reply,
+    // and the approval that unblocks it must already have a way through.
+    *shared_stdin.lock().unwrap_or_else(|p| p.into_inner()) = Some(stdin);
+    *shared_thread_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread_id.clone());
+
     let request = crate::ai_codex::turn_start_request(&thread_id, message);
-    if stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush()).is_err() {
+    if !write_to_codex(shared_stdin, &request) {
         let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
             "the Codex CLI closed before the turn started".to_string(),
         )));
@@ -1906,7 +1990,9 @@ fn codex_turn(
     }
 
     state.model = model;
-    let session = state.session.insert(CodexSession { stdin, stdout, thread_id });
+    let session = state
+        .session
+        .insert(CodexSession { stdin: Arc::clone(shared_stdin), stdout, thread_id });
     read_codex_turn(session, tx);
 }
 
@@ -3070,5 +3156,121 @@ mod agent_diff_utf8_tests {
 
         let applied = apply_unified_diff(original, diff).expect("a well-formed patch applies");
         assert_eq!(applied, "<?php\n$título = 'configuração';\n$fim = 1;\n");
+    }
+}
+
+#[cfg(test)]
+mod codex_deadlock_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// The owner's report: "travou infinito no modo agent".
+    ///
+    /// # The deadlock, as it was
+    ///
+    /// `codex_turn` takes `codex.lock()` and holds it **for the whole turn**. In agent mode
+    /// the turn then parks inside `read_codex_turn`'s `read_line`, waiting for the user to
+    /// approve a file change. Approving called `answer_codex`, which took that same lock —
+    /// on the **main thread**. So the click that would unblock the turn waited on the turn,
+    /// and the turn waited on the click. No panic, no crash log, a frozen window.
+    ///
+    /// Cancel had it too, which is worse: it is the button you press *because* it is stuck.
+    ///
+    /// This models the shape rather than driving a real CLI (that needs a logged-in Codex
+    /// and a live child). The property under test is structural: **the reply path must not
+    /// need the lock the turn holds.** A join with a timeout is the assertion — a deadlock
+    /// is exactly "this never finishes".
+    #[test]
+    fn answering_does_not_need_the_lock_the_turn_holds() {
+        // The turn's lock, and the channel standing in for the child's stdin/stdout pair.
+        let turn_lock = Arc::new(Mutex::new(()));
+        let stdin: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let (approved_tx, approved_rx) = std::sync::mpsc::channel::<()>();
+
+        let held = Arc::clone(&turn_lock);
+        let turn_stdin = Arc::clone(&stdin);
+        let turn = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            // Parked exactly like `read_line`, waiting for the approval to arrive.
+            let got = approved_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            // Touch the shared handle the way the reader's session does.
+            drop(turn_stdin.lock().unwrap());
+            got
+        });
+
+        // Give the turn time to be holding the lock and parked — the exact window in which
+        // the user clicks Apply.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // The main thread answers. With the old design this line was
+        // `turn_lock.lock()` and never returned. It must reach stdin without it.
+        *stdin.lock().unwrap() = Some("approval".to_string());
+        approved_tx.send(()).expect("the reply must reach a turn that is still parked");
+
+        let answered = turn.join().expect("the turn thread must not have panicked");
+        assert!(answered, "the turn must have received the approval rather than timing out");
+    }
+
+    /// `write_to_codex` holds the stdin lock only for the write, so two writers — an
+    /// approval from the UI and a turn start from the background — cannot wedge each other.
+    ///
+    /// The rule that makes the fix safe: this mutex is never held across a blocking read.
+    #[test]
+    fn the_stdin_lock_is_never_held_across_a_wait() {
+        let stdin: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let stdin = Arc::clone(&stdin);
+                std::thread::spawn(move || {
+                    for n in 0..50 {
+                        stdin.lock().unwrap().push(format!("{i}:{n}"));
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().expect("no writer may block on another");
+        }
+        assert_eq!(stdin.lock().unwrap().len(), 400, "every write must have landed");
+    }
+
+    /// The structural guarantee, checked mechanically rather than by review.
+    ///
+    /// The two tests above model the deadlock's *shape*; this one pins the actual code. The
+    /// bug was one `self.codex.lock()` in a method the UI calls, and it read as completely
+    /// ordinary next to the four other `.lock()` calls in this file — which is exactly why a
+    /// reviewer would not catch its return.
+    ///
+    /// `try_lock` is allowed: it cannot wait, so it cannot deadlock. A blocking `lock()` on
+    /// `self.codex` from a `&self`/`&mut self` method is the pattern that froze the window.
+    #[test]
+    fn no_ui_method_blocks_on_the_turn_lock() {
+        // Only the production half: this module names the offending pattern in its own
+        // detector and in its failure message, and a check that trips on its own text is a
+        // check nobody can keep green.
+        let source = include_str!("ai_chat.rs");
+        let source = source.split("mod codex_deadlock_tests").next().unwrap_or(source);
+
+        let offenders: Vec<_> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let code = line.split("//").next().unwrap_or("");
+                code.contains("self.codex.lock()")
+            })
+            .map(|(i, line)| format!("  {}: {}", i + 1, line.trim()))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "`self.codex` is held by `codex_turn` for the whole turn, and in agent mode that \
+             turn blocks waiting for the user. A UI method that waits for this lock freezes \
+             the window. Reach the child through `codex_stdin` / `codex_thread_id`, or use \
+             `try_lock`:\n{}",
+            offenders.join("\n")
+        );
     }
 }
