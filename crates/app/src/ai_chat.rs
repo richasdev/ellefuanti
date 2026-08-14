@@ -1407,7 +1407,13 @@ pub fn diff_file_from_unified(relative: &str, diff: &str) -> elle_git::DiffFile 
         if line.is_empty() {
             continue;
         }
-        let (marker, text) = line.split_at(1);
+        // By character, not by byte — `apply_unified_diff`'s bug, and this copy is the one
+        // that fires *first*: this runs while rendering the proposed diff, so a model-emitted
+        // line beginning with `ç` or `日` took the window down before the user could even
+        // read the proposal, let alone click Apply.
+        let mut chars = line.chars();
+        let marker_len = chars.next().map(|c| c.len_utf8()).unwrap_or(0);
+        let (marker, text) = line.split_at(marker_len);
         let (kind, old_line, new_line) = match marker {
             "+" => (elle_git::LineKind::Added, None, Some(new_no)),
             "-" => (elle_git::LineKind::Removed, Some(old_no), None),
@@ -1487,7 +1493,22 @@ pub fn apply_unified_diff(original: &str, diff: &str) -> Result<String, String> 
             if body.is_empty() {
                 continue;
             }
-            let (marker, text) = body.split_at(1);
+            // Split at the first *character*, not the first byte. `split_at(1)` panicked
+            // whenever a body line began with a multi-byte character — "end byte index 1
+            // is not a char boundary; it is inside 'ç'" — and took the window down mid-apply.
+            //
+            // A well-formed diff never produces such a line: every body line starts with an
+            // ASCII ` `, `+` or `-`. But this diff arrives from a language model, and a
+            // dropped marker (which models do emit, especially on whitespace-only lines) is
+            // ordinary malformed input. Everything else malformed here is an `Err` — hunks
+            // out of order, a patch longer than the file, context that does not match — so a
+            // panic was the one failure mode that escaped the contract.
+            //
+            // The unmatched marker falls through to the `_` arm below, which already ignores
+            // annotation lines, so a mangled line is skipped rather than applied blindly.
+            let mut chars = body.chars();
+            let marker = chars.next().map(|c| c.len_utf8()).unwrap_or(0);
+            let (marker, text) = body.split_at(marker);
             match marker {
                 "+" => out.push(text.to_string()),
                 " " | "-" => {
@@ -2958,5 +2979,96 @@ mod tests {
 
         // Available: the panel is ready, and the base URL is none of Codex's business.
         assert_eq!(setup_guidance(true, ai::Provider::Codex, "", Some(&Ok(()))), None);
+    }
+}
+
+#[cfg(test)]
+mod agent_diff_utf8_tests {
+    use super::apply_unified_diff;
+
+    /// The owner's report: "crashou no modo agent".
+    ///
+    /// `apply_unified_diff` reads each hunk-body line as `body.split_at(1)` to separate the
+    /// ` `/`+`/`-` marker from the text. `split_at` takes a **byte** index, so a body line
+    /// whose first character is multi-byte splits *inside* that character and panics.
+    ///
+    /// A well-formed diff never produces one — every body line starts with an ASCII marker.
+    /// But the diff here comes from a language model over a wire, and agent mode applies it
+    /// to the user's files: a model that drops the leading space on a context line (which
+    /// they do, especially on lines that are only whitespace) hands this function a line
+    /// starting with `ç`, `日` or an emoji. The panic then takes the whole window down mid-apply.
+    ///
+    /// Malformed input must be an error, not a crash: the surrounding code already returns
+    /// `Err` for out-of-order hunks, over-long patches and mismatched context.
+    #[test]
+    fn a_body_line_starting_with_a_multibyte_character_is_an_error_not_a_panic() {
+        let original = "<?php\n$a = 1;\n$b = 2;\n";
+
+        // Marker dropped from a context line whose text begins with an accent — the shape
+        // a model actually emits.
+        let hostile = [
+            "@@ -1,3 +1,3 @@\nção alterada\n",
+            "@@ -1,3 +1,3 @@\n日本語の行\n",
+            "@@ -1,3 +1,3 @@\n👨‍👩‍👧‍👦\n",
+            // Also the combining-mark case, where the boundary is not where it looks.
+            "@@ -1,3 +1,3 @@\ne\u{0301}poca\n",
+        ];
+
+        for diff in hostile {
+            let outcome = std::panic::catch_unwind(|| apply_unified_diff(original, diff));
+            assert!(
+                outcome.is_ok(),
+                "applying {diff:?} panicked; a malformed patch must be reported, not fatal"
+            );
+        }
+    }
+
+    /// The *rendering* half of the same bug, which fires before Apply is even possible.
+    ///
+    /// `diff_file_from_unified` turns a proposed patch into the structure the git-diff
+    /// renderer draws. It read the marker with the same `split_at(1)`, so a model-emitted
+    /// body line starting with a multi-byte character crashed the panel while drawing the
+    /// proposal — the user never got to accept or decline it.
+    #[test]
+    fn rendering_a_proposal_with_multibyte_lines_does_not_panic() {
+        let hostile = [
+            "@@ -1,3 +1,3 @@\nção alterada\n",
+            "@@ -1,3 +1,3 @@\n日本語の行\n",
+            "@@ -1,3 +1,3 @@\n👨‍👩‍👧‍👦\n",
+            "@@ -1,3 +1,3 @@\ne\u{0301}poca\n",
+        ];
+
+        for diff in hostile {
+            let outcome = std::panic::catch_unwind(|| {
+                super::diff_file_from_unified("app/Models/Configuração.php", diff)
+            });
+            assert!(outcome.is_ok(), "rendering {diff:?} panicked; a malformed patch must draw, not crash");
+        }
+    }
+
+    /// A well-formed proposal over accented text still renders with its markers read
+    /// correctly — the fix must not turn every line into an annotation.
+    #[test]
+    fn a_well_formed_proposal_over_accented_text_still_renders() {
+        let diff = "@@ -2,1 +2,1 @@\n-$título = 'ação';\n+$título = 'configuração';\n";
+        let file = super::diff_file_from_unified("app/M.php", diff);
+        let kinds: Vec<_> =
+            file.hunks.iter().flat_map(|h| h.lines.iter().map(|l| l.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![elle_git::LineKind::Removed, elle_git::LineKind::Added],
+            "the markers must still be read off accented lines"
+        );
+    }
+
+    /// The happy path stays intact — a robustness fix that refused valid patches would
+    /// disable agent mode instead of fixing it.
+    #[test]
+    fn a_well_formed_patch_over_accented_text_still_applies() {
+        let original = "<?php\n$título = 'ação';\n$fim = 1;\n";
+        let diff = "@@ -2,1 +2,1 @@\n-$título = 'ação';\n+$título = 'configuração';\n";
+
+        let applied = apply_unified_diff(original, diff).expect("a well-formed patch applies");
+        assert_eq!(applied, "<?php\n$título = 'configuração';\n$fim = 1;\n");
     }
 }
