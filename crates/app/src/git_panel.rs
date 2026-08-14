@@ -765,7 +765,7 @@ impl DiffRenderer {
 /// Returns one entry per line, so the renderer indexes rather than searches. Plain text and
 /// any language without a grammar produce empty vectors, which render as uncoloured lines —
 /// correct, and the reason there is no error path here.
-fn highlight_lines(
+pub(crate) fn highlight_lines(
     language: Language,
     text: &str,
 ) -> Vec<Vec<(std::ops::Range<usize>, elle_syntax::HighlightStyle)>> {

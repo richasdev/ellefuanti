@@ -1420,12 +1420,12 @@ impl AiChatPanel {
         // paste matters most: nobody retypes a stack trace to ask about it.
         if keystroke.modifiers.platform && keystroke.key == "v" {
             if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                // Collapsed to one line like every other field here, because this box *is*
-                // one line: `enter` sends (see `confirm`), so there is no way to type a
-                // newline into it and nothing that would render one. When it grows into a
-                // real multi-line composer this is the call site that should keep the
-                // breaks — a pasted stack trace is the reason it will.
-                let pasted = crate::actions::pasted_into_single_line(&pasted);
+                // Breaks kept: this became a multi-line composer (⇧Enter, and the field
+                // renders every line), which is exactly the moment the old single-line
+                // collapse said to stop collapsing — a pasted stack trace arrives with its
+                // lines, and flattening it was losing the structure the question is about.
+                // `\r` still goes: CRLF clipboard content renders as boxes otherwise.
+                let pasted = pasted.replace('\r', "");
                 if !pasted.is_empty() {
                     self.input.push_str(&pasted);
                     cx.notify();
@@ -1445,6 +1445,14 @@ impl AiChatPanel {
             || keystroke.modifiers.control
             || keystroke.modifiers.function
         {
+            return;
+        }
+        // ⇧Enter breaks the line; plain Enter sends (the Confirm binding). Zed's composer
+        // convention, and the half that has to live here: the keymap dispatches bare
+        // "enter" to Confirm, so the shifted chord is the only enter this handler sees.
+        if keystroke.key.as_str() == "enter" && keystroke.modifiers.shift {
+            self.input.push('\n');
+            cx.notify();
             return;
         }
         if matches!(
@@ -1669,7 +1677,8 @@ impl Attachment {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Segment {
     Text(String),
-    Code(String),
+    /// A fenced block, with whatever language tag the fence carried (```php -> "php").
+    Code { language: Option<String>, code: String },
 }
 
 /// Splits reply text on ``` fences. No markdown beyond that — #99's scope is "plain text
@@ -1681,17 +1690,22 @@ pub fn split_fences(text: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut in_code = false;
+    // The opening fence's tag (```php -> "php"), kept for the highlighter. Owned by the
+    // loop because the tag is read at the opening fence and used at the closing one.
+    let mut language: Option<String> = None;
     for line in text.split('\n') {
-        // The whole line is the fence; an opening fence's language tag is dropped
-        // (highlighting is out of scope, the monospace box is the rendering).
         if line.trim_start().starts_with("```") {
             if !current.is_empty() {
                 let segment = std::mem::take(&mut current);
                 segments.push(if in_code {
-                    Segment::Code(segment)
+                    Segment::Code { language: language.take(), code: segment }
                 } else {
                     Segment::Text(segment)
                 });
+            }
+            if !in_code {
+                let tag = line.trim_start().trim_start_matches('`').trim();
+                language = (!tag.is_empty()).then(|| tag.to_lowercase());
             }
             in_code = !in_code;
             continue;
@@ -1702,7 +1716,11 @@ pub fn split_fences(text: &str) -> Vec<Segment> {
         current.push_str(line);
     }
     if !current.is_empty() {
-        segments.push(if in_code { Segment::Code(current) } else { Segment::Text(current) });
+        segments.push(if in_code {
+            Segment::Code { language: language.take(), code: current }
+        } else {
+            Segment::Text(current)
+        });
     }
     segments
 }
@@ -2687,7 +2705,9 @@ impl AiChatPanel {
             for (seg_index, segment) in split_fences(&turn.text).into_iter().enumerate() {
                 body.push(match segment {
                     Segment::Text(text) => render_prose(&text, theme),
-                    Segment::Code(code) => render_code_block(index, seg_index, &code, theme, fonts),
+                    Segment::Code { language, code } => {
+                        render_code_block(index, seg_index, language.as_deref(), &code, theme, fonts)
+                    }
                 });
             }
         }
@@ -3205,10 +3225,17 @@ impl AiChatPanel {
                 div()
                     .flex_1()
                     .min_w(px(80.0))
-                    .h(px(22.0))
+                    // Grows with its lines (⇧Enter), bounded so a pasted log cannot push
+                    // the transcript off screen — past that it scrolls.
+                    .id("ai-chat-input")
+                    .min_h(px(22.0))
+                    .max_h(px(120.0))
+                    .overflow_y_scroll()
                     .flex()
-                    .items_center()
+                    .flex_col()
+                    .justify_center()
                     .px_2()
+                    .py_0p5()
                     .rounded_sm()
                     .bg(theme.background)
                     .border_1()
@@ -3217,15 +3244,35 @@ impl AiChatPanel {
                     .when(focused && empty, |el| {
                         el.child(div().w(px(2.0)).h(px(14.0)).mr_1().flex_none().bg(theme.cursor))
                     })
-                    .child(SharedString::from(if empty {
-                        "Ask — Enter sends".to_string()
-                    } else {
-                        self.input.clone()
-                    }))
-                    .when(focused && !empty, |el| {
-                        el.child(
-                            div().w(px(2.0)).h(px(14.0)).ml(px(1.0)).flex_none().bg(theme.cursor),
-                        )
+                    .when(empty, |el| {
+                        el.child(SharedString::from("Ask — Enter sends, ⇧Enter breaks".to_string()))
+                    })
+                    .when(!empty, |el| {
+                        let lines: Vec<String> =
+                            self.input.split('\n').map(str::to_string).collect();
+                        let last = lines.len().saturating_sub(1);
+                        el.children(lines.into_iter().enumerate().map(|(index, line)| {
+                            let is_last = index == last;
+                            div()
+                                .flex()
+                                .items_center()
+                                .child(SharedString::from(if line.is_empty() && !is_last {
+                                    " ".to_string()
+                                } else {
+                                    line
+                                }))
+                                // The caret rides the last line, where typing lands.
+                                .when(focused && is_last, |el| {
+                                    el.child(
+                                        div()
+                                            .w(px(2.0))
+                                            .h(px(14.0))
+                                            .ml(px(1.0))
+                                            .flex_none()
+                                            .bg(theme.cursor),
+                                    )
+                                })
+                        }))
                     }),
             )
             .child(action_button)
@@ -3267,24 +3314,168 @@ fn render_prose(text: &str, theme: &Theme) -> gpui::AnyElement {
         .flex_col()
         .text_color(theme.text)
         .children(text.split('\n').map(|line| {
-            div().child(SharedString::from(if line.is_empty() {
-                " ".to_string()
-            } else {
-                line.to_string()
-            }))
+            if line.is_empty() {
+                return div().child(SharedString::from(" ".to_string())).into_any_element();
+            }
+            let (clean, spans) = parse_inline_markdown(line);
+            let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = spans
+                .into_iter()
+                .map(|(range, kind)| {
+                    let style = match kind {
+                        InlineStyle::Bold => gpui::HighlightStyle {
+                            font_weight: Some(gpui::FontWeight::BOLD),
+                            ..Default::default()
+                        },
+                        // Inline code reads as code: the accent colour stands in for the
+                        // font switch, because StyledText carries one font family and a
+                        // per-span face change would need a run-splitting layout of its
+                        // own. Colour is the affordable 90% of the signal.
+                        InlineStyle::Code => gpui::HighlightStyle {
+                            color: Some(theme.accent),
+                            ..Default::default()
+                        },
+                    };
+                    (range, style)
+                })
+                .collect();
+            div()
+                .child(
+                    gpui::StyledText::new(SharedString::from(clean)).with_highlights(highlights),
+                )
+                .into_any_element()
         }))
         .into_any_element()
 }
 
-/// A code segment: monospace box on the editor's background, with a Copy button.
+/// What an inline span should look like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineStyle {
+    Bold,
+    Code,
+}
+
+/// Strips `**bold**`, `` `code` `` and leading-`#` headers off one line, returning the
+/// clean text and the byte ranges (into the clean text) each style applies to.
+///
+/// # Scope, stated
+///
+/// The subset models actually emit in chat, chosen against Zed's rendering: bold, inline
+/// code, headers-as-bold. Italics are skipped because `*` is ambiguous with multiplication
+/// in the code-adjacent prose these replies are made of, and links are skipped because a
+/// terminal-style panel has nowhere to put them. An unclosed marker renders literally —
+/// mid-stream text must not flicker between styled and plain as delimiters arrive.
+fn parse_inline_markdown(line: &str) -> (String, Vec<(std::ops::Range<usize>, InlineStyle)>) {
+    // A header line is the whole line bold, markers stripped.
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let body = rest.trim_start_matches('#').trim_start();
+        if !body.is_empty() {
+            let (clean, mut spans) = parse_inline_markdown(body);
+            spans.push((0..clean.len(), InlineStyle::Bold));
+            return (clean, spans);
+        }
+    }
+
+    let mut clean = String::with_capacity(line.len());
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        // Backticks first: markdown gives code spans precedence, and a `**` inside one is
+        // literal asterisks.
+        if let Some(after_open) = rest.strip_prefix('`') {
+            if let Some(end) = after_open.find('`') {
+                let start = clean.len();
+                clean.push_str(&after_open[..end]);
+                spans.push((start..clean.len(), InlineStyle::Code));
+                rest = &after_open[end + 1..];
+                continue;
+            }
+        }
+        if let Some(after_open) = rest.strip_prefix("**") {
+            if let Some(end) = after_open.find("**") {
+                let start = clean.len();
+                clean.push_str(&after_open[..end]);
+                spans.push((start..clean.len(), InlineStyle::Bold));
+                rest = &after_open[end + 2..];
+                continue;
+            }
+        }
+        // Advance one character; anything not opening a span is content.
+        let ch = rest.chars().next().expect("non-empty");
+        clean.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    (clean, spans)
+}
+
+/// A code segment: monospace box on the editor's background, highlighted, with Copy.
+///
+/// # The Zed reference
+///
+/// The owner asked for "the same chat as Zed", and the single biggest visible difference
+/// was here: Zed's replies carry syntax-highlighted code, this panel drew plain grey text.
+/// The machinery already existed on both sides — `split_fences` had the language tag and
+/// threw it away ("highlighting is out of scope"), and the git panel's `highlight_lines`
+/// already turns any `Language` into per-line spans for its diffs. This joins them.
+///
+/// The tag maps through [`fence_language`]; an unknown or absent tag renders as plain
+/// text, which is what the block was before — degradation, not regression.
 fn render_code_block(
     turn_index: usize,
     seg_index: usize,
+    language: Option<&str>,
     code: &str,
     theme: &Theme,
     fonts: &Fonts,
 ) -> gpui::AnyElement {
     let code_owned = code.to_string();
+    let highlighted = fence_language(language)
+        .map(|language| crate::git_panel::highlight_lines(language, code))
+        .unwrap_or_default();
+
+    let lines: Vec<gpui::AnyElement> = code_owned
+        .split('\n')
+        .enumerate()
+        .map(|(line_index, line)| {
+            let text = if line.is_empty() { " " } else { line };
+            let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = highlighted
+                .get(line_index)
+                .map(|spans| {
+                    spans
+                        .iter()
+                        .filter_map(|(range, style)| {
+                            // The git panel's defensive clip, for the git panel's reason: a
+                            // span off a char boundary panics the render pass, and the
+                            // window is worth more than one span.
+                            let start = range.start.min(text.len());
+                            let end = range.end.min(text.len());
+                            if start >= end
+                                || !text.is_char_boundary(start)
+                                || !text.is_char_boundary(end)
+                            {
+                                return None;
+                            }
+                            Some((
+                                start..end,
+                                gpui::HighlightStyle {
+                                    color: Some(theme.syntax(*style)),
+                                    ..Default::default()
+                                },
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            div()
+                .whitespace_nowrap()
+                .child(
+                    gpui::StyledText::new(SharedString::from(text.to_string()))
+                        .with_highlights(highlights),
+                )
+                .into_any_element()
+        })
+        .collect();
+
     div()
         .flex()
         .flex_col()
@@ -3293,22 +3484,37 @@ fn render_code_block(
         .border_1()
         .border_color(theme.border)
         .child(
-            div().flex().justify_end().px_1().child(
-                div()
-                    .id(("ai-copy", turn_index * 1000 + seg_index))
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(px(10.0))
-                    .text_color(theme.text_muted)
-                    .hover(|el| el.text_color(theme.text))
-                    .on_mouse_down(MouseButton::Left, {
-                        let code = code_owned.clone();
-                        move |_ev, _window, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
-                        }
-                    })
-                    .child("Copy"),
-            ),
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .px_1()
+                // The language tag where Zed puts it: naming the block's language is also
+                // what tells the user the highlighting is intentional, not accidental.
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(language.unwrap_or("").to_string())),
+                )
+                .child(
+                    div()
+                        .id(("ai-copy", turn_index * 1000 + seg_index))
+                        .px_1()
+                        .cursor_pointer()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .hover(|el| el.text_color(theme.text))
+                        .on_mouse_down(MouseButton::Left, {
+                            let code = code_owned.clone();
+                            move |_ev, _window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    code.clone(),
+                                ));
+                            }
+                        })
+                        .child("Copy"),
+                ),
         )
         .child(
             div()
@@ -3320,15 +3526,32 @@ fn render_code_block(
                 .text_size(px(11.0))
                 .flex()
                 .flex_col()
-                .children(code_owned.split('\n').map(|line| {
-                    div().whitespace_nowrap().child(SharedString::from(if line.is_empty() {
-                        " ".to_string()
-                    } else {
-                        line.to_string()
-                    }))
-                })),
+                .children(lines),
         )
         .into_any_element()
+}
+
+/// Maps a fence tag to a grammar this build ships.
+///
+/// The aliases are the ones models actually emit; anything unrecognised is `None` and the
+/// block renders unhighlighted rather than wrongly.
+fn fence_language(tag: Option<&str>) -> Option<elle_syntax::Language> {
+    use elle_syntax::Language;
+    Some(match tag? {
+        "php" => Language::Php,
+        "blade" => Language::Blade,
+        "js" | "javascript" | "jsx" => Language::JavaScript,
+        "ts" | "typescript" | "tsx" => Language::TypeScript,
+        "css" | "scss" => Language::Css,
+        "html" => Language::Html,
+        "json" => Language::Json,
+        "yaml" | "yml" => Language::Yaml,
+        "toml" => Language::Toml,
+        "sh" | "bash" | "shell" | "zsh" | "env" | "dotenv" => Language::Shell,
+        "rust" | "rs" => Language::Rust,
+        "md" | "markdown" => Language::Markdown,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -3343,7 +3566,7 @@ mod tests {
             split_fences(reply),
             vec![
                 Segment::Text("Use this:".to_string()),
-                Segment::Code("echo 1;".to_string()),
+                Segment::Code { language: Some("php".to_string()), code: "echo 1;".to_string() },
                 Segment::Text("Done.".to_string()),
             ]
         );
@@ -3356,7 +3579,10 @@ mod tests {
         let partial = "Look:\n```\n$a = 1;";
         assert_eq!(
             split_fences(partial),
-            vec![Segment::Text("Look:".to_string()), Segment::Code("$a = 1;".to_string())]
+            vec![
+                Segment::Text("Look:".to_string()),
+                Segment::Code { language: None, code: "$a = 1;".to_string() }
+            ]
         );
     }
 
@@ -3892,5 +4118,65 @@ mod input_and_clear_tests {
             !family.ends_with('\u{200d}'),
             "a deletion must not leave a dangling joiner: {family:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod inline_markdown_tests {
+    use super::{InlineStyle, parse_inline_markdown};
+
+    /// Markers are stripped and their ranges land on the *clean* text — an off-by-marker
+    /// range would style the wrong characters, which reads worse than no styling.
+    #[test]
+    fn bold_and_code_spans_strip_their_markers() {
+        let (clean, spans) = parse_inline_markdown("use **artisan** and `php -v` here");
+        assert_eq!(clean, "use artisan and php -v here");
+        assert_eq!(
+            spans,
+            vec![(4..11, InlineStyle::Bold), (16..22, InlineStyle::Code)]
+        );
+        assert_eq!(&clean[4..11], "artisan");
+        assert_eq!(&clean[16..22], "php -v");
+    }
+
+    /// `**` inside backticks is literal — markdown gives code spans precedence, and a
+    /// glob like `**/*.php` must not turn the rest of the line bold.
+    #[test]
+    fn asterisks_inside_code_spans_stay_literal() {
+        let (clean, spans) = parse_inline_markdown("match `**/*.php` files");
+        assert_eq!(clean, "match **/*.php files");
+        assert_eq!(spans, vec![(6..14, InlineStyle::Code)]);
+    }
+
+    /// An unclosed marker renders literally. Mid-stream, the closing `**` may simply not
+    /// have arrived yet; styling half a line and re-styling it a chunk later is flicker.
+    #[test]
+    fn unclosed_markers_render_literally() {
+        let (clean, spans) = parse_inline_markdown("this **is not closed");
+        assert_eq!(clean, "this **is not closed");
+        assert!(spans.is_empty());
+
+        let (clean, spans) = parse_inline_markdown("nor `is this");
+        assert_eq!(clean, "nor `is this");
+        assert!(spans.is_empty());
+    }
+
+    /// A header line is the whole line bold, with the `#`s gone — and inline spans inside
+    /// it still resolve, because models emit `## The `fix``.
+    #[test]
+    fn headers_render_as_bold_lines() {
+        let (clean, spans) = parse_inline_markdown("## Como corrigir");
+        assert_eq!(clean, "Como corrigir");
+        assert!(spans.contains(&(0..13, InlineStyle::Bold)));
+    }
+
+    /// Multi-byte text around the markers: the ranges are byte ranges into the clean
+    /// string and must land on char boundaries — the session's recurring bug class.
+    #[test]
+    fn multibyte_text_keeps_ranges_on_boundaries() {
+        let (clean, spans) = parse_inline_markdown("a função **`ação`** está");
+        for (range, _) in &spans {
+            assert!(clean.is_char_boundary(range.start) && clean.is_char_boundary(range.end));
+        }
     }
 }
