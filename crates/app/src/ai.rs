@@ -331,6 +331,13 @@ pub enum AgentEvent {
     Proposed { item_id: String, changes: Vec<ProposedFileChange> },
     /// The agent is blocked waiting for a decision on `item_id`, at JSON-RPC `request_id`.
     ApprovalRequested { request_id: u64, item_id: String },
+    /// The agent is blocked on a decision that is **not** about writing files: a command it
+    /// wants to run, or permissions (an MCP server) it wants granted.
+    ///
+    /// Separate from `ApprovalRequested` because there is nothing to diff — the panel shows
+    /// the sentence and two or three buttons, not a patch. `summary` is rendered verbatim;
+    /// `allow_for_session` says whether the CLI offered a session-wide accept for this kind.
+    ActionApprovalRequested { request_id: u64, summary: String, allow_for_session: bool },
 }
 
 impl From<StreamEvent> for AgentEvent {

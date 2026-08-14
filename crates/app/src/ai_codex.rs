@@ -167,6 +167,85 @@ pub fn approval_response(request_id: u64, approve: bool) -> String {
     }))
 }
 
+/// What a non-file approval is asking permission for.
+///
+/// Three cases rather than a bool because they read differently to a user and because
+/// `Unknown` must exist: a method this build does not recognise still has to be answerable,
+/// or the turn hangs (see [`CodexEvent::ActionApprovalRequested`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// The turn wants to run a shell command.
+    Command,
+    /// The turn wants a permission profile granted — this is the MCP-server case.
+    Permissions,
+    /// An approval method this build does not know about.
+    Unknown,
+}
+
+/// How an approval was answered.
+///
+/// `AcceptForSession` is the CLI's own `acceptForSession`, which it offers for commands:
+/// the same command shape stops asking until the session ends. Deliberately *not* a
+/// persisted setting — a session-scoped grant dies with the panel, so a blanket allow can
+/// never outlive the conversation the user granted it in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Accept,
+    AcceptForSession,
+    Decline,
+}
+
+/// The answer to an [`CodexEvent::ActionApprovalRequested`], at the request's own id.
+///
+/// The wire words come from the CLI's schema (`CommandExecutionApprovalDecision`), not from
+/// guessing: `accept`, `acceptForSession`, `decline`.
+pub fn action_approval_response(request_id: u64, decision: Decision) -> String {
+    let word = match decision {
+        Decision::Accept => "accept",
+        Decision::AcceptForSession => "acceptForSession",
+        Decision::Decline => "decline",
+    };
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"decision": word},
+    }))
+}
+
+/// A one-line description of a command approval, for the panel to show verbatim.
+///
+/// Falls back through the fields the schema marks optional, and never returns empty: a
+/// button with no question above it is worse than a vague question.
+fn command_summary(params: Option<&Value>) -> String {
+    let Some(params) = params else { return "run a command".to_string() };
+    if let Some(command) = params.get("command").and_then(Value::as_str)
+        && !command.trim().is_empty()
+    {
+        return format!("run: {command}");
+    }
+    // Some shapes carry argv instead of a rendered string.
+    if let Some(argv) = params.get("argv").and_then(Value::as_array) {
+        let joined: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
+        if !joined.is_empty() {
+            return format!("run: {}", joined.join(" "));
+        }
+    }
+    "run a command".to_string()
+}
+
+/// A one-line description of a permissions approval (the MCP case).
+fn permissions_summary(params: Option<&Value>) -> String {
+    let Some(params) = params else { return "grant permissions".to_string() };
+    let reason = params.get("reason").and_then(Value::as_str).unwrap_or("").trim();
+    if !reason.is_empty() {
+        return format!("grant permissions: {reason}");
+    }
+    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+        return format!("grant permissions in {cwd}");
+    }
+    "grant permissions".to_string()
+}
+
 /// One file a turn wants to change, as the CLI describes it.
 ///
 /// The `diff` is the CLI's own unified diff for this file — already in the `@@` format the
@@ -204,6 +283,29 @@ pub enum CodexEvent {
     /// The CLI is blocked on the user: may it write the files of `item_id`? Nothing is on
     /// disk yet, and nothing will be until [`approval_response`] says `accept`.
     ApprovalRequested { request_id: u64, item_id: String },
+    /// The CLI is blocked on the user for something that is **not** a file write: a command
+    /// it wants to run, or a permission profile (an MCP server) it wants granted.
+    ///
+    /// # Why this variant exists
+    ///
+    /// It did not, and that was the "loop infinito": `codex app-server`'s own schema
+    /// (`codex app-server generate-json-schema`) declares *three* approval methods —
+    /// `item/fileChange/requestApproval`, `item/commandExecution/requestApproval` and
+    /// `item/permissions/requestApproval` — and this parser matched only the first. The
+    /// other two fell into the `_ => Ignored` arm, so the panel drew nothing, the user had
+    /// no button to press, and the CLI waited forever for an answer that could not be given.
+    ///
+    /// Carried as a `summary` the panel can render verbatim rather than a typed shape per
+    /// method: what the user needs is the *sentence* ("run `composer install`", "grant
+    /// filesystem access to server X") and two buttons. Parsing every optional field of two
+    /// evolving schemas to rebuild that sentence would be a second source of truth that
+    /// silently rots when the CLI changes.
+    ActionApprovalRequested {
+        request_id: u64,
+        kind: ApprovalKind,
+        /// What is being asked, in the user's words. Never empty — falls back to the method.
+        summary: String,
+    },
     /// A line that is well-formed and deliberately carries nothing: lifecycle chatter,
     /// rate-limit updates, MCP startup noise. Distinct from `None` (unparseable) so a
     /// reader can tell "understood and skipped" from "not JSON at all".
@@ -223,14 +325,45 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
     // A *server request* carries both `id` and `method` — it is the CLI asking us
     // something and waiting for an answer at that id. It has to be matched before the
     // reply branch below, which would otherwise read the id and treat it as an ack.
-    if let (Some(id), Some("item/fileChange/requestApproval")) =
+    if let (Some(id), Some(method)) =
         (value.get("id").and_then(Value::as_u64), value.get("method").and_then(Value::as_str))
     {
-        let item_id = value.get("params")?.get("itemId")?.as_str()?;
-        return Some(CodexEvent::ApprovalRequested {
-            request_id: id,
-            item_id: item_id.to_string(),
-        });
+        match method {
+            "item/fileChange/requestApproval" => {
+                let item_id = value.get("params")?.get("itemId")?.as_str()?;
+                return Some(CodexEvent::ApprovalRequested {
+                    request_id: id,
+                    item_id: item_id.to_string(),
+                });
+            }
+            "item/commandExecution/requestApproval" => {
+                return Some(CodexEvent::ActionApprovalRequested {
+                    request_id: id,
+                    kind: ApprovalKind::Command,
+                    summary: command_summary(value.get("params")),
+                });
+            }
+            "item/permissions/requestApproval" => {
+                return Some(CodexEvent::ActionApprovalRequested {
+                    request_id: id,
+                    kind: ApprovalKind::Permissions,
+                    summary: permissions_summary(value.get("params")),
+                });
+            }
+            // An approval method this build does not know. **Not `Ignored`** — an
+            // unanswered request is a turn that hangs forever, which is the bug this whole
+            // branch exists to stop. Surfaced with the method name so the user can decline
+            // and see what was asked, and so the next such method is a visible gap rather
+            // than a freeze.
+            other if other.ends_with("/requestApproval") => {
+                return Some(CodexEvent::ActionApprovalRequested {
+                    request_id: id,
+                    kind: ApprovalKind::Unknown,
+                    summary: format!("an approval this version does not recognise ({other})"),
+                });
+            }
+            _ => {}
+        }
     }
 
     // A reply carries `id`; a notification carries `method`. Replies first, because the
@@ -647,5 +780,85 @@ mod binary_resolution_tests {
             dirs.iter().any(|dir| dir.ends_with(".local/bin")),
             "~/.local/bin is where `codex` installs; it must be searched: {dirs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod approval_kind_tests {
+    use super::*;
+
+    /// The bug: `codex app-server` declares **three** approval methods and this parser
+    /// matched one. The other two fell into `_ => Ignored`, so nothing rendered, no button
+    /// existed, and the CLI waited forever — the owner's "loop infinito" when the model
+    /// wanted to run a command or an MCP server asked for permissions.
+    ///
+    /// The method names are not guessed: they come from `codex app-server
+    /// generate-json-schema`, which lists `item/fileChange/requestApproval`,
+    /// `item/commandExecution/requestApproval` and `item/permissions/requestApproval`.
+    #[test]
+    fn every_approval_method_the_cli_can_send_is_answerable() {
+        let command = r#"{"jsonrpc":"2.0","id":7,"method":"item/commandExecution/requestApproval","params":{"itemId":"exec-1","threadId":"t","turnId":"u","startedAtMs":0,"command":"composer install"}}"#;
+        match parse_line(command) {
+            Some(CodexEvent::ActionApprovalRequested { request_id, kind, summary }) => {
+                assert_eq!(request_id, 7);
+                assert_eq!(kind, ApprovalKind::Command);
+                assert!(summary.contains("composer install"), "the user must see it: {summary}");
+            }
+            other => panic!("a command approval must be answerable, got {other:?}"),
+        }
+
+        let permissions = r#"{"jsonrpc":"2.0","id":9,"method":"item/permissions/requestApproval","params":{"itemId":"perm-1","threadId":"t","turnId":"u","startedAtMs":0,"cwd":"/srv/app","permissions":{},"reason":"filesystem access for the docs server"}}"#;
+        match parse_line(permissions) {
+            Some(CodexEvent::ActionApprovalRequested { request_id, kind, summary }) => {
+                assert_eq!(request_id, 9);
+                assert_eq!(kind, ApprovalKind::Permissions);
+                assert!(summary.contains("docs server"), "the reason must reach the user: {summary}");
+            }
+            other => panic!("a permissions approval must be answerable, got {other:?}"),
+        }
+    }
+
+    /// An approval method added by a future CLI must still be *answerable*, not ignored.
+    ///
+    /// This is the rule the original bug broke. Ignoring an unknown `/requestApproval` is
+    /// indistinguishable, from the user's chair, from the app freezing: the CLI blocks on a
+    /// reply that no code path can send. Declining an unknown request loses a feature;
+    /// ignoring it loses the session.
+    #[test]
+    fn an_unknown_approval_method_is_surfaced_rather_than_ignored() {
+        let future = r#"{"jsonrpc":"2.0","id":11,"method":"item/somethingNew/requestApproval","params":{"itemId":"x"}}"#;
+        match parse_line(future) {
+            Some(CodexEvent::ActionApprovalRequested { request_id, kind, summary }) => {
+                assert_eq!(request_id, 11);
+                assert_eq!(kind, ApprovalKind::Unknown);
+                assert!(summary.contains("somethingNew"), "name what was asked: {summary}");
+            }
+            other => panic!("an unknown approval must not be ignored, got {other:?}"),
+        }
+    }
+
+    /// The file-change path must keep working exactly as before — it is the one that
+    /// already had a diff and buttons.
+    #[test]
+    fn the_file_change_approval_still_parses() {
+        let file = r#"{"jsonrpc":"2.0","id":0,"method":"item/fileChange/requestApproval","params":{"itemId":"exec-10e2"}}"#;
+        assert_eq!(
+            parse_line(file),
+            Some(CodexEvent::ApprovalRequested {
+                request_id: 0,
+                item_id: "exec-10e2".to_string()
+            })
+        );
+    }
+
+    /// The decision words are the CLI's, from `CommandExecutionApprovalDecision`.
+    #[test]
+    fn the_decision_words_match_the_cli_schema() {
+        assert!(action_approval_response(1, Decision::Accept).contains(r#""decision":"accept""#));
+        assert!(
+            action_approval_response(1, Decision::AcceptForSession)
+                .contains(r#""decision":"acceptForSession""#)
+        );
+        assert!(action_approval_response(1, Decision::Decline).contains(r#""decision":"decline""#));
     }
 }

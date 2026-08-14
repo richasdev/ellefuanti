@@ -205,6 +205,23 @@ struct PendingApproval {
     answered: bool,
 }
 
+/// A non-file approval the CLI is blocked on: a command to run, or permissions to grant.
+///
+/// # Why this is not folded into [`PendingApproval`]
+///
+/// That one is keyed by Codex *item* and pairs with a diff the user reads before deciding.
+/// This has no item and no diff — the whole question is one sentence — and it must render
+/// even when `proposals` is empty, which is precisely the case that hung: the CLI asked to
+/// run a command, the panel had nothing to draw, and the turn waited forever.
+struct ActionApproval {
+    /// The JSON-RPC id the answer is addressed to.
+    request_id: u64,
+    /// What is being asked, shown verbatim.
+    summary: String,
+    /// Whether to offer "allow for this session" — the CLI only accepts it for commands.
+    allow_for_session: bool,
+}
+
 /// What the workspace can tell the panel about the active editor, gathered at send or
 /// attach time — never earlier, because a snapshot taken at panel-open describes a tab
 /// the user has since left.
@@ -357,6 +374,12 @@ pub struct AiChatPanel {
     proposals: Vec<Proposal>,
     /// Per Codex item: the approval id, and whether it has been answered.
     approvals: std::collections::HashMap<String, PendingApproval>,
+    /// A command or permission approval the CLI is blocked on, if any.
+    ///
+    /// One at a time, because the CLI asks one at a time and blocks until answered — a
+    /// queue would be modelling a concurrency the protocol does not have. `None` means
+    /// nothing is waiting on the user.
+    action_approval: Option<ActionApproval>,
     /// What the user decided about the last turn's proposals, waiting to be told to the
     /// model on the next send. See [`Self::report_outcome`] for why it waits.
     pending_report: Option<String>,
@@ -389,6 +412,7 @@ impl AiChatPanel {
             codex_stdin: Arc::default(),
             codex_thread_id: Arc::default(),
             codex_model: Arc::default(),
+            action_approval: None,
             stream_task: None,
             attach_selection: false,
             attach_file: false,
@@ -722,6 +746,23 @@ impl AiChatPanel {
                         self.answer_codex(request_id, false);
                     }
                 }
+                AgentEvent::ActionApprovalRequested { request_id, summary, allow_for_session } => {
+                    if self.mode == ChatMode::Agent {
+                        // Shown as a note as well as a prompt: the row scrolls with the
+                        // conversation, so the question stays in the transcript after it is
+                        // answered rather than vanishing without trace.
+                        self.turns.push(ChatTurn {
+                            role: Role::Note,
+                            text: format!("Codex asks to {summary}"),
+                        });
+                        self.action_approval =
+                            Some(ActionApproval { request_id, summary, allow_for_session });
+                    } else {
+                        // Ask mode grants nothing. Declining keeps the turn moving instead
+                        // of leaving the CLI blocked on a question the mode cannot show.
+                        self.answer_action(request_id, crate::ai_codex::Decision::Decline);
+                    }
+                }
                 AgentEvent::Stream(StreamEvent::Error(message)) => {
                     // A reply that never started leaves no empty bubble behind; one that
                     // half-arrived keeps its words, with the error after them.
@@ -977,6 +1018,23 @@ impl AiChatPanel {
     fn answer_codex(&self, request_id: u64, approve: bool) {
         let reply = crate::ai_codex::approval_response(request_id, approve);
         write_to_codex(&self.codex_stdin, &reply);
+    }
+
+    /// Answers a command or permission approval, and clears the prompt.
+    ///
+    /// Lock-free for [`Self::answer_codex`]'s reason — this runs on the main thread while
+    /// the turn holds the state lock and blocks on the reply.
+    ///
+    /// Clearing `action_approval` before the write is deliberate: the prompt must not
+    /// survive a failed write, or the user is left clicking a button whose child is gone.
+    fn answer_action(&mut self, request_id: u64, decision: crate::ai_codex::Decision) {
+        if self.action_approval.as_ref().is_some_and(|a| a.request_id == request_id) {
+            self.action_approval = None;
+        }
+        write_to_codex(
+            &self.codex_stdin,
+            &crate::ai_codex::action_approval_response(request_id, decision),
+        );
     }
 
     /// Apply, on one file. **The only path in this panel that writes anything.**
@@ -2062,6 +2120,29 @@ fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<AgentE
                     return;
                 }
             }
+            // Commands and permissions (the MCP case). Forwarded on the same channel as
+            // file approvals so there is still one drain and one cancel — but as a distinct
+            // event, because there is no diff to draw, only a question to answer.
+            Some(crate::ai_codex::CodexEvent::ActionApprovalRequested {
+                request_id,
+                kind,
+                summary,
+            }) => {
+                // The CLI offers `acceptForSession` for commands; a permission grant and an
+                // unknown method get the two-button form, because a blanket yes to something
+                // this build cannot describe is exactly what should not be one click away.
+                let allow_for_session = kind == crate::ai_codex::ApprovalKind::Command;
+                if tx
+                    .send_blocking(AgentEvent::ActionApprovalRequested {
+                        request_id,
+                        summary,
+                        allow_for_session,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             Some(crate::ai_codex::CodexEvent::TurnCompleted) => {
                 let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Done));
                 return;
@@ -2215,6 +2296,11 @@ impl Render for AiChatPanel {
                     // transcript.
                     .when(!self.proposals.is_empty(), |el| {
                         el.child(self.render_proposals(&theme, cx))
+                    })
+                    // Beside the proposals and for the same reason: it is a pending action
+                    // the turn is blocked on, so it must not scroll away with the transcript.
+                    .when(self.action_approval.is_some(), |el| {
+                        el.child(self.render_action_approval(&theme, cx))
                     })
                     .children(self.note.clone().map(|note| {
                         div().px_2().py_1().text_color(theme.error).text_size(px(11.0)).child(note)
@@ -2392,6 +2478,116 @@ impl AiChatPanel {
     /// Rendered above the input rather than inside the transcript because these are not
     /// conversation — they are a pending action, and burying them in a scrolled history
     /// is how an Apply button gets missed.
+    /// The prompt for a command or permission approval.
+    ///
+    /// # Why this exists
+    ///
+    /// Without it the CLI's question had nowhere to appear. `codex app-server` declares
+    /// three approval methods; the panel understood one, so a request to run a command or
+    /// to grant an MCP server's permissions was parsed into nothing, drew nothing, and left
+    /// the turn blocked on an answer the user had no way to give — the "loop infinito",
+    /// spinner and all.
+    ///
+    /// Deliberately plain: one sentence and buttons. There is no diff to show, and inventing
+    /// a richer view would mean parsing two evolving schemas to rebuild a description the
+    /// CLI already sent as text.
+    fn render_action_approval(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(approval) = self.action_approval.as_ref() else {
+            return div().into_any_element();
+        };
+        let request_id = approval.request_id;
+
+        let mut buttons = div().flex().gap_1();
+
+        let accept = cx.entity();
+        buttons = buttons.child(
+            div()
+                .id("ai-action-accept")
+                .px_2()
+                .py_0p5()
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .text_color(theme.accent)
+                .hover(|el| el.bg(theme.hover))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    accept.update(cx, |this, cx| {
+                        this.answer_action(request_id, crate::ai_codex::Decision::Accept);
+                        cx.notify();
+                    });
+                })
+                .child("Allow"),
+        );
+
+        // Only when the CLI accepts it for this kind. A session grant the CLI would reject
+        // is a button that silently does nothing, which is worse than not offering it.
+        if approval.allow_for_session {
+            let session = cx.entity();
+            buttons = buttons.child(
+                div()
+                    .id("ai-action-accept-session")
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .text_color(theme.text_muted)
+                    .hover(|el| el.bg(theme.hover))
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        session.update(cx, |this, cx| {
+                            this.answer_action(
+                                request_id,
+                                crate::ai_codex::Decision::AcceptForSession,
+                            );
+                            cx.notify();
+                        });
+                    })
+                    .child("Allow for this session"),
+            );
+        }
+
+        let decline = cx.entity();
+        buttons = buttons.child(
+            div()
+                .id("ai-action-decline")
+                .px_2()
+                .py_0p5()
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .text_color(theme.text_muted)
+                .hover(|el| el.bg(theme.hover))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    decline.update(cx, |this, cx| {
+                        this.answer_action(request_id, crate::ai_codex::Decision::Decline);
+                        cx.notify();
+                    });
+                })
+                .child("Deny"),
+        );
+
+        div()
+            .id("ai-action-approval")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Codex is waiting for your decision")),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(approval.summary.clone())),
+            )
+            .child(buttons)
+            .into_any_element()
+    }
+
     fn render_proposals(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let cards: Vec<gpui::AnyElement> = self
             .proposals
