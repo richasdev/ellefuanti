@@ -130,6 +130,53 @@ pub enum Role {
 pub struct ChatTurn {
     pub role: Role,
     pub text: String,
+    /// The turn as it happened: text and activities interleaved, in arrival order.
+    ///
+    /// `text` stays the whole reply (context building, ⌃L, and the tests read it); the
+    /// flow is how it *renders*. The owner's spec, verbatim: "meu prompt / texto da IA /
+    /// ações dela / próximo texto / ação / próximo texto e assim vai" — which a single
+    /// activity list pinned above the text cannot say, because it loses the order.
+    pub flow: Vec<FlowBlock>,
+}
+
+/// Appends reply text to a flow: extends the open text block, or opens one after an
+/// activity — that boundary is what makes "texto → ação → próximo texto" three blocks
+/// instead of one.
+fn flow_push_text(flow: &mut Vec<FlowBlock>, text: &str) {
+    if let Some(FlowBlock::Text(block)) = flow.last_mut() {
+        block.push_str(text);
+    } else {
+        flow.push(FlowBlock::Text(text.to_string()));
+    }
+}
+
+/// Appends an activity: closes every previous one, collapses a consecutive duplicate.
+fn flow_push_activity(flow: &mut Vec<FlowBlock>, label: String) {
+    let duplicate =
+        matches!(flow.last(), Some(FlowBlock::Activity { label: last, .. }) if *last == label);
+    if duplicate {
+        return;
+    }
+    flow_finish_activities(flow);
+    flow.push(FlowBlock::Activity { label, done: false });
+}
+
+/// Marks every activity done — an item completed, or the turn ended.
+fn flow_finish_activities(flow: &mut [FlowBlock]) {
+    for block in flow {
+        if let FlowBlock::Activity { done, .. } = block {
+            *done = true;
+        }
+    }
+}
+
+/// One block of an assistant turn's timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlowBlock {
+    /// A stretch of reply text (rendered through the same fences/markdown pipeline).
+    Text(String),
+    /// Something the turn did: label plus whether it finished.
+    Activity { label: String, done: bool },
 }
 
 /// Which mode the panel is in (`ai.chat_mode`).
@@ -395,13 +442,6 @@ pub struct AiChatPanel {
     proposals: Vec<Proposal>,
     /// Per Codex item: the approval id, and whether it has been answered.
     approvals: std::collections::HashMap<String, PendingApproval>,
-    /// What the running turn is doing, in order: `(label, done)`. Cleared at each send.
-    ///
-    /// The activity log the owner asked for ("mostrando o que tá fazendo, e as
-    /// atividades dele"): the current act carries a live dot, finished ones a check, and
-    /// the list survives the turn so the transcript says what happened, not only what was
-    /// answered.
-    activities: Vec<(String, bool)>,
     /// A command or permission approval the CLI is blocked on, if any.
     ///
     /// One at a time, because the CLI asks one at a time and blocks until answered — a
@@ -441,7 +481,6 @@ impl AiChatPanel {
             codex_thread_id: Arc::default(),
             codex_model: Arc::default(),
             action_approval: None,
-            activities: Vec::new(),
             stream_task: None,
             attach_selection: false,
             attach_file: false,
@@ -622,7 +661,7 @@ impl AiChatPanel {
         // the way out — leaving it on screen would let a diff computed against an older
         // file be applied after a newer answer has arrived.
         self.discard_proposals(true);
-        self.turns.push(ChatTurn { role: Role::User, text: message.clone() });
+        self.turns.push(ChatTurn { role: Role::User, text: message.clone(), flow: Vec::new() });
 
         // The body carries the history *up to and including* the new user turn; the empty
         // assistant turn below is a UI placeholder the wire must not see. Codex has no
@@ -644,8 +683,7 @@ impl AiChatPanel {
         // exactly the "nothing leaves without an explicit act" rule read backwards.
         self.attachments.clear();
 
-        self.activities.clear();
-        self.turns.push(ChatTurn { role: Role::Assistant, text: String::new() });
+        self.turns.push(ChatTurn { role: Role::Assistant, text: String::new(), flow: Vec::new() });
         self.streaming = true;
         self.scroll.scroll_to_bottom();
         cx.notify();
@@ -779,9 +817,17 @@ impl AiChatPanel {
                         self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
                     {
                         turn.text.push_str(&text);
+                        flow_push_text(&mut turn.flow, &text);
                     }
                 }
-                AgentEvent::Stream(StreamEvent::Done) => finished = true,
+                AgentEvent::Stream(StreamEvent::Done) => {
+                    finished = true;
+                    if let Some(turn) =
+                        self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
+                    {
+                        flow_finish_activities(&mut turn.flow);
+                    }
+                }
                 // Agent mode only. Both are ignored in Ask mode rather than trusted: the
                 // thread is opened read-only either way, so a proposal arriving in Ask
                 // mode would be a CLI that changed its mind about the sandbox, and the
@@ -800,18 +846,20 @@ impl AiChatPanel {
                     }
                 }
                 AgentEvent::Activity(label) => {
-                    // A new act closes the previous ones; duplicates collapse so a chatty
-                    // stream of identical starteds reads as one line, not a ladder.
-                    if self.activities.last().map(|(l, _)| l.as_str()) != Some(label.as_str()) {
-                        for activity in &mut self.activities {
-                            activity.1 = true;
-                        }
-                        self.activities.push((label, false));
+                    // Into the turn's flow, in arrival order — the interleaving is the
+                    // point. A new act closes the previous ones; consecutive duplicates
+                    // collapse so a chatty stream of starteds reads as one line.
+                    if let Some(turn) =
+                        self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
+                    {
+                        flow_push_activity(&mut turn.flow, label);
                     }
                 }
                 AgentEvent::ActivityEnded => {
-                    for activity in &mut self.activities {
-                        activity.1 = true;
+                    if let Some(turn) =
+                        self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
+                    {
+                        flow_finish_activities(&mut turn.flow);
                     }
                 }
                 AgentEvent::ActionApprovalRequested {
@@ -827,6 +875,7 @@ impl AiChatPanel {
                         self.turns.push(ChatTurn {
                             role: Role::Note,
                             text: format!("Codex asks to {summary}"),
+                            flow: Vec::new(),
                         });
                         self.action_approval =
                             Some(ActionApproval { request_id, summary, allow_for_session, kind });
@@ -846,7 +895,7 @@ impl AiChatPanel {
                     {
                         self.turns.pop();
                     }
-                    self.turns.push(ChatTurn { role: Role::Note, text: message });
+                    self.turns.push(ChatTurn { role: Role::Note, text: message, flow: Vec::new() });
                     finished = true;
                 }
             }
@@ -1055,7 +1104,7 @@ impl AiChatPanel {
             summary.push_str(&format!("Rejected, left unchanged: {}.", refused.join(", ")));
         }
         if !summary.is_empty() {
-            self.turns.push(ChatTurn { role: Role::Note, text: summary.clone() });
+            self.turns.push(ChatTurn { role: Role::Note, text: summary.clone(), flow: Vec::new() });
             self.report_outcome(summary);
         }
     }
@@ -1160,6 +1209,7 @@ impl AiChatPanel {
                             this.turns.push(ChatTurn {
                                 role: Role::Note,
                                 text: "Signed in to Codex.".to_string(),
+                                flow: Vec::new(),
                             });
                         }
                         cx.notify();
@@ -1216,6 +1266,7 @@ impl AiChatPanel {
                         Ok(()) => "Signed out of Codex.".to_string(),
                         Err(reason) => format!("Sign-out failed: {reason}"),
                     },
+                    flow: Vec::new(),
                 });
                 cx.notify();
             })
@@ -2013,6 +2064,26 @@ pub fn apply_unified_diff(original: &str, diff: &str) -> Result<String, String> 
     Ok(out.join("\n"))
 }
 
+/// Counts added and removed lines in a unified diff, headers excluded.
+///
+/// `+++`/`---` are file headers, not content; `@@` opens a hunk. What remains marked
+/// `+`/`-` is the change itself — the number a reviewer weighs before reading a line.
+fn diff_line_counts(diff: &str) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// The 1-based start line on the *old* side of an `@@ -a,b +c,d @@` header, or `None` for
 /// any other line.
 fn parse_hunk_start(line: &str) -> Option<usize> {
@@ -2692,6 +2763,16 @@ impl Render for AiChatPanel {
             // is empty unless the status is NotLoggedIn, so mounting it unconditionally
             // costs nothing when signed in.
             .child(self.render_codex_login(&theme, cx))
+            // Pending questions mount OUTSIDE the ready gate, like the sign-in row and for
+            // its exact reason: `ready` tracks the *input row's* preconditions, and a
+            // guidance flicker (a probe in flight, a provider hiccup) must never hide an
+            // Apply button or an Allow/Deny the CLI is blocked on. The owner's "os botões
+            // não aparecem" has this as its one static cause; unconditional mounting
+            // removes the class, whatever the trigger.
+            .when(!self.proposals.is_empty(), |el| el.child(self.render_proposals(&theme, cx)))
+            .when(self.action_approval.is_some(), |el| {
+                el.child(self.render_action_approval(&theme, cx))
+            })
             .when(ready, |el| {
                 el
                     // Agent selected on a provider that cannot do it: said out loud, and
@@ -2704,14 +2785,6 @@ impl Render for AiChatPanel {
                             .text_size(px(11.0))
                             .child(SharedString::from(notice))
                     }))
-                    .when(!self.proposals.is_empty(), |el| {
-                        el.child(self.render_proposals(&theme, cx))
-                    })
-                    // Beside the proposals and for the same reason: it is a pending action
-                    // the turn is blocked on, so it must not scroll away with the transcript.
-                    .when(self.action_approval.is_some(), |el| {
-                        el.child(self.render_action_approval(&theme, cx))
-                    })
                     .children(self.note.clone().map(|note| {
                         div().px_2().py_1().text_color(theme.error).text_size(px(11.0)).child(note)
                     }))
@@ -2822,56 +2895,59 @@ impl AiChatPanel {
         };
 
         let mut body: Vec<gpui::AnyElement> = Vec::new();
-        // The activity log rides the last assistant turn: live dot on the current act,
-        // check on the finished ones. It stays after the turn ends — the transcript then
-        // says what was *done*, not only what was said.
-        if turn.role == Role::Assistant && is_last && !self.activities.is_empty() {
-            body.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .pb_1()
-                    .children(self.activities.iter().map(|(label, done)| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_size(px(10.0))
-                            .child(
-                                div()
-                                    .text_color(if *done {
-                                        theme.diff_added()
-                                    } else {
-                                        theme.accent
-                                    })
-                                    .child(if *done { "✓" } else { "●" }),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme.text_muted)
-                                    .child(SharedString::from(label.clone())),
-                            )
-                    }))
-                    .into_any_element(),
-            );
-        }
-        if turn.role == Role::Assistant
-            && turn.text.is_empty()
-            && self.streaming
-            && is_last
-            && self.activities.is_empty()
+        let activity_row = |label: &str, done: bool| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(10.0))
+                .child(
+                    div()
+                        .text_color(if done { theme.diff_added() } else { theme.accent })
+                        .child(if done { "✓" } else { "●" }),
+                )
+                .child(div().text_color(theme.text_muted).child(SharedString::from(label.to_string())))
+                .into_any_element()
+        };
+        if !turn.flow.is_empty() {
+            // The timeline as it happened: text, then what the turn did, then more text —
+            // the owner's spec is the order itself, so the flow *is* the render.
+            for (block_index, block) in turn.flow.iter().enumerate() {
+                match block {
+                    FlowBlock::Activity { label, done } => body.push(activity_row(label, *done)),
+                    FlowBlock::Text(text) => {
+                        for (seg_index, segment) in split_fences(text).into_iter().enumerate() {
+                            body.push(match segment {
+                                Segment::Text(text) => render_prose(&text, theme),
+                                Segment::Code { language, code } => render_code_block(
+                                    index * 100 + block_index,
+                                    seg_index,
+                                    language.as_deref(),
+                                    &code,
+                                    theme,
+                                    fonts,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        } else if turn.role == Role::Assistant && turn.text.is_empty() && self.streaming && is_last
         {
-            // The dim ellipsis while nothing has arrived at all — before the first
-            // activity lands, the reply exists but nothing can be said about it yet.
+            // The dim ellipsis before anything has arrived at all.
             body.push(div().text_color(theme.text_muted).child("…").into_any_element());
         } else {
             for (seg_index, segment) in split_fences(&turn.text).into_iter().enumerate() {
                 body.push(match segment {
                     Segment::Text(text) => render_prose(&text, theme),
-                    Segment::Code { language, code } => {
-                        render_code_block(index, seg_index, language.as_deref(), &code, theme, fonts)
-                    }
+                    Segment::Code { language, code } => render_code_block(
+                        index,
+                        seg_index,
+                        language.as_deref(),
+                        &code,
+                        theme,
+                        fonts,
+                    ),
                 });
             }
         }
@@ -3143,6 +3219,9 @@ impl AiChatPanel {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| proposal.path.display().to_string());
+        // "+N −M" beside the file name, computed from the diff the card already holds —
+        // the size of a change is the first thing a reviewer weighs, before reading it.
+        let (added, removed) = diff_line_counts(&proposal.diff);
 
         // The decision row: buttons while pending, a settled word once it is not.
         let controls: gpui::AnyElement = match proposal.state {
@@ -3218,12 +3297,29 @@ impl AiChatPanel {
                     .px_2()
                     .py_0p5()
                     .child(
-                        div().flex().items_center().gap_1().child(SharedString::from(name)).child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(proposal.kind.clone())),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(SharedString::from(name))
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(proposal.kind.clone())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.diff_added())
+                                    .child(SharedString::from(format!("+{added}"))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.error)
+                                    .child(SharedString::from(format!("−{removed}"))),
+                            ),
                     )
                     .child(controls),
             )
@@ -4431,5 +4527,63 @@ mod editing_chord_tests {
         let mut line = "linha um\n".to_string();
         delete_previous_word(&mut line);
         assert_eq!(line, "linha um\n", "the word-kill must not cross the line break");
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::{FlowBlock, flow_finish_activities, flow_push_activity, flow_push_text};
+
+    /// The owner's spec, as an assertion: "texto da IA / ações dela / próximo texto" must
+    /// come out as distinct blocks in that order — an activity closes the text block, and
+    /// text after it opens a new one rather than gluing onto the old.
+    #[test]
+    fn text_and_activities_interleave_in_arrival_order() {
+        let mut flow = Vec::new();
+        flow_push_text(&mut flow, "Vou olhar o projeto.");
+        flow_push_activity(&mut flow, "Running: ls".to_string());
+        flow_push_text(&mut flow, "Encontrei o problema");
+        flow_push_text(&mut flow, " no routes.php.");
+
+        assert_eq!(
+            flow,
+            vec![
+                FlowBlock::Text("Vou olhar o projeto.".to_string()),
+                // Still live: text streaming afterwards does not close an activity —
+                // only `item/completed`, a newer activity, or the turn ending do. A
+                // command can keep running while the model narrates around it.
+                FlowBlock::Activity { label: "Running: ls".to_string(), done: false },
+                FlowBlock::Text("Encontrei o problema no routes.php.".to_string()),
+            ],
+            "three blocks, in order — and the second delta extended the open block \
+             instead of opening a fourth"
+        );
+    }
+
+    /// A new activity closes the previous one (the dot moves), and a consecutive
+    /// duplicate collapses — a chatty stream of identical starteds is one line.
+    #[test]
+    fn a_new_activity_closes_the_previous_and_duplicates_collapse() {
+        let mut flow = Vec::new();
+        flow_push_activity(&mut flow, "Thinking…".to_string());
+        flow_push_activity(&mut flow, "Thinking…".to_string());
+        flow_push_activity(&mut flow, "Running: composer install".to_string());
+
+        assert_eq!(
+            flow,
+            vec![
+                FlowBlock::Activity { label: "Thinking…".to_string(), done: true },
+                FlowBlock::Activity {
+                    label: "Running: composer install".to_string(),
+                    done: false
+                },
+            ]
+        );
+
+        flow_finish_activities(&mut flow);
+        assert!(flow.iter().all(|block| !matches!(
+            block,
+            FlowBlock::Activity { done: false, .. }
+        )));
     }
 }

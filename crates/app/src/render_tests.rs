@@ -2458,12 +2458,13 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
     panel.update(cx, |panel, cx| {
         panel.seed_turns_for_test(
             vec![
-                ChatTurn { role: Role::User, text: "what does this do?".to_string() },
+                ChatTurn { role: Role::User, text: "what does this do?".to_string(), flow: Vec::new() },
                 ChatTurn {
                     role: Role::Assistant,
                     text: "It echoes:\n```php\necho 1;\n```\nthat is all.".to_string(),
+                    flow: Vec::new(),
                 },
-                ChatTurn { role: Role::Note, text: "overloaded".to_string() },
+                ChatTurn { role: Role::Note, text: "overloaded".to_string(), flow: Vec::new() },
             ],
             cx,
         );
