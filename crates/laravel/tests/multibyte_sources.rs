@@ -13,7 +13,11 @@
 //! with wherever the caret happens to be, and a caret lands mid-character as easily as not
 //! — that is the whole bug class.
 
-use elle_laravel::{extract_livewire, extract_migration_columns, extract_model, reference_at};
+use elle_laravel::{
+    extract_livewire, extract_migration_columns, extract_model, reference_at, reference_at_in_tree,
+};
+use elle_syntax::{Language, SyntaxTree};
+use elle_text::Buffer;
 
 /// Real-shaped Laravel sources with the accents and CJK that this owner's projects
 /// actually contain — Portuguese comments and Japanese content, in the places a scanner
@@ -111,11 +115,28 @@ fn real_php_sources_are_safe_at_every_offset() {
         let _ = extract_migration_columns(&source);
 
         let blade = path.to_string_lossy().ends_with(".blade.php");
+
+        // The tree-reusing path, parsed once per file rather than once per offset. The
+        // first version of this test called the parsing variant at every stride and took
+        // minutes on 300 files — a test slow enough that nobody runs it is a test that is
+        // not protecting anything. Equivalence between the two paths is pinned in the
+        // crate's unit tests, so exercising the fast one here loses no coverage.
+        let buffer = Buffer::new(&source);
+        let syntax = SyntaxTree::new(Language::Php, &buffer).ok();
+        let tree = syntax.as_ref().and_then(|syntax| syntax.tree());
+
         // Striding rather than every byte: these files run to tens of kilobytes and the
         // point is coverage of *positions*, not of every index in a large file.
         let mut offset = 0;
         while offset <= source.len() {
-            let _ = reference_at(&source, offset, blade);
+            match tree {
+                Some(tree) => {
+                    let _ = reference_at_in_tree(&source, offset, blade, tree);
+                }
+                None => {
+                    let _ = reference_at(&source, offset, blade);
+                }
+            }
             offset += 7; // coprime with 2, 3 and 4 — lands inside characters of every width
         }
         checked += 1;
