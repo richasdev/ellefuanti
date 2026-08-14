@@ -304,6 +304,19 @@ pub struct AiChatPanel {
     /// `codex_stdin`: an interrupt needs it, and Cancel is the button a user reaches for
     /// *while* a turn is running — the one moment the turn lock is guaranteed to be held.
     codex_thread_id: Arc<Mutex<Option<String>>>,
+    /// The model the CLI reported, published out of the turn lock.
+    ///
+    /// **`render` reads this, which is why it cannot live in `CodexState`.** It did, and
+    /// that froze the window a second time — caught in a live `sample`: the main thread
+    /// parked in `AiChatPanel::render` → `__psynch_mutexwait` while the background turn sat
+    /// in `read_line` holding the lock. The turn only releases it when the turn ends, and in
+    /// agent mode the turn does not end until the user answers an approval they cannot see,
+    /// because the frame that would draw it is the thing being blocked. The spinner spins
+    /// forever.
+    ///
+    /// Anything `render` touches must be reachable without waiting. That is the rule this
+    /// field exists to keep, not a fact about the model name.
+    codex_model: Arc<Mutex<Option<String>>>,
     /// The drain task. Held so it lives; finished tasks are replaced on the next send
     /// rather than cleared mid-poll, because a task must not drop itself from inside
     /// its own `update`.
@@ -375,6 +388,7 @@ impl AiChatPanel {
             kill: Arc::default(),
             codex_stdin: Arc::default(),
             codex_thread_id: Arc::default(),
+            codex_model: Arc::default(),
             stream_task: None,
             attach_selection: false,
             attach_file: false,
@@ -644,6 +658,7 @@ impl AiChatPanel {
         // cancels through, so the turn must publish into the same ones the UI reads.
         let shared_stdin = self.codex_stdin.clone();
         let shared_thread_id = self.codex_thread_id.clone();
+        let shared_model = self.codex_model.clone();
 
         let producer = cx.background_spawn(async move {
             codex_turn(
@@ -651,6 +666,7 @@ impl AiChatPanel {
                 &kill,
                 &shared_stdin,
                 &shared_thread_id,
+                &shared_model,
                 root.as_deref(),
                 &message,
                 &tx,
@@ -792,6 +808,7 @@ impl AiChatPanel {
         // fresh one. Dropping it here also closes the child's stdin, which is what makes a
         // CLI ignoring the interrupt still exit.
         *self.codex_stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.codex_model.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         // The session itself is cleared by the turn when it notices, or by the next send.
         // Not taken here, because taking it needs the lock this method exists to avoid.
@@ -1855,6 +1872,7 @@ fn codex_turn(
     // `AiChatPanel::codex_stdin` for the deadlock this prevents.
     shared_stdin: &Arc<Mutex<Option<ChildStdin>>>,
     shared_thread_id: &Arc<Mutex<Option<String>>>,
+    shared_model: &Arc<Mutex<Option<String>>>,
     root: Option<&Path>,
     message: &str,
     tx: &smol::channel::Sender<AgentEvent>,
@@ -1989,6 +2007,7 @@ fn codex_turn(
         return;
     }
 
+    *shared_model.lock().unwrap_or_else(|p| p.into_inner()) = model.clone();
     state.model = model;
     let session = state
         .session
@@ -2097,10 +2116,10 @@ impl Render for AiChatPanel {
         // (the subscription decides), so it is reported back from `thread/start` rather
         // than read from `ai.chat_model`, which it does not obey.
         let model = if provider == ai::Provider::Codex {
-            self.codex
+            // `codex_model`, never `self.codex`: render must not wait on the turn lock.
+            self.codex_model
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .model
                 .clone()
                 .unwrap_or_else(|| "subscription".to_string())
         } else {
@@ -3254,15 +3273,27 @@ mod codex_deadlock_tests {
         let source = include_str!("ai_chat.rs");
         let source = source.split("mod codex_deadlock_tests").next().unwrap_or(source);
 
-        let offenders: Vec<_> = source
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
-                let code = line.split("//").next().unwrap_or("");
-                code.contains("self.codex.lock()")
-            })
-            .map(|(i, line)| format!("  {}: {}", i + 1, line.trim()))
-            .collect();
+        // Whitespace-insensitive, because the first version of this check was not and it
+        // missed the very next instance of the bug: rustfmt had wrapped it as
+        // `self.codex\n    .lock()`, the grep looked for the one-line spelling, and the
+        // window froze again — this time inside `render`. A guard that only catches the
+        // formatting it was written against is a guard that reports success while the bug
+        // ships.
+        let stripped: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut offenders = Vec::new();
+        if stripped.contains("self.codex.lock()") {
+            // Report with line numbers, re-found on the whitespace-collapsed form so the
+            // message still points somewhere useful.
+            for (i, window) in source.lines().enumerate() {
+                let code = window.split("//").next().unwrap_or("");
+                if code.contains("self.codex") && !code.contains("try_lock") {
+                    offenders.push(format!("  {}: {}", i + 1, window.trim()));
+                }
+            }
+            if offenders.is_empty() {
+                offenders.push("  (a blocking self.codex.lock() exists; grep for it)".to_string());
+            }
+        }
 
         assert!(
             offenders.is_empty(),
