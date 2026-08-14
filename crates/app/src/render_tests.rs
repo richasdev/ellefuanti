@@ -5830,3 +5830,63 @@ async fn ai_agent_a_retried_proposal_after_apply_is_skipped_not_reshown(cx: &mut
     assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER);
     draw(cx);
 }
+
+/// The Reject half of the retry loop.
+///
+/// After a decline the file is *unchanged*, so the CLI's re-sent patch applies cleanly —
+/// the stale pre-flight (built for the Apply half) waves it through, and the user who
+/// just said no is asked the identical question again. The rejected `(path, diff)` pair
+/// is the fingerprint; within the same turn it is refused with a record. A *new send*
+/// clears the memory: re-proposing after a fresh prompt is the user changing their mind.
+#[gpui::test]
+async fn ai_agent_a_retried_proposal_after_reject_is_declined_not_reshown(
+    cx: &mut TestAppContext,
+) {
+    use crate::ai_chat::{ChatMode, FlowBlock};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.reject_proposal_for_test(0, cx);
+        // The retry: same edit, fresh ids — and the file still matches, so only the
+        // rejected-fingerprint check can stop it.
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-2".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 1,
+                    item_id: "item-2".to_string(),
+                },
+            ],
+            cx,
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "no second card for a spurned edit");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                FlowBlock::Activity { label, .. } if label.contains("Declined again")
+            ))),
+            "the rerun is named"
+        );
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE, "still untouched");
+}

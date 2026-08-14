@@ -442,6 +442,15 @@ pub struct AiChatPanel {
     proposals: Vec<Proposal>,
     /// Per Codex item: the approval id, and whether it has been answered.
     approvals: std::collections::HashMap<String, PendingApproval>,
+    /// `(path, diff)` of every proposal the user rejected in the current turn.
+    ///
+    /// The Reject half of the CLI's retry habit: after a decline the file is *unchanged*,
+    /// so the re-sent patch applies cleanly and the stale pre-flight lets it back in — the
+    /// user rejects, the same card returns, ad nauseam. A rejected `(path, diff)` pair is
+    /// the fingerprint of that loop; matching it refuses the rerun with a record instead
+    /// of a card. Cleared at each send — a *new prompt* re-proposing the same edit is the
+    /// user changing their mind, not the model retrying.
+    rejected_this_turn: Vec<(PathBuf, String)>,
     /// A command or permission approval the CLI is blocked on, if any.
     ///
     /// One at a time, because the CLI asks one at a time and blocks until answered — a
@@ -481,6 +490,7 @@ impl AiChatPanel {
             codex_thread_id: Arc::default(),
             codex_model: Arc::default(),
             action_approval: None,
+            rejected_this_turn: Vec::new(),
             stream_task: None,
             attach_selection: false,
             attach_file: false,
@@ -683,6 +693,7 @@ impl AiChatPanel {
         // exactly the "nothing leaves without an explicit act" rule read backwards.
         self.attachments.clear();
 
+        self.rejected_this_turn.clear();
         self.turns.push(ChatTurn { role: Role::Assistant, text: String::new(), flow: Vec::new() });
         self.streaming = true;
         self.scroll.scroll_to_bottom();
@@ -1036,6 +1047,39 @@ impl AiChatPanel {
             // absent file (a proposal that *creates* one) skips the check entirely.
             let stale = std::fs::read_to_string(&path)
                 .is_ok_and(|current| apply_unified_diff(&current, &change.diff).is_err());
+            // The Reject half: the file is unchanged after a decline, so the retry passes
+            // the stale check — but its `(path, diff)` matches what the user just said no
+            // to, and a question answered seconds ago is not asked again.
+            let rerun_of_rejected = self
+                .rejected_this_turn
+                .iter()
+                .any(|(rejected_path, rejected_diff)| {
+                    *rejected_path == path && *rejected_diff == change.diff
+                });
+            if rerun_of_rejected {
+                if self.turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
+                    self.turns.push(ChatTurn {
+                        role: Role::Assistant,
+                        text: String::new(),
+                        flow: Vec::new(),
+                    });
+                }
+                if let Some(turn) =
+                    self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
+                {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| change.path.clone());
+                    turn.flow.push(FlowBlock::Activity {
+                        label: format!(
+                            "Declined again — the model retried the rejected edit to {name}"
+                        ),
+                        done: true,
+                    });
+                }
+                continue;
+            }
             if stale {
                 let name = path
                     .file_name()
@@ -1506,6 +1550,8 @@ impl AiChatPanel {
             return;
         }
         let item_id = proposal.item_id.clone();
+        self.rejected_this_turn
+            .push((proposal.path.clone(), proposal.diff.clone()));
         self.proposals[index].state = ProposalState::Rejected;
         self.settle_item(&item_id);
         cx.notify();
