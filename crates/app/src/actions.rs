@@ -80,6 +80,9 @@ actions!(
         // The AI chat panel (#99). Workspace-scoped like the terminal toggle, and for the
         // same reason: the chord must also *close* the panel while the panel has focus.
         ToggleAiChat,
+        /// Clears the AI chat transcript (⌃L), the shell's own chord for the same act.
+        /// Explicit, because closing the panel no longer discards anything.
+        ClearAiChat,
         // The preview pane (#31). Workspace-scoped for the same reason as the two above:
         // the chord closes the pane while the pane has focus.
         TogglePreview,
@@ -410,6 +413,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("enter", Confirm, Some(context::AI_CHAT)),
         KeyBinding::new("escape", Cancel, Some(context::AI_CHAT)),
         KeyBinding::new("backspace", Backspace, Some(context::AI_CHAT)),
+        // ⌃L is what a terminal uses to clear, and this panel is read as one. Scoped to the
+        // chat so it cannot shadow anything elsewhere; nothing else in this keymap claims
+        // it, and macOS's symbolic-hotkey table does not either (checked as ⌥⌘I was).
+        KeyBinding::new("ctrl-l", ClearAiChat, Some(context::AI_CHAT)),
         //
         // The completion popup (#61). These exist *only* while the popup is on screen,
         // because the context comes from the popup's own element — which is what makes

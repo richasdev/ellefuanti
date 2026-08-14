@@ -752,10 +752,17 @@ pub struct WorkspaceView {
     ai_chat_width: Pixels,
     /// Where the pointer was when the current divider drag began. `None` between drags.
     divider_origin: Option<Pixels>,
-    /// The AI chat panel (#99). `Some` only while it is open, like the terminal: a
-    /// closed panel is absent, so a reply still streaming when it closes is cancelled
-    /// by the drop rather than narrating to nobody.
+    /// The AI chat panel (#99). `Some` once it has been opened, **and it stays `Some`
+    /// after it is closed** — see `ai_chat_visible`.
+    ///
+    /// It used to be taken on close, which cancelled a streaming reply as a side effect of
+    /// the drop. It also deleted the conversation: the owner's report was that clicking the
+    /// AI icon "apaga tudo". Closing a panel is not the same act as discarding what is in
+    /// it, and only one of those should need a click.
     ai_chat: Option<Entity<AiChatPanel>>,
+    /// Whether the panel is on screen. Separate from `ai_chat` being `Some` so closing
+    /// hides the panel and keeps its history; the entity is only dropped with the window.
+    ai_chat_visible: bool,
     /// Which Keychain account the open API-key prompt writes to (#99): `Some` between
     /// the settings panel's "Set API key…" and the prompt's confirm or dismissal.
     /// Cleared on dismissal so a stale arm cannot route a later prompt's text — which
@@ -905,6 +912,7 @@ impl WorkspaceView {
             ai_chat_width: Metrics::AI_CHAT_WIDTH,
             divider_origin: None,
             ai_chat: None,
+            ai_chat_visible: false,
             pending_api_key: None,
             git_cancel: None,
             git_diff: None,
@@ -1365,8 +1373,26 @@ impl WorkspaceView {
     /// ⌘⇧A (#99): the AI chat panel on the right. Absent when closed, like the terminal —
     /// dropping the entity is also what cancels a reply still streaming into it.
     fn toggle_ai_chat(&mut self, _: &ToggleAiChat, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ai_chat.take().is_some() {
+        if self.ai_chat_visible {
+            // Hidden, not dropped: the conversation is still there when it reopens. The
+            // stream is cancelled explicitly, which the drop used to do implicitly — a
+            // reply narrating to a panel nobody can see is the thing to avoid, not the
+            // history it was narrating into.
+            if let Some(panel) = self.ai_chat.clone() {
+                panel.update(cx, |panel, cx| panel.cancel_stream_for_close(cx));
+            }
+            self.ai_chat_visible = false;
             self.focus_editor_or_workspace(window, cx);
+            cx.notify();
+            return;
+        }
+        // Reopening an existing panel: show it again, history intact, and do not rebuild
+        // the closures below — the ones it already holds are still correct.
+        if self.ai_chat.is_some() {
+            self.ai_chat_visible = true;
+            if let Some(panel) = self.ai_chat.clone() {
+                window.focus(&panel.focus_handle(cx));
+            }
             cx.notify();
             return;
         }
@@ -1447,6 +1473,7 @@ impl WorkspaceView {
         let panel = cx.new(|cx| AiChatPanel::new(snapshot, apply, project_root, cx));
         window.focus(&panel.read(cx).focus_handle(cx));
         self.ai_chat = Some(panel);
+        self.ai_chat_visible = true;
         cx.notify();
     }
 
@@ -1732,6 +1759,13 @@ impl WorkspaceView {
     }
 
     #[cfg(test)]
+    /// Whether the panel is on screen. Distinct from it *existing*: closing hides it and
+    /// keeps the conversation, so a test asking "is it closed" must ask this.
+    #[cfg(test)]
+    pub fn ai_chat_visible_for_test(&self) -> bool {
+        self.ai_chat_visible
+    }
+
     pub fn ai_chat_for_test(&self) -> Option<Entity<AiChatPanel>> {
         self.ai_chat.clone()
     }
@@ -8041,7 +8075,7 @@ impl Render for WorkspaceView {
                     // and the window edge, full height under the titlebar. Chrome, so
                     // zen hides it with the rest — the conversation survives, hidden,
                     // because the entity is only dropped by the toggle.
-                    .when(!zen && self.ai_chat.is_some(), |el| {
+                    .when(!zen && self.ai_chat_visible, |el| {
                         // Divider first: it sits between the editor and the panel, and
                         // the panel grows leftwards, hence the -1.
                         el.child(self.render_divider("divider-ai-chat", -1.0, &theme, cx))

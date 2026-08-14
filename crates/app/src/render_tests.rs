@@ -2472,7 +2472,26 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
 
     workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
     workspace.read_with(cx, |workspace, _cx| {
-        assert!(workspace.ai_chat_for_test().is_none(), "the same toggle closes it");
+        assert!(!workspace.ai_chat_visible_for_test(), "the same toggle closes it");
+        // **Closed, not destroyed.** Taking the entity is what made clicking the AI icon
+        // delete the conversation ("apaga tudo"); the panel now survives being closed so
+        // reopening shows the history, and ⌃L is the explicit way to discard it.
+        assert!(
+            workspace.ai_chat_for_test().is_some(),
+            "closing must keep the conversation, not throw it away"
+        );
+    });
+    draw(cx);
+
+    // And reopening shows the same panel rather than a fresh one.
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    workspace.read_with(cx, |workspace, cx| {
+        assert!(workspace.ai_chat_visible_for_test(), "the toggle reopens it");
+        let panel = workspace.ai_chat_for_test().expect("the panel survived");
+        assert!(
+            !panel.read(cx).turns_for_test().is_empty(),
+            "the seeded conversation must still be there after a close and reopen"
+        );
     });
     draw(cx);
 }

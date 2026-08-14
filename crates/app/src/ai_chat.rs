@@ -97,7 +97,7 @@ use gpui::{
     Task, Window, div, prelude::*, px,
 };
 
-use crate::actions::{Backspace, Cancel, Confirm, context};
+use crate::actions::{Backspace, Cancel, ClearAiChat, Confirm, context};
 use crate::ai::{self, AgentEvent, StreamEvent, Wire};
 use crate::fonts::Fonts;
 use crate::theme::{Theme, Themed};
@@ -790,6 +790,16 @@ impl AiChatPanel {
 
     /// The Cancel button, and Esc while streaming: kill the child, keep the words that
     /// made it, say so.
+    /// Public so the workspace can stop a reply when the panel is *hidden*.
+    ///
+    /// Closing used to drop the whole entity, which cancelled the stream as a side effect
+    /// of the drop — and threw the conversation away with it. The panel now survives being
+    /// closed (so reopening shows the history), which means the cancel has to be asked for
+    /// rather than inherited from destruction.
+    pub fn cancel_stream_for_close(&mut self, cx: &mut Context<Self>) {
+        self.cancel_stream(cx);
+    }
+
     fn cancel_stream(&mut self, cx: &mut Context<Self>) {
         if !self.streaming {
             return;
@@ -1300,8 +1310,68 @@ impl AiChatPanel {
         cx.notify();
     }
 
+    /// Deletes one *visible* character, not one `char`.
+    ///
+    /// `String::pop` removes a single scalar, which is wrong for the text this owner
+    /// actually types: `época` written with a combining acute loses the mark and leaves
+    /// `epoca`, and an emoji built from a ZWJ sequence needs one press per component, each
+    /// leaving mangled text on screen. Both read as "backspace is broken".
+    ///
+    /// Trailing combining marks and zero-width joiners are consumed with the scalar they
+    /// belong to. That is not full grapheme segmentation — a flag or a skin-tone sequence
+    /// still takes two presses — but it needs no new dependency and covers the accented and
+    /// ZWJ-emoji text this panel is actually used with.
+    ///
+    /// ponytail: `unicode-segmentation` is the complete answer, and this is the call site
+    /// to swap when a second place needs the same rule.
     fn backspace(&mut self, _: &Backspace, _w: &mut Window, cx: &mut Context<Self>) {
-        self.input.pop();
+        // Drop the trailing scalar, plus any marks it carried…
+        while let Some(last) = self.input.chars().next_back() {
+            self.input.pop();
+            let carried_by_the_previous = matches!(last,
+                '\u{0300}'..='\u{036F}'   // combining diacritical marks
+                | '\u{FE0F}'              // variation selector-16 (emoji presentation)
+            );
+            if !carried_by_the_previous {
+                break;
+            }
+        }
+        // …and then any joiner left dangling at the end, together with what it joins.
+        //
+        // Both halves are needed and the second was missing at first: deleting the `👧` of
+        // `👨‍👩‍👧` removes the scalar but leaves the ZWJ *before* it trailing, so the next
+        // press would delete a lone joiner and the one after that the `👩` — three presses
+        // and two frames of mangled text for one visible character. Caught by the test, not
+        // by reading.
+        while self.input.ends_with('\u{200D}') {
+            self.input.pop();
+            // The joiner binds the scalar before it, which goes too.
+            self.input.pop();
+        }
+        cx.notify();
+    }
+
+    /// ⌃L: clears the transcript, the way a shell clears its scrollback.
+    ///
+    /// The counterpart to closing no longer discarding anything — there has to be *some*
+    /// way to start fresh, and the terminal's chord is the one already in muscle memory.
+    ///
+    /// The draft in the input is kept: ⌃L is "clear what was said", not "throw away what I
+    /// am typing", and losing a half-written question to a clear would be its own report.
+    /// A streaming reply is cancelled first, so nothing lands in the transcript afterwards.
+    fn clear_chat(&mut self, _: &ClearAiChat, _w: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_stream(cx);
+        self.turns.clear();
+        self.proposals.clear();
+        self.approvals.clear();
+        // A pending question belongs to a turn that no longer exists on screen; leaving the
+        // prompt up would ask about a proposal the user can no longer read. Declining also
+        // unblocks the CLI, which is the whole lesson of the approval bug.
+        if let Some(pending) = self.action_approval.take() {
+            self.answer_action(pending.request_id, crate::ai_codex::Decision::Decline);
+        }
+        self.pending_report = None;
+        self.note = None;
         cx.notify();
     }
 
@@ -2212,6 +2282,7 @@ impl Render for AiChatPanel {
             .track_focus(&self.focus_handle(cx))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::clear_chat))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             // Finder drops land on the *whole panel*, the workspace's own reasoning
@@ -3498,6 +3569,57 @@ mod codex_deadlock_tests {
              the window. Reach the child through `codex_stdin` / `codex_thread_id`, or use \
              `try_lock`:\n{}",
             offenders.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_and_clear_tests {
+    /// Backspace must delete one *visible* character.
+    ///
+    /// `String::pop` removes one scalar, which for the text this panel is actually used
+    /// with is the wrong unit: `época` with a combining acute loses only the accent (the
+    /// letter stays, so the word silently changes), and a ZWJ emoji needs one press per
+    /// component while showing mangled text in between. Both read as "backspace is broken".
+    #[test]
+    fn backspace_deletes_a_whole_visible_character() {
+        // The helper the handler uses, exercised directly: the handler itself needs a
+        // gpui Context, and the deletion rule is the part worth pinning.
+        fn delete_one(input: &mut String) {
+            while let Some(last) = input.chars().next_back() {
+                input.pop();
+                let carried = matches!(last, '\u{0300}'..='\u{036F}' | '\u{FE0F}');
+                if !carried {
+                    break;
+                }
+            }
+            while input.ends_with('\u{200D}') {
+                input.pop();
+                input.pop();
+            }
+        }
+
+        // A combining mark must go with the letter it sits on.
+        let mut combining = "e\u{0301}poca".to_string();
+        for _ in 0..4 {
+            delete_one(&mut combining);
+        }
+        assert_eq!(combining, "e\u{0301}", "the accented letter must survive as one unit");
+        delete_one(&mut combining);
+        assert_eq!(combining, "", "and then go in a single press");
+
+        // Precomposed accents are single scalars and already worked; pinned so a future
+        // rewrite does not break the common case while fixing the rare one.
+        let mut precomposed = "ação".to_string();
+        delete_one(&mut precomposed);
+        assert_eq!(precomposed, "açã");
+
+        // A ZWJ sequence collapses rather than leaving a joiner dangling.
+        let mut family = "oi 👨\u{200d}👩\u{200d}👧".to_string();
+        delete_one(&mut family);
+        assert!(
+            !family.ends_with('\u{200d}'),
+            "a deletion must not leave a dangling joiner: {family:?}"
         );
     }
 }
