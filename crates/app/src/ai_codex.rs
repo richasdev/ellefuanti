@@ -341,6 +341,12 @@ pub enum CodexEvent {
         /// What is being asked, in the user's words. Never empty — falls back to the method.
         summary: String,
     },
+    /// The turn started doing something visible: thinking, running a command, calling an
+    /// MCP tool. The label is ready for the UI — built here so every consumer says the
+    /// same words for the same act.
+    Activity(String),
+    /// The item that was running finished. The panel marks its activity rows done.
+    ActivityEnded,
     /// A server request this build cannot serve at all. The reader must answer it with
     /// [`method_not_found_response`] — an unanswered id is a hang — and may tell the user.
     UnservableRequest { request_id: u64, method: String },
@@ -465,8 +471,41 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
         // both would show every proposed file twice.
         "item/started" => {
             let item = params?.get("item")?;
-            if item.get("type")?.as_str()? != "fileChange" {
-                return Some(CodexEvent::Ignored);
+            let kind = item.get("type")?.as_str()?;
+            // Every visible act becomes a labelled activity (the owner's report: the
+            // panel "fica pensando e tal, mas não tem nenhuma indicação"). The labels
+            // come from the CLI's own item types — nine in the schema — so the panel
+            // narrates what is actually happening rather than a generic spinner.
+            match kind {
+                "reasoning" => return Some(CodexEvent::Activity("Thinking…".to_string())),
+                "agentMessage" => return Some(CodexEvent::Activity("Writing…".to_string())),
+                "webSearch" => {
+                    return Some(CodexEvent::Activity("Searching the web…".to_string()));
+                }
+                "imageGeneration" => {
+                    return Some(CodexEvent::Activity("Generating an image…".to_string()));
+                }
+                "commandExecution" => {
+                    let command = item.get("command").and_then(Value::as_str).unwrap_or("");
+                    return Some(CodexEvent::Activity(if command.is_empty() {
+                        "Running a command…".to_string()
+                    } else {
+                        format!("Running: {command}")
+                    }));
+                }
+                "mcpToolCall" => {
+                    let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+                    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+                    return Some(CodexEvent::Activity(match (server, tool) {
+                        ("", "") => "Using an MCP tool…".to_string(),
+                        (server, "") => format!("Using {server}…"),
+                        (server, tool) => format!("Using {server}: {tool}"),
+                    }));
+                }
+                "fileChange" => {}
+                // `userMessage` is the echo of what was typed; `error` arrives again as
+                // `turn/failed` with the message intact.
+                _ => return Some(CodexEvent::Ignored),
             }
             let item_id = item.get("id")?.as_str()?.to_string();
             let changes = item
@@ -489,6 +528,7 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
             }
             Some(CodexEvent::Proposed { item_id, changes })
         }
+        "item/completed" => Some(CodexEvent::ActivityEnded),
         "turn/completed" => Some(CodexEvent::TurnCompleted),
         "turn/failed" => {
             let message = params
@@ -788,16 +828,21 @@ mod tests {
         assert_eq!(parse_line(user_item), Some(CodexEvent::Ignored));
 
         let agent_started = r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg_0157b6","text":"","phase":"final_answer"},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
+        // Once Ignored; now the activity label — but the guarantee this test pins is
+        // unchanged: an item *start* must never be treated as reply text. The words
+        // arrive only through `item/agentMessage/delta`.
         assert_eq!(
             parse_line(agent_started),
-            Some(CodexEvent::Ignored),
-            "only a fileChange item/started carries a proposal"
+            Some(CodexEvent::Activity("Writing…".to_string())),
+            "an agentMessage start is a status, never text"
         );
 
         let agent_completed = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg_0157b6","text":"OK","phase":"final_answer"},"threadId":"019ff65a","turnId":"019ff65a"}}"#;
+        // ActivityEnded now, and the original point stands verbatim: the completed item
+        // repeats the whole reply in `text`, and treating it as text would double it.
         assert_eq!(
             parse_line(agent_completed),
-            Some(CodexEvent::Ignored),
+            Some(CodexEvent::ActivityEnded),
             "the full text here would double every reply"
         );
     }
@@ -887,7 +932,10 @@ mod tests {
         // `item/completed` repeats the whole change with a final status. Acting on it
         // would show every proposed file a second time, under a stale Apply button.
         let captured = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"exec-10e21aa1","changes":[{"path":"/tmp/corr/hello.php","kind":{"type":"update","move_path":null},"diff":"@@ -2,3 +2,3 @@\n x\n"}],"status":"declined"},"threadId":"019ff8c2","turnId":"019ff8c2"}}"#;
-        assert_eq!(parse_line(captured), Some(CodexEvent::Ignored));
+        // Once Ignored; now it checks activities off — but the guarantee this test pins
+        // is unchanged: a completed fileChange must never come out as `Proposed`, or every
+        // file would be offered a second time under a stale Apply button.
+        assert_eq!(parse_line(captured), Some(CodexEvent::ActivityEnded));
     }
 
     #[test]

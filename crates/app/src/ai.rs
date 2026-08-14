@@ -337,6 +337,11 @@ pub enum AgentEvent {
     /// Separate from `ApprovalRequested` because there is nothing to diff — the panel shows
     /// the sentence and two or three buttons, not a patch. `summary` is rendered verbatim;
     /// `allow_for_session` says whether the CLI offered a session-wide accept for this kind.
+    /// The turn is visibly doing something; the label is display-ready ("Thinking…",
+    /// "Running: composer install"). One at a time — a new one supersedes.
+    Activity(String),
+    /// The running item finished; the panel checks off its activity rows.
+    ActivityEnded,
     ActionApprovalRequested {
         request_id: u64,
         summary: String,

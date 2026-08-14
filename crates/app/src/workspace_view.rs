@@ -1374,13 +1374,12 @@ impl WorkspaceView {
     /// dropping the entity is also what cancels a reply still streaming into it.
     fn toggle_ai_chat(&mut self, _: &ToggleAiChat, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai_chat_visible {
-            // Hidden, not dropped: the conversation is still there when it reopens. The
-            // stream is cancelled explicitly, which the drop used to do implicitly — a
-            // reply narrating to a panel nobody can see is the thing to avoid, not the
-            // history it was narrating into.
-            if let Some(panel) = self.ai_chat.clone() {
-                panel.update(cx, |panel, cx| panel.cancel_stream_for_close(cx));
-            }
+            // Hidden, not dropped — and the turn **keeps running**. The first version
+            // cancelled here, carried over from the era when closing destroyed the panel;
+            // the owner hit it immediately ("quando minimiza ele cancela a execução").
+            // The entity survives a hide, its drain keeps draining, so a running turn
+            // finishes into the hidden transcript and is simply *there* on reopen — Zed's
+            // behaviour, and the only one that respects work already paid for.
             self.ai_chat_visible = false;
             self.focus_editor_or_workspace(window, cx);
             cx.notify();

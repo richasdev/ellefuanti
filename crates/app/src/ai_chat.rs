@@ -395,6 +395,13 @@ pub struct AiChatPanel {
     proposals: Vec<Proposal>,
     /// Per Codex item: the approval id, and whether it has been answered.
     approvals: std::collections::HashMap<String, PendingApproval>,
+    /// What the running turn is doing, in order: `(label, done)`. Cleared at each send.
+    ///
+    /// The activity log the owner asked for ("mostrando o que tá fazendo, e as
+    /// atividades dele"): the current act carries a live dot, finished ones a check, and
+    /// the list survives the turn so the transcript says what happened, not only what was
+    /// answered.
+    activities: Vec<(String, bool)>,
     /// A command or permission approval the CLI is blocked on, if any.
     ///
     /// One at a time, because the CLI asks one at a time and blocks until answered — a
@@ -434,6 +441,7 @@ impl AiChatPanel {
             codex_thread_id: Arc::default(),
             codex_model: Arc::default(),
             action_approval: None,
+            activities: Vec::new(),
             stream_task: None,
             attach_selection: false,
             attach_file: false,
@@ -636,6 +644,7 @@ impl AiChatPanel {
         // exactly the "nothing leaves without an explicit act" rule read backwards.
         self.attachments.clear();
 
+        self.activities.clear();
         self.turns.push(ChatTurn { role: Role::Assistant, text: String::new() });
         self.streaming = true;
         self.scroll.scroll_to_bottom();
@@ -790,6 +799,21 @@ impl AiChatPanel {
                         self.answer_codex(request_id, false);
                     }
                 }
+                AgentEvent::Activity(label) => {
+                    // A new act closes the previous ones; duplicates collapse so a chatty
+                    // stream of identical starteds reads as one line, not a ladder.
+                    if self.activities.last().map(|(l, _)| l.as_str()) != Some(label.as_str()) {
+                        for activity in &mut self.activities {
+                            activity.1 = true;
+                        }
+                        self.activities.push((label, false));
+                    }
+                }
+                AgentEvent::ActivityEnded => {
+                    for activity in &mut self.activities {
+                        activity.1 = true;
+                    }
+                }
                 AgentEvent::ActionApprovalRequested {
                     request_id,
                     summary,
@@ -839,16 +863,6 @@ impl AiChatPanel {
 
     /// The Cancel button, and Esc while streaming: kill the child, keep the words that
     /// made it, say so.
-    /// Public so the workspace can stop a reply when the panel is *hidden*.
-    ///
-    /// Closing used to drop the whole entity, which cancelled the stream as a side effect
-    /// of the drop — and threw the conversation away with it. The panel now survives being
-    /// closed (so reopening shows the history), which means the cancel has to be asked for
-    /// rather than inherited from destruction.
-    pub fn cancel_stream_for_close(&mut self, cx: &mut Context<Self>) {
-        self.cancel_stream(cx);
-    }
-
     fn cancel_stream(&mut self, cx: &mut Context<Self>) {
         if !self.streaming {
             return;
@@ -2478,6 +2492,16 @@ fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<AgentE
             // JSON-RPC error: the CLI is blocked on this id, and routing it to a UI that
             // has no buttons for it would recreate the freeze with extra steps. The note
             // keeps it honest — a declined capability the user can see beats a silent one.
+            Some(crate::ai_codex::CodexEvent::Activity(label)) => {
+                if tx.send_blocking(AgentEvent::Activity(label)).is_err() {
+                    return;
+                }
+            }
+            Some(crate::ai_codex::CodexEvent::ActivityEnded) => {
+                if tx.send_blocking(AgentEvent::ActivityEnded).is_err() {
+                    return;
+                }
+            }
             Some(crate::ai_codex::CodexEvent::UnservableRequest { request_id, method }) => {
                 write_to_codex(
                     &session.stdin,
@@ -2798,9 +2822,48 @@ impl AiChatPanel {
         };
 
         let mut body: Vec<gpui::AnyElement> = Vec::new();
-        if turn.role == Role::Assistant && turn.text.is_empty() && self.streaming && is_last {
-            // The dim ellipsis while nothing has arrived: the reply exists, its words
-            // do not yet.
+        // The activity log rides the last assistant turn: live dot on the current act,
+        // check on the finished ones. It stays after the turn ends — the transcript then
+        // says what was *done*, not only what was said.
+        if turn.role == Role::Assistant && is_last && !self.activities.is_empty() {
+            body.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .pb_1()
+                    .children(self.activities.iter().map(|(label, done)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(10.0))
+                            .child(
+                                div()
+                                    .text_color(if *done {
+                                        theme.diff_added()
+                                    } else {
+                                        theme.accent
+                                    })
+                                    .child(if *done { "✓" } else { "●" }),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(label.clone())),
+                            )
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if turn.role == Role::Assistant
+            && turn.text.is_empty()
+            && self.streaming
+            && is_last
+            && self.activities.is_empty()
+        {
+            // The dim ellipsis while nothing has arrived at all — before the first
+            // activity lands, the reply exists but nothing can be said about it yet.
             body.push(div().text_color(theme.text_muted).child("…").into_any_element());
         } else {
             for (seg_index, segment) in split_fences(&turn.text).into_iter().enumerate() {
