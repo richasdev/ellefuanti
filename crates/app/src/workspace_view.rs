@@ -4145,7 +4145,13 @@ impl WorkspaceView {
         // claim (the literal names a column of *that* class), and running both would put
         // every column in the list twice. Only when no context holds does "the file is a
         // model" offer the whole surface.
-        if let Some(context) = elle_laravel::column_context_at(&text, offset) {
+        // The document's tree, for `request_route_completions`' reason: this also runs on
+        // every keystroke, and parsing here cost 1.98 ms on a real 22 KB source.
+        let column_context = match editor.read(cx).document.syntax.tree() {
+            Some(tree) => elle_laravel::column_context_in_tree(tree, &text, offset),
+            None => elle_laravel::column_context_at(&text, offset),
+        };
+        if let Some(context) = column_context {
             let class = match context.target {
                 elle_laravel::ColumnTarget::Class(name) => name,
                 // `$this->where(` — the class is whatever model this file declares; a
@@ -4178,7 +4184,12 @@ impl WorkspaceView {
         // `User::ac` mid-typing: the scanner reads the class off the prefix, and the
         // items are the scopes by *call* name — the one list where the declared method
         // name (the server's answer) is exactly what the user must not type.
-        if let Some((class, _)) = elle_laravel::scope_context_at(&text, offset) {
+        // The document's tree, like the two sources above: also per keystroke.
+        let scope_context = match editor.read(cx).document.syntax.tree() {
+            Some(tree) => elle_laravel::scope_context_in_tree(tree, &text, offset),
+            None => elle_laravel::scope_context_at(&text, offset),
+        };
+        if let Some((class, _)) = scope_context {
             let task = cx.background_spawn(async move {
                 let path = crate::file_cache::index_path(&root)?;
                 let (index, _) = elle_index::Index::open(&path).ok()?;

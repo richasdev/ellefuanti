@@ -28,7 +28,10 @@ mod resolved;
 mod routes;
 mod targets;
 
-pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at, scope_context_at};
+pub use columns::{
+    Argument, ColumnContext, ColumnTarget, column_context_at, column_context_in_tree,
+    scope_context_at, scope_context_in_tree,
+};
 pub use composer::composer_scripts;
 pub use livewire::{
     LivewireFacts, WireTarget, extract_livewire, livewire_class_path, wire_context_at,
