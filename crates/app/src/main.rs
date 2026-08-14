@@ -228,11 +228,34 @@ fn install_panic_logger() {
     }));
 }
 
+/// `--version`/`-v`: answer and exit, before any GUI exists.
+///
+/// # Why a GUI app needs this at all
+///
+/// The terminal is a supported way to run this editor (`ellefuanti .`), and the first
+/// thing anyone checks in a CLI is which version answered. Without this, `ellefuanti
+/// --version` fell through `path_argument`'s leading-dash skip and **launched the whole
+/// app** — and because stdout was a pipe rather than a TTY, `detach_from_terminal`
+/// stayed in the foreground and the caller's script hung on a GUI it never wanted.
+/// Found by running exactly that probe.
+///
+/// Only version, deliberately: `--help` would promise a CLI surface this binary does not
+/// have. The one positional argument is documented where it is parsed.
+fn answer_version_and_exit_if_asked() {
+    let Some(flag) = std::env::args().nth(1) else { return };
+    if flag == "--version" || flag == "-v" {
+        println!("ellefuanti {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+}
+
 fn main() {
     // Before `detach_from_terminal`, so a panic in the detach path is captured too — that
     // code re-execs and touches libc, and it is the one place that runs before there is
     // any other way to see a failure.
     install_panic_logger();
+
+    answer_version_and_exit_if_asked();
 
     detach_from_terminal();
 
@@ -421,3 +444,4 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+

@@ -61,5 +61,18 @@ ditto "$MOUNT/ellefuanti.app" "$APP"
 # produces the dead-end warning.
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
+# A terminal command, like VS Code's `code`. A **symlink**, never a copy: a copy is frozen
+# at whatever build it was taken from and silently serves stale bugs after every update —
+# found on the owner's machine as a three-day-old binary in ~/.local/bin that predated a
+# week of crash fixes. The symlink always resolves to whatever is installed.
+#
+# ~/.local/bin because it needs no sudo and is already on the PATH of anyone who has it;
+# skipped quietly when the directory does not exist, because creating PATH entries is the
+# user's call, not an installer's.
+if [ -d "$HOME/.local/bin" ]; then
+    ln -sf "$APP/Contents/MacOS/ellefuanti" "$HOME/.local/bin/ellefuanti"
+    echo "Terminal command installed: ellefuanti ."
+fi
+
 echo "Installed. Opening ellefuanti…"
 open "$APP"
