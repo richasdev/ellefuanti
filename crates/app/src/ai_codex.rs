@@ -584,6 +584,33 @@ pub(crate) fn binary() -> Option<std::path::PathBuf> {
     crate::lsp_session::resolve_binary("codex", &crate::lsp_session::search_dirs())
 }
 
+/// Runs `codex logout`, which removes the stored credential.
+///
+/// # Why this exists
+///
+/// The panel grew a sign-in button and nothing to undo it — a door that only opened
+/// inwards, reported by the owner as exactly that. Signing out is the CLI's own
+/// `codex logout` (probed against a scratch `CODEX_HOME`: it deletes `auth.json` and says
+/// "Successfully logged out"), so the same boundary holds in both directions: this app
+/// never touches the credential, not to write it and not to remove it.
+///
+/// Synchronous, unlike [`begin_login`]: there is no browser and no user step to wait on,
+/// so the caller can just be told whether it worked. **Blocking** — run it off the main
+/// thread.
+pub fn sign_out() -> Result<(), String> {
+    let Some(binary) = binary() else { return Err(Availability::NotInstalled.message()) };
+    let output = std::process::Command::new(&binary)
+        .arg("logout")
+        .output()
+        .map_err(|err| format!("could not run `codex logout`: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        // The CLI's own words, because "sign-out failed" with no reason is unactionable.
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// Where the CLI keeps its login. Only ever asked whether it *exists* — reading it would
 /// mean holding a credential this app has no business holding.
 fn auth_path() -> Option<std::path::PathBuf> {

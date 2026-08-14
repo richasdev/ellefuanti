@@ -1146,6 +1146,41 @@ impl AiChatPanel {
         .detach();
     }
 
+    /// Signs out of Codex: ends the live session, runs `codex logout`, re-probes.
+    ///
+    /// Order matters and each step has a reason:
+    ///
+    /// 1. **The session dies first.** The running `codex app-server` authenticated when it
+    ///    started; killing the credential under it would leave a child that still answers
+    ///    with the old login until it exits — signed out everywhere except the one place
+    ///    the user is looking at. `interrupt_codex` also closes the shared stdin, which is
+    ///    what actually ends the child.
+    /// 2. `codex logout` runs off the main thread (it is blocking, though brief).
+    /// 3. The status is re-probed rather than assumed: the panel flips to the sign-in
+    ///    button because the CLI *says* the login is gone, not because we hope it is.
+    fn sign_out_codex(&mut self, cx: &mut Context<Self>) {
+        self.interrupt_codex();
+        *self.codex_model.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        cx.spawn(async move |this, cx| {
+            let outcome = cx.background_spawn(async { crate::ai_codex::sign_out() }).await;
+            let status = cx.background_spawn(async { crate::ai_codex::status() }).await;
+            this.update(cx, |this, cx| {
+                this.codex_status = Some(status);
+                this.turns.push(ChatTurn {
+                    role: Role::Note,
+                    text: match outcome {
+                        Ok(()) => "Signed out of Codex.".to_string(),
+                        Err(reason) => format!("Sign-out failed: {reason}"),
+                    },
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Answers a command or permission approval, and clears the prompt.
     ///
     /// Lock-free for [`Self::answer_codex`]'s reason — this runs on the main thread while
@@ -2465,6 +2500,41 @@ impl Render for AiChatPanel {
                             .gap_2()
                             .child("AI Chat")
                             .child(self.render_mode_switch(&theme, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            // Sign-out lives beside the identity it undoes: the label is
+                            // where "you are signed in" shows, so "stop being" belongs next
+                            // to it rather than in a settings page nobody thinks to open —
+                            // the owner's report was precisely "não sei como desloga".
+                            .when(
+                                provider == ai::Provider::Codex
+                                    && self.codex_status.as_ref()
+                                        == Some(&crate::ai_codex::Availability::Ready),
+                                |el| {
+                                    let entity = cx.entity();
+                                    el.child(
+                                        div()
+                                            .id("ai-codex-signout")
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted)
+                                            .cursor_pointer()
+                                            .hover(|el| el.text_color(theme.error))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_ev, _window, cx| {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.sign_out_codex(cx);
+                                                    });
+                                                },
+                                            )
+                                            .child("sign out"),
+                                    )
+                                },
+                            ),
                     )
                     .child(div().text_color(theme.text_muted).text_size(px(11.0)).child(
                         SharedString::from(format!("{} · {model}", provider.setting_name())),
