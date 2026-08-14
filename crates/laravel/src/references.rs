@@ -69,6 +69,36 @@ pub fn reference_at(source: &str, offset: usize, blade: bool) -> Option<Referenc
     if blade { blade_reference_at(source, offset) } else { php_reference_at(source, offset) }
 }
 
+/// [`reference_at`], reusing a tree the caller already has.
+///
+/// # Why this exists
+///
+/// `reference_at` parses the whole file with tree-sitter on every call — measured at
+/// **3 ms on a real 22 KB `routes/web.php`**, against 3 µs for the Blade scanner beside it,
+/// so the parse *is* the cost. That was tolerable when only ⌘click used it and unnoticeable
+/// in fixtures a few hundred bytes long.
+///
+/// It stopped being tolerable when route completion started calling it **per keystroke**:
+/// `request_route_completions` runs on every character typed inside `route('…')`, so typing
+/// a route name in a real project paid a full reparse per letter. The editor already holds
+/// an incrementally-maintained tree for the open document; handing it over turns 3 ms into
+/// a tree walk.
+///
+/// The parsing variant stays for callers that have only a string — the tests, and anything
+/// scanning a file that is not open in a tab.
+pub fn reference_at_in_tree(
+    source: &str,
+    offset: usize,
+    blade: bool,
+    tree: &tree_sitter::Tree,
+) -> Option<Reference> {
+    // Blade never parsed: its scanner is literal and already microseconds.
+    if blade {
+        return blade_reference_at(source, offset);
+    }
+    reference_in_php_tree(tree, source, offset)
+}
+
 // ---------------------------------------------------------------------------
 // PHP, via the tree
 // ---------------------------------------------------------------------------
@@ -97,7 +127,16 @@ fn php_reference_at(source: &str, offset: usize) -> Option<Reference> {
     let buffer = Buffer::new(source);
     // The same parse path the editor uses (ADR-0005), so a grammar upgrade moves both.
     let tree = SyntaxTree::new(Language::Php, &buffer).ok()?;
-    let tree = tree.tree()?;
+    reference_in_php_tree(tree.tree()?, source, offset)
+}
+
+/// The tree walk itself, shared by the parsing and the tree-reusing entry points so the
+/// two cannot disagree about what counts as a reference.
+fn reference_in_php_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    offset: usize,
+) -> Option<Reference> {
     let src = source.as_bytes();
 
     // Descend to the smallest node containing the cursor, then walk back out looking for a
@@ -564,5 +603,65 @@ mod tests {
         assert_eq!(char_boundary_at_or_below(src, 2), 1, "mid-`£` snaps down to its start");
         assert_eq!(char_boundary_at_or_below(src, 3), 3);
         assert_eq!(char_boundary_at_or_below(src, 99), src.len(), "past the end clamps to len");
+    }
+}
+
+#[cfg(test)]
+mod tree_reuse_tests {
+    use elle_syntax::{Language, SyntaxTree};
+    use elle_text::Buffer;
+
+    /// The fast path must answer exactly what the parsing path answers.
+    ///
+    /// `reference_at_in_tree` exists for speed — 3 ms of tree-sitter parse per keystroke on
+    /// a real `routes/web.php` — and a faster function that disagrees is a worse bug than
+    /// the slowness it fixes: ⌘click and completion would navigate to different places.
+    ///
+    /// Every offset, not a sample: the disagreement a sparse check misses is the one at a
+    /// node boundary, which is where the two implementations could differ at all.
+    #[test]
+    fn the_tree_path_agrees_with_the_parsing_path_at_every_offset() {
+        const SOURCE: &str = r#"<?php
+// route('commented') must stay invisible to both paths
+Route::get('/u', [UserController::class, 'index'])->name('users.índice');
+$url = route('users.índice');
+$cfg = config('app.timezone');
+$view = view('pages.configuração');
+$interpolated = route("users.{$id}");
+$empty = route('');
+"#;
+
+        let buffer = Buffer::new(SOURCE);
+        let syntax = SyntaxTree::new(Language::Php, &buffer).expect("the php grammar");
+        let tree = syntax.tree().expect("a parse tree");
+
+        for offset in 0..=SOURCE.len() {
+            let parsing = super::reference_at(SOURCE, offset, false);
+            let reusing = super::reference_at_in_tree(SOURCE, offset, false, tree);
+            assert_eq!(
+                format!("{parsing:?}"),
+                format!("{reusing:?}"),
+                "the two paths disagree at offset {offset}"
+            );
+        }
+    }
+
+    /// Blade ignores the tree entirely — its scanner is literal — so passing a PHP tree
+    /// must not change what it reports. Pinned because the signature invites a caller to
+    /// assume the tree is consulted.
+    #[test]
+    fn the_blade_path_ignores_the_tree_it_is_handed() {
+        const SOURCE: &str = "<div>@include('partials.cabeçalho')</div>\n";
+        let buffer = Buffer::new(SOURCE);
+        let syntax = SyntaxTree::new(Language::Php, &buffer).expect("the php grammar");
+        let tree = syntax.tree().expect("a parse tree");
+
+        for offset in 0..=SOURCE.len() {
+            assert_eq!(
+                format!("{:?}", super::reference_at(SOURCE, offset, true)),
+                format!("{:?}", super::reference_at_in_tree(SOURCE, offset, true, tree)),
+                "blade must not consult the tree, at offset {offset}"
+            );
+        }
     }
 }

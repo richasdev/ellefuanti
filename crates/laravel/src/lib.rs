@@ -35,7 +35,7 @@ pub use livewire::{
 };
 pub use logs::{LogEntry, parse_laravel_log, parse_laravel_log_tail};
 pub use models::{ModelFacts, extract_migration_columns, extract_model};
-pub use references::{Reference, ReferenceKind, reference_at};
+pub use references::{Reference, ReferenceKind, reference_at, reference_at_in_tree};
 pub use resolved::Resolved;
 pub use routes::{HttpMethod, Route, RouteAction, RouteExtraction, extract_routes};
 pub use targets::{Target, resolve, route_names};

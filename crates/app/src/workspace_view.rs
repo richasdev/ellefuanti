@@ -4068,7 +4068,17 @@ impl WorkspaceView {
         let source = document.buffer.text();
         let offset = document.selection.head;
 
-        let Some(reference) = elle_laravel::reference_at(&source, offset, blade) else { return };
+        // The document's own tree, not a fresh parse. This runs on **every keystroke**
+        // inside `route('…')`, and `reference_at` parses the whole file: measured at 3 ms
+        // on a real 22 KB `routes/web.php`, per character typed. The editor already keeps
+        // this tree up to date incrementally, so reusing it is the difference between
+        // typing that stutters and typing that does not.
+        let reference = match document.syntax.tree() {
+            Some(tree) => elle_laravel::reference_at_in_tree(&source, offset, blade, tree),
+            // No tree only when the grammar failed to load; the parsing path still answers.
+            None => elle_laravel::reference_at(&source, offset, blade),
+        };
+        let Some(reference) = reference else { return };
         if reference.kind != elle_laravel::ReferenceKind::Route {
             return;
         }
