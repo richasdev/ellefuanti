@@ -5746,3 +5746,87 @@ async fn an_editor_renders_while_composing(cx: &mut TestAppContext) {
 
     draw(cx);
 }
+
+/// The retry loop, replayed from a live probe against codex-cli 0.146.
+///
+/// The panel answers every fileChange approval with `decline` (it writes the file
+/// itself), and the response carries no note — so the CLI, seeing a bare decline,
+/// **re-proposes the same edit** under a fresh itemId seconds later. Before the
+/// pre-flight, that drew a second card for a change already on disk: Apply → record ✓ →
+/// the same question again, reported as "ainda meio bugado, apply e decline".
+///
+/// The re-sent patch is detectable precisely because the first copy was applied: its
+/// context no longer matches the file. This replays the probe's exact shape — apply,
+/// then the retry — and pins that the retry dies quietly: no card, a "skipped" record,
+/// and the CLI's blocked id still answered so the turn moves.
+#[gpui::test]
+async fn ai_agent_a_retried_proposal_after_apply_is_skipped_not_reshown(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, FlowBlock};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        // Turn one: the proposal, its approval, the user applying.
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.apply_proposal_for_test(0, cx);
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER);
+
+    panel.update(cx, |panel, cx| {
+        // The CLI's retry: same diff, fresh item id, new approval id — exactly what the
+        // probe transcript shows after the decline goes back.
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-2".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 1,
+                    item_id: "item-2".to_string(),
+                },
+            ],
+            cx,
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(
+            panel.proposals_for_test().is_empty(),
+            "the retry must not become a second card"
+        );
+        let flow_labels: Vec<String> = panel
+            .turns_for_test()
+            .iter()
+            .flat_map(|turn| turn.flow.iter())
+            .filter_map(|block| match block {
+                FlowBlock::Activity { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            flow_labels.iter().filter(|label| label.starts_with("Applied hello.php")).count(),
+            1,
+            "one apply, one record: {flow_labels:?}"
+        );
+        assert!(
+            flow_labels.iter().any(|label| label.contains("Skipped a stale proposal")),
+            "the retry is named, not hidden: {flow_labels:?}"
+        );
+    });
+    // And the file was written exactly once — the retry changed nothing.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER);
+    draw(cx);
+}

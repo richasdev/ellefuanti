@@ -1011,6 +1011,54 @@ impl AiChatPanel {
     fn add_proposals(&mut self, item_id: String, changes: Vec<ai::ProposedFileChange>) {
         for change in changes {
             let path = PathBuf::from(&change.path);
+
+            // Pre-flight: a patch that no longer applies to the file's current bytes is
+            // refused before it ever becomes a card.
+            //
+            // # The retry loop this kills (probed against codex-cli 0.146, live)
+            //
+            // This panel writes approved changes itself and answers `decline` (see
+            // `settle_item` for why). The response carries a decision and nothing else —
+            // no note field — so within the turn the CLI sees a bare decline and **tries
+            // again**: the probe's transcript shows a second `fileChange` approval, new
+            // itemId, same edit, seconds after the first. On screen that was Apply →
+            // record ✓ → *the same card pops up again*, the owner's "ainda meio bugado".
+            //
+            // The retry is detectable precisely because the editor already applied the
+            // first copy: the re-sent patch's context no longer matches the file. And the
+            // rule is safe in general — a proposal that fails this check would fail the
+            // Apply click with "the patch does not match the file" anyway; refusing it
+            // early only moves the same verdict before the button. A *genuine* follow-up
+            // edit applies cleanly on top and still becomes a card.
+            //
+            // Disk only, deliberately: an open tab's unsaved buffer can differ from disk,
+            // and a wrong "stale" verdict would hide a reviewable card. An unreadable or
+            // absent file (a proposal that *creates* one) skips the check entirely.
+            let stale = std::fs::read_to_string(&path)
+                .is_ok_and(|current| apply_unified_diff(&current, &change.diff).is_err());
+            if stale {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| change.path.clone());
+                if self.turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
+                    self.turns.push(ChatTurn {
+                        role: Role::Assistant,
+                        text: String::new(),
+                        flow: Vec::new(),
+                    });
+                }
+                if let Some(turn) =
+                    self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
+                {
+                    turn.flow.push(FlowBlock::Activity {
+                        label: format!("Skipped a stale proposal for {name} (already applied)"),
+                        done: true,
+                    });
+                }
+                continue;
+            }
+
             let state = match ai::deny_reason(&path) {
                 Some(reason) => ProposalState::Blocked(reason),
                 None => ProposalState::Pending,
@@ -1023,6 +1071,9 @@ impl AiChatPanel {
                 state,
             });
         }
+        // The entry exists even when every change was skipped: the CLI still asks, and
+        // `settle_item` over an empty file list answers the decline that keeps the turn
+        // moving — an unanswered id is a hang, the lesson this panel keeps re-learning.
         self.approvals.entry(item_id).or_default();
     }
 
@@ -1086,9 +1137,11 @@ impl AiChatPanel {
         // the review cards leave the pinned area. The card was the *question*; answered,
         // it has no business sitting over the input while the turn writes its ending
         // (the owner's screenshot: an applied card pinned there forever).
-        if self.turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
+        if !files.is_empty() && self.turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
             // No assistant turn to land on (a settle after ⌃L, or a test pumping events
             // straight in): the records still belong in the transcript, so one is made.
+            // Skipped when the whole item was pre-flighted away — there is nothing to
+            // record, and an empty turn would draw as a blank bubble.
             self.turns.push(ChatTurn {
                 role: Role::Assistant,
                 text: String::new(),
