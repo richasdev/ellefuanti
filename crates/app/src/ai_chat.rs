@@ -2585,6 +2585,14 @@ impl Render for AiChatPanel {
                 Some(guidance) => self.render_guidance(guidance, enabled, &theme, cx),
                 None => self.render_conversation(&theme, &fonts),
             })
+            // **Outside** the `ready` block, and that is the entire bug it fixes: `ready`
+            // means "no guidance", and NotLoggedIn *produces* guidance — so a sign-in
+            // button mounted under `ready` required being logged out and not logged out at
+            // once. It could never render; the guidance told the user about a button that
+            // did not exist ("manda fazer login mas nao tem botao"). The function itself
+            // is empty unless the status is NotLoggedIn, so mounting it unconditionally
+            // costs nothing when signed in.
+            .child(self.render_codex_login(&theme, cx))
             .when(ready, |el| {
                 el
                     // Agent selected on a provider that cannot do it: said out loud, and
@@ -2597,10 +2605,6 @@ impl Render for AiChatPanel {
                             .text_size(px(11.0))
                             .child(SharedString::from(notice))
                     }))
-                    // The review list sits directly above the input: it is a pending
-                    // action, not history, and it must not scroll away with the
-                    // transcript.
-                    .child(self.render_codex_login(&theme, cx))
                     .when(!self.proposals.is_empty(), |el| {
                         el.child(self.render_proposals(&theme, cx))
                     })
@@ -4200,5 +4204,39 @@ mod inline_markdown_tests {
         for (range, _) in &spans {
             assert!(clean.is_char_boundary(range.start) && clean.is_char_boundary(range.end));
         }
+    }
+}
+
+#[cfg(test)]
+mod login_row_reachability_tests {
+    /// The sign-in row must be mounted where a signed-out panel can reach it.
+    ///
+    /// The bug this pins: the row was mounted inside the `.when(ready, …)` block, and
+    /// `ready` means "no guidance" — while NotLoggedIn *produces* guidance. The button
+    /// therefore required being signed out and not signed out at once: unreachable by
+    /// construction, while the guidance text told the user to click it. 1707 tests were
+    /// green the whole time, because none of them asked whether the thing being pointed
+    /// at could render.
+    ///
+    /// A source-order check, because a headless draw cannot ask "is this element on
+    /// screen": the mount must appear *before* the `ready` gate in the render body.
+    #[test]
+    fn the_sign_in_row_is_mounted_outside_the_ready_gate() {
+        let source = include_str!("ai_chat.rs");
+        let body = source
+            .split("fn render(")
+            .nth(1)
+            .expect("the render body must exist");
+
+        let mount = body
+            .find(".child(self.render_codex_login")
+            .expect("the sign-in row must be mounted in render");
+        let gate = body.find(".when(ready,").expect("the ready gate must exist");
+
+        assert!(
+            mount < gate,
+            "the sign-in row is mounted inside the ready gate again — `ready` is false \
+             exactly when the user is signed out, so the button can never render there"
+        );
     }
 }
