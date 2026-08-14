@@ -1388,6 +1388,12 @@ impl WorkspaceView {
         }
         // Reopening an existing panel: show it again, history intact, and do not rebuild
         // the closures below — the ones it already holds are still correct.
+        // The settings modal covers the whole window, and its own text points here with
+        // "use Sign in, in the AI panel (⌘⇧A)". Without this, following that advice
+        // toggled a panel *behind* the modal — dispatched, rendered, and invisible, which
+        // from the user's chair is "nada acontece". Opening the chat is leaving settings.
+        self.settings_panel = None;
+
         if self.ai_chat.is_some() {
             self.ai_chat_visible = true;
             if let Some(panel) = self.ai_chat.clone() {
@@ -8081,7 +8087,12 @@ impl Render for WorkspaceView {
                         // the panel grows leftwards, hence the -1.
                         el.child(self.render_divider("divider-ai-chat", -1.0, &theme, cx))
                     })
-                    .when(!zen, |el| {
+                    // `ai_chat_visible`, not just `!zen` — the owner's "a aba não
+                    // minimiza". When closing dropped the entity, `!zen` was enough: no
+                    // entity, nothing to mount. Hide-don't-drop broke that silently — the
+                    // divider got the visibility gate, the panel itself kept the old one,
+                    // and a hidden panel rendered forever with only its divider gone.
+                    .when(!zen && self.ai_chat_visible, |el| {
                         el.children(self.ai_chat.clone().map(|panel| {
                             div().w(self.ai_chat_width).flex_none().h_full().child(panel)
                         }))
@@ -9423,7 +9434,9 @@ impl WorkspaceView {
     /// already there?" — the state the keyboard shortcut alone never showed.
     fn render_ai_chat_button(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
-        let open = self.ai_chat.is_some();
+        // Visibility, not existence: the entity outlives a close now, so `is_some()` is
+        // permanently true after the first open and the button would read "Close" forever.
+        let open = self.ai_chat_visible;
         div()
             .id("titlebar-ai-chat")
             .size(px(22.0))
