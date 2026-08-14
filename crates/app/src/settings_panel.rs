@@ -62,7 +62,7 @@ pub struct SettingsPanel {
     /// Codex availability (#99), resolved once off the main thread and cached. `None`
     /// while the probe runs. It lives here rather than being read per-render because the
     /// check spawns `codex --version`, and a render must never spawn a process.
-    codex_status: Option<Result<(), String>>,
+    codex_status: Option<crate::ai_codex::Availability>,
 }
 
 impl EventEmitter<SettingsPanelEvent> for SettingsPanel {}
@@ -73,7 +73,7 @@ impl SettingsPanel {
         // and an answer that only arrives after the user lands there reads as a stall.
         #[cfg(not(test))]
         cx.spawn(async move |this, cx| {
-            let status = cx.background_spawn(async { crate::ai_codex::availability() }).await;
+            let status = cx.background_spawn(async { crate::ai_codex::status() }).await;
             this.update(cx, |this, cx| {
                 this.codex_status = Some(status);
                 cx.notify();
@@ -336,12 +336,20 @@ impl Render for SettingsPanel {
         // logged in, or the command that would fix it. Cached by the panel rather than
         // probed here — a render must not spawn a process.
         let codex_row = (chat_provider == crate::ai::Provider::Codex).then(|| {
+            use crate::ai_codex::Availability;
+            // Sentences sized for the row they live in. The old text ended "— run `codex
+            // login` in a terminal", which the row's truncation cut to "run `c" — advice
+            // that was unreadable *and* stale, since sign-in is a button in the AI panel
+            // now. A message that must fit its row is also a message short enough to act on.
             let status = match &self.codex_status {
                 None => "checking…".to_string(),
-                Some(Ok(())) => "installed, logged in".to_string(),
-                Some(Err(reason)) => reason.clone(),
+                Some(Availability::Ready) => "installed, logged in".to_string(),
+                Some(Availability::NotLoggedIn) => {
+                    "not logged in — use Sign in, in the AI panel (⌘⇧A)".to_string()
+                }
+                Some(Availability::NotInstalled) => "CLI not installed".to_string(),
             };
-            row_readonly("Codex", status, &theme)
+            row_wrapping("Codex", status, &theme)
         });
 
         // "Set API key…" is meaningless for a provider that holds its own login, and a
@@ -534,6 +542,28 @@ fn row_toggle(
 }
 
 /// A row that only shows a value — the models (#99), whose edit path is the JSON file.
+/// A read-only row whose value is a sentence: wraps instead of truncating.
+///
+/// `row` truncates deliberately (a long font-family name must not wrap the row), but that
+/// same truncation cut the Codex status to "run `c" — unreadable, reported by screenshot.
+/// A status is prose; prose wraps. `min_h` instead of `h`, so a second line grows the row
+/// rather than being clipped by it.
+fn row_wrapping(
+    label: &'static str,
+    value: String,
+    theme: &crate::theme::Theme,
+) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .min_h(Metrics::ROW_HEIGHT)
+        .py_1()
+        .gap_2()
+        .child(div().w(px(140.0)).flex_none().text_color(theme.text_muted).child(label))
+        .child(div().flex_1().child(SharedString::from(value)))
+        .into_any_element()
+}
+
 fn row_readonly(
     label: &'static str,
     value: String,
