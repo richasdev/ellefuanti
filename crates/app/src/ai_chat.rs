@@ -486,6 +486,28 @@ impl AiChatPanel {
     /// as dead code and `-D warnings` fails the build. That is the CI break, and the
     /// honest fix is to say so here rather than to give the tests a call they do not
     /// want just to keep the lint quiet.
+    /// Re-probes Codex on every *show*, because the panel now outlives its closes.
+    ///
+    /// The probe at construction was enough when closing dropped the entity: every open
+    /// was a fresh panel, so the status was always fresh. Hide-don't-drop turned that
+    /// probe into a one-shot — the owner signed out (via this panel's own button, while it
+    /// was later hidden the state moved on), reopened, and the cached `Ready` meant no
+    /// sign-in button anywhere while settings said "not logged in". Two answers on one
+    /// screen, both from caches of different ages.
+    ///
+    /// Cheap to call unconditionally: the probe is off-thread, and skipped entirely when
+    /// Codex is not the provider.
+    pub fn refresh_codex_status(&self, cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        if ai::Provider::from_setting(crate::settings::current(cx).ai_chat_provider())
+            == ai::Provider::Codex
+        {
+            self.probe_codex(cx);
+        }
+        #[cfg(test)]
+        let _ = cx;
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     fn probe_codex(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {

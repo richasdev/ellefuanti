@@ -1398,6 +1398,10 @@ impl WorkspaceView {
             self.ai_chat_visible = true;
             if let Some(panel) = self.ai_chat.clone() {
                 window.focus(&panel.focus_handle(cx));
+                // The status may have moved while the panel was hidden — a sign-out from
+                // its own header, a `codex login` in a terminal. Stale `Ready` here is how
+                // "não aparece nenhum sign in" happens while settings says "not logged in".
+                panel.update(cx, |panel, cx| panel.refresh_codex_status(cx));
             }
             cx.notify();
             return;
