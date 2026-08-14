@@ -451,22 +451,119 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
 /// The two failures are deliberately distinct: an uninstalled CLI and a logged-out one
 /// need different commands, and "AI chat is broken" would be neither.
 pub fn availability() -> Result<(), String> {
-    let Some(binary) = binary() else {
-        return Err("Codex CLI not found — install it and run `codex login`".to_string());
-    };
+    match status() {
+        Availability::Ready => Ok(()),
+        other => Err(other.message()),
+    }
+}
+
+/// Why Codex can or cannot answer, as something the caller can *branch on*.
+///
+/// # Why not just the sentence
+///
+/// `availability` returns `Result<(), String>`, so every caller could show the problem and
+/// none could act on it. The two failures need different offers: a missing CLI needs an
+/// install link, a logged-out one needs a **button that logs in** — and telling them apart
+/// from prose means matching on error text, which is how a message reword silently turns a
+/// button off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Availability {
+    /// Installed and logged in.
+    Ready,
+    /// No `codex` binary anywhere this app looks.
+    NotInstalled,
+    /// The CLI is there; nobody is signed in. **This one is actionable in-app.**
+    NotLoggedIn,
+}
+
+impl Availability {
+    /// The sentence to show. Names the exact command, because the button is a convenience
+    /// and a terminal is still the answer when it fails.
+    pub fn message(&self) -> String {
+        match self {
+            Availability::Ready => String::new(),
+            Availability::NotInstalled => {
+                "Codex CLI not found — install it and run `codex login`".to_string()
+            }
+            Availability::NotLoggedIn => {
+                "Codex is installed but not logged in — run `codex login`".to_string()
+            }
+        }
+    }
+}
+
+/// Whether this machine can chat through Codex, and why not when it cannot.
+///
+/// **Blocking** — it runs the CLI — so call it off the main thread.
+///
+/// Login is decided by `codex login status` rather than by the presence of
+/// `~/.codex/auth.json`: an expired or revoked session leaves that file exactly where it
+/// was, so the file test reported "logged in" for an account that could no longer answer.
+/// Asking the CLI is asking the thing that actually knows, and it still tells this app
+/// nothing about the credential itself — only "Logged in" or "Not logged in".
+pub fn status() -> Availability {
+    let Some(binary) = binary() else { return Availability::NotInstalled };
     let installed = std::process::Command::new(&binary)
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success());
     if !installed {
-        return Err("Codex CLI not found — install it and run `codex login`".to_string());
+        return Availability::NotInstalled;
     }
-    if !auth_path().is_some_and(|path| path.exists()) {
-        return Err(
-            "Codex is installed but not logged in — run `codex login` in a terminal".to_string()
-        );
-    }
-    Ok(())
+
+    let logged_in = std::process::Command::new(&binary)
+        .arg("login")
+        .arg("status")
+        .output()
+        .map(|output| {
+            // The **exit code**, measured against `codex-cli 0.146.0`: 0 when signed in, 1
+            // when not. Both write their sentence to **stderr** and leave stdout empty, so
+            // a first version of this that matched "not logged in" in stdout was reading a
+            // stream that is always blank — it happened to return the right answer for the
+            // logged-in case and would have reported a logged-out user as ready.
+            //
+            // The text is still consulted, but only as a tiebreak for a future CLI that
+            // stops using the exit code: an unrecognised phrasing reads as logged in and
+            // lets the turn try, rather than hiding the panel behind a login button from
+            // someone who is already signed in.
+            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+            if stderr.contains("not logged in") {
+                false
+            } else {
+                output.status.success() || stderr.contains("logged in")
+            }
+        })
+        // The CLI failing to answer is not proof of being logged out; fall back to the file,
+        // which is what this checked before `login status` existed here.
+        .unwrap_or_else(|_| auth_path().is_some_and(|path| path.exists()));
+
+    if logged_in { Availability::Ready } else { Availability::NotLoggedIn }
+}
+
+/// Runs `codex login`, which opens the browser for OpenAI's own sign-in.
+///
+/// **This app never sees a credential.** The CLI owns the OAuth flow end to end and writes
+/// `~/.codex/auth.json` itself; all this does is start it, which is the difference between
+/// "the editor logs you in" and "the editor saves you a trip to the terminal". Nothing here
+/// reads a password, a token or that file — the same rule the module docs state.
+///
+/// Spawned rather than waited on: the flow ends in a browser the user has to interact with,
+/// so blocking on the child would freeze whatever called it for as long as they take. The
+/// caller polls [`status`] to learn when it finished.
+///
+/// **Blocking** only for the spawn itself.
+pub fn begin_login() -> Result<std::process::Child, String> {
+    let Some(binary) = binary() else { return Err(Availability::NotInstalled.message()) };
+    std::process::Command::new(&binary)
+        .arg("login")
+        // The child's own output is not the user interface — the browser is, and `status`
+        // is how completion is detected. Left on null so a chatty CLI cannot block on a
+        // pipe nobody reads.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|err| format!("could not start `codex login`: {err}"))
 }
 
 /// The `codex` executable, looked up the same way language servers are.
@@ -860,5 +957,74 @@ mod approval_kind_tests {
                 .contains(r#""decision":"acceptForSession""#)
         );
         assert!(action_approval_response(1, Decision::Decline).contains(r#""decision":"decline""#));
+    }
+}
+
+#[cfg(test)]
+mod login_boundary_tests {
+    /// The credential boundary, checked mechanically.
+    ///
+    /// Adding a "Sign in to Codex" button is the moment this rule is easiest to break: the
+    /// obvious next step for anyone extending it is to collect an email and a password in
+    /// the panel and hand them over, or to read `auth.json` to show *who* is signed in.
+    /// Both would make this editor a credential holder, which the module docs say it must
+    /// never be — and which is exactly what the owner objected to before the button existed.
+    ///
+    /// So the rule is a test rather than a paragraph: this module may check that the auth
+    /// file *exists*, and may never read it.
+    #[test]
+    fn the_auth_file_is_never_read() {
+        let source = include_str!("ai_codex.rs");
+        let source = source.split("mod login_boundary_tests").next().unwrap_or(source);
+
+        for forbidden in
+            ["read_to_string", "fs::read", "File::open", "read_link", "with_api_key", "password"]
+        {
+            let hits: Vec<_> = source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let code = line.split("//").next().unwrap_or("");
+                    code.contains(forbidden)
+                })
+                .map(|(i, line)| format!("  {}: {}", i + 1, line.trim()))
+                .collect();
+
+            assert!(
+                hits.is_empty(),
+                "this module must never read a credential — `codex login` owns the flow and \
+                 writes ~/.codex/auth.json, and all this app may ask is whether it exists. \
+                 Found `{forbidden}`:\n{}",
+                hits.join("\n")
+            );
+        }
+    }
+
+    /// `begin_login` must run the CLI's own flow and nothing else — no flags that would
+    /// route a secret through this process.
+    ///
+    /// `--with-api-key` and `--with-access-token` read a credential from **stdin**, which
+    /// would mean this app holding one to pipe it. Using them would be the easy way to
+    /// "improve" the button and the exact thing that must not happen.
+    #[test]
+    fn the_login_command_takes_no_credential_flags() {
+        let source = include_str!("ai_codex.rs");
+        let begin = source
+            .split("pub fn begin_login")
+            .nth(1)
+            .expect("begin_login must exist")
+            .split("\n}")
+            .next()
+            .expect("a function body");
+
+        assert!(begin.contains(r#".arg("login")"#), "it must run `codex login`");
+        assert!(
+            !begin.contains("with-api-key") && !begin.contains("with-access-token"),
+            "no flag may route a credential through this process: {begin}"
+        );
+        assert!(
+            begin.contains("Stdio::null()"),
+            "stdin stays closed, so nothing can be piped into the login: {begin}"
+        );
     }
 }

@@ -205,6 +205,22 @@ struct PendingApproval {
     answered: bool,
 }
 
+/// A `codex login` the panel started and is waiting on.
+///
+/// The flow finishes in a **browser**, not in this process: the CLI opens OpenAI's sign-in
+/// page and the user authenticates there. So there is nothing to await — the child is held
+/// only so it can be reaped, and completion is learned by re-probing [`crate::ai_codex::status`]
+/// on a timer.
+///
+/// `message` is what the panel shows meanwhile. It is a field rather than a constant
+/// because a failed spawn has to say *why* in the same place the progress was showing.
+struct LoginProgress {
+    child: Option<std::process::Child>,
+    message: String,
+    /// True once the attempt has ended badly, so the button comes back.
+    failed: bool,
+}
+
 /// A non-file approval the CLI is blocked on: a command to run, or permissions to grant.
 ///
 /// # Why this is not folded into [`PendingApproval`]
@@ -364,7 +380,10 @@ pub struct AiChatPanel {
     codex: Arc<Mutex<CodexState>>,
     /// Codex availability, resolved off the main thread once per panel and cached: the
     /// check spawns `codex --version`, which a render must never do.
-    codex_status: Option<Result<(), String>>,
+    codex_status: Option<crate::ai_codex::Availability>,
+    /// Set while `codex login` is running, so the panel can say so and not offer the
+    /// button twice. Cleared when the poll sees the login land — or fail.
+    codex_login: Option<LoginProgress>,
     /// Ask or Agent. Read from settings at construction so the panel opens in the mode
     /// the user left it in, and written back when the switch is clicked.
     mode: ChatMode,
@@ -425,6 +444,7 @@ impl AiChatPanel {
             project_root,
             codex: Arc::default(),
             codex_status: None,
+            codex_login: None,
             // The mode the user left the panel in. Read once here rather than per render:
             // the switch below is what changes it, and it writes both places at once.
             mode: {
@@ -469,7 +489,7 @@ impl AiChatPanel {
     #[cfg_attr(test, allow(dead_code))]
     fn probe_codex(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let status = cx.background_spawn(async { crate::ai_codex::availability() }).await;
+            let status = cx.background_spawn(async { crate::ai_codex::status() }).await;
             this.update(cx, |this, cx| {
                 this.codex_status = Some(status);
                 cx.notify();
@@ -1028,6 +1048,102 @@ impl AiChatPanel {
     fn answer_codex(&self, request_id: u64, approve: bool) {
         let reply = crate::ai_codex::approval_response(request_id, approve);
         write_to_codex(&self.codex_stdin, &reply);
+    }
+
+    /// Starts `codex login` and watches for it to land.
+    ///
+    /// # What this does and does not do
+    ///
+    /// It **starts** the CLI's own OAuth flow, which opens a browser on OpenAI's sign-in
+    /// page. The password is typed there, the token is written there, and this app reads
+    /// neither — the same boundary the module docs draw, unchanged by there being a button
+    /// now. What the button removes is the trip to a terminal, not the consent.
+    ///
+    /// Completion cannot be awaited: the child returns when the *flow* is done, which may be
+    /// after the user has clicked through several pages, and blocking the panel on that
+    /// would freeze it for as long as they take. So the status is re-probed on a timer until
+    /// it flips, which is also what makes the panel notice a login completed in a terminal.
+    ///
+    /// Bounded, because an unattended app must not poll forever: after `LOGIN_TIMEOUT` the
+    /// attempt is reported as not completed and the button comes back. The user is not cut
+    /// off — the browser is still open and finishing there still works; the next probe will
+    /// see it.
+    fn begin_codex_login(&mut self, cx: &mut Context<Self>) {
+        if self.codex_login.as_ref().is_some_and(|login| !login.failed) {
+            return; // already running: a second `codex login` would open a second browser
+        }
+
+        match crate::ai_codex::begin_login() {
+            Ok(child) => {
+                self.codex_login = Some(LoginProgress {
+                    child: Some(child),
+                    message: "Opening your browser to sign in…".to_string(),
+                    failed: false,
+                });
+            }
+            Err(reason) => {
+                self.codex_login =
+                    Some(LoginProgress { child: None, message: reason, failed: true });
+                cx.notify();
+                return;
+            }
+        }
+        cx.notify();
+
+        // Poll until the CLI reports a login, or the budget runs out.
+        cx.spawn(async move |this, cx| {
+            const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+            const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + LOGIN_TIMEOUT;
+
+            loop {
+                cx.background_executor().timer(POLL).await;
+
+                let status = cx.background_spawn(async { crate::ai_codex::status() }).await;
+                let ready = status == crate::ai_codex::Availability::Ready;
+
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        this.codex_status = Some(status);
+                        if ready {
+                            // Reap the child rather than leaving a zombie; it has done its
+                            // job the moment the status flips.
+                            if let Some(mut login) = this.codex_login.take()
+                                && let Some(child) = login.child.as_mut()
+                            {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                            this.turns.push(ChatTurn {
+                                role: Role::Note,
+                                text: "Signed in to Codex.".to_string(),
+                            });
+                        }
+                        cx.notify();
+                        !ready
+                    })
+                    .unwrap_or(false);
+
+                if !keep_going {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    this.update(cx, |this, cx| {
+                        if let Some(login) = this.codex_login.as_mut() {
+                            login.failed = true;
+                            login.message =
+                                "Sign-in did not finish. Finish it in the browser, or run \
+                                 `codex login` in a terminal."
+                                    .to_string();
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Answers a command or permission approval, and clears the prompt.
@@ -1830,13 +1946,13 @@ pub fn mode_notice(mode: ChatMode, provider: ai::Provider) -> Option<String> {
 /// What stands in the conversation area before the panel can work: which provider is
 /// selected and what is missing. `None` means the panel is ready for an input row.
 ///
-/// `codex_status` is the cached [`crate::ai_codex::availability`] answer: `None` while the
+/// `codex_status` is the cached [`crate::ai_codex::status`] answer: `None` while the
 /// probe is still running, and consulted only when Codex is the selected provider.
 pub fn setup_guidance(
     enabled: bool,
     provider: ai::Provider,
     base_url: &str,
-    codex_status: Option<&Result<(), String>>,
+    codex_status: Option<&crate::ai_codex::Availability>,
 ) -> Option<String> {
     if !enabled {
         return Some(format!(
@@ -1854,16 +1970,25 @@ pub fn setup_guidance(
     }
     if provider == ai::Provider::Codex {
         return match codex_status {
+            Some(crate::ai_codex::Availability::Ready) => None,
+            // Not logged in is the case with a button beside it, so the text stops at the
+            // explanation and does not repeat the command — `render_codex_login` offers the
+            // click, and the sentence there names `codex login` for when it fails.
+            Some(crate::ai_codex::Availability::NotLoggedIn) => Some(
+                "Chat runs your local `codex` CLI, which uses your own ChatGPT login. \
+                 This editor never sees your credentials, and the thread is read-only — \
+                 it can read the open project, not write to it."
+                    .to_string(),
+            ),
             // The probe's own sentence already names the command to run — repeating it
             // here in different words is how two error messages start disagreeing.
-            Some(Err(reason)) => Some(format!(
-                "{reason}.\n\nChat runs your local `codex` CLI, which uses your own \
-                 ChatGPT login. This editor never sees your credentials, and the thread \
-                 is read-only — it can read the open project, not write to it."
+            Some(other) => Some(format!(
+                "{}.\n\nChat runs your local `codex` CLI, which uses your own ChatGPT \
+                 login. This editor never sees your credentials.",
+                other.message()
             )),
             // Still probing: no input row yet, because a send would race the answer.
             None => Some("Checking for the Codex CLI…".to_string()),
-            Some(Ok(())) => None,
         };
     }
     None
@@ -2365,6 +2490,7 @@ impl Render for AiChatPanel {
                     // The review list sits directly above the input: it is a pending
                     // action, not history, and it must not scroll away with the
                     // transcript.
+                    .child(self.render_codex_login(&theme, cx))
                     .when(!self.proposals.is_empty(), |el| {
                         el.child(self.render_proposals(&theme, cx))
                     })
@@ -2549,6 +2675,68 @@ impl AiChatPanel {
     /// Rendered above the input rather than inside the transcript because these are not
     /// conversation — they are a pending action, and burying them in a scrolled history
     /// is how an Apply button gets missed.
+    /// The sign-in row: a button when logged out, live progress while signing in.
+    ///
+    /// Only for [`crate::ai_codex::Availability::NotLoggedIn`] — a missing CLI needs an
+    /// install, which this cannot do, so offering a button there would be a click that
+    /// fails. The guidance text above still names `codex login` for both cases, because a
+    /// button is a shortcut and the terminal stays the answer when it does not work.
+    fn render_codex_login(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let logged_out =
+            self.codex_status.as_ref() == Some(&crate::ai_codex::Availability::NotLoggedIn);
+        if !logged_out {
+            return div().into_any_element();
+        }
+
+        // Signing in right now: show what is happening instead of a second button.
+        if let Some(login) = self.codex_login.as_ref()
+            && !login.failed
+        {
+            return div()
+                .px_2()
+                .py_1()
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(login.message.clone()))
+                .into_any_element();
+        }
+
+        let failure = self
+            .codex_login
+            .as_ref()
+            .filter(|login| login.failed)
+            .map(|login| login.message.clone());
+
+        let entity = cx.entity();
+        let button = div()
+            .id("ai-codex-login")
+            .px_2()
+            .py_0p5()
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .text_color(theme.accent)
+            .hover(|el| el.bg(theme.hover))
+            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                entity.update(cx, |this, cx| this.begin_codex_login(cx));
+            })
+            .child("Sign in to Codex");
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(button)
+            .children(failure.map(|message| {
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.error)
+                    .child(SharedString::from(message))
+            }))
+            .into_any_element()
+    }
+
     /// The prompt for a command or permission approval.
     ///
     /// # Why this exists
@@ -3328,29 +3516,42 @@ mod tests {
         assert_eq!(apply_unified_diff("", diff).unwrap(), "<?php\nreturn 1;\n");
     }
 
-    /// An unavailable Codex must say the command that fixes it, never fail silently (#99).
+    /// An unavailable Codex must say what is wrong and who owns the login (#99).
     #[test]
     fn codex_guidance_carries_the_command_that_fixes_it() {
-        let missing = Err("Codex CLI not found — install it and run `codex login`".to_string());
-        let guidance = setup_guidance(true, ai::Provider::Codex, "", Some(&missing)).unwrap();
+        use crate::ai_codex::Availability;
+
+        // A missing CLI is the case the app cannot fix for the user, so the text still
+        // carries the command — there is no button for this one.
+        let guidance =
+            setup_guidance(true, ai::Provider::Codex, "", Some(&Availability::NotInstalled))
+                .unwrap();
         assert!(guidance.contains("codex login"), "the exact command to run: {guidance}");
         assert!(
             guidance.contains("never sees your credentials"),
             "and who owns the login: {guidance}"
         );
 
-        let logged_out =
-            Err("Codex is installed but not logged in — run `codex login` in a terminal"
-                .to_string());
-        let guidance = setup_guidance(true, ai::Provider::Codex, "", Some(&logged_out)).unwrap();
-        assert!(guidance.contains("not logged in"), "{guidance}");
-        assert!(guidance.contains("codex login"), "{guidance}");
+        // Logged out *is* fixable in-app, so the text explains and `render_codex_login`
+        // offers the click. What must survive either way is the credential boundary: the
+        // reason a sign-in button is acceptable at all is that the CLI owns the flow.
+        let guidance =
+            setup_guidance(true, ai::Provider::Codex, "", Some(&Availability::NotLoggedIn))
+                .unwrap();
+        assert!(
+            guidance.contains("never sees your credentials"),
+            "the boundary must be stated where the button is offered: {guidance}"
+        );
+        assert!(
+            guidance.contains("read-only"),
+            "and that the thread cannot write on its own: {guidance}"
+        );
 
         // While the probe is in flight there is still no input row: a send would race it.
         assert!(setup_guidance(true, ai::Provider::Codex, "", None).is_some());
 
         // Available: the panel is ready, and the base URL is none of Codex's business.
-        assert_eq!(setup_guidance(true, ai::Provider::Codex, "", Some(&Ok(()))), None);
+        assert_eq!(setup_guidance(true, ai::Provider::Codex, "", Some(&Availability::Ready)), None);
     }
 }
 
