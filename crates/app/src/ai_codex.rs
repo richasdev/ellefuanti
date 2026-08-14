@@ -180,6 +180,11 @@ pub enum ApprovalKind {
     Permissions,
     /// An approval method this build does not know about.
     Unknown,
+    /// An MCP server asking the user something (`mcpServer/elicitation/request`) — the
+    /// "may I read this skill / use this server" prompts. Its answer is a different wire
+    /// shape (`action`) from the command decisions (`decision`), which is why the kind
+    /// travels with the request: the button click must pick the right encoder.
+    McpElicitation,
 }
 
 /// How an approval was answered.
@@ -209,6 +214,36 @@ pub fn action_approval_response(request_id: u64, decision: Decision) -> String {
         "jsonrpc": "2.0",
         "id": request_id,
         "result": {"decision": word},
+    }))
+}
+
+/// The answer to an MCP elicitation, at the request's own id.
+///
+/// `content: {}` on accept mirrors a bare confirmation; decline carries none (the schema
+/// marks it nullable for exactly that). `cancel` is deliberately unused — the panel offers
+/// two buttons, and a third state whose semantics differ per server is not worth a third
+/// button nobody can predict the effect of.
+pub fn elicitation_response(request_id: u64, accept: bool) -> String {
+    let result = if accept {
+        json!({"action": "accept", "content": {}})
+    } else {
+        json!({"action": "decline"})
+    };
+    line(json!({"jsonrpc": "2.0", "id": request_id, "result": result}))
+}
+
+/// A JSON-RPC "method not found", for server requests this build cannot serve.
+///
+/// **An unanswered request is a hang** — the whole lesson of the approval bugs: the CLI
+/// blocks on its reply, the panel shows nothing, and the user reports a spinner. The
+/// schema lists nine server→client methods and new ones will keep arriving; erroring the
+/// unknown ones keeps the turn moving and downgrades "the app froze" to "a feature this
+/// build lacks".
+pub fn method_not_found_response(request_id: u64) -> String {
+    line(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": -32601, "message": "this client does not implement that method"},
     }))
 }
 
@@ -306,6 +341,9 @@ pub enum CodexEvent {
         /// What is being asked, in the user's words. Never empty — falls back to the method.
         summary: String,
     },
+    /// A server request this build cannot serve at all. The reader must answer it with
+    /// [`method_not_found_response`] — an unanswered id is a hang — and may tell the user.
+    UnservableRequest { request_id: u64, method: String },
     /// A line that is well-formed and deliberately carries nothing: lifecycle chatter,
     /// rate-limit updates, MCP startup noise. Distinct from `None` (unparseable) so a
     /// reader can tell "understood and skipped" from "not JSON at all".
@@ -350,6 +388,20 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
                     summary: permissions_summary(value.get("params")),
                 });
             }
+            // MCP servers asking the user (`mode: confirm` skills prompts and friends).
+            // The message is the server's own sentence; shown verbatim like the others.
+            "mcpServer/elicitation/request" => {
+                let message = value
+                    .get("params")
+                    .and_then(|params| params.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("an MCP server is asking for confirmation");
+                return Some(CodexEvent::ActionApprovalRequested {
+                    request_id: id,
+                    kind: ApprovalKind::McpElicitation,
+                    summary: message.to_string(),
+                });
+            }
             // An approval method this build does not know. **Not `Ignored`** — an
             // unanswered request is a turn that hangs forever, which is the bug this whole
             // branch exists to stop. Surfaced with the method name so the user can decline
@@ -362,7 +414,18 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
                     summary: format!("an approval this version does not recognise ({other})"),
                 });
             }
-            _ => {}
+            // Any other server *request* — `item/tool/call`, `item/tool/requestUserInput`,
+            // `attestation/generate`, whatever ships next — cannot go to `Ignored`: it has
+            // an id, the CLI is blocked on its answer, and silence is the freeze the owner
+            // kept reporting. The reader answers it with a JSON-RPC error so the turn
+            // moves, and the event carries the method so the transcript can say what was
+            // declined instead of hiding it.
+            other => {
+                return Some(CodexEvent::UnservableRequest {
+                    request_id: id,
+                    method: other.to_string(),
+                });
+            }
         }
     }
 
@@ -973,6 +1036,41 @@ mod approval_kind_tests {
                 item_id: "exec-10e2".to_string()
             })
         );
+    }
+
+    /// The MCP prompt path — "may I read this skill / use this server". Its answer is a
+    /// different wire shape (`action`, not `decision`), so the kind must survive parsing.
+    #[test]
+    fn an_mcp_elicitation_is_answerable_with_its_own_shape() {
+        let line = r#"{"jsonrpc":"2.0","id":21,"method":"mcpServer/elicitation/request","params":{"message":"Allow the docs server to read your skills?","mode":"confirm","requestedSchema":{}}}"#;
+        match parse_line(line) {
+            Some(CodexEvent::ActionApprovalRequested { request_id, kind, summary }) => {
+                assert_eq!(request_id, 21);
+                assert_eq!(kind, ApprovalKind::McpElicitation);
+                assert!(summary.contains("docs server"), "the server's sentence: {summary}");
+            }
+            other => panic!("an elicitation must reach the user, got {other:?}"),
+        }
+        assert!(elicitation_response(21, true).contains(r#""action":"accept""#));
+        assert!(elicitation_response(21, false).contains(r#""action":"decline""#));
+    }
+
+    /// Every *other* server request must come out answerable too — an id with no reply is
+    /// a hang, which is the bug class behind every "loop infinito" this panel has had.
+    /// `item/tool/call` stands in for the lot (the schema lists nine and counting).
+    #[test]
+    fn any_unknown_server_request_is_surfaced_for_an_error_reply() {
+        let line = r#"{"jsonrpc":"2.0","id":33,"method":"item/tool/call","params":{}}"#;
+        match parse_line(line) {
+            Some(CodexEvent::UnservableRequest { request_id, method }) => {
+                assert_eq!(request_id, 33);
+                assert_eq!(method, "item/tool/call");
+            }
+            other => panic!("an unservable request must not be ignored, got {other:?}"),
+        }
+        let reply = method_not_found_response(33);
+        assert!(reply.contains("-32601"), "the JSON-RPC error code: {reply}");
+        assert!(reply.contains(r#""id":33"#), "addressed to the blocked id: {reply}");
     }
 
     /// The decision words are the CLI's, from `CommandExecutionApprovalDecision`.

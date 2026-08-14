@@ -65,13 +65,27 @@ use crate::workspace_view::WorkspaceView;
 /// ponytail: `std::env::args` rather than a parser. There is one optional positional
 /// argument and no flags. Reach for `clap` at the second one.
 fn path_argument() -> Option<std::path::PathBuf> {
-    let raw = std::env::args().nth(1)?;
-    // macOS hands a `.app` launched by the Finder a `-psn_0_12345` process-serial argument.
-    // Treating that as a path would make every Finder launch report a missing file.
-    if raw.starts_with('-') {
-        return None;
-    }
-    Some(std::path::PathBuf::from(raw))
+    // The first argument that is not a flag. `nth(1)` broke the moment `-w` existed:
+    // `ellefuanti -w .` put the path second, and the old read found the flag, skipped it
+    // as a `-psn`-style non-path, and opened an empty window.
+    std::env::args()
+        .skip(1)
+        .find(|raw| !raw.starts_with('-'))
+        .map(std::path::PathBuf::from)
+}
+
+/// `-w` / `--wait`: hold the terminal until the window closes, vim's working rhythm.
+///
+/// # What this is and is not
+///
+/// It is the *workflow* of a terminal editor — `ellefuanti -w file.php` blocks the prompt,
+/// you edit, you close, the prompt returns — which is what `git config core.editor` and
+/// every "wait for the editor" integration needs. It is **not** a terminal UI: gpui draws
+/// with Metal into a window, and a curses ellefuanti would be a second renderer, not a
+/// flag. Stated here because "abre no terminal como o vim" reads as both, and only one is
+/// buildable.
+fn wait_flag() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "-w" || arg == "--wait")
 }
 
 /// Hands the terminal back: `ellefuanti .` must return the prompt, not squat on it.
@@ -92,6 +106,11 @@ fn path_argument() -> Option<std::path::PathBuf> {
 /// under SIGTERM and SIGKILL both — there is no orphan, only a borrowed prompt.
 fn detach_from_terminal() {
     use std::io::IsTerminal;
+    // `-w` is the user asking for vim's rhythm: the prompt stays captive until the window
+    // closes, so detaching would defeat the flag's whole point.
+    if wait_flag() {
+        return;
+    }
     if std::env::var_os("ELLE_FOREGROUND").is_some() || !std::io::stdout().is_terminal() {
         return;
     }

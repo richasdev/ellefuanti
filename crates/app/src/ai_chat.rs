@@ -236,6 +236,8 @@ struct ActionApproval {
     summary: String,
     /// Whether to offer "allow for this session" — the CLI only accepts it for commands.
     allow_for_session: bool,
+    /// Which response encoder the buttons must use (see `AgentEvent::ActionApprovalRequested`).
+    kind: crate::ai_codex::ApprovalKind,
 }
 
 /// What the workspace can tell the panel about the active editor, gathered at send or
@@ -788,8 +790,13 @@ impl AiChatPanel {
                         self.answer_codex(request_id, false);
                     }
                 }
-                AgentEvent::ActionApprovalRequested { request_id, summary, allow_for_session } => {
-                    if self.mode == ChatMode::Agent {
+                AgentEvent::ActionApprovalRequested {
+                    request_id,
+                    summary,
+                    allow_for_session,
+                    kind,
+                } => {
+                    if self.mode == ChatMode::Agent || kind == crate::ai_codex::ApprovalKind::McpElicitation {
                         // Shown as a note as well as a prompt: the row scrolls with the
                         // conversation, so the question stays in the transcript after it is
                         // answered rather than vanishing without trace.
@@ -798,11 +805,11 @@ impl AiChatPanel {
                             text: format!("Codex asks to {summary}"),
                         });
                         self.action_approval =
-                            Some(ActionApproval { request_id, summary, allow_for_session });
+                            Some(ActionApproval { request_id, summary, allow_for_session, kind });
                     } else {
                         // Ask mode grants nothing. Declining keeps the turn moving instead
                         // of leaving the CLI blocked on a question the mode cannot show.
-                        self.answer_action(request_id, crate::ai_codex::Decision::Decline);
+                        self.answer_action_of_kind(request_id, kind, false);
                     }
                 }
                 AgentEvent::Stream(StreamEvent::Error(message)) => {
@@ -1211,13 +1218,54 @@ impl AiChatPanel {
     /// Clearing `action_approval` before the write is deliberate: the prompt must not
     /// survive a failed write, or the user is left clicking a button whose child is gone.
     fn answer_action(&mut self, request_id: u64, decision: crate::ai_codex::Decision) {
+        let kind = self
+            .action_approval
+            .as_ref()
+            .filter(|approval| approval.request_id == request_id)
+            .map(|approval| approval.kind)
+            .unwrap_or(crate::ai_codex::ApprovalKind::Command);
         if self.action_approval.as_ref().is_some_and(|a| a.request_id == request_id) {
             self.action_approval = None;
         }
-        write_to_codex(
-            &self.codex_stdin,
-            &crate::ai_codex::action_approval_response(request_id, decision),
-        );
+        // The wire shape follows the request's kind: an elicitation answered with a
+        // `decision` word is a protocol error the MCP server reports as a failed prompt.
+        if kind == crate::ai_codex::ApprovalKind::McpElicitation {
+            let accept = decision != crate::ai_codex::Decision::Decline;
+            write_to_codex(
+                &self.codex_stdin,
+                &crate::ai_codex::elicitation_response(request_id, accept),
+            );
+        } else {
+            write_to_codex(
+                &self.codex_stdin,
+                &crate::ai_codex::action_approval_response(request_id, decision),
+            );
+        }
+    }
+
+    /// [`Self::answer_action`] for callers that know the kind but hold no pending state.
+    fn answer_action_of_kind(
+        &mut self,
+        request_id: u64,
+        kind: crate::ai_codex::ApprovalKind,
+        accept: bool,
+    ) {
+        if kind == crate::ai_codex::ApprovalKind::McpElicitation {
+            write_to_codex(
+                &self.codex_stdin,
+                &crate::ai_codex::elicitation_response(request_id, accept),
+            );
+        } else {
+            let decision = if accept {
+                crate::ai_codex::Decision::Accept
+            } else {
+                crate::ai_codex::Decision::Decline
+            };
+            write_to_codex(
+                &self.codex_stdin,
+                &crate::ai_codex::action_approval_response(request_id, decision),
+            );
+        }
     }
 
     /// Apply, on one file. **The only path in this panel that writes anything.**
@@ -1453,6 +1501,18 @@ impl AiChatPanel {
                     cx.notify();
                 }
             }
+            return;
+        }
+        // ⌘⌫ and ⌥⌫, the macOS editing chords Zed's composer honours: kill to line start,
+        // kill the previous word. Before the modifier guard below, which would eat both.
+        if keystroke.key == "backspace" && (keystroke.modifiers.platform || keystroke.modifiers.alt)
+        {
+            if keystroke.modifiers.platform {
+                delete_to_line_start(&mut self.input);
+            } else {
+                delete_previous_word(&mut self.input);
+            }
+            cx.notify();
             return;
         }
         // ⌘C copies the draft whole: no selection model in this field, and one is out of
@@ -2407,9 +2467,24 @@ fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<AgentE
                         request_id,
                         summary,
                         allow_for_session,
+                        kind,
                     })
                     .is_err()
                 {
+                    return;
+                }
+            }
+            // A request this build cannot serve. Answered *here*, from the reader, with a
+            // JSON-RPC error: the CLI is blocked on this id, and routing it to a UI that
+            // has no buttons for it would recreate the freeze with extra steps. The note
+            // keeps it honest — a declined capability the user can see beats a silent one.
+            Some(crate::ai_codex::CodexEvent::UnservableRequest { request_id, method }) => {
+                write_to_codex(
+                    &session.stdin,
+                    &crate::ai_codex::method_not_found_response(request_id),
+                );
+                let note = format!("Codex asked for `{method}`, which this build cannot do yet.");
+                if tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(note))).is_err() {
                     return;
                 }
             }
@@ -3373,6 +3448,25 @@ fn render_prose(text: &str, theme: &Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// ⌘⌫: clears back to the start of the current line (multi-line composer: only the line
+/// the caret is on, matching every macOS text field).
+fn delete_to_line_start(input: &mut String) {
+    let start = input.rfind('\n').map_or(0, |at| at + 1);
+    input.truncate(start);
+}
+
+/// ⌥⌫: deletes the previous word — trailing separators first, then the word itself, the
+/// boundary rule macOS text views use.
+fn delete_previous_word(input: &mut String) {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    while input.chars().next_back().is_some_and(|c| !is_word(c) && c != '\n') {
+        input.pop();
+    }
+    while input.chars().next_back().is_some_and(is_word) {
+        input.pop();
+    }
+}
+
 /// What an inline span should look like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InlineStyle {
@@ -4238,5 +4332,41 @@ mod login_row_reachability_tests {
             "the sign-in row is mounted inside the ready gate again — `ready` is false \
              exactly when the user is signed out, so the button can never render there"
         );
+    }
+}
+
+#[cfg(test)]
+mod editing_chord_tests {
+    use super::{delete_previous_word, delete_to_line_start};
+
+    /// ⌘⌫ clears the caret's line only — in a multi-line draft the lines above survive,
+    /// which is what every macOS text field does and what Zed's composer does.
+    #[test]
+    fn cmd_backspace_kills_to_line_start_only() {
+        let mut input = "primeira linha\nsegunda até aqui".to_string();
+        delete_to_line_start(&mut input);
+        assert_eq!(input, "primeira linha\n");
+
+        let mut single = "só isto".to_string();
+        delete_to_line_start(&mut single);
+        assert_eq!(single, "");
+    }
+
+    /// ⌥⌫ takes separators then the word — `foo.bar ` loses ` ` then `bar`... wait, it
+    /// loses the trailing space and `bar`, leaving `foo.` — the macOS boundary rule. It
+    /// must also stop at a line break rather than eating the previous line.
+    #[test]
+    fn alt_backspace_kills_one_word() {
+        let mut input = "use App\\Models\\Usuário".to_string();
+        delete_previous_word(&mut input);
+        assert_eq!(input, "use App\\Models\\");
+
+        let mut spaced = "composer install ".to_string();
+        delete_previous_word(&mut spaced);
+        assert_eq!(spaced, "composer ");
+
+        let mut line = "linha um\n".to_string();
+        delete_previous_word(&mut line);
+        assert_eq!(line, "linha um\n", "the word-kill must not cross the line break");
     }
 }

@@ -20,3 +20,15 @@ fn version_flag_answers_and_exits() {
         );
     }
 }
+
+/// `ellefuanti -w .` must still find the path: the old `nth(1)` read the flag, dismissed
+/// it as a non-path, and opened an empty window — the path was one slot further along.
+#[test]
+fn the_path_survives_being_preceded_by_a_flag() {
+    // Pure-logic double of `path_argument`'s rule, since args can't be injected into the
+    // real one: first non-flag argument wins.
+    let find = |args: &[&str]| args.iter().find(|a| !a.starts_with('-')).map(|a| a.to_string());
+    assert_eq!(find(&["-w", "src/app.php"]), Some("src/app.php".to_string()));
+    assert_eq!(find(&["--wait", "."]), Some(".".to_string()));
+    assert_eq!(find(&["-psn_0_12345"]), None);
+}

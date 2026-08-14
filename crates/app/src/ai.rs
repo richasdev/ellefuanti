@@ -337,7 +337,14 @@ pub enum AgentEvent {
     /// Separate from `ApprovalRequested` because there is nothing to diff — the panel shows
     /// the sentence and two or three buttons, not a patch. `summary` is rendered verbatim;
     /// `allow_for_session` says whether the CLI offered a session-wide accept for this kind.
-    ActionApprovalRequested { request_id: u64, summary: String, allow_for_session: bool },
+    ActionApprovalRequested {
+        request_id: u64,
+        summary: String,
+        allow_for_session: bool,
+        /// Which wire shape the answer takes — command decisions and MCP elicitations
+        /// encode differently, and the button click is where that choice lands.
+        kind: crate::ai_codex::ApprovalKind,
+    },
 }
 
 impl From<StreamEvent> for AgentEvent {
