@@ -1766,6 +1766,7 @@ impl WorkspaceView {
         self.ai_chat_visible
     }
 
+    #[cfg(test)]
     pub fn ai_chat_for_test(&self) -> Option<Entity<AiChatPanel>> {
         self.ai_chat.clone()
     }

@@ -418,24 +418,37 @@ pub fn family_is_usable(family: &str, cx: &App) -> bool {
 fn usable(family: &str, asked_for: bool, cx: &App) -> bool {
     let level = if asked_for { tracing::Level::ERROR } else { tracing::Level::DEBUG };
 
+    // Metrics first, existence second — the reverse of the doc-comment order above, and
+    // the order is the whole optimisation. The module docs record that a family that does
+    // not exist resolves to the *proportional* fallback (`i` 3.55px, `W` 15.10px), so the
+    // monospace measurement already rejects a missing font; three `advance` calls are
+    // microseconds against the ~90 ms `all_font_names` enumeration. On the happy path —
+    // the stock machine whose first chain entry is Menlo — the font list is now never
+    // walked at all, which was 46% of a measured 236 ms startup.
+    //
+    // `is_available` is kept for the *diagnosis*: once the measurement fails, the
+    // enumeration says whether the family is missing or genuinely proportional, and that
+    // difference is the difference between "install it" and "pick another font" for the
+    // person reading the log. A failure already costs a font-list walk at most once,
+    // because `installed_families` caches it.
+    if is_monospace(family, cx) {
+        return true;
+    }
+
     if !is_available(family, cx) {
         log_at(level, family, "font family is not installed");
         return false;
     }
 
-    if !is_monospace(family, cx) {
-        // Always an error, even for a chain entry: a *proportional* family under one of
-        // these names means the machine has something unexpected installed, and silently
-        // walking past it hides why the editor looks wrong.
-        tracing::error!(
-            font = family,
-            "font family is not monospaced; column positions \
-             would be wrong, skipping it"
-        );
-        return false;
-    }
-
-    true
+    // Always an error, even for a chain entry: a *proportional* family under one of
+    // these names means the machine has something unexpected installed, and silently
+    // walking past it hides why the editor looks wrong.
+    tracing::error!(
+        font = family,
+        "font family is not monospaced; column positions \
+         would be wrong, skipping it"
+    );
+    false
 }
 
 fn log_at(level: tracing::Level, family: &str, message: &str) {
@@ -459,7 +472,33 @@ fn log_at(level: tracing::Level, family: &str, message: &str) {
 /// at 16px. Exempting it therefore admitted a family that fails the check it was exempted
 /// from, which is the exact bug this module exists to prevent, dressed as a safety net.
 fn is_available(family: &str, cx: &App) -> bool {
-    cx.text_system().all_font_names().iter().any(|name| name == family)
+    installed_families(cx).iter().any(|name| name == family)
+}
+
+/// Every font family the system has, enumerated **once** per launch.
+///
+/// # Why this is cached
+///
+/// `all_font_names()` walks the platform's font registry. Measured on this machine it is
+/// **~108 ms for 265 families** — 46% of a 236 ms startup, spent answering "is Menlo
+/// installed?".
+///
+/// The cost is per *call*, and `resolve` calls `is_available` once per family in the
+/// fallback chain: a user whose configured font is missing paid it again for every entry,
+/// which measured **178 ms** with one bad name in `settings.json` — the person with the
+/// broken config waits the longest, which is backwards.
+///
+/// Caching is sound because the answer cannot change underneath a launch in any way this
+/// app would act on: fonts are installed by a separate application, and a family that
+/// appears mid-session is picked up on the next start. That is the same trade the settings
+/// file already makes.
+///
+/// ponytail: a `OnceLock`, not a gpui global. It is a pure function of the machine, has no
+/// invalidation story worth writing, and a global would need a type, a registration and a
+/// reset hook for the tests that use `NoopTextSystem`.
+fn installed_families(cx: &App) -> &'static [String] {
+    static FAMILIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FAMILIES.get_or_init(|| cx.text_system().all_font_names())
 }
 
 /// Do `i`, `W` and `m` all advance by the same amount?
