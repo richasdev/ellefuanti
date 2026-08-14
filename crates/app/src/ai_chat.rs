@@ -1059,7 +1059,7 @@ impl AiChatPanel {
         if entry.answered {
             return;
         }
-        let files: Vec<(String, ProposalState)> = self
+        let files: Vec<(String, ProposalState, (usize, usize))> = self
             .proposals
             .iter()
             .filter(|proposal| proposal.item_id == item_id)
@@ -1069,10 +1069,10 @@ impl AiChatPanel {
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| proposal.path.display().to_string());
-                (name, proposal.state)
+                (name, proposal.state, diff_line_counts(&proposal.diff))
             })
             .collect();
-        if files.iter().any(|(_, state)| *state == ProposalState::Pending) {
+        if files.iter().any(|(_, state, _)| *state == ProposalState::Pending) {
             return; // still waiting on the user for at least one file
         }
 
@@ -1081,17 +1081,46 @@ impl AiChatPanel {
             entry.answered = true;
         }
 
-        // What the user did, as a note in the transcript. A rejection the model is never
+        // A settled batch collapses into the transcript, Zed's shape: one compact line
+        // per file, in the turn's own flow — "Applied create.blade.php (+62 −18)" — and
+        // the review cards leave the pinned area. The card was the *question*; answered,
+        // it has no business sitting over the input while the turn writes its ending
+        // (the owner's screenshot: an applied card pinned there forever).
+        if self.turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
+            // No assistant turn to land on (a settle after ⌃L, or a test pumping events
+            // straight in): the records still belong in the transcript, so one is made.
+            self.turns.push(ChatTurn {
+                role: Role::Assistant,
+                text: String::new(),
+                flow: Vec::new(),
+            });
+        }
+        if let Some(turn) = self.turns.last_mut().filter(|turn| turn.role == Role::Assistant) {
+            for (name, state, (added, removed)) in &files {
+                let label = match state {
+                    ProposalState::Applied => format!("Applied {name} (+{added} −{removed})"),
+                    // The block reason survives the collapse: it is the one fact the user
+                    // must still see after the card is gone, or a denylisted path looks
+                    // like an ordinary refusal.
+                    ProposalState::Blocked(reason) => format!("Blocked {name} — {reason}"),
+                    _ => format!("Rejected {name}"),
+                };
+                turn.flow.push(FlowBlock::Activity { label, done: true });
+            }
+        }
+        self.proposals.retain(|proposal| proposal.item_id != item_id);
+
+        // The model's copy of the same facts, on the next send — a rejection it is never
         // told about is a rejection it will make again.
         let applied: Vec<&str> = files
             .iter()
-            .filter(|(_, state)| *state == ProposalState::Applied)
-            .map(|(name, _)| name.as_str())
+            .filter(|(_, state, _)| *state == ProposalState::Applied)
+            .map(|(name, _, _)| name.as_str())
             .collect();
         let refused: Vec<&str> = files
             .iter()
-            .filter(|(_, state)| *state != ProposalState::Applied)
-            .map(|(name, _)| name.as_str())
+            .filter(|(_, state, _)| *state != ProposalState::Applied)
+            .map(|(name, _, _)| name.as_str())
             .collect();
         let mut summary = String::new();
         if !applied.is_empty() {
@@ -1104,7 +1133,6 @@ impl AiChatPanel {
             summary.push_str(&format!("Rejected, left unchanged: {}.", refused.join(", ")));
         }
         if !summary.is_empty() {
-            self.turns.push(ChatTurn { role: Role::Note, text: summary.clone(), flow: Vec::new() });
             self.report_outcome(summary);
         }
     }

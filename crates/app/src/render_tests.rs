@@ -2559,8 +2559,19 @@ async fn ai_agent_a_proposal_writes_nothing_until_it_is_applied(cx: &mut TestApp
 
     panel.update(cx, |panel, cx| panel.apply_proposal_for_test(0, cx));
 
+    // Settled means collapsed (the Zed shape): the card leaves the pinned review area and
+    // a compact record lands in the transcript flow — the applied card no longer squats
+    // over the input while the turn finishes (the owner's screenshot).
     panel.read_with(cx, |panel, _cx| {
-        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Applied);
+        assert!(panel.proposals_for_test().is_empty(), "an applied card must not linger");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, done: true }
+                    if label.starts_with("Applied hello.php")
+            ))),
+            "the transcript keeps the compact record"
+        );
     });
     assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER, "and only Apply writes it");
 }
@@ -2583,12 +2594,20 @@ async fn ai_agent_rejecting_leaves_the_file_exactly_as_it_was(cx: &mut TestAppCo
         panel.set_mode_for_test(ChatMode::Agent);
         panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
         panel.reject_proposal_for_test(0, cx);
-        // A rejected proposal is terminal: Apply afterwards must not write it.
+        // Terminal, and now *gone*: the settled card collapses out of the list, so a
+        // late Apply click has no target at all — stronger than the old state check.
         panel.apply_proposal_for_test(0, cx);
     });
 
     panel.read_with(cx, |panel, _cx| {
-        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Rejected);
+        assert!(panel.proposals_for_test().is_empty(), "a settled card leaves the list");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, .. } if label == "Rejected hello.php"
+            ))),
+            "the rejection stays visible as a record"
+        );
     });
     assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE);
 }
@@ -2668,14 +2687,20 @@ async fn ai_agent_a_proposal_for_a_secret_path_is_blocked_with_its_reason(cx: &m
     });
 
     panel.read_with(cx, |panel, _cx| {
-        let state = panel.proposals_for_test()[0].state;
+        // Collapsed like every settled card — but the *reason* must survive the collapse,
+        // or a denylisted path reads as an ordinary refusal.
+        assert!(panel.proposals_for_test().is_empty(), "a blocked card settles and leaves");
         assert!(
-            matches!(state, ProposalState::Blocked(reason) if reason.contains("credentials")),
-            "the reason travels with the refusal: {state:?}"
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, .. }
+                    if label.starts_with("Blocked .env") && label.contains("credentials")
+            ))),
+            "the reason travels with the record"
         );
     });
     assert_eq!(std::fs::read_to_string(&env).unwrap(), "APP_KEY=original\n");
-    // The blocked row renders, reason and all.
+    // The transcript row renders, reason and all.
     draw(cx);
 }
 
@@ -2736,7 +2761,9 @@ async fn ai_agent_an_open_tab_is_patched_through_its_buffer(cx: &mut TestAppCont
     });
 
     panel.read_with(cx, |panel, _cx| {
-        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Applied);
+        // Settled → collapsed; what this test is really about is the *buffer* patching
+        // below, and the collapse is asserted in its own test.
+        assert!(panel.proposals_for_test().is_empty());
     });
 
     // The buffer carries the change; the file on disk is untouched until a save, which is
@@ -2784,14 +2811,14 @@ async fn ai_agent_a_rejection_is_reported_to_the_model_on_the_next_send(cx: &mut
         assert!(body.contains("try something else"), "alongside the new question: {body}");
     });
 
-    // The user sees the same verdict as a note in the transcript.
+    // The user sees the same verdict in the transcript — as a flow record now, not a
+    // Note turn: the "!"-labelled note was the duplicate the collapse replaced.
     panel.read_with(cx, |panel, _cx| {
         assert!(
-            panel
-                .turns_for_test()
-                .iter()
-                .any(|turn| turn.role == crate::ai_chat::Role::Note
-                    && turn.text.contains("Rejected")),
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, .. } if label.contains("Rejected")
+            ))),
             "the decision is on screen too"
         );
     });
