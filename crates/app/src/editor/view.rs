@@ -1306,7 +1306,13 @@ impl EditorView {
         let column = if line.is_empty() || x <= px(0.0) {
             0
         } else {
-            let measured = &line[..line.len().min(MAX_MEASURE_BYTES)];
+            // Floored, because `MAX_MEASURE_BYTES` is a byte budget and lands wherever it
+            // lands: on a long CJK line (2000 `日` puts byte 4096 inside a character) the
+            // unfloored slice panics, and this is the *click* path — the crash arrives on
+            // a mouse press. The measure below at `cursor_x` already floors for this
+            // reason; this site was missed, which is the argument for the shared helper
+            // rather than two hand-clamped slices.
+            let measured = &line[..floor_boundary(&line, line.len().min(MAX_MEASURE_BYTES))];
             let runs = [TextRun {
                 len: measured.len(),
                 font: fonts.font(),
@@ -4295,5 +4301,40 @@ mod tests {
             "and the match keeps every byte the brackets did not take"
         );
         assert_sorted_and_disjoint(&runs);
+    }
+}
+
+#[cfg(test)]
+mod measure_budget_tests {
+    use super::*;
+
+    /// `MAX_MEASURE_BYTES` is a budget, not a boundary, and `offset_at` slices a line at it
+    /// on every click.
+    ///
+    /// A line of 2000 `日` puts byte 4096 *inside* a character, so the unfloored slice that
+    /// shipped panicked on a mouse press — the same byte-vs-char shape as the Blade crash,
+    /// on the input path instead of the render path. The sibling measure at `cursor_x`
+    /// already floored; this one did not.
+    #[test]
+    fn the_measure_budget_lands_inside_a_character_and_must_be_floored() {
+        let line = "日".repeat(2000);
+        assert!(line.len() > MAX_MEASURE_BYTES, "the line must exceed the budget");
+        assert!(
+            !line.is_char_boundary(MAX_MEASURE_BYTES),
+            "this test is only meaningful if the raw budget splits a character"
+        );
+
+        // The expression `offset_at` uses. Slicing at the raw budget would panic here.
+        let cut = floor_boundary(&line, line.len().min(MAX_MEASURE_BYTES));
+        assert!(line.is_char_boundary(cut), "the floored cut must be a boundary");
+        let _measured = &line[..cut]; // must not panic
+
+        // And it must not floor further than necessary: the budget is a performance
+        // bound, so a correct floor loses at most the bytes of one character.
+        assert!(
+            MAX_MEASURE_BYTES - cut < 4,
+            "flooring lost {} bytes; at most one character's worth is expected",
+            MAX_MEASURE_BYTES - cut
+        );
     }
 }
