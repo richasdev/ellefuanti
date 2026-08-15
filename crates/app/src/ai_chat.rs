@@ -1028,12 +1028,13 @@ impl AiChatPanel {
             //
             // # The retry loop this kills (probed against codex-cli 0.146, live)
             //
-            // This panel writes approved changes itself and answers `decline` (see
-            // `settle_item` for why). The response carries a decision and nothing else —
-            // no note field — so within the turn the CLI sees a bare decline and **tries
-            // again**: the probe's transcript shows a second `fileChange` approval, new
-            // itemId, same edit, seconds after the first. On screen that was Apply →
-            // record ✓ → *the same card pops up again*, the owner's "ainda meio bugado".
+            // A declined batch (a reject, a block, a mixed decision — `settle_item`)
+            // carries a decision and nothing else — no note field — so within the turn
+            // the CLI sees a bare decline and **tries again**: the probe's transcript
+            // shows a second `fileChange` approval, new itemId, same edit, seconds after
+            // the first. On screen that was Apply → record ✓ → *the same card pops up
+            // again*, the owner's "ainda meio bugado". (A fully-applied batch now
+            // answers `accept` and never enters this loop.)
             //
             // The retry is detectable precisely because the editor already applied the
             // first copy: the re-sent patch's context no longer matches the file. And the
@@ -1135,19 +1136,18 @@ impl AiChatPanel {
 
     /// Answers the CLI once every file of `item_id` has been decided.
     ///
-    /// **Always `decline`, even for files the user applied.** That reads backwards and is
-    /// the crux of the design: this panel writes the file itself, through the open buffer
-    /// (one undo step) or through the atomic `fs::write_file`. Answering `accept` would
-    /// ask the CLI to apply *its* copy of the patch as well — to a file the panel has
-    /// already changed — which either fails as a stale patch or applies twice. Declining
-    /// leaves the sandbox exactly as it was: nothing written by Codex, everything written
-    /// by the editor, one writer and one undo story.
+    /// **Accept when the whole batch was applied, decline otherwise** ([`batch_decision`]).
+    /// The first design declined even after Apply, fearing the CLI's own apply would
+    /// land twice on the file the editor had already changed. Probed live, that fear
+    /// holds only when the local bytes *differ* from the patch's result — then the CLI
+    /// re-proposes (a retry card). When the editor applies the CLI's own diff, the bytes
+    /// are identical by construction and the CLI treats its apply as already done: one
+    /// approval, no retry, and a closing message that says "updated" instead of blaming
+    /// a refusal — the decline path cost 5–15 s per retry and ended turns claiming the
+    /// edit failed while the file sat there edited ("demora muito e não escreve").
     ///
-    /// The model is not left guessing. `decline` keeps the turn alive — that is the
-    /// protocol's own wording — so the CLI learns the patch did not go in and can react
-    /// within the same turn. What it cannot learn from a bare decline is *why*, or that
-    /// the editor applied some of it, so [`Self::report_outcome`] sends that as the next
-    /// turn's input; the note pushed here is the user's copy of the same sentence.
+    /// On decline the model is still not left guessing: [`Self::report_outcome`] carries
+    /// what really happened into the next send.
     fn settle_item(&mut self, item_id: &str) {
         let Some(entry) = self.approvals.get(item_id) else { return };
         let Some(request_id) = entry.request_id else { return };
@@ -1171,7 +1171,24 @@ impl AiChatPanel {
             return; // still waiting on the user for at least one file
         }
 
-        self.answer_codex(request_id, false);
+        // Accept when the user applied *every* file in the batch, decline otherwise.
+        //
+        // Accept is what kills the retry loop at its root: a decline tells the CLI its
+        // edit was refused, and it retries the same change two or three times before
+        // giving up — 5–15 s of dead air per retry, and a closing message claiming the
+        // edit failed while the file sits there edited (measured live: 48 s with three
+        // proposals for a one-line edit under decline, 22 s and one proposal under
+        // accept). On accept the CLI writes the same bytes the editor just applied,
+        // which is idempotent, and moves on.
+        //
+        // The batch is one request with one answer, so a mixed batch — some files
+        // applied, one rejected or blocked — must decline: accept would authorise the
+        // CLI to write the rejected files too, and a denylisted path must never get an
+        // accept. The applied subset was already written by the editor, so the old
+        // decline behaviour (with its possible retry, killed by the pre-flight) is the
+        // acceptable price of the rare mixed case.
+        let accept = batch_decision(&files);
+        self.answer_codex(request_id, accept);
         if let Some(entry) = self.approvals.get_mut(item_id) {
             entry.answered = true;
         }
@@ -1208,7 +1225,12 @@ impl AiChatPanel {
         self.proposals.retain(|proposal| proposal.item_id != item_id);
 
         // The model's copy of the same facts, on the next send — a rejection it is never
-        // told about is a rejection it will make again.
+        // told about is a rejection it will make again. Skipped entirely on accept: the
+        // wire already told the model its change landed, and a second report saying
+        // "applied by the editor" reads as a different, contradicting event.
+        if accept {
+            return;
+        }
         let applied: Vec<&str> = files
             .iter()
             .filter(|(_, state, _)| *state == ProposalState::Applied)
@@ -3820,6 +3842,17 @@ fn render_proposal_diff(
         .into_any_element()
 }
 
+/// The one answer a settled batch sends back: accept only when the user applied every
+/// file in it.
+///
+/// A mixed or refused batch declines, because the single wire answer covers the whole
+/// batch — accept would authorise the CLI to write the rejected files too, and a
+/// denylisted (Blocked) path must never be accepted. An empty batch declines: there is
+/// nothing an accept would be true about.
+fn batch_decision(files: &[(String, ProposalState, (usize, usize))]) -> bool {
+    !files.is_empty() && files.iter().all(|(_, state, _)| *state == ProposalState::Applied)
+}
+
 /// Prose renders line by line so blank lines survive; a plain multi-line string child
 /// would rely on text layout honouring `\n`, which is not a promise worth leaning on.
 ///
@@ -4817,6 +4850,51 @@ mod input_and_clear_tests {
             !family.ends_with('\u{200d}'),
             "a deletion must not leave a dangling joiner: {family:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_decision_tests {
+    use super::{ProposalState, batch_decision};
+
+    fn file(state: ProposalState) -> (String, ProposalState, (usize, usize)) {
+        ("hello.php".to_string(), state, (1, 1))
+    }
+
+    /// Every file applied → accept. This is the answer that stops the CLI's decline-retry
+    /// loop (measured live: three re-proposals and 48 s under decline, one and 22 s under
+    /// accept for the same one-line edit).
+    #[test]
+    fn a_fully_applied_batch_is_accepted() {
+        assert!(batch_decision(&[file(ProposalState::Applied)]));
+        assert!(batch_decision(&[file(ProposalState::Applied), file(ProposalState::Applied)]));
+    }
+
+    /// One refusal anywhere in the batch declines the whole answer: accept is a single
+    /// authorisation for every change in the item, including the ones the user refused.
+    #[test]
+    fn a_mixed_batch_is_declined() {
+        assert!(!batch_decision(&[
+            file(ProposalState::Applied),
+            file(ProposalState::Rejected)
+        ]));
+    }
+
+    /// A denylisted path must never ride out on an accept — the CLI would write the file
+    /// the editor just refused to.
+    #[test]
+    fn a_blocked_file_forces_decline() {
+        assert!(!batch_decision(&[
+            file(ProposalState::Applied),
+            file(ProposalState::Blocked("path is denylisted")),
+        ]));
+    }
+
+    /// An empty batch (every change pre-flighted away) declines — there is nothing an
+    /// accept would be true about.
+    #[test]
+    fn an_empty_batch_is_declined() {
+        assert!(!batch_decision(&[]));
     }
 }
 
