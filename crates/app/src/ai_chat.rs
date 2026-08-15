@@ -93,8 +93,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, ScrollHandle, SharedString,
-    Task, Window, div, prelude::*, px,
+    AnimationExt as _, App, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton,
+    ScrollHandle, SharedString, Task, Window, div, prelude::*, px,
 };
 
 use crate::actions::{Backspace, Cancel, ClearAiChat, Confirm, context};
@@ -2830,14 +2830,7 @@ impl Render for AiChatPanel {
                     .py_1()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child("AI Chat")
-                            .child(self.render_mode_switch(&theme, cx)),
-                    )
+                    .child(div().flex().items_center().gap_2().child("AI Chat"))
                     .child(
                         div()
                             .flex()
@@ -2872,10 +2865,7 @@ impl Render for AiChatPanel {
                                     )
                                 },
                             ),
-                    )
-                    .child(div().text_color(theme.text_muted).text_size(px(11.0)).child(
-                        SharedString::from(format!("{} · {model}", provider.setting_name())),
-                    )),
+                    ),
             )
             .child(match guidance {
                 // Setup guidance instead of an input that cannot work (#99's first-open).
@@ -2915,8 +2905,7 @@ impl Render for AiChatPanel {
                     .children(self.note.clone().map(|note| {
                         div().px_2().py_1().text_color(theme.error).text_size(px(11.0)).child(note)
                     }))
-                    .child(self.render_chips(&theme, cx))
-                    .child(self.render_input(&theme, window, cx))
+                    .child(self.render_composer(&theme, provider, &model, window, cx))
             })
     }
 }
@@ -3015,12 +3004,6 @@ impl AiChatPanel {
         fonts: &Fonts,
     ) -> gpui::AnyElement {
         let is_last = index + 1 == self.turns.len();
-        let (label, label_color) = match turn.role {
-            Role::User => ("You", theme.accent),
-            Role::Assistant => ("AI", theme.text_muted),
-            Role::Note => ("!", theme.error),
-        };
-
         let mut body: Vec<gpui::AnyElement> = Vec::new();
         let activity_row = |label: &str, done: bool| {
             div()
@@ -3045,7 +3028,11 @@ impl AiChatPanel {
                     FlowBlock::Text(text) => {
                         for (seg_index, segment) in split_fences(text).into_iter().enumerate() {
                             body.push(match segment {
-                                Segment::Text(text) => render_prose(&text, theme),
+                                Segment::Text(text) => render_prose(
+                                    (index * 100 + block_index) * 10 + seg_index,
+                                    &text,
+                                    theme,
+                                ),
                                 Segment::Code { language, code } => render_code_block(
                                     index * 100 + block_index,
                                     seg_index,
@@ -3061,12 +3048,26 @@ impl AiChatPanel {
             }
         } else if turn.role == Role::Assistant && turn.text.is_empty() && self.streaming && is_last
         {
-            // The dim ellipsis before anything has arrived at all.
-            body.push(div().text_color(theme.text_muted).child("…").into_any_element());
+            // Zed's generating row, minus the sprite: a pulsating label instead of a dim
+            // static ellipsis, so "working" and "stalled" stop looking identical.
+            body.push(
+                div()
+                    .text_color(theme.text_muted)
+                    .text_size(px(11.0))
+                    .child("Generating…")
+                    .with_animation(
+                        ("ai-generating", index),
+                        gpui::Animation::new(std::time::Duration::from_secs(2))
+                            .repeat()
+                            .with_easing(gpui::pulsating_between(0.4, 0.9)),
+                        |el, delta| el.opacity(delta),
+                    )
+                    .into_any_element(),
+            );
         } else {
             for (seg_index, segment) in split_fences(&turn.text).into_iter().enumerate() {
                 body.push(match segment {
-                    Segment::Text(text) => render_prose(&text, theme),
+                    Segment::Text(text) => render_prose(index * 1000 + seg_index, &text, theme),
                     Segment::Code { language, code } => render_code_block(
                         index,
                         seg_index,
@@ -3079,13 +3080,84 @@ impl AiChatPanel {
             }
         }
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_size(px(10.0)).text_color(label_color).child(label))
-            .children(body)
-            .into_any_element()
+        // Zed's speaker asymmetry, copied whole: the user's message is a bordered card on
+        // the editor background, the assistant's is bare text on the panel — no "You"/"AI"
+        // labels, no avatars. The card alone says who is talking.
+        match turn.role {
+            Role::User => div()
+                .rounded(px(6.0))
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.border)
+                .px_2()
+                .py_1p5()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(body)
+                .into_any_element(),
+            Role::Assistant => {
+                let copy_text = if turn.flow.is_empty() {
+                    turn.text.clone()
+                } else {
+                    turn.flow
+                        .iter()
+                        .filter_map(|block| match block {
+                            FlowBlock::Text(text) => Some(text.as_str()),
+                            FlowBlock::Activity { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                // Zed's thread controls: ghosted until hover, right-aligned, after a turn
+                // that has settled. Just Copy here — thumbs and token counts have no wire
+                // to ride on this side.
+                let settled = !(self.streaming && is_last) && !copy_text.is_empty();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(body)
+                    .when(settled, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .opacity(0.4)
+                                .hover(|el| el.opacity(1.0))
+                                .child(
+                                    div()
+                                        .id(("ai-copy-turn", index))
+                                        .px_1()
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted)
+                                        .hover(|el| el.text_color(theme.text))
+                                        .on_mouse_down(MouseButton::Left, {
+                                            move |_ev, _window, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(
+                                                        copy_text.clone(),
+                                                    ),
+                                                );
+                                            }
+                                        })
+                                        .child("Copy"),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Role::Note => div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_size(px(11.0))
+                .text_color(theme.error)
+                .children(body)
+                .into_any_element(),
+        }
     }
 
     /// The Ask | Agent switch. A segmented pair, styled like the context chips so the two
@@ -3533,10 +3605,6 @@ impl AiChatPanel {
             .flex_wrap()
             .items_center()
             .gap_1()
-            .px_2()
-            .py_1()
-            .border_t_1()
-            .border_color(theme.border)
             .text_size(px(11.0))
             .child(chip("ai-chip-selection", "Selection", self.attach_selection, Chip::Selection))
             .child(chip("ai-chip-file", "Current file", self.attach_file, Chip::CurrentFile))
@@ -3557,7 +3625,63 @@ impl AiChatPanel {
             .into_any_element()
     }
 
-    fn render_input(
+    /// The composer, shaped like Zed's: a flat strip on the *editor* background with a
+    /// single top border — no card, no rounding, no focus ring. The background contrast
+    /// against the panel is what makes it read as an input area (their design, verified
+    /// in `thread_view.rs::render_message_editor`), and inside it stack the context
+    /// chips, the flat editor, then the bottom toolbar — mode selector on the left,
+    /// model and the send button on the right, Zed's exact arrangement.
+    fn render_composer(
+        &self,
+        theme: &Theme,
+        provider: ai::Provider,
+        model: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .border_t_1()
+            .border_color(theme.border)
+            .px_2()
+            .pt_1p5()
+            .pb_1p5()
+            .gap_1p5()
+            .child(self.render_chips(theme, cx))
+            .child(self.render_editor(theme, window, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(self.render_mode_switch(theme, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div().text_size(px(10.0)).text_color(theme.text_muted).child(
+                                    SharedString::from(format!(
+                                        "{} · {model}",
+                                        provider.setting_name()
+                                    )),
+                                ),
+                            )
+                            .child(self.render_send_button(theme, cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The editor field, flat on the composer's background — Zed puts no border on it.
+    /// The palette's caret (#164) still marks focus: a bar before the placeholder and
+    /// after typed text. Only when focused — the panel can sit open beside a focused
+    /// editor, and a caret there would claim the keyboard it does not have. Solid, not
+    /// blinking, so an open panel does not buy a timer.
+    fn render_editor(
         &self,
         theme: &Theme,
         window: &Window,
@@ -3566,103 +3690,106 @@ impl AiChatPanel {
         let empty = self.input.is_empty();
         let focused = self.focus_handle.is_focused(window);
         let entity = cx.entity();
-        let action_button = if self.streaming {
-            let entity = entity.clone();
-            div()
+        div()
+            .w_full()
+            // Grows with its lines (⇧Enter), bounded so a pasted log cannot push the
+            // transcript off screen — past that it scrolls.
+            .id("ai-chat-input")
+            .min_h(px(22.0))
+            .max_h(px(120.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .px_1()
+            .py_0p5()
+            .cursor_text()
+            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                entity.update(cx, |this, _cx| window.focus(&this.focus_handle));
+            })
+            .when(empty, |el| el.text_color(theme.text_muted))
+            .when(focused && empty, |el| {
+                el.child(div().w(px(2.0)).h(px(14.0)).mr_1().flex_none().bg(theme.cursor))
+            })
+            .when(empty, |el| {
+                el.child(SharedString::from(
+                    "Message the agent — Enter sends, ⇧Enter breaks".to_string(),
+                ))
+            })
+            .when(!empty, |el| {
+                let lines: Vec<String> = self.input.split('\n').map(str::to_string).collect();
+                let last = lines.len().saturating_sub(1);
+                el.children(lines.into_iter().enumerate().map(|(index, line)| {
+                    let is_last = index == last;
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(SharedString::from(if line.is_empty() && !is_last {
+                            " ".to_string()
+                        } else {
+                            line
+                        }))
+                        // The caret rides the last line, where typing lands.
+                        .when(focused && is_last, |el| {
+                            el.child(
+                                div()
+                                    .w(px(2.0))
+                                    .h(px(14.0))
+                                    .ml(px(1.0))
+                                    .flex_none()
+                                    .bg(theme.cursor),
+                            )
+                        })
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// Zed's send button, state for state: muted and inert while there is nothing to
+    /// send, filled accent when there is, a red stop while a turn streams. Glyphs stand
+    /// in for their icon set — the shapes are the same.
+    fn render_send_button(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
+        if self.streaming {
+            return div()
                 .id("ai-chat-cancel")
                 .px_2()
                 .py_0p5()
                 .rounded(px(4.0))
                 .cursor_pointer()
+                .bg(theme.error.opacity(0.15))
                 .text_color(theme.error)
-                .hover(|el| el.bg(theme.hover))
+                .hover(|el| el.bg(theme.error.opacity(0.25)))
                 .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                     entity.update(cx, |this, cx| this.cancel_stream(cx));
                 })
-                .child("Cancel")
-        } else {
-            let entity = entity.clone();
-            div()
+                .child("■")
+                .into_any_element();
+        }
+        if self.input.is_empty() {
+            // Disabled: no handler, no cursor — typing is what arms it.
+            return div()
                 .id("ai-chat-send")
                 .px_2()
                 .py_0p5()
                 .rounded(px(4.0))
-                .cursor_pointer()
-                .text_color(theme.accent)
-                .hover(|el| el.bg(theme.hover))
-                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                    entity.update(cx, |this, cx| this.send(cx));
-                })
-                .child("Send")
-        };
-
+                .text_color(theme.text_muted)
+                .child("↑")
+                .into_any_element();
+        }
         div()
-            .flex()
-            .items_center()
-            .gap_1()
+            .id("ai-chat-send")
             .px_2()
-            .py_1()
-            .child(
-                // The find bar's field, now with the palette's caret (#164): a bar before
-                // the placeholder and after typed text, so the box reads as an input
-                // either way. Only when focused — the panel can sit open beside a focused
-                // editor, and a caret there would claim the keyboard it does not have.
-                // Solid, not blinking, for the palette's reason: a steady bar says "type
-                // here" without buying a timer per open panel.
-                div()
-                    .flex_1()
-                    .min_w(px(80.0))
-                    // Grows with its lines (⇧Enter), bounded so a pasted log cannot push
-                    // the transcript off screen — past that it scrolls.
-                    .id("ai-chat-input")
-                    .min_h(px(22.0))
-                    .max_h(px(120.0))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_sm()
-                    .bg(theme.background)
-                    .border_1()
-                    .border_color(theme.accent)
-                    .when(empty, |el| el.text_color(theme.text_muted))
-                    .when(focused && empty, |el| {
-                        el.child(div().w(px(2.0)).h(px(14.0)).mr_1().flex_none().bg(theme.cursor))
-                    })
-                    .when(empty, |el| {
-                        el.child(SharedString::from("Ask — Enter sends, ⇧Enter breaks".to_string()))
-                    })
-                    .when(!empty, |el| {
-                        let lines: Vec<String> =
-                            self.input.split('\n').map(str::to_string).collect();
-                        let last = lines.len().saturating_sub(1);
-                        el.children(lines.into_iter().enumerate().map(|(index, line)| {
-                            let is_last = index == last;
-                            div()
-                                .flex()
-                                .items_center()
-                                .child(SharedString::from(if line.is_empty() && !is_last {
-                                    " ".to_string()
-                                } else {
-                                    line
-                                }))
-                                // The caret rides the last line, where typing lands.
-                                .when(focused && is_last, |el| {
-                                    el.child(
-                                        div()
-                                            .w(px(2.0))
-                                            .h(px(14.0))
-                                            .ml(px(1.0))
-                                            .flex_none()
-                                            .bg(theme.cursor),
-                                    )
-                                })
-                        }))
-                    }),
-            )
-            .child(action_button)
+            .py_0p5()
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .bg(theme.accent)
+            .text_color(theme.background)
+            .hover(|el| el.opacity(0.85))
+            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                entity.update(cx, |this, cx| this.send(cx));
+            })
+            .child("↑")
             .into_any_element()
     }
 }
@@ -3695,42 +3822,170 @@ fn render_proposal_diff(
 
 /// Prose renders line by line so blank lines survive; a plain multi-line string child
 /// would rely on text layout honouring `\n`, which is not a promise worth leaning on.
-fn render_prose(text: &str, theme: &Theme) -> gpui::AnyElement {
+///
+/// # The Zed reference, round two
+///
+/// Zed's markdown crate renders the full block grammar; this is the by-hand subset that
+/// covers what models emit in chat — headings (restrained sizes: chat text is small, so
+/// the ramp is nearly flat, Zed's own choice), bullet and ordered lists, blockquotes as a
+/// left rail, rules, and links that open in the browser. Tables and images stay out of
+/// scope: a narrow panel misrenders them worse than plain text does.
+///
+/// `seed` disambiguates the interactive (link) elements across turns and segments — two
+/// `InteractiveText`s sharing an id would share click state.
+fn render_prose(seed: usize, text: &str, theme: &Theme) -> gpui::AnyElement {
     div()
         .flex()
         .flex_col()
         .text_color(theme.text)
-        .children(text.split('\n').map(|line| {
-            if line.is_empty() {
-                return div().child(SharedString::from(" ".to_string())).into_any_element();
+        .children(
+            text.split('\n')
+                .enumerate()
+                .map(|(line_index, line)| render_prose_line(seed, line_index, line, theme)),
+        )
+        .into_any_element()
+}
+
+fn render_prose_line(seed: usize, line_index: usize, line: &str, theme: &Theme) -> gpui::AnyElement {
+    if line.is_empty() {
+        return div().child(SharedString::from(" ".to_string())).into_any_element();
+    }
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+
+    // A rule: three or more of one of `-*_` and nothing else on the line.
+    if trimmed.len() >= 3 {
+        for marker in ['-', '*', '_'] {
+            if trimmed.chars().all(|c| c == marker) {
+                return div()
+                    .my_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .into_any_element();
             }
-            let (clean, spans) = parse_inline_markdown(line);
-            let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = spans
-                .into_iter()
-                .map(|(range, kind)| {
-                    let style = match kind {
-                        InlineStyle::Bold => gpui::HighlightStyle {
-                            font_weight: Some(gpui::FontWeight::BOLD),
-                            ..Default::default()
-                        },
-                        // Inline code reads as code: the accent colour stands in for the
-                        // font switch, because StyledText carries one font family and a
-                        // per-span face change would need a run-splitting layout of its
-                        // own. Colour is the affordable 90% of the signal.
-                        InlineStyle::Code => gpui::HighlightStyle {
-                            color: Some(theme.accent),
-                            ..Default::default()
-                        },
-                    };
-                    (range, style)
-                })
-                .collect();
-            div()
+        }
+    }
+
+    // Headings: bold plus a nearly-flat size ramp — Zed's agent panel deliberately keeps
+    // chat headings close to body size, and the parser already bolds the stripped line.
+    if trimmed.starts_with('#') {
+        let level = trimmed.chars().take_while(|&c| c == '#').count();
+        let size = match level {
+            1 => px(15.0),
+            2 => px(14.0),
+            _ => px(13.0),
+        };
+        return div()
+            .mt_1()
+            .text_size(size)
+            .child(inline_text(seed, line_index, trimmed, theme))
+            .into_any_element();
+    }
+
+    // Blockquote: the left rail. Consecutive quote lines each carry their own rail,
+    // which stacks into one visually because the rows have no gap.
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        return div()
+            .pl_2()
+            .border_l_2()
+            .border_color(theme.border)
+            .text_color(theme.text_muted)
+            .child(inline_text(seed, line_index, rest.trim_start(), theme))
+            .into_any_element();
+    }
+
+    // Bullet list item: marker swapped for a typographic bullet, indent preserved so
+    // nested lists step in.
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .pl(px(8.0 + indent as f32 * 6.0))
+                .child(div().flex_none().text_color(theme.text_muted).child("•"))
+                .child(div().flex_1().child(inline_text(seed, line_index, rest, theme)))
+                .into_any_element();
+        }
+    }
+
+    // Ordered list item: `12. rest` — the number is kept, muted like the bullet.
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        if let Some(rest) = trimmed[digits..].strip_prefix(". ") {
+            return div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .pl(px(8.0 + indent as f32 * 6.0))
                 .child(
-                    gpui::StyledText::new(SharedString::from(clean)).with_highlights(highlights),
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(trimmed[..digits + 1].to_string())),
                 )
-                .into_any_element()
-        }))
+                .child(div().flex_1().child(inline_text(seed, line_index, rest, theme)))
+                .into_any_element();
+        }
+    }
+
+    div().child(inline_text(seed, line_index, line, theme)).into_any_element()
+}
+
+/// One line's inline spans as a text element — interactive when it carries links, plain
+/// `StyledText` otherwise (the id an `InteractiveText` needs is not free: it registers a
+/// hitbox per element, so lines without links skip it).
+fn inline_text(seed: usize, line_index: usize, line: &str, theme: &Theme) -> gpui::AnyElement {
+    let (clean, spans, links) = parse_inline_markdown(line);
+    let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = spans
+        .into_iter()
+        .map(|(range, kind)| {
+            let style = match kind {
+                InlineStyle::Bold => gpui::HighlightStyle {
+                    font_weight: Some(gpui::FontWeight::BOLD),
+                    ..Default::default()
+                },
+                // Inline code reads as code: accent colour plus Zed's faint background
+                // wash stand in for the font switch, because StyledText carries one font
+                // family and a per-span face change would need a run-splitting layout of
+                // its own.
+                InlineStyle::Code => gpui::HighlightStyle {
+                    color: Some(theme.accent),
+                    background_color: Some(theme.text.opacity(0.08)),
+                    ..Default::default()
+                },
+                InlineStyle::Strike => gpui::HighlightStyle {
+                    strikethrough: Some(gpui::StrikethroughStyle {
+                        thickness: px(1.0),
+                        color: Some(theme.text_muted),
+                    }),
+                    ..Default::default()
+                },
+                // Zed's link: accent text over a half-opacity accent underline.
+                InlineStyle::Link => gpui::HighlightStyle {
+                    color: Some(theme.accent),
+                    underline: Some(gpui::UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(theme.accent.opacity(0.5)),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            };
+            (range, style)
+        })
+        .collect();
+    let styled = gpui::StyledText::new(SharedString::from(clean)).with_highlights(highlights);
+    if links.is_empty() {
+        return styled.into_any_element();
+    }
+    let (ranges, urls): (Vec<_>, Vec<String>) = links.into_iter().unzip();
+    gpui::InteractiveText::new(("ai-md-link", seed * 10_000 + line_index), styled)
+        .on_click(ranges, move |index, _window, cx| {
+            if let Some(url) = urls.get(index) {
+                cx.open_url(url);
+            }
+        })
         .into_any_element()
 }
 
@@ -3758,32 +4013,42 @@ fn delete_previous_word(input: &mut String) {
 enum InlineStyle {
     Bold,
     Code,
+    Strike,
+    Link,
 }
 
-/// Strips `**bold**`, `` `code` `` and leading-`#` headers off one line, returning the
-/// clean text and the byte ranges (into the clean text) each style applies to.
+/// Strips `**bold**`, `` `code` ``, `~~strike~~`, `[text](url)` and leading-`#` headers
+/// off one line, returning the clean text, the byte ranges (into the clean text) each
+/// style applies to, and each link's range with its URL — the click targets.
 ///
 /// # Scope, stated
 ///
 /// The subset models actually emit in chat, chosen against Zed's rendering: bold, inline
-/// code, headers-as-bold. Italics are skipped because `*` is ambiguous with multiplication
-/// in the code-adjacent prose these replies are made of, and links are skipped because a
-/// terminal-style panel has nowhere to put them. An unclosed marker renders literally —
-/// mid-stream text must not flicker between styled and plain as delimiters arrive.
-fn parse_inline_markdown(line: &str) -> (String, Vec<(std::ops::Range<usize>, InlineStyle)>) {
+/// code, strikethrough, links, headers-as-bold. Italics are skipped because `*` is
+/// ambiguous with multiplication in the code-adjacent prose these replies are made of.
+/// An unclosed marker renders literally — mid-stream text must not flicker between
+/// styled and plain as delimiters arrive.
+type InlineSpans = (
+    String,
+    Vec<(std::ops::Range<usize>, InlineStyle)>,
+    Vec<(std::ops::Range<usize>, String)>,
+);
+
+fn parse_inline_markdown(line: &str) -> InlineSpans {
     // A header line is the whole line bold, markers stripped.
     let trimmed = line.trim_start();
     if let Some(rest) = trimmed.strip_prefix('#') {
         let body = rest.trim_start_matches('#').trim_start();
         if !body.is_empty() {
-            let (clean, mut spans) = parse_inline_markdown(body);
+            let (clean, mut spans, links) = parse_inline_markdown(body);
             spans.push((0..clean.len(), InlineStyle::Bold));
-            return (clean, spans);
+            return (clean, spans, links);
         }
     }
 
     let mut clean = String::with_capacity(line.len());
     let mut spans = Vec::new();
+    let mut links = Vec::new();
     let mut rest = line;
     while !rest.is_empty() {
         // Backticks first: markdown gives code spans precedence, and a `**` inside one is
@@ -3806,12 +4071,40 @@ fn parse_inline_markdown(line: &str) -> (String, Vec<(std::ops::Range<usize>, In
                 continue;
             }
         }
+        if let Some(after_open) = rest.strip_prefix("~~") {
+            if let Some(end) = after_open.find("~~") {
+                let start = clean.len();
+                clean.push_str(&after_open[..end]);
+                spans.push((start..clean.len(), InlineStyle::Strike));
+                rest = &after_open[end + 2..];
+                continue;
+            }
+        }
+        // `[text](url)` — the label lands in the clean text, the URL rides beside it.
+        // Both halves must close on this line or the bracket is literal (mid-stream rule).
+        if let Some(after_open) = rest.strip_prefix('[') {
+            if let Some(label_end) = after_open.find("](") {
+                let after_label = &after_open[label_end + 2..];
+                if let Some(url_end) = after_label.find(')') {
+                    let url = &after_label[..url_end];
+                    // A "link" with an empty label or URL is literal punctuation.
+                    if label_end > 0 && !url.is_empty() {
+                        let start = clean.len();
+                        clean.push_str(&after_open[..label_end]);
+                        spans.push((start..clean.len(), InlineStyle::Link));
+                        links.push((start..clean.len(), url.to_string()));
+                        rest = &after_label[url_end + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
         // Advance one character; anything not opening a span is content.
         let ch = rest.chars().next().expect("non-empty");
         clean.push(ch);
         rest = &rest[ch.len_utf8()..];
     }
-    (clean, spans)
+    (clean, spans, links)
 }
 
 /// A code segment: monospace box on the editor's background, highlighted, with Copy.
@@ -4535,7 +4828,7 @@ mod inline_markdown_tests {
     /// range would style the wrong characters, which reads worse than no styling.
     #[test]
     fn bold_and_code_spans_strip_their_markers() {
-        let (clean, spans) = parse_inline_markdown("use **artisan** and `php -v` here");
+        let (clean, spans, _) = parse_inline_markdown("use **artisan** and `php -v` here");
         assert_eq!(clean, "use artisan and php -v here");
         assert_eq!(
             spans,
@@ -4549,7 +4842,7 @@ mod inline_markdown_tests {
     /// glob like `**/*.php` must not turn the rest of the line bold.
     #[test]
     fn asterisks_inside_code_spans_stay_literal() {
-        let (clean, spans) = parse_inline_markdown("match `**/*.php` files");
+        let (clean, spans, _) = parse_inline_markdown("match `**/*.php` files");
         assert_eq!(clean, "match **/*.php files");
         assert_eq!(spans, vec![(6..14, InlineStyle::Code)]);
     }
@@ -4558,11 +4851,11 @@ mod inline_markdown_tests {
     /// have arrived yet; styling half a line and re-styling it a chunk later is flicker.
     #[test]
     fn unclosed_markers_render_literally() {
-        let (clean, spans) = parse_inline_markdown("this **is not closed");
+        let (clean, spans, _) = parse_inline_markdown("this **is not closed");
         assert_eq!(clean, "this **is not closed");
         assert!(spans.is_empty());
 
-        let (clean, spans) = parse_inline_markdown("nor `is this");
+        let (clean, spans, _) = parse_inline_markdown("nor `is this");
         assert_eq!(clean, "nor `is this");
         assert!(spans.is_empty());
     }
@@ -4571,7 +4864,7 @@ mod inline_markdown_tests {
     /// it still resolve, because models emit `## The `fix``.
     #[test]
     fn headers_render_as_bold_lines() {
-        let (clean, spans) = parse_inline_markdown("## Como corrigir");
+        let (clean, spans, _) = parse_inline_markdown("## Como corrigir");
         assert_eq!(clean, "Como corrigir");
         assert!(spans.contains(&(0..13, InlineStyle::Bold)));
     }
@@ -4580,10 +4873,43 @@ mod inline_markdown_tests {
     /// string and must land on char boundaries — the session's recurring bug class.
     #[test]
     fn multibyte_text_keeps_ranges_on_boundaries() {
-        let (clean, spans) = parse_inline_markdown("a função **`ação`** está");
+        let (clean, spans, _) = parse_inline_markdown("a função **`ação`** está");
         for (range, _) in &spans {
             assert!(clean.is_char_boundary(range.start) && clean.is_char_boundary(range.end));
         }
+    }
+
+    /// A link keeps its label in the clean text and carries the URL beside the same
+    /// range — the render's click target. Both halves must close on the line.
+    #[test]
+    fn links_keep_the_label_and_carry_the_url() {
+        let (clean, spans, links) =
+            parse_inline_markdown("see [the docs](https://laravel.com/docs) for more");
+        assert_eq!(clean, "see the docs for more");
+        assert_eq!(spans, vec![(4..12, InlineStyle::Link)]);
+        assert_eq!(links, vec![(4..12, "https://laravel.com/docs".to_string())]);
+        assert_eq!(&clean[4..12], "the docs");
+    }
+
+    /// An unclosed bracket, an empty label, or an empty URL is literal punctuation — the
+    /// mid-stream rule applied to links: `array[0]` and `fn(x)` prose must not vanish.
+    #[test]
+    fn bracket_text_that_is_not_a_link_stays_literal() {
+        let (clean, _, links) = parse_inline_markdown("indexing array[0] and calling f(x)");
+        assert_eq!(clean, "indexing array[0] and calling f(x)");
+        assert!(links.is_empty());
+
+        let (clean, _, links) = parse_inline_markdown("empty [](https://x.test) label");
+        assert_eq!(clean, "empty [](https://x.test) label");
+        assert!(links.is_empty());
+    }
+
+    /// `~~strike~~` strips its markers like the other pairs.
+    #[test]
+    fn strikethrough_strips_its_markers() {
+        let (clean, spans, _) = parse_inline_markdown("was ~~wrong~~ fixed");
+        assert_eq!(clean, "was wrong fixed");
+        assert_eq!(spans, vec![(4..9, InlineStyle::Strike)]);
     }
 }
 
