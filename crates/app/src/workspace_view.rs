@@ -1476,10 +1476,41 @@ impl WorkspaceView {
             })
         });
 
+        // How a tab catches up with a file the CLI wrote itself (a workspace-write
+        // turn). The tab branch of `apply`, alone: the disk is already the truth, so a
+        // closed file needs nothing, and the buffer takes the same patch the CLI applied
+        // — one undo step. A buffer whose unsaved edits the patch no longer fits is
+        // reported as the conflict it is, and left alone.
+        let workspace = cx.entity().downgrade();
+        let refresh: crate::ai_chat::RefreshFn = Box::new(move |path, patch, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return crate::ai_chat::Refresh::Untouched;
+            };
+            workspace.update(cx, |workspace, cx| {
+                let open = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.path.as_deref() == Some(path))
+                    .map(|tab| tab.editor.clone());
+                let Some(editor) = open else { return crate::ai_chat::Refresh::Untouched };
+                editor.update(cx, |editor, cx| {
+                    let current = editor.document.buffer.text();
+                    match patch(&current) {
+                        Ok(updated) => {
+                            editor.document.apply_edits(vec![(0..current.len(), updated)]);
+                            cx.notify();
+                            crate::ai_chat::Refresh::Reloaded
+                        }
+                        Err(_) => crate::ai_chat::Refresh::Conflict,
+                    }
+                })
+            })
+        });
+
         // The open folder, so a Codex thread can be rooted at the project the user is
         // looking at (#99) — that is how the CLI gets to read the code it is asked about.
         let project_root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
-        let panel = cx.new(|cx| AiChatPanel::new(snapshot, apply, project_root, cx));
+        let panel = cx.new(|cx| AiChatPanel::new(snapshot, apply, refresh, project_root, cx));
         window.focus(&panel.read(cx).focus_handle(cx));
         self.ai_chat = Some(panel);
         self.ai_chat_visible = true;

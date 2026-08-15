@@ -101,15 +101,17 @@ pub fn initialize_request(client_version: &str) -> String {
 /// read a directory the user never opened.
 ///
 /// `sandbox` and `approvalPolicy` are sent explicitly rather than left to the CLI's
-/// defaults — in **both** modes, and both to the same values. They are the settings that
-/// decide whether a write can happen without being asked about (see the module docs), so
-/// they are stated here where they can be read, not inherited from whatever a future CLI
-/// version or a user's `~/.codex/config.toml` happens to default to.
+/// defaults. They are the settings that decide whether a write can happen without being
+/// asked about (see the module docs), so they are stated here where they can be read,
+/// not inherited from whatever a future CLI version or a user's `~/.codex/config.toml`
+/// happens to default to.
 pub fn thread_start_request(cwd: Option<&Path>) -> String {
     let mut params = json!({
-        // Every write is a sandbox escape, and an escape is a question. This is what
-        // makes "nothing reaches disk unapproved" a property of the protocol rather than
-        // a promise the panel makes.
+        // The thread's *base* is read-only: a turn that says nothing about its sandbox
+        // cannot write. Each `turn/start` then overrides per mode
+        // ([`turn_start_request`]) — Agent turns get `workspaceWrite`, Ask turns restate
+        // `readOnly` — so the write permission is granted turn by turn, by the mode the
+        // user picked, never inherited.
         "sandbox": "read-only",
         "approvalPolicy": "on-request",
     });
@@ -126,7 +128,16 @@ pub fn thread_start_request(cwd: Option<&Path>) -> String {
 
 /// One user message. The `input` array is a content-block list like the HTTP wires'; only
 /// text blocks are sent, because only text is what the panel can produce.
-pub fn turn_start_request(thread_id: &str, text: &str) -> String {
+///
+/// `write` is the mode, translated to the sandbox the turn runs under — the schema's
+/// per-turn `sandboxPolicy` override, probed live against 0.146. Agent turns get
+/// `workspaceWrite`: the CLI edits files inside the open project directly, which is its
+/// own native flow (measured: 25 s and correct files, against 93 s of read-only flailing,
+/// approval round-trips and decline-retries for the same two-file task — the owner's
+/// "demora muito e não escreve"). Ask turns stay `readOnly`: a question must not write.
+/// Neither variant grants network access — `workspaceWrite`'s `network_access` defaults
+/// to false and is left there.
+pub fn turn_start_request(thread_id: &str, text: &str, write: bool) -> String {
     line(json!({
         "jsonrpc": "2.0",
         "id": TURN_START_ID,
@@ -134,6 +145,7 @@ pub fn turn_start_request(thread_id: &str, text: &str) -> String {
         "params": {
             "threadId": thread_id,
             "input": [{"type": "text", "text": text}],
+            "sandboxPolicy": {"type": if write { "workspaceWrite" } else { "readOnly" }},
         },
     }))
 }
@@ -315,6 +327,10 @@ pub enum CodexEvent {
     /// A turn wants to change files, and has said which and how. Arrives *before* the
     /// approval request, which is why the panel can show a diff when the question lands.
     Proposed { item_id: String, changes: Vec<ProposedChange> },
+    /// A `fileChange` item completed with `status: "completed"` — the CLI already wrote
+    /// these changes itself (a workspace-write turn). The panel's job is to record them
+    /// and re-sync any open tab, not to ask about them: the write has happened.
+    Applied { item_id: String, changes: Vec<ProposedChange> },
     /// The CLI is blocked on the user: may it write the files of `item_id`? Nothing is on
     /// disk yet, and nothing will be until [`approval_response`] says `accept`.
     ApprovalRequested { request_id: u64, item_id: String },
@@ -363,6 +379,29 @@ pub enum CodexEvent {
 /// the first `item/started` of a turn is the echoed **user** message, not the reply. Only
 /// `item/agentMessage/delta` is treated as text, so nothing gets appended twice and the
 /// user's own words never come back as the assistant's.
+/// The `changes` array of a `fileChange` item, shared by `item/started` (a proposal)
+/// and `item/completed` (a write the CLI already made).
+fn parse_changes(item: &Value) -> Vec<ProposedChange> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| {
+                    Some(ProposedChange {
+                        path: change.get("path")?.as_str()?.to_string(),
+                        kind: change.get("kind")?.get("type")?.as_str()?.to_string(),
+                        // A change with no diff is nothing the user could review, so it
+                        // is dropped rather than rendered as an empty pane with an Apply
+                        // button under it.
+                        diff: change.get("diff")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn parse_line(text: &str) -> Option<CodexEvent> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
 
@@ -508,27 +547,35 @@ pub fn parse_line(text: &str) -> Option<CodexEvent> {
                 _ => return Some(CodexEvent::Ignored),
             }
             let item_id = item.get("id")?.as_str()?.to_string();
-            let changes = item
-                .get("changes")?
-                .as_array()?
-                .iter()
-                .filter_map(|change| {
-                    Some(ProposedChange {
-                        path: change.get("path")?.as_str()?.to_string(),
-                        kind: change.get("kind")?.get("type")?.as_str()?.to_string(),
-                        // A change with no diff is nothing the user could review, so it is
-                        // dropped rather than rendered as an empty pane with an Apply
-                        // button under it.
-                        diff: change.get("diff")?.as_str()?.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>();
+            let changes = parse_changes(item);
             if changes.is_empty() {
                 return Some(CodexEvent::Ignored);
             }
             Some(CodexEvent::Proposed { item_id, changes })
         }
-        "item/completed" => Some(CodexEvent::ActivityEnded),
+        // A completed `fileChange` is the CLI reporting bytes it wrote itself — the
+        // workspace-write path, where no approval gates the edit. It carries the same
+        // `changes` array as the proposal, plus a `status`; only `"completed"` counts,
+        // a failed item wrote nothing worth recording. Everything else completing is
+        // just the end of an activity.
+        "item/completed" => {
+            let applied = (|| {
+                let item = params?.get("item")?;
+                if item.get("type")?.as_str()? != "fileChange" {
+                    return None;
+                }
+                if item.get("status").and_then(Value::as_str) != Some("completed") {
+                    return None;
+                }
+                let item_id = item.get("id")?.as_str()?.to_string();
+                let changes = parse_changes(item);
+                if changes.is_empty() {
+                    return None;
+                }
+                Some(CodexEvent::Applied { item_id, changes })
+            })();
+            Some(applied.unwrap_or(CodexEvent::ActivityEnded))
+        }
         "turn/completed" => Some(CodexEvent::TurnCompleted),
         "turn/failed" => {
             let message = params
@@ -763,13 +810,50 @@ mod tests {
     #[test]
     fn a_turn_sends_the_thread_id_and_one_text_block() {
         let value: Value =
-            serde_json::from_str(&turn_start_request("019ff658-abc", "explain this")).unwrap();
+            serde_json::from_str(&turn_start_request("019ff658-abc", "explain this", false))
+                .unwrap();
         assert_eq!(value["method"], "turn/start");
         assert_eq!(value["params"]["threadId"], "019ff658-abc");
         let input = value["params"]["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[0]["text"], "explain this");
+    }
+
+    /// The mode decides the turn's sandbox: Agent writes inside the workspace, Ask
+    /// restates read-only. Stated per turn so the permission is never inherited — and
+    /// the write variant must never open the network.
+    #[test]
+    fn the_turn_sandbox_follows_the_mode() {
+        let agent: Value = serde_json::from_str(&turn_start_request("t", "go", true)).unwrap();
+        assert_eq!(agent["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert!(
+            agent["params"]["sandboxPolicy"].get("networkAccess").is_none(),
+            "network stays at the CLI's default of none: {agent}"
+        );
+
+        let ask: Value = serde_json::from_str(&turn_start_request("t", "what", false)).unwrap();
+        assert_eq!(ask["params"]["sandboxPolicy"]["type"], "readOnly");
+    }
+
+    /// The captured wire shape of a write the CLI made itself (workspace-write turn):
+    /// `item/completed` with `status: "completed"` and the same `changes` array a
+    /// proposal carries. It must parse as `Applied`, and anything less — a failed item,
+    /// another item type — stays a plain activity ending.
+    #[test]
+    fn a_completed_file_change_reports_what_was_written() {
+        let captured = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"exec-90587fda","changes":[{"path":"/Users/u/filminho/hello.php","kind":{"type":"update","move_path":null},"diff":"@@ -2,3 +2,3 @@\n function hello() {\n-    return 'turnwrite';\n+    return 'shape';\n }\n"}],"status":"completed"},"threadId":"01a00343","turnId":"01a00343-3260"}}"#;
+        let Some(CodexEvent::Applied { item_id, changes }) = parse_line(captured) else {
+            panic!("expected Applied, got {:?}", parse_line(captured));
+        };
+        assert_eq!(item_id, "exec-90587fda");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "/Users/u/filminho/hello.php");
+        assert_eq!(changes[0].kind, "update");
+        assert!(changes[0].diff.contains("+    return 'shape';"));
+
+        let failed = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"x","changes":[{"path":"/a","kind":{"type":"update"},"diff":"d"}],"status":"failed"}}}"#;
+        assert_eq!(parse_line(failed), Some(CodexEvent::ActivityEnded), "a failed write wrote nothing");
     }
 
     #[test]

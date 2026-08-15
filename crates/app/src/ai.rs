@@ -329,6 +329,9 @@ pub enum AgentEvent {
     /// The agent wants to change files, and has said which and how. Nothing is written:
     /// this is the proposal, and the approval below is the question about it.
     Proposed { item_id: String, changes: Vec<ProposedFileChange> },
+    /// The agent already wrote these changes itself — a workspace-write turn. There is
+    /// no question to ask; the panel records what happened and re-syncs open tabs.
+    Edited { item_id: String, changes: Vec<ProposedFileChange> },
     /// The agent is blocked waiting for a decision on `item_id`, at JSON-RPC `request_id`.
     ApprovalRequested { request_id: u64, item_id: String },
     /// The agent is blocked on a decision that is **not** about writing files: a command it

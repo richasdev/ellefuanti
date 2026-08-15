@@ -58,25 +58,29 @@
 //! history lives in the CLI rather than being re-sent as a message array. It dies with the
 //! panel or with a cancel.
 //!
-//! # Ask and Agent, and the rule that outranks the feature
+//! # Ask and Agent, and where the write permission lives
 //!
-//! Ask is this panel as it was: a conversation, and nothing else. Agent lets the model
-//! propose file changes — and **nothing it proposes reaches disk without the user seeing a
-//! diff and pressing Apply.** That is the mirror of [`ai::deny_reason`], which decides what
-//! may leave the machine; this decides what may enter the user's files.
+//! Ask is this panel as it was: a conversation, and nothing else — its turns run under a
+//! `readOnly` sandbox, so a question cannot write. Agent is the mode the user picks *to
+//! have files edited*: its turns run under `workspaceWrite`, the CLI's own native flow,
+//! and edits inside the open project land directly — each one recorded in the flow as
+//! "Edited web.php (+3 −1)", any open tab re-synced ([`RefreshFn`]), everything visible
+//! and revertable in the git panel. The consent is the mode switch plus the send: the
+//! first design gated every file behind an Apply click on a read-only sandbox, and the
+//! CLI fought it — shell-write flailing, decline-retries, minutes-long turns that ended
+//! claiming failure over an edited file (measured live, 93 s vs 25 s for the same task —
+//! the owner's "demora muito e não escreve").
 //!
-//! The guarantee is not a promise this panel makes, it is a property of how the Codex
-//! thread is opened. The sandbox stays `read-only` in *both* modes, which makes every
-//! attempted write a sandbox escape, which makes it a question the CLI has to ask before
-//! it can act (see [`crate::ai_codex`] for the probe that established this — asking for
-//! write access would have *removed* the consent step, not added one). So:
+//! What survives of the old gate, because the CLI still asks when it wants more than the
+//! workspace:
 //!
-//! - a proposal arrives as a diff, already rendered, before anything is written;
-//! - each file is approved or rejected on its own — a turn touching five files is five
-//!   decisions, not one;
-//! - a rejection is *told to the model*, so it can adapt rather than re-propose blindly;
-//! - a proposal for a path [`ai::deny_reason`] refuses is blocked, with the reason shown;
-//! - a cancel discards everything still pending rather than half-applying it.
+//! - a write *outside* the project (or any turn the CLI chooses to ask about) still
+//!   arrives as diff cards — each file approved or rejected on its own, a rejection told
+//!   to the model, a denylisted path blocked with its reason;
+//! - commands that escalate, MCP servers and skills still raise their approval GUI;
+//! - a cancel discards everything still pending rather than half-applying it;
+//! - egress is untouched: [`ai::deny_reason`] still decides what may leave the machine,
+//!   and neither sandbox variant grants network access.
 //!
 //! Approvals are answered on the same stdin the turn is running on, from the foreground,
 //! while the background reader is parked on `read_line` — the one place the two threads
@@ -324,6 +328,27 @@ pub type ApplyFn = Box<
         + 'static,
 >;
 
+/// What became of an open tab after the CLI wrote its file on disk (a workspace-write
+/// turn). The disk copy is already the truth in every case — this is only about whether
+/// the tab still shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refresh {
+    /// No tab holds the path; nothing to sync.
+    Untouched,
+    /// The open buffer took the same patch, as one undo step. Tab and disk agree.
+    Reloaded,
+    /// The buffer has edits the patch no longer fits around. The tab and the disk now
+    /// disagree, and the user must hear it — a silent divergence ends with a save that
+    /// clobbers the agent's edit or an agent edit that clobbers the user's.
+    Conflict,
+}
+
+/// Re-syncs the tab (if any) that shows `path`, by applying the same patch the CLI just
+/// applied to disk. The workspace's closure, for [`ApplyFn`]'s reason: only it knows
+/// which paths are open in tabs. It never touches the disk — the CLI already did.
+pub type RefreshFn =
+    Box<dyn Fn(&Path, &dyn Fn(&str) -> Result<String, String>, &mut App) -> Refresh + 'static>;
+
 /// A live `codex app-server` child and the thread it opened (#99).
 ///
 /// Held across turns because the *thread* is the conversation: Codex keeps the history,
@@ -420,6 +445,8 @@ pub struct AiChatPanel {
     /// How an approved change reaches the buffer or the file. The workspace's closure, for
     /// the same reason as `snapshot`: only it knows which paths are open in tabs.
     apply: ApplyFn,
+    /// How a tab catches up with a file the CLI wrote (workspace-write turns).
+    refresh: RefreshFn,
     /// The open folder, so a Codex thread can be rooted at the project the user is
     /// actually looking at. `None` when nothing is open — then the thread gets no `cwd`
     /// rather than one pointing wherever the app was launched from.
@@ -442,6 +469,15 @@ pub struct AiChatPanel {
     proposals: Vec<Proposal>,
     /// Per Codex item: the approval id, and whether it has been answered.
     approvals: std::collections::HashMap<String, PendingApproval>,
+    /// Changes announced by `item/started` and not yet resolved either way.
+    ///
+    /// In a workspace-write turn the CLI usually just writes them (`Edited` arrives, the
+    /// panel records and re-syncs tabs); when it instead asks for approval — an edit
+    /// outside the workspace, a read-only Ask turn — the held changes become review
+    /// cards at that moment. Held rather than shown eagerly because a card with buttons
+    /// for a write that will happen anyway (or already has) is a question nobody is
+    /// being asked.
+    pending_changes: std::collections::HashMap<String, Vec<ai::ProposedFileChange>>,
     /// `(path, diff)` of every proposal the user rejected in the current turn.
     ///
     /// The Reject half of the CLI's retry habit: after a decline the file is *unchanged*,
@@ -477,6 +513,7 @@ impl AiChatPanel {
     pub fn new(
         snapshot: SnapshotFn,
         apply: ApplyFn,
+        refresh: RefreshFn,
         project_root: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -500,6 +537,7 @@ impl AiChatPanel {
             scroll: ScrollHandle::new(),
             snapshot,
             apply,
+            refresh,
             project_root,
             codex: Arc::default(),
             codex_status: None,
@@ -518,6 +556,7 @@ impl AiChatPanel {
             },
             proposals: Vec::new(),
             approvals: std::collections::HashMap::new(),
+            pending_changes: std::collections::HashMap::new(),
             pending_report: None,
             #[cfg(test)]
             transport_disabled: false,
@@ -785,6 +824,10 @@ impl AiChatPanel {
         let shared_stdin = self.codex_stdin.clone();
         let shared_thread_id = self.codex_thread_id.clone();
         let shared_model = self.codex_model.clone();
+        // The mode at the moment of send is the turn's sandbox: Agent writes in the
+        // workspace, Ask stays read-only. Captured here, not read later — the user can
+        // flip the switch while the turn runs, and the sandbox it started under holds.
+        let write = self.mode == ChatMode::Agent;
 
         let producer = cx.background_spawn(async move {
             codex_turn(
@@ -795,6 +838,7 @@ impl AiChatPanel {
                 &shared_model,
                 root.as_deref(),
                 &message,
+                write,
                 &tx,
             );
         });
@@ -839,17 +883,29 @@ impl AiChatPanel {
                         flow_finish_activities(&mut turn.flow);
                     }
                 }
-                // Agent mode only. Both are ignored in Ask mode rather than trusted: the
-                // thread is opened read-only either way, so a proposal arriving in Ask
-                // mode would be a CLI that changed its mind about the sandbox, and the
-                // safe reading of that is to show nothing and approve nothing.
+                // Announced changes are *held*, not shown: in a workspace-write turn the
+                // CLI will normally just write them (`Edited` below), and a card with
+                // Apply/Reject buttons for a write that happens anyway is a question
+                // nobody is being asked. They become cards only if the CLI asks.
                 AgentEvent::Proposed { item_id, changes } => {
                     if self.mode == ChatMode::Agent {
-                        self.add_proposals(item_id, changes);
+                        self.pending_changes.insert(item_id, changes);
+                    }
+                }
+                // The CLI wrote these itself. Record each file in the flow and re-sync
+                // any open tab; nothing to approve.
+                AgentEvent::Edited { item_id, changes } => {
+                    if self.mode == ChatMode::Agent {
+                        self.record_edits(&item_id, changes, cx);
                     }
                 }
                 AgentEvent::ApprovalRequested { request_id, item_id } => {
                     if self.mode == ChatMode::Agent {
+                        // The moment a question actually exists, the held changes become
+                        // review cards — an edit outside the workspace still gates here.
+                        if let Some(changes) = self.pending_changes.remove(&item_id) {
+                            self.add_proposals(item_id.clone(), changes);
+                        }
                         self.note_approval_request(request_id, item_id);
                     } else {
                         // Nothing was offered, so nothing can be approved.
@@ -1120,6 +1176,64 @@ impl AiChatPanel {
         // `settle_item` over an empty file list answers the decline that keeps the turn
         // moving — an unanswered id is a hang, the lesson this panel keeps re-learning.
         self.approvals.entry(item_id).or_default();
+    }
+
+    /// Records writes the CLI made itself (a workspace-write turn) and re-syncs any open
+    /// tab so the user is not looking at stale text over changed bytes.
+    ///
+    /// The record is the same compact line an approved batch collapses to — "Edited
+    /// web.php (+3 −1)" — because to the reader they are the same fact: this file
+    /// changed, this much. A tab whose unsaved edits the patch no longer fits around is
+    /// a conflict said out loud in the note row; every other case is silent.
+    fn record_edits(
+        &mut self,
+        item_id: &str,
+        changes: Vec<ai::ProposedFileChange>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_changes.remove(item_id);
+        // An item that went through the approval flow was already recorded by the
+        // Apply/Reject click; its completion is the CLI catching up, not news.
+        if self.approvals.contains_key(item_id) {
+            return;
+        }
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut records: Vec<String> = Vec::new();
+        for change in changes {
+            let path = PathBuf::from(&change.path);
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| change.path.clone());
+            let (added, removed) = diff_line_counts(&change.diff);
+            let patch = |current: &str| apply_unified_diff(current, &change.diff);
+            if (self.refresh)(&path, &patch, cx) == Refresh::Conflict {
+                conflicts.push(name.clone());
+            }
+            records.push(format!("Edited {name} (+{added} −{removed})"));
+        }
+        if self.turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
+            self.turns.push(ChatTurn {
+                role: Role::Assistant,
+                text: String::new(),
+                flow: Vec::new(),
+            });
+        }
+        if let Some(turn) = self.turns.last_mut().filter(|turn| turn.role == Role::Assistant) {
+            for label in records {
+                turn.flow.push(FlowBlock::Activity { label, done: true });
+            }
+        }
+        if !conflicts.is_empty() {
+            self.note = Some(
+                format!(
+                    "{} changed on disk, but the open tab has unsaved edits — its text was \
+                     left alone",
+                    conflicts.join(", ")
+                )
+                .into(),
+            );
+        }
     }
 
     /// Notes the id an item's approval is waiting at, and answers immediately if every
@@ -1600,6 +1714,8 @@ impl AiChatPanel {
         }
         self.proposals.clear();
         self.approvals.clear();
+        // Held announcements go with them: they belong to the same turn.
+        self.pending_changes.clear();
     }
 
     // --- chips -----------------------------------------------------------------------
@@ -2345,8 +2461,8 @@ pub fn setup_guidance(
             // click, and the sentence there names `codex login` for when it fails.
             Some(crate::ai_codex::Availability::NotLoggedIn) => Some(
                 "Chat runs your local `codex` CLI, which uses your own ChatGPT login. \
-                 This editor never sees your credentials, and the thread is read-only — \
-                 it can read the open project, not write to it."
+                 This editor never sees your credentials. Ask mode is read-only; Agent \
+                 mode lets it edit files in the open project."
                     .to_string(),
             ),
             // The probe's own sentence already names the command to run — repeating it
@@ -2497,6 +2613,7 @@ fn codex_turn(
     shared_model: &Arc<Mutex<Option<String>>>,
     root: Option<&Path>,
     message: &str,
+    write: bool,
     tx: &smol::channel::Sender<AgentEvent>,
 ) {
     // Availability first, so "not installed" and "not logged in" arrive as the sentence
@@ -2514,7 +2631,7 @@ fn codex_turn(
     // An existing session means the CLI already holds this conversation, so a second
     // question is one `turn/start` on the same thread rather than a fresh handshake.
     if let Some(session) = state.session.as_mut() {
-        let request = crate::ai_codex::turn_start_request(&session.thread_id, message);
+        let request = crate::ai_codex::turn_start_request(&session.thread_id, message, write);
         if write_to_codex(&session.stdin, &request) {
             read_codex_turn(session, tx);
             return;
@@ -2621,7 +2738,7 @@ fn codex_turn(
     *shared_stdin.lock().unwrap_or_else(|p| p.into_inner()) = Some(stdin);
     *shared_thread_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread_id.clone());
 
-    let request = crate::ai_codex::turn_start_request(&thread_id, message);
+    let request = crate::ai_codex::turn_start_request(&thread_id, message, write);
     if !write_to_codex(shared_stdin, &request) {
         let _ = tx.send_blocking(AgentEvent::Stream(StreamEvent::Error(
             "the Codex CLI closed before the turn started".to_string(),
@@ -2675,6 +2792,20 @@ fn read_codex_turn(session: &mut CodexSession, tx: &smol::channel::Sender<AgentE
                     })
                     .collect();
                 if tx.send_blocking(AgentEvent::Proposed { item_id, changes }).is_err() {
+                    return;
+                }
+            }
+            // A write the CLI already made (workspace-write turn): recorded, not asked.
+            Some(crate::ai_codex::CodexEvent::Applied { item_id, changes }) => {
+                let changes = changes
+                    .into_iter()
+                    .map(|change| ai::ProposedFileChange {
+                        path: change.path,
+                        kind: change.kind,
+                        diff: change.diff,
+                    })
+                    .collect();
+                if tx.send_blocking(AgentEvent::Edited { item_id, changes }).is_err() {
                     return;
                 }
             }
@@ -4571,8 +4702,8 @@ mod tests {
             "the boundary must be stated where the button is offered: {guidance}"
         );
         assert!(
-            guidance.contains("read-only"),
-            "and that the thread cannot write on its own: {guidance}"
+            guidance.contains("read-only") && guidance.contains("Agent"),
+            "and which mode can write — Ask reads, Agent edits: {guidance}"
         );
 
         // While the probe is in flight there is still no input row: a send would race it.

@@ -2628,40 +2628,161 @@ async fn ai_agent_approval_is_per_file_not_all_or_nothing(cx: &mut TestAppContex
     workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
     let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
 
-    // One item carrying two files, which is how a multi-file edit arrives.
+    // One item carrying two files, which is how a multi-file edit arrives. The cards
+    // exist only once the CLI *asks* — an announcement alone stays held, because in a
+    // workspace-write turn the CLI just writes and there is nothing to click.
     panel.update(cx, |panel, cx| {
         panel.set_mode_for_test(ChatMode::Agent);
         panel.apply_events_for_test(
-            vec![crate::ai::AgentEvent::Proposed {
-                item_id: "item-1".to_string(),
-                changes: vec![
-                    crate::ai::ProposedFileChange {
-                        path: kept.display().to_string(),
-                        kind: "update".to_string(),
-                        diff: HELLO_DIFF.to_string(),
-                    },
-                    crate::ai::ProposedFileChange {
-                        path: changed.display().to_string(),
-                        kind: "update".to_string(),
-                        diff: HELLO_DIFF.to_string(),
-                    },
-                ],
-            }],
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-1".to_string(),
+                    changes: vec![
+                        crate::ai::ProposedFileChange {
+                            path: kept.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                        crate::ai::ProposedFileChange {
+                            path: changed.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                    ],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 7,
+                    item_id: "item-1".to_string(),
+                },
+            ],
             cx,
         );
-        // Reject the first, apply the second.
-        panel.reject_proposal_for_test(0, cx);
-        panel.apply_proposal_for_test(1, cx);
     });
 
     panel.read_with(cx, |panel, _cx| {
         let proposals = panel.proposals_for_test();
         assert_eq!(proposals.len(), 2, "two files, two rows");
-        assert_eq!(proposals[0].state, ProposalState::Rejected);
-        assert_eq!(proposals[1].state, ProposalState::Applied);
+        assert!(proposals.iter().all(|p| p.state == ProposalState::Pending));
+    });
+
+    // Reject the first, apply the second. Deciding the last file settles the batch:
+    // the cards collapse into records, and the files show the split decision.
+    panel.update(cx, |panel, cx| {
+        panel.reject_proposal_for_test(0, cx);
+        panel.apply_proposal_for_test(1, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "a settled batch collapses");
     });
     assert_eq!(std::fs::read_to_string(&kept).unwrap(), HELLO_BEFORE, "the rejected one is intact");
     assert_eq!(std::fs::read_to_string(&changed).unwrap(), HELLO_AFTER, "the applied one changed");
+}
+
+/// A workspace-write turn: the CLI writes the file itself and reports it. No card, no
+/// button — a record in the flow ("Edited hello.php (+1 −1)") is the whole ceremony,
+/// because the write has already happened and a question about it would be theatre.
+#[gpui::test]
+async fn ai_agent_a_cli_write_is_recorded_not_asked(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, FlowBlock};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_AFTER).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![
+                // The announcement, then the completion — the CLI's own order. No
+                // approval ever arrives, because the sandbox let it write.
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-1".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+                crate::ai::AgentEvent::Edited {
+                    item_id: "item-1".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+            ],
+            cx,
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "no card for a write already made");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                FlowBlock::Activity { label, done: true }
+                    if label == "Edited hello.php (+1 −1)"
+            ))),
+            "the write is recorded in the flow"
+        );
+    });
+}
+
+/// The same write while the file sits open in a tab: the buffer takes the same patch the
+/// CLI applied to disk, so the user is not reading stale text over changed bytes — the
+/// gap that made workspace-write unshippable until this closure existed.
+#[gpui::test]
+async fn ai_agent_a_cli_write_refreshes_the_open_tab(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_argument(file.clone(), window, cx);
+        workspace.toggle_ai_chat_for_test(window, cx);
+    });
+    // The open reads the file on the background executor; the tab exists after the pump.
+    cx.run_until_parked();
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    // The CLI's write reaches the disk first, then the report reaches the panel.
+    std::fs::write(&file, HELLO_AFTER).expect("cli write");
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![crate::ai::AgentEvent::Edited {
+                item_id: "item-1".to_string(),
+                changes: vec![crate::ai::ProposedFileChange {
+                    path: file.display().to_string(),
+                    kind: "update".to_string(),
+                    diff: HELLO_DIFF.to_string(),
+                }],
+            }],
+            cx,
+        );
+    });
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the tab is open");
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(
+            editor.document.buffer.text(),
+            HELLO_AFTER,
+            "the open buffer caught up with the CLI's write"
+        );
+    });
 }
 
 /// The denylist decides what may *enter* the user's files too, not only what leaves.
@@ -5475,6 +5596,7 @@ async fn every_small_text_field_lays_out_with_and_without_text(cx: &mut TestAppC
         AiChatPanel::new(
             Box::new(|_| Default::default()),
             Box::new(|_, _, _| Err("render tests never write".to_string())),
+            Box::new(|_, _, _| crate::ai_chat::Refresh::Untouched),
             None,
             cx,
         )
