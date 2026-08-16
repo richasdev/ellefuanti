@@ -2465,6 +2465,15 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
                     flow: Vec::new(),
                 },
                 ChatTurn { role: Role::Note, text: "overloaded".to_string(), flow: Vec::new() },
+                // An empty note (a CLI dying without a message) must draw as nothing —
+                // it rendered as a bare red sliver, the orphan "!".
+                ChatTurn { role: Role::Note, text: "  ".to_string(), flow: Vec::new() },
+                // And a markdown image renders as its link, with no leftover `!`.
+                ChatTurn {
+                    role: Role::Assistant,
+                    text: "See:\n![screenshot](shot.png)".to_string(),
+                    flow: Vec::new(),
+                },
             ],
             cx,
         );
@@ -2610,6 +2619,219 @@ async fn ai_agent_rejecting_leaves_the_file_exactly_as_it_was(cx: &mut TestAppCo
         );
     });
     assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE);
+}
+
+/// The wire itself, observed for the first time: a mixed batch (one applied, one
+/// rejected) must answer its request with exactly one `decline` — accept would authorise
+/// the CLI to write the rejected file too, and an unanswered id parks the CLI on
+/// `read_line` forever ("travou infinito").
+#[gpui::test]
+async fn ai_agent_a_mixed_batch_answers_the_cli_with_one_decline(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let kept = dir.path().join("kept.php");
+    let changed = dir.path().join("changed.php");
+    let sink = dir.path().join("replies.ndjson");
+    std::fs::write(&kept, HELLO_BEFORE).expect("write");
+    std::fs::write(&changed, HELLO_BEFORE).expect("write");
+
+    // A real child whose stdin the panel writes to, echoing into a file the test reads —
+    // `write_to_codex` is a silent no-op without a child, so without this sink a "was
+    // the reply sent?" assertion passes vacuously.
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec cat > '{}'", sink.display()))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sink");
+    let stdin = child.stdin.take().expect("sink stdin");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.set_codex_stdin_for_test(stdin);
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-mixed".to_string(),
+                    changes: vec![
+                        crate::ai::ProposedFileChange {
+                            path: changed.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                        crate::ai::ProposedFileChange {
+                            path: kept.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                    ],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 7,
+                    item_id: "item-mixed".to_string(),
+                },
+            ],
+            cx,
+        );
+        panel.apply_proposal_for_test(0, cx);
+        // Half a batch decided answers nothing yet — the request is one question.
+        panel.reject_proposal_for_test(1, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "the settled batch collapses");
+    });
+
+    // Close the pipe so the sink child sees EOF and exits, then read what was sent.
+    panel.update(cx, |panel, _cx| panel.set_codex_stdin_for_test_take());
+    let _ = child.wait();
+    let sent = std::fs::read_to_string(&sink).unwrap_or_default();
+    assert!(
+        sent.contains("\"id\":7") && sent.contains("\"decision\":\"decline\""),
+        "a mixed batch must decline, got: {sent:?}"
+    );
+    assert_eq!(sent.matches("\"decision\"").count(), 1, "one question, exactly one answer");
+    assert_eq!(std::fs::read_to_string(&changed).unwrap(), HELLO_AFTER);
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), HELLO_BEFORE);
+}
+
+/// A delete proposal is honest before the click: the card offers no Apply (this build
+/// shows deletions for review, it does not perform them) and Reject still settles it.
+#[gpui::test]
+async fn ai_agent_a_delete_proposal_offers_review_but_no_apply(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("old.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-del".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "delete".to_string(),
+                        diff: String::new(),
+                    }],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 0,
+                    item_id: "item-del".to_string(),
+                },
+            ],
+            cx,
+        );
+    });
+    panel.read_with(cx, |panel, _cx| {
+        let proposals = panel.proposals_for_test();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].kind, "delete");
+        assert_eq!(proposals[0].state, ProposalState::Pending);
+    });
+    // The Apply-less card draws.
+    draw(cx);
+
+    panel.update(cx, |panel, cx| panel.reject_proposal_for_test(0, cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "reject settles the delete card");
+    });
+    assert!(file.exists(), "and the file was never touched");
+}
+
+/// Every approval kind answers on the wire with its own encoder — and answers exactly
+/// once. `Command` speaks `decision`, an MCP elicitation speaks `action`, and `Unknown`
+/// (a method this build does not recognise) is forced to `decline` even when the caller
+/// says accept: consenting to unknown semantics is not consent. An unanswered id parks
+/// the CLI on `read_line` forever, which is why every branch must write *something*.
+#[gpui::test]
+async fn ai_agent_every_approval_kind_answers_once_with_its_own_encoder(
+    cx: &mut TestAppContext,
+) {
+    use crate::ai_chat::ChatMode;
+    use crate::ai_codex::{ApprovalKind, Decision};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let sink = dir.path().join("replies.ndjson");
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec cat > '{}'", sink.display()))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sink");
+    let stdin = child.stdin.take().expect("sink stdin");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    let ask = |request_id: u64, kind: ApprovalKind| crate::ai::AgentEvent::ActionApprovalRequested {
+        request_id,
+        summary: format!("do thing {request_id}"),
+        allow_for_session: kind == ApprovalKind::Command,
+        kind,
+    };
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.set_codex_stdin_for_test(stdin);
+
+        panel.apply_events_for_test(vec![ask(1, ApprovalKind::Command)], cx);
+        panel.answer_action_for_test(1, Decision::Accept);
+
+        panel.apply_events_for_test(vec![ask(2, ApprovalKind::McpElicitation)], cx);
+        panel.answer_action_for_test(2, Decision::Accept);
+
+        panel.apply_events_for_test(vec![ask(3, ApprovalKind::Unknown)], cx);
+        assert_eq!(
+            panel.action_approval_kind_for_test(),
+            Some(ApprovalKind::Unknown),
+            "the unknown request still raises a card (it must be answerable)"
+        );
+    });
+    // The Deny-only card draws.
+    draw(cx);
+    panel.update(cx, |panel, _cx| {
+        // The caller says accept; the panel must refuse to encode it.
+        panel.answer_action_for_test(3, Decision::Accept);
+        panel.set_codex_stdin_for_test_take();
+    });
+    let _ = child.wait();
+
+    let sent = std::fs::read_to_string(&sink).unwrap_or_default();
+    let lines: Vec<&str> = sent.lines().collect();
+    assert_eq!(lines.len(), 3, "three questions, exactly three answers: {sent:?}");
+    assert!(
+        lines[0].contains("\"id\":1") && lines[0].contains("\"decision\":\"accept\""),
+        "a command speaks the decision shape: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("\"id\":2")
+            && lines[1].contains("\"action\":\"accept\"")
+            && !lines[1].contains("\"decision\""),
+        "an elicitation speaks the action shape: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("\"id\":3") && lines[2].contains("\"decision\":\"decline\""),
+        "unknown semantics can only be declined: {}",
+        lines[2]
+    );
 }
 
 /// Per-file approval: a turn touching two files is two decisions, not one.

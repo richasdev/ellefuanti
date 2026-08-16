@@ -1797,6 +1797,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "smol",
  "tempfile",

@@ -254,6 +254,10 @@ struct PendingApproval {
     request_id: Option<u64>,
     /// Whether the reply has gone, so a second decision cannot answer the same id twice.
     answered: bool,
+    /// The batch decision, remembered at collapse time: the cards may be gone from
+    /// `proposals` by the time the CLI asks (the question can trail the clicks), and a
+    /// late request is answered from here instead of from cards that no longer exist.
+    decided: Option<bool>,
 }
 
 /// A `codex login` the panel started and is waiting on.
@@ -428,6 +432,12 @@ pub struct AiChatPanel {
     /// rather than cleared mid-poll, because a task must not drop itself from inside
     /// its own `update`.
     stream_task: Option<Task<()>>,
+    /// Received-but-not-yet-shown reply text. Deltas arrive in bursts; showing them raw
+    /// makes the transcript jump. A 16 ms task drains this smoothly ([`crate::ai_stream`]);
+    /// any non-text event flushes it first so the reading order stays the arrival order.
+    reveal: crate::ai_stream::RevealBuffer,
+    /// The reveal task. `None` when the backlog is empty; respawned on the next delta.
+    reveal_task: Option<Task<()>>,
     /// The context chips (#99): off by default, explicit, visible.
     attach_selection: bool,
     attach_file: bool,
@@ -529,6 +539,8 @@ impl AiChatPanel {
             action_approval: None,
             rejected_this_turn: Vec::new(),
             stream_task: None,
+            reveal: crate::ai_stream::RevealBuffer::default(),
+            reveal_task: None,
             attach_selection: false,
             attach_file: false,
             attachments: Vec::new(),
@@ -565,6 +577,35 @@ impl AiChatPanel {
             #[cfg(test)]
             force_enabled: false,
         };
+        // The last conversation, restored — closing the app stopped meaning losing it.
+        // Tests never touch the real file: their panels must not read (or later save
+        // over) the owner's history.
+        #[cfg(not(test))]
+        let panel = {
+            let mut panel = panel;
+            let is_codex = ai::Provider::from_setting(
+                crate::settings::current(cx).ai_chat_provider(),
+            ) == ai::Provider::Codex;
+            if let Some(path) = crate::ai_history::history_path() {
+                let restored = crate::ai_history::load_from(&path);
+                if !restored.is_empty() {
+                    panel.turns = restored;
+                    // Honest about what came back: an HTTP provider re-sends the turns,
+                    // so its context truly resumes; the Codex thread lives inside the
+                    // CLI process and did not survive the restart.
+                    if is_codex {
+                        panel.turns.push(ChatTurn {
+                            role: Role::Note,
+                            text: "Previous conversation restored for reading — the \
+                                   agent's context starts fresh."
+                                .to_string(),
+                            flow: Vec::new(),
+                        });
+                    }
+                }
+            }
+            panel
+        };
         // Probed at open, not at render: `codex --version` is a subprocess, and a render
         // that spawns one would pay for it every frame. Only when Codex is the chat
         // provider — nobody else's panel should run a CLI they did not ask for.
@@ -576,6 +617,24 @@ impl AiChatPanel {
         }
         panel
     }
+
+    /// Writes the conversation to disk, off the main thread. Called wherever a turn
+    /// stops changing — the reveal task's end (Done, error, cancel all funnel there)
+    /// and ⌃L — so the file always holds the last settled state.
+    #[cfg(not(test))]
+    fn save_history(&self, cx: &mut Context<Self>) {
+        let Some(path) = crate::ai_history::history_path() else { return };
+        let turns = self.turns.clone();
+        cx.background_spawn(async move {
+            if let Err(err) = crate::ai_history::save_to(&path, &turns) {
+                tracing::debug!("chat history not saved: {err}");
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    fn save_history(&self, _cx: &mut Context<Self>) {}
 
     /// Resolves Codex availability off the main thread and caches the answer.
     ///
@@ -626,6 +685,10 @@ impl AiChatPanel {
         if self.streaming {
             return; // one reply at a time; the button says Cancel right now anyway
         }
+        // A send seconds after a reply ended can catch the reveal mid-drain; the context
+        // built below reads `turn.text`, which must be the whole reply by then.
+        let held = self.reveal.flush();
+        self.append_reply_text(&held);
         let settings = crate::settings::current(cx);
         let enabled = {
             #[cfg(test)]
@@ -782,6 +845,7 @@ impl AiChatPanel {
         let (tx, rx) = smol::channel::unbounded::<AgentEvent>();
         let kill: Arc<Mutex<Option<Child>>> = Arc::default();
         self.kill = kill.clone();
+        self.start_reveal_task(cx);
 
         let producer = cx.background_spawn(async move {
             stream_reply(provider, wire, &base_url, &body, &kill, &tx);
@@ -818,6 +882,7 @@ impl AiChatPanel {
         let codex = self.codex.clone();
         let kill: Arc<Mutex<Option<Child>>> = Arc::default();
         self.kill = kill.clone();
+        self.start_reveal_task(cx);
         let root = self.project_root.clone();
         // Cloned, not re-created: these are the handles the *panel* answers approvals and
         // cancels through, so the turn must publish into the same ones the UI reads.
@@ -862,18 +927,66 @@ impl AiChatPanel {
         }));
     }
 
+    /// Appends reply text to the open assistant turn — the single door revealed and
+    /// flushed text both go through, so `turn.text` and the flow can never disagree.
+    fn append_reply_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(turn) = self.turns.last_mut().filter(|turn| turn.role == Role::Assistant) {
+            turn.text.push_str(text);
+            flow_push_text(&mut turn.flow, text);
+        }
+    }
+
+    /// Starts the 16 ms drain that reveals buffered reply text smoothly (Zed's shape:
+    /// the backlog empties over ~200 ms, so a burst reveals fast and a trickle types).
+    ///
+    /// Spawned once per stream, next to `stream_task`, and replaced the same way on the
+    /// next send — never cleared from inside its own `update`, the rule that field's
+    /// comment states. It outlives `streaming` by however long the tail takes to drain.
+    fn start_reveal_task(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().clone();
+        self.reveal_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                timer.timer(crate::ai_stream::REVEAL_TICK).await;
+                let done = this
+                    .update(cx, |this, cx| {
+                        if let Some(part) = this.reveal.take_reveal(crate::ai_stream::REVEAL_TICK)
+                        {
+                            this.append_reply_text(&part);
+                            this.scroll.scroll_to_bottom();
+                            cx.notify();
+                        }
+                        !this.streaming && this.reveal.is_empty()
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+            // The turn is settled (Done, an error, or a cancel — all end here): persist.
+            let _ = this.update(cx, |this, cx| this.save_history(cx));
+        }));
+    }
+
     /// Applies one batch of stream events. Returns whether the reply is over.
     fn apply_events(&mut self, batch: Vec<AgentEvent>, cx: &mut Context<Self>) -> bool {
         let mut finished = false;
         for event in batch {
+            // Anything that is not reply text lands in the transcript *after* every word
+            // received before it: the reveal buffer is flushed first, so an activity row
+            // or a proposal card can never overtake the sentence that introduced it.
+            if !matches!(event, AgentEvent::Stream(StreamEvent::Delta(_) | StreamEvent::Done)) {
+                let held = self.reveal.flush();
+                self.append_reply_text(&held);
+            }
             match event {
                 AgentEvent::Stream(StreamEvent::Delta(text)) => {
-                    if let Some(turn) =
-                        self.turns.last_mut().filter(|turn| turn.role == Role::Assistant)
-                    {
-                        turn.text.push_str(&text);
-                        flow_push_text(&mut turn.flow, &text);
-                    }
+                    // Buffered, not appended: the reveal task (started with the stream)
+                    // shows it smoothly instead of the transcript jumping a paragraph
+                    // per batch.
+                    self.reveal.push(&text);
                 }
                 AgentEvent::Stream(StreamEvent::Done) => {
                     finished = true;
@@ -999,6 +1112,9 @@ impl AiChatPanel {
         // Dropping the drain stops the await; the producer ends when its send fails.
         self.stream_task = None;
         self.streaming = false;
+        // Received text is real text: land it before the cancel marker, not after.
+        let held = self.reveal.flush();
+        self.append_reply_text(&held);
         // A cancel mid-proposal discards what was pending rather than half-applying it.
         // Nothing is told to the CLI: `interrupt_codex` above already dropped the session
         // and the child is being killed, so a reply would be written into a closed pipe.
@@ -1102,8 +1218,12 @@ impl AiChatPanel {
             // Disk only, deliberately: an open tab's unsaved buffer can differ from disk,
             // and a wrong "stale" verdict would hide a reviewable card. An unreadable or
             // absent file (a proposal that *creates* one) skips the check entirely.
-            let stale = std::fs::read_to_string(&path)
-                .is_ok_and(|current| apply_unified_diff(&current, &change.diff).is_err());
+            // A delete has no patch to fit, so the stale check cannot judge it — without
+            // this exemption an empty diff always reads as stale and the card is
+            // silently swallowed.
+            let stale = change.kind != "delete"
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|current| apply_unified_diff(&current, &change.diff).is_err());
             // The Reject half: the file is unchanged after a decline, so the retry passes
             // the stale check — but its `(path, diff)` matches what the user just said no
             // to, and a question answered seconds ago is not asked again.
@@ -1248,7 +1368,8 @@ impl AiChatPanel {
         self.settle_item(&item_id);
     }
 
-    /// Answers the CLI once every file of `item_id` has been decided.
+    /// Settles `item_id` once every file of it has been decided: collapses the cards into
+    /// the transcript **for every provider**, and answers the CLI iff it asked.
     ///
     /// **Accept when the whole batch was applied, decline otherwise** ([`batch_decision`]).
     /// The first design declined even after Apply, fearing the CLI's own apply would
@@ -1263,11 +1384,6 @@ impl AiChatPanel {
     /// On decline the model is still not left guessing: [`Self::report_outcome`] carries
     /// what really happened into the next send.
     fn settle_item(&mut self, item_id: &str) {
-        let Some(entry) = self.approvals.get(item_id) else { return };
-        let Some(request_id) = entry.request_id else { return };
-        if entry.answered {
-            return;
-        }
         let files: Vec<(String, ProposalState, (usize, usize))> = self
             .proposals
             .iter()
@@ -1301,10 +1417,26 @@ impl AiChatPanel {
         // accept. The applied subset was already written by the editor, so the old
         // decline behaviour (with its possible retry, killed by the pre-flight) is the
         // acceptable price of the rare mixed case.
-        let accept = batch_decision(&files);
-        self.answer_codex(request_id, accept);
-        if let Some(entry) = self.approvals.get_mut(item_id) {
+        // From the cards when they are still here; from the remembered decision when
+        // they already collapsed and only the CLI's late question is left to answer.
+        let accept = if files.is_empty() {
+            self.approvals.get(item_id).and_then(|entry| entry.decided).unwrap_or(false)
+        } else {
+            batch_decision(&files)
+        };
+
+        // Answer the CLI iff it asked and was not answered yet. Without a request — an
+        // HTTP provider's parsed diff, a workspace-write turn that never asks — there is
+        // nothing to answer, but the collapse below must happen anyway: gating it on a
+        // `request_id` is what pinned applied cards over the input forever on those paths.
+        let entry = self.approvals.entry(item_id.to_string()).or_default();
+        entry.decided = Some(accept);
+        let unanswered_request = entry.request_id.filter(|_| !entry.answered);
+        let mut wire_accepted = false;
+        if let Some(request_id) = unanswered_request {
             entry.answered = true;
+            self.answer_codex(request_id, accept);
+            wire_accepted = accept;
         }
 
         // A settled batch collapses into the transcript, Zed's shape: one compact line
@@ -1339,10 +1471,11 @@ impl AiChatPanel {
         self.proposals.retain(|proposal| proposal.item_id != item_id);
 
         // The model's copy of the same facts, on the next send — a rejection it is never
-        // told about is a rejection it will make again. Skipped entirely on accept: the
-        // wire already told the model its change landed, and a second report saying
-        // "applied by the editor" reads as a different, contradicting event.
-        if accept {
+        // told about is a rejection it will make again. Skipped only when the wire just
+        // said accept: there the model already heard its change landed, and a second
+        // report saying "applied by the editor" reads as a contradicting event. An HTTP
+        // provider has no wire answer, so it is always told here.
+        if wire_accepted {
             return;
         }
         let applied: Vec<&str> = files
@@ -1553,6 +1686,14 @@ impl AiChatPanel {
         if self.action_approval.as_ref().is_some_and(|a| a.request_id == request_id) {
             self.action_approval = None;
         }
+        // A request this build does not recognise can only be safely refused: an accept
+        // for unknown semantics is a blank cheque. The card renders Deny alone, and this
+        // guard makes that true for every caller, not just the button.
+        let decision = if kind == crate::ai_codex::ApprovalKind::Unknown {
+            crate::ai_codex::Decision::Decline
+        } else {
+            decision
+        };
         // The wire shape follows the request's kind: an elicitation answered with a
         // `decision` word is a protocol error the MCP server reports as a failed prompt.
         if kind == crate::ai_codex::ApprovalKind::McpElicitation {
@@ -1943,6 +2084,9 @@ impl AiChatPanel {
         }
         self.pending_report = None;
         self.note = None;
+        // ⌃L means gone, including from disk — a cleared conversation must not
+        // resurrect on the next launch.
+        self.save_history(cx);
         cx.notify();
     }
 
@@ -2000,7 +2144,12 @@ impl AiChatPanel {
         batch: Vec<AgentEvent>,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.apply_events(batch, cx)
+        let finished = self.apply_events(batch, cx);
+        // Tests assert on the transcript synchronously; the 16 ms reveal is a display
+        // affordance, not part of the contract, so it is flushed out of the way here.
+        let held = self.reveal.flush();
+        self.append_reply_text(&held);
+        finished
     }
 
     pub fn proposals_for_test(&self) -> &[Proposal] {
@@ -2042,6 +2191,31 @@ impl AiChatPanel {
 
     pub fn note_for_test(&self) -> Option<&str> {
         self.note.as_ref().map(|note| note.as_ref())
+    }
+
+    /// Points the panel's Codex stdin at a test-owned sink child, so tests can read back
+    /// exactly what would have gone to the CLI — `write_to_codex` is a silent no-op
+    /// without a child, which lets a "was the reply sent?" test pass vacuously.
+    pub fn set_codex_stdin_for_test(&mut self, stdin: ChildStdin) {
+        *self.codex_stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stdin);
+    }
+
+    /// Drops the test sink's stdin so the child sees EOF and flushes.
+    pub fn set_codex_stdin_for_test_take(&mut self) {
+        *self.codex_stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// The button click, minus the button: answers the pending action approval.
+    pub fn answer_action_for_test(
+        &mut self,
+        request_id: u64,
+        decision: crate::ai_codex::Decision,
+    ) {
+        self.answer_action(request_id, decision);
+    }
+
+    pub fn action_approval_kind_for_test(&self) -> Option<crate::ai_codex::ApprovalKind> {
+        self.action_approval.as_ref().map(|approval| approval.kind)
     }
 }
 
@@ -3157,6 +3331,11 @@ impl AiChatPanel {
         fonts: &Fonts,
     ) -> gpui::AnyElement {
         let is_last = index + 1 == self.turns.len();
+        // A note that says nothing draws nothing: an empty error string (a CLI dying
+        // without a message) otherwise renders as a bare red sliver — the orphan "!".
+        if turn.role == Role::Note && turn.text.trim().is_empty() && turn.flow.is_empty() {
+            return div().into_any_element();
+        }
         let mut body: Vec<gpui::AnyElement> = Vec::new();
         let activity_row = |label: &str, done: bool| {
             div()
@@ -3437,31 +3616,36 @@ impl AiChatPanel {
             return div().into_any_element();
         };
         let request_id = approval.request_id;
+        // A kind this build cannot interpret gets no Allow: consenting to unknown
+        // semantics is not consent. Deny (below) is the only enabled action.
+        let unknown = approval.kind == crate::ai_codex::ApprovalKind::Unknown;
 
         let mut buttons = div().flex().gap_1();
 
-        let accept = cx.entity();
-        buttons = buttons.child(
-            div()
-                .id("ai-action-accept")
-                .px_2()
-                .py_0p5()
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .text_color(theme.accent)
-                .hover(|el| el.bg(theme.hover))
-                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                    accept.update(cx, |this, cx| {
-                        this.answer_action(request_id, crate::ai_codex::Decision::Accept);
-                        cx.notify();
-                    });
-                })
-                .child("Allow"),
-        );
+        if !unknown {
+            let accept = cx.entity();
+            buttons = buttons.child(
+                div()
+                    .id("ai-action-accept")
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .hover(|el| el.bg(theme.hover))
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        accept.update(cx, |this, cx| {
+                            this.answer_action(request_id, crate::ai_codex::Decision::Accept);
+                            cx.notify();
+                        });
+                    })
+                    .child("Allow"),
+            );
+        }
 
         // Only when the CLI accepts it for this kind. A session grant the CLI would reject
         // is a button that silently does nothing, which is worse than not offering it.
-        if approval.allow_for_session {
+        if approval.allow_for_session && !unknown {
             let session = cx.entity();
             buttons = buttons.child(
                 div()
@@ -3525,6 +3709,16 @@ impl AiChatPanel {
                     .text_color(theme.text)
                     .child(SharedString::from(approval.summary.clone())),
             )
+            .when(unknown, |el| {
+                el.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(
+                            "This build does not recognise this request — Deny is the only safe answer",
+                        )),
+                )
+            })
             .child(buttons)
             .into_any_element()
     }
@@ -3575,6 +3769,9 @@ impl AiChatPanel {
         // the size of a change is the first thing a reviewer weighs, before reading it.
         let (added, removed) = diff_line_counts(&proposal.diff);
 
+        // Deleting a file is shown for review but not applied by this build; the button
+        // says so *before* the click instead of failing after it.
+        let is_delete = proposal.kind == "delete";
         // The decision row: buttons while pending, a settled word once it is not.
         let controls: gpui::AnyElement = match proposal.state {
             ProposalState::Pending => {
@@ -3583,20 +3780,33 @@ impl AiChatPanel {
                 div()
                     .flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .id(("ai-proposal-apply", index))
-                            .px_2()
-                            .py_0p5()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_color(theme.accent)
-                            .hover(|el| el.bg(theme.hover))
-                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                                apply_entity.update(cx, |this, cx| this.apply_proposal(index, cx));
-                            })
-                            .child("Apply"),
-                    )
+                    .when(is_delete, |el| {
+                        el.child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child("deletions are shown for review, not applied"),
+                        )
+                    })
+                    .when(!is_delete, |el| {
+                        el.child(
+                            div()
+                                .id(("ai-proposal-apply", index))
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_color(theme.accent)
+                                .hover(|el| el.bg(theme.hover))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    apply_entity
+                                        .update(cx, |this, cx| this.apply_proposal(index, cx));
+                                })
+                                .child("Apply"),
+                        )
+                    })
                     .child(
                         div()
                             .id(("ai-proposal-reject", index))
@@ -4093,7 +4303,24 @@ fn render_prose_line(seed: usize, line_index: usize, line: &str, theme: &Theme) 
         }
     }
 
+    // A markdown image: there is nothing to draw it *as* (the panel embeds no remote
+    // images), so it renders as the link it wraps — `![alt](url)` becomes `[alt](url)`.
+    // Without this the `!` survives as prose, and a mid-stream split can leave it alone
+    // on a line — the orphan "!" in the owner's screenshot.
+    if let Some(rest) = image_line_as_link(trimmed) {
+        return div()
+            .pl(px(indent as f32 * 6.0))
+            .child(inline_text(seed, line_index, rest, theme))
+            .into_any_element();
+    }
+
     div().child(inline_text(seed, line_index, line, theme)).into_any_element()
+}
+
+/// `![alt](url)` → `[alt](url)`: a leading markdown-image line, with the bang dropped so
+/// the inline parser's link rule takes it. `None` for anything that is not an image line.
+fn image_line_as_link(trimmed: &str) -> Option<&str> {
+    trimmed.starts_with("![").then(|| &trimmed[1..])
 }
 
 /// One line's inline spans as a text element — interactive when it carries links, plain
@@ -4421,6 +4648,16 @@ fn fence_language(tag: Option<&str>) -> Option<elle_syntax::Language> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn an_image_line_renders_as_its_link_never_as_a_bang() {
+        assert_eq!(image_line_as_link("![shot](x.png)"), Some("[shot](x.png)"));
+        // Mid-stream, only the opening has arrived: still no bare `!` on screen.
+        assert_eq!(image_line_as_link("!["), Some("["));
+        // Ordinary prose that happens to start with a bang is not an image.
+        assert_eq!(image_line_as_link("!important"), None);
+        assert_eq!(image_line_as_link("!"), None);
+    }
 
     #[test]
     fn prose_and_fences_split_into_alternating_segments() {

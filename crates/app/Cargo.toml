@@ -60,6 +60,9 @@ notify.workspace = true
 # Reads GitHub's releases/latest response for the self-updater. Already compiled for
 # every build through the settings crate — declaring it here adds nothing new.
 serde_json.workspace = true
+# Derive only, for chat history round-tripping — serde itself is already compiled into
+# every build through serde_json; the derive feature is proc-macro-time, zero bytes shipped.
+serde.workspace = true
 regex.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
