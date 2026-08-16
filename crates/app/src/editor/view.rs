@@ -16,15 +16,16 @@ use gpui::{
 };
 
 use crate::actions::{
-    Backspace, Copy, Cut, Delete, DeleteLine, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
-    DeleteWordRight, DuplicateLineDown, DuplicateLineUp, FoldBlock, Indent, MoveDocumentEnd,
-    MoveDocumentStart, MoveDown, MoveLeft, MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp,
-    MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent,
-    Paste, Redo, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft,
-    SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
-    ToggleComment, Undo, UnfoldBlock, context,
+    AcceptPredictionLine, AcceptPredictionWord, Backspace, Copy, Cut, Delete, DeleteLine,
+    DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft, DeleteWordRight, DuplicateLineDown,
+    DuplicateLineUp, FoldBlock, Indent, MoveDocumentEnd, MoveDocumentStart, MoveDown, MoveLeft,
+    MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp, MoveRight, MoveUp, MoveWordLeft,
+    MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent, Paste, Redo, SelectAll,
+    SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineStart,
+    SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab, ToggleComment, Undo, UnfoldBlock,
+    context,
 };
-use crate::editor::ghost::{self, GhostSuggestion};
+use crate::edit_prediction::{provider, state::Prediction};
 use crate::editor::ime;
 use crate::editor::inlay::{HintKind, ResolvedHint, hints_on_line};
 use crate::editor::input_element::InputHandlerElement;
@@ -76,6 +77,21 @@ pub struct EditorView {
     /// handed cannot go stale in a way that matters — it is simply the last thing the
     /// server said, and an empty one is the correct rendering when there is no server.
     diagnostics: Vec<(Range<usize>, Severity, SharedString)>,
+    /// Rows carrying a breakpoint, pushed in by the workspace (#30).
+    ///
+    /// Rows rather than byte offsets, because a breakpoint is a *line* — that is the unit
+    /// DBGp addresses, and an offset would need remapping on every edit to answer a
+    /// question the protocol only ever asks in line numbers.
+    ///
+    /// Pushed for the same reason diagnostics are: the workspace owns the debug session and
+    /// the breakpoint store, and an editor reaching into either would make "the session
+    /// died" something every open tab has to cope with.
+    breakpoints: Vec<usize>,
+    /// The row execution is stopped on, if it is in *this* file.
+    ///
+    /// `Option` rather than a flag on the row, because only one row in one file can be the
+    /// current statement, and letting each editor decide would eventually show two arrows.
+    debug_row: Option<usize>,
     /// True between a left mouse-down on a row and its release: drag-selection (#82).
     dragging: bool,
     /// An ⌥-drag in progress: the anchor's window-x and row, plus the offset to fall
@@ -139,17 +155,17 @@ pub struct EditorView {
     /// The AI ghost suggestion, if one is showing (#29).
     ///
     /// Stamped with the buffer version and cursor offset it was made for, and only ever
-    /// consulted through its validity check — see [`GhostSuggestion::is_valid_for`]. The
+    /// consulted through its validity check — see [`Prediction::is_valid_for`]. The
     /// stamp is what makes stale state harmless: paths that move the cursor without
     /// passing through a dismissal leave a ghost that simply never renders or accepts.
-    ghost: Option<GhostSuggestion>,
+    ghost: Option<Prediction>,
     /// The 400ms pause-then-request timer (#29). Dropping it cancels it — the blink's
     /// contract — so every keystroke replaces the task rather than stacking timers, and
     /// no timer exists at all while the feature is off or the editor sits unedited (#93).
     ghost_debounce: Option<gpui::Task<()>>,
     /// The completion request in flight, at most one (#93). The task owns the `curl`
     /// child via `kill_on_drop`, so replacing or clearing this slot kills the process —
-    /// see `editor::ghost`'s module doc for the full cancellation chain.
+    /// see `edit_prediction::provider`'s module doc for the full cancellation chain.
     ghost_request: Option<gpui::Task<()>>,
     /// Bumped by every dismissal; a request result whose epoch no longer matches is
     /// discarded. Belt to the version-stamp's braces: the stamp proves the *document*
@@ -210,6 +226,8 @@ impl EditorView {
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
             diagnostics: Vec::new(),
+            breakpoints: Vec::new(),
+            debug_row: None,
             link_hint: None,
             dragging: false,
             alt_drag: None,
@@ -284,6 +302,26 @@ impl EditorView {
         // mouse move rebuilds it against the new list. Keeping it would show a message
         // about bytes that no longer carry it.
         self.hover_diagnostic = None;
+    }
+
+    /// Replaces the breakpoint rows drawn in the gutter (#30).
+    ///
+    /// Called by the workspace whenever the store changes, and with an empty vector for a
+    /// file that has none — clearing matters for the reason `set_diagnostics` documents.
+    pub fn set_breakpoints(&mut self, rows: Vec<usize>, cx: &mut Context<Self>) {
+        self.breakpoints = rows;
+        cx.notify();
+    }
+
+    /// Marks the row execution is stopped on, or `None` when it is not in this file.
+    pub fn set_debug_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        self.debug_row = row;
+        cx.notify();
+    }
+
+    /// The cursor's row, for the actions that operate on a line rather than a selection.
+    pub fn cursor_row(&self) -> usize {
+        self.document.cursor_point().row
     }
 
     /// Replaces the inlay hints drawn over this document (#93 follow-up).
@@ -654,7 +692,9 @@ impl EditorView {
     // keymap. Not worth it at this size.
 
     fn backspace(&mut self, _: &Backspace, _w: &mut Window, cx: &mut Context<Self>) {
-        self.document.backspace_at_all_cursors();
+        if !self.document.backspace_with_pairs() {
+            self.document.backspace_at_all_cursors();
+        }
         self.after_edit(cx);
     }
 
@@ -712,6 +752,26 @@ impl EditorView {
 
     fn tab(&mut self, _: &Tab, _w: &mut Window, cx: &mut Context<Self>) {
         self.tab_impl(cx);
+    }
+
+    /// ⌃Tab / ⌃⇧Tab do nothing without a visible ghost — a partial accept of nothing is
+    /// not a keystroke worth stealing, so the keys stay free for whatever comes later.
+    fn accept_prediction_word(
+        &mut self,
+        _: &AcceptPredictionWord,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.accept_ghost_word(cx);
+    }
+
+    fn accept_prediction_line(
+        &mut self,
+        _: &AcceptPredictionLine,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.accept_ghost_line(cx);
     }
 
     /// Split from the handler so tests can drive it without a `Window` (unused anyway).
@@ -993,7 +1053,9 @@ impl EditorView {
 
     /// Deletes backwards for a backspace the popup received, for the same reason.
     pub fn backspace_typed(&mut self, cx: &mut Context<Self>) {
-        self.document.backspace();
+        if !self.document.backspace_with_pairs() {
+            self.document.backspace();
+        }
         self.after_edit(cx);
     }
 
@@ -1035,7 +1097,7 @@ impl EditorView {
     //   - any edit or cursor move discards; Tab accepts; Escape dismisses.
 
     /// The ghost, if it is showing *right now* — stamped for exactly this buffer state.
-    fn visible_ghost(&self) -> Option<&GhostSuggestion> {
+    fn visible_ghost(&self) -> Option<&Prediction> {
         self.ghost.as_ref().filter(|ghost| ghost.is_valid_for(&self.document))
     }
 
@@ -1051,27 +1113,55 @@ impl EditorView {
         self.ghost = None;
     }
 
-    /// The edit half of the lifecycle: discard, then re-arm the debounce while enabled.
+    /// The edit half of the lifecycle: interpolate if the user typed the prediction's
+    /// own prefix, otherwise discard and re-arm the debounce while enabled.
     fn ghost_after_edit(&mut self, cx: &mut Context<Self>) {
+        // Zed's `interpolate_edits`, the single biggest quality jump over the first
+        // ghost: typing through the suggestion shrinks it in place — no flicker, no new
+        // request, no 400ms wait. Divergence falls through to the ordinary dismiss.
+        if let Some(ghost) = self.ghost.take()
+            && let Some(shrunk) = ghost.interpolated(&self.document)
+        {
+            self.ghost = Some(shrunk);
+            cx.notify();
+            return;
+        }
         self.dismiss_ghost();
         // Tests drive edits by the thousand and must never find a timer or a subprocess
         // behind one — the same blanket guard the update check uses.
         if cfg!(test) {
             return;
         }
-        if !crate::settings::current(cx).ai_autocomplete_enabled() {
+        let settings = crate::settings::current(cx);
+        if !settings.ai_autocomplete_enabled() {
             return;
         }
+        // Codex pays per-turn latency, so it waits for a real pause, not a fast one.
+        let debounce = if crate::ai::Provider::from_setting(settings.ai_provider())
+            == crate::ai::Provider::Codex
+        {
+            crate::edit_prediction::codex_provider::DEBOUNCE
+        } else {
+            provider::DEBOUNCE
+        };
         let epoch = self.ghost_epoch;
         self.ghost_debounce = Some(cx.spawn(async move |this, cx| {
             // An edit inside this window drops the task and starts a new one, so a burst
             // of typing costs zero requests — the tree watcher's latest-wins shape.
-            cx.background_executor().timer(ghost::DEBOUNCE).await;
+            cx.background_executor().timer(debounce).await;
             let _ = this.update(cx, |this, cx| this.ghost_fire(epoch, cx));
         }));
     }
 
     /// The debounce elapsed with no further edits: snapshot the context and go.
+    ///
+    /// ponytail: no coordination with the completion popup — the popup owns focus and
+    /// therefore Tab (`context::COMPLETION` beats `context::EDITOR`, Zed's
+    /// `!showing_completions` arbitration for free), so the worst case is a dim ghost
+    /// visible under an open menu. Zed also suppresses the request while an LSP
+    /// completion is in flight; wire that through the workspace if the flicker ever
+    /// bothers anyone. Same rung: no gutter "requesting…" pulse — the rows are shaped
+    /// `Line`s, not divs, and an animated element per row is not cheap to add.
     fn ghost_fire(&mut self, epoch: u64, cx: &mut Context<Self>) {
         self.ghost_debounce = None;
         if epoch != self.ghost_epoch {
@@ -1094,24 +1184,44 @@ impl EditorView {
             return; // switched off during the debounce
         }
         let provider = crate::ai::Provider::from_setting(settings.ai_provider());
+        // The experimental Codex path: opt-in, and silent once its latency gate has
+        // tripped — `edit_prediction::codex_provider` owns both rules.
+        let use_codex = provider == crate::ai::Provider::Codex;
+        if use_codex
+            && (!settings.ai_codex_autocomplete_enabled()
+                || crate::edit_prediction::codex_provider::disabled_reason().is_some())
+        {
+            return;
+        }
         let base_url = settings.ai_base_url().to_string();
         let model = settings.ai_completion_model().to_string();
 
         let offset = self.document.selection.head;
         let version = self.document.buffer.version();
         let text = self.document.buffer.text();
-        let user_turn = ghost::build_user_turn(&text, offset);
-        // The cursor line's tail, for the echo-stripping half of `clean_completion`.
+        let user_turn = provider::build_user_turn(&text, offset);
+        // The cursor line's two halves: the tail before it for the echo-stripping half
+        // of `clean_completion`, the rest after it for the doubled-closer trim.
         let cursor = self.document.cursor_point();
         let line = self.document.buffer.line(cursor.row);
-        let line_before_cursor = line[..cursor.column.min(line.len())].to_string();
+        let split = cursor.column.min(line.len());
+        let line_before_cursor = line[..split].to_string();
+        let line_after_cursor = line[split..].to_string();
 
         // Replacing the slot cancels any older request and kills its curl — at most one
         // in flight, which is the #93 budget for a feature that runs between keystrokes.
         self.ghost_request = Some(cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_spawn(ghost::fetch_completion(provider, base_url, model, user_turn))
-                .await;
+            let outcome = if use_codex {
+                cx.background_spawn(async move {
+                    crate::edit_prediction::codex_provider::complete(user_turn)
+                })
+                .await
+            } else {
+                cx.background_spawn(provider::fetch_completion(
+                    provider, base_url, model, user_turn,
+                ))
+                .await
+            };
             let _ = this.update(cx, |this, cx| {
                 this.ghost_request = None;
                 if this.ghost_epoch != epoch {
@@ -1126,7 +1236,10 @@ impl EditorView {
                         return;
                     }
                 };
-                let cleaned = ghost::clean_completion(&raw, &line_before_cursor);
+                let cleaned = provider::clean_completion(&raw, &line_before_cursor);
+                // Models re-type the closer that already follows the cursor (`foo(|)` →
+                // `$bar)`); the trim is what keeps Tab from doubling it.
+                let cleaned = provider::trim_suffix_overlap(&cleaned, &line_after_cursor);
                 if cleaned.is_empty() {
                     return;
                 }
@@ -1140,7 +1253,7 @@ impl EditorView {
                 if !unchanged {
                     return;
                 }
-                this.ghost = Some(GhostSuggestion { text: cleaned, at_offset: offset, version });
+                this.ghost = Some(Prediction::stamped(cleaned, &this.document));
                 cx.notify();
             });
         }));
@@ -1160,6 +1273,49 @@ impl EditorView {
         self.dismiss_ghost();
         self.document.insert(&ghost.text);
         self.after_edit(cx);
+        true
+    }
+
+    /// ⌃Tab: accept only the prediction's next word — Zed's partial accept. The
+    /// remainder keeps showing, re-stamped, so a chain of ⌃Tabs walks through the
+    /// suggestion one step at a time.
+    fn accept_ghost_word(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_partial(Prediction::word_len, cx)
+    }
+
+    /// ⌃⇧Tab: accept through the prediction's first newline; single-line falls back to
+    /// accepting everything (Zed's rule — a "line" of a one-line suggestion is all of it).
+    fn accept_ghost_line(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_partial(Prediction::line_len, cx)
+    }
+
+    fn accept_ghost_partial(
+        &mut self,
+        step: impl Fn(&Prediction) -> usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.visible_ghost().is_none() {
+            return false;
+        }
+        let ghost = self.ghost.take().expect("visible_ghost checked");
+        let take = step(&ghost).min(ghost.text.len());
+        if take == 0 || take >= ghost.text.len() {
+            // Nothing partial about it: fall back to the full accept.
+            self.dismiss_ghost();
+            self.document.insert(&ghost.text);
+            self.after_edit(cx);
+            return true;
+        }
+        let head = ghost.text[..take].to_string();
+        let rest = ghost.text[take..].to_string();
+        self.dismiss_ghost();
+        self.document.insert(&head);
+        self.after_edit(cx);
+        // The rest keeps showing, stamped for the document as it now stands. The
+        // debounce `after_edit` armed stays armed on purpose: a refresh may improve the
+        // remainder (Zed's `PredictionPartiallyAccepted` re-request).
+        self.ghost = Some(Prediction::stamped(rest, &self.document));
+        cx.notify();
         true
     }
 
@@ -1204,11 +1360,17 @@ impl EditorView {
     /// Plants a suggestion at the current cursor, stamped as a fresh request would be.
     #[cfg(test)]
     pub fn set_ghost_for_test(&mut self, text: &str) {
-        self.ghost = Some(GhostSuggestion {
-            text: text.to_string(),
-            at_offset: self.document.selection.head,
-            version: self.document.buffer.version(),
-        });
+        self.ghost = Some(Prediction::stamped(text.to_string(), &self.document));
+    }
+
+    #[cfg(test)]
+    pub fn accept_ghost_word_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_word(cx)
+    }
+
+    #[cfg(test)]
+    pub fn accept_ghost_line_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_line(cx)
     }
 
     /// The stored ghost's text, valid or not — `None` proves a dismissal actually
@@ -1269,7 +1431,13 @@ impl EditorView {
         let column = if line.is_empty() || x <= px(0.0) {
             0
         } else {
-            let measured = &line[..line.len().min(MAX_MEASURE_BYTES)];
+            // Floored, because `MAX_MEASURE_BYTES` is a byte budget and lands wherever it
+            // lands: on a long CJK line (2000 `日` puts byte 4096 inside a character) the
+            // unfloored slice panics, and this is the *click* path — the crash arrives on
+            // a mouse press. The measure below at `cursor_x` already floors for this
+            // reason; this site was missed, which is the argument for the shared helper
+            // rather than two hand-clamped slices.
+            let measured = &line[..floor_boundary(&line, line.len().min(MAX_MEASURE_BYTES))];
             let runs = [TextRun {
                 len: measured.len(),
                 font: fonts.font(),
@@ -1847,6 +2015,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::accept_prediction_word))
+            .on_action(cx.listener(Self::accept_prediction_line))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::move_left))
@@ -2059,6 +2229,10 @@ impl EditorView {
                     .collect();
 
                 let is_cursor_row = line_index == cursor.row;
+                // Both are lookups over lists that hold at most a handful of entries for
+                // this file, done per visible row — a screenful, not the document.
+                let has_breakpoint = self.breakpoints.contains(&line_index);
+                let is_debug_row = self.debug_row == Some(line_index);
                 // Each selection's slice of this row, in line-local bytes, for precise
                 // painting (#82). The old full-row tint made a word selection look like a
                 // line selection — and on themes where hover and selected share a value
@@ -2182,7 +2356,28 @@ impl EditorView {
                             // to draw it, which would be a request per cursor move. See
                             // `row_diagnostics` above: the editor is told about
                             // diagnostics, so this costs nothing.
-                            .child(if is_cursor_row && !row_diagnostics.is_empty() {
+                            //
+                            // A breakpoint and the current statement replace the number for
+                            // the same reason, and they outrank the bulb: while stopped,
+                            // where execution *is* matters more than an offer to rewrite the
+                            // line. The arrow wins over the dot when a breakpoint is the
+                            // thing that stopped us, because the arrow is the transient fact
+                            // and the dot is still readable from the panel.
+                            //
+                            // Both are glyphs, not colours: a red dot alone says nothing to
+                            // anyone who cannot see red, and this is the one margin mark
+                            // that changes what the program does.
+                            .child(if is_debug_row {
+                                div()
+                                    .text_color(theme.warning)
+                                    .child(SharedString::from("▶"))
+                                    .into_any_element()
+                            } else if has_breakpoint {
+                                div()
+                                    .text_color(theme.error)
+                                    .child(SharedString::from("●"))
+                                    .into_any_element()
+                            } else if is_cursor_row && !row_diagnostics.is_empty() {
                                 quick_fix_bulb(&theme, &entity).into_any_element()
                             } else {
                                 // The buffer line's own number — after a fold, rows are
@@ -2409,7 +2604,10 @@ fn styled_line(
             len: ghost_text.len(),
             font: fonts.font(),
             color: theme.text_muted,
-            background_color: None,
+            // Zed's whitespace rule: a dimmed *space* is invisible, so a suggestion that
+            // is only indentation gets a faint background wash instead — the user can
+            // see that whitespace is being proposed at all.
+            background_color: ghost_text.trim().is_empty().then(|| theme.accent.opacity(0.12)),
             underline: None,
             strikethrough: None,
         };
@@ -4233,5 +4431,40 @@ mod tests {
             "and the match keeps every byte the brackets did not take"
         );
         assert_sorted_and_disjoint(&runs);
+    }
+}
+
+#[cfg(test)]
+mod measure_budget_tests {
+    use super::*;
+
+    /// `MAX_MEASURE_BYTES` is a budget, not a boundary, and `offset_at` slices a line at it
+    /// on every click.
+    ///
+    /// A line of 2000 `日` puts byte 4096 *inside* a character, so the unfloored slice that
+    /// shipped panicked on a mouse press — the same byte-vs-char shape as the Blade crash,
+    /// on the input path instead of the render path. The sibling measure at `cursor_x`
+    /// already floored; this one did not.
+    #[test]
+    fn the_measure_budget_lands_inside_a_character_and_must_be_floored() {
+        let line = "日".repeat(2000);
+        assert!(line.len() > MAX_MEASURE_BYTES, "the line must exceed the budget");
+        assert!(
+            !line.is_char_boundary(MAX_MEASURE_BYTES),
+            "this test is only meaningful if the raw budget splits a character"
+        );
+
+        // The expression `offset_at` uses. Slicing at the raw budget would panic here.
+        let cut = floor_boundary(&line, line.len().min(MAX_MEASURE_BYTES));
+        assert!(line.is_char_boundary(cut), "the floored cut must be a boundary");
+        let _measured = &line[..cut]; // must not panic
+
+        // And it must not floor further than necessary: the budget is a performance
+        // bound, so a correct floor loses at most the bytes of one character.
+        assert!(
+            MAX_MEASURE_BYTES - cut < 4,
+            "flooring lost {} bytes; at most one character's worth is expected",
+            MAX_MEASURE_BYTES - cut
+        );
     }
 }

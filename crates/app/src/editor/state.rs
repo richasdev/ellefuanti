@@ -1797,6 +1797,41 @@ impl Document {
         false
     }
 
+    /// Backspace between an empty pair deletes both ends as one undo step — the other
+    /// half of auto-close. Typing `(` gave two characters for one keystroke; deleting
+    /// straight after must not leave the orphan `)` the user never typed. `false` when
+    /// the cursor is not exactly between an empty pair, so the caller falls back to the
+    /// ordinary backspace (indent-aware, multi-cursor, all of it).
+    pub fn backspace_with_pairs(&mut self) -> bool {
+        if !self.selection.is_empty() || self.has_multiple_cursors() {
+            return false;
+        }
+        let head = self.selection.head;
+        if head == 0 {
+            return false;
+        }
+        let prev = self.prev_char_offset(head);
+        let next_end = self.next_char_offset(head);
+        if next_end == head {
+            return false; // nothing after the cursor
+        }
+        let around = self.buffer.slice(prev..next_end);
+        let mut chars = around.chars();
+        let (Some(open), Some(close), None) = (chars.next(), chars.next(), chars.next()) else {
+            return false;
+        };
+        if !Self::PAIRS.iter().any(|&(o, c)| o == open && c == close) {
+            return false;
+        }
+        // One replace, one undo step — ⌘Z restores the pair whole, mirroring how one
+        // keystroke created it.
+        let edit = self.buffer.replace(prev..next_end, "");
+        self.selection = Selection::at(edit.range.start);
+        self.goal_column = None;
+        self.sync_syntax();
+        true
+    }
+
     /// Enter, keeping the new line's indentation.
     ///
     /// Matches the current line's indent, and adds one level when the cursor sits just
@@ -3597,6 +3632,52 @@ $ação = 1;
         assert_eq!(d.buffer.text(), "<?php\n$a = '';\n", "still two quotes, not four");
     }
 
+    #[test]
+    fn backspace_between_an_empty_pair_deletes_both_ends_as_one_undo_step() {
+        // The other half of auto-close: `(` gave `()` for one keystroke, so backspace
+        // straight after must not leave the orphan `)`.
+        for (typed, pair) in [("(", "()"), ("[", "[]"), ("{", "{}")] {
+            let mut d = doc("<?php\n$a = ;\n");
+            d.move_to(d.buffer.text().find(';').unwrap(), false);
+            assert!(d.insert_with_pairs(typed));
+            assert_eq!(d.buffer.text(), format!("<?php\n$a = {pair};\n"));
+            assert!(d.backspace_with_pairs(), "between the empty pair, both go");
+            assert_eq!(d.buffer.text(), "<?php\n$a = ;\n");
+            // One undo step restores the pair whole, mirroring the one keystroke.
+            d.undo();
+            assert_eq!(d.buffer.text(), format!("<?php\n$a = {pair};\n"));
+        }
+
+        // Quotes pair the same way.
+        let mut d = doc("<?php\n$a = ;\n");
+        d.move_to(d.buffer.text().find(';').unwrap(), false);
+        assert!(d.insert_with_pairs("'"));
+        assert!(d.backspace_with_pairs());
+        assert_eq!(d.buffer.text(), "<?php\n$a = ;\n");
+    }
+
+    #[test]
+    fn backspace_falls_back_when_the_cursor_is_not_between_an_empty_pair() {
+        // A non-empty pair: `('x'` — deleting the `x` is the ordinary backspace's job.
+        let mut d = doc("<?php\nfoo(x);\n");
+        d.move_to(d.buffer.text().find("x)").unwrap() + 1, false);
+        assert!(!d.backspace_with_pairs(), "content between the ends means no pair delete");
+
+        // Mismatched neighbours: `)(` is not a pair.
+        let mut d = doc("<?php\n$a = )(;\n");
+        d.move_to(d.buffer.text().find("(;").unwrap(), false);
+        assert!(!d.backspace_with_pairs());
+
+        // Start of buffer, end of buffer, and a selection all fall through.
+        let mut d = doc("()");
+        d.move_to(0, false);
+        assert!(!d.backspace_with_pairs(), "nothing before the cursor");
+        d.move_to(2, false);
+        assert!(!d.backspace_with_pairs(), "nothing after the cursor");
+        d.move_to(0, true);
+        assert!(!d.backspace_with_pairs(), "a selection is the ordinary delete");
+    }
+
     // --- PHP array smart keys ----------------------------------------------------------
 
     #[test]
@@ -3613,6 +3694,13 @@ $ação = 1;
         d.move_to(d.buffer.text().find(" ]").unwrap() + 1, false);
         assert!(d.insert_with_pairs("="));
         assert_eq!(d.buffer.text(), "<?php\n$a = ['name' => ];\n");
+
+        // The classic syntax is the same node in tree-sitter-php
+        // (`array_creation_expression` covers `array(...)` and `[...]` both).
+        let mut d = doc("<?php\n$a = array('name');\n");
+        d.move_to(d.buffer.text().find("')").unwrap() + 1, false);
+        assert!(d.insert_with_pairs("="), "array(...) is an array literal too");
+        assert_eq!(d.buffer.text(), "<?php\n$a = array('name' => );\n");
     }
 
     #[test]
@@ -4415,5 +4503,52 @@ $ação = 1;
         // rescan look unnecessary.
         search(&mut d, "cat");
         assert_eq!(d.search.matches().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod utf8_robustness_tests {
+    use super::*;
+
+    /// Text that has broken editors before: accents, CJK, emoji with a ZWJ sequence, a
+    /// combining mark, and an RTL run. Every one is multi-byte, so any code that treats a
+    /// byte offset as a character offset panics somewhere in here.
+    const HOSTILE: &str =
+        "<?php\n$café = 'ação';\n// 日本語のコメント\n$x = '👨‍👩‍👧‍👦';\n$e\u{0301} = 1;\n// مرحبا\n";
+
+    /// Every byte offset, including the ones inside a character, on every API that takes
+    /// one. A user reaches these by clicking, and a click lands wherever it lands.
+    #[test]
+    fn byte_offsets_inside_characters_never_panic() {
+        let doc = Document::new(None, HOSTILE, false).expect("plain text parses");
+
+        for offset in 0..=HOSTILE.len() + 4 {
+            // Read-only queries first: these run on hover and on render.
+            let _ = doc.word_span_at(offset);
+
+            // Then the mutating ones, on a fresh document so each is independent.
+            let mut probe = Document::new(None, HOSTILE, false).expect("plain text parses");
+            probe.move_to(offset, false);
+            probe.select_word_at(offset);
+            probe.add_cursor_at(offset);
+        }
+
+        // The document must still be intact after all that.
+        assert_eq!(doc.text_for_save(), HOSTILE, "probing must not have mutated the document");
+    }
+
+    /// Inserting at a boundary that is *inside* a multi-byte character is the same class of
+    /// bug as reading at one, and it is reachable by paste with a stale cursor.
+    #[test]
+    fn inserting_at_every_offset_never_panics() {
+        for offset in 0..=HOSTILE.len() + 4 {
+            let mut doc = Document::new(None, HOSTILE, false).expect("plain text parses");
+            doc.move_to(offset, false);
+            doc.insert("ç");
+            assert!(
+                doc.text_for_save().contains('ç'),
+                "the insert must have landed at offset {offset}"
+            );
+        }
     }
 }

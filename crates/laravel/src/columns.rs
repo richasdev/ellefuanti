@@ -71,7 +71,20 @@ const RELATION_METHODS: [&str; 8] =
 pub fn column_context_at(source: &str, offset: usize) -> Option<ColumnContext> {
     let buffer = Buffer::new(source);
     let tree = SyntaxTree::new(Language::Php, &buffer).ok()?;
-    let tree = tree.tree()?;
+    column_context_in_tree(tree.tree()?, source, offset)
+}
+
+/// [`column_context_at`], reusing a tree the caller already has.
+///
+/// Same reason as `reference_at_in_tree`, and found by the same measurement:
+/// `request_column_completions` runs on every keystroke and this parsed the whole file
+/// each time — **1.98 ms on a real 22 KB source**, against 5 µs for `extract_model` beside
+/// it. The parse is the entire cost; the walk is free.
+pub fn column_context_in_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    offset: usize,
+) -> Option<ColumnContext> {
     let src = source.as_bytes();
 
     let mut node = tree.root_node().descendant_for_byte_range(offset, offset)?;
@@ -121,7 +134,18 @@ fn call_context(call: Node, src: &[u8]) -> Option<ColumnContext> {
 pub fn scope_context_at(source: &str, offset: usize) -> Option<(String, std::ops::Range<usize>)> {
     let buffer = Buffer::new(source);
     let tree = SyntaxTree::new(Language::Php, &buffer).ok()?;
-    let tree = tree.tree()?;
+    scope_context_in_tree(tree.tree()?, source, offset)
+}
+
+/// [`scope_context_at`], reusing a tree the caller already has.
+///
+/// The third of the three per-keystroke scanners that parsed the whole file — the same
+/// measurement and the same fix as `column_context_in_tree` beside it.
+pub fn scope_context_in_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    offset: usize,
+) -> Option<(String, std::ops::Range<usize>)> {
     let src = source.as_bytes();
 
     // The cursor sits at the *end* of the partial word, so look at the byte before it —
@@ -333,5 +357,80 @@ mod tests {
             context("<?php User::whereHas('posts', function ($q) { $q->where('|'); });"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_reuse_tests {
+    use elle_syntax::{Language, SyntaxTree};
+    use elle_text::Buffer;
+
+    const SOURCE: &str = r#"<?php
+class Usuário extends Model
+{
+    protected $table = 'usuários';
+    public function ativos()
+    {
+        return $this->where('está_ativo', true)->orderBy('criado_em');
+    }
+    public function outros()
+    {
+        return Post::where('título', 'x')->where('', 'y');
+    }
+}
+"#;
+
+    /// The fast path must answer exactly what the parsing path answers, at every offset.
+    ///
+    /// A faster completion source that disagrees with ⌘click is worse than a slow one.
+    #[test]
+    fn the_tree_path_agrees_with_the_parsing_path() {
+        let buffer = Buffer::new(SOURCE);
+        let syntax = SyntaxTree::new(Language::Php, &buffer).expect("the php grammar");
+        let tree = syntax.tree().expect("a parse tree");
+
+        for offset in 0..=SOURCE.len() {
+            assert_eq!(
+                format!("{:?}", super::column_context_at(SOURCE, offset)),
+                format!("{:?}", super::column_context_in_tree(tree, SOURCE, offset)),
+                "the two paths disagree at offset {offset}"
+            );
+        }
+    }
+
+    /// A `.blade.php` document's tree is built with `Language::Blade`, and the caller hands
+    /// over whatever the document has. That is only safe because Blade uses the PHP grammar
+    /// (`language.rs`: `Php | Blade => LANGUAGE_PHP`), so the trees are interchangeable
+    /// here — pinned, because a future real Blade grammar would silently break it.
+    #[test]
+    fn a_blade_document_tree_gives_the_same_answers() {
+        let buffer = Buffer::new(SOURCE);
+        let blade = SyntaxTree::new(Language::Blade, &buffer).expect("the blade grammar");
+        let tree = blade.tree().expect("a parse tree");
+
+        for offset in 0..=SOURCE.len() {
+            assert_eq!(
+                format!("{:?}", super::column_context_at(SOURCE, offset)),
+                format!("{:?}", super::column_context_in_tree(tree, SOURCE, offset)),
+                "a blade-language tree must not change the answer, at offset {offset}"
+            );
+        }
+    }
+
+    /// `scope_context_in_tree` must agree with the parsing path too — the third scanner,
+    /// pinned like the other two rather than trusted because it looked mechanical.
+    #[test]
+    fn the_scope_tree_path_agrees_with_the_parsing_path() {
+        let buffer = Buffer::new(SOURCE);
+        let syntax = SyntaxTree::new(Language::Php, &buffer).expect("the php grammar");
+        let tree = syntax.tree().expect("a parse tree");
+
+        for offset in 0..=SOURCE.len() {
+            assert_eq!(
+                format!("{:?}", super::scope_context_at(SOURCE, offset)),
+                format!("{:?}", super::scope_context_in_tree(tree, SOURCE, offset)),
+                "the two scope paths disagree at offset {offset}"
+            );
+        }
     }
 }

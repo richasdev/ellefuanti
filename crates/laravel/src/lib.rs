@@ -28,14 +28,17 @@ mod resolved;
 mod routes;
 mod targets;
 
-pub use columns::{Argument, ColumnContext, ColumnTarget, column_context_at, scope_context_at};
+pub use columns::{
+    Argument, ColumnContext, ColumnTarget, column_context_at, column_context_in_tree,
+    scope_context_at, scope_context_in_tree,
+};
 pub use composer::composer_scripts;
 pub use livewire::{
     LivewireFacts, WireTarget, extract_livewire, livewire_class_path, wire_context_at,
 };
 pub use logs::{LogEntry, parse_laravel_log, parse_laravel_log_tail};
 pub use models::{ModelFacts, extract_migration_columns, extract_model};
-pub use references::{Reference, ReferenceKind, reference_at};
+pub use references::{Reference, ReferenceKind, reference_at, reference_at_in_tree};
 pub use resolved::Resolved;
 pub use routes::{HttpMethod, Route, RouteAction, RouteExtraction, extract_routes};
 pub use targets::{Target, resolve, route_names};

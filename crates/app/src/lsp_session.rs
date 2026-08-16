@@ -1386,3 +1386,65 @@ mod tests {
         assert!(file.items[0].range.end <= text.len(), "must clamp into the buffer");
     }
 }
+
+#[cfg(test)]
+mod hostile_server_tests {
+    use super::*;
+    use elle_lsp::lsp_types::{Position, Range, TextEdit};
+
+    fn edit(sl: u32, sc: u32, el: u32, ec: u32, new: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position { line: sl, character: sc },
+                end: Position { line: el, character: ec },
+            },
+            new_text: new.to_string(),
+        }
+    }
+
+    /// A language server is a separate process that can be buggy, wedged, or a different
+    /// version than expected — §24's premise. Every position it sends is untrusted input,
+    /// and `apply_lsp_edits_to_text` slices a `&str` with the result. Anything that
+    /// panics here is a crash reachable by using rename or format on a real project.
+    #[test]
+    fn out_of_range_positions_from_a_server_do_not_panic() {
+        let text = "<?php\n$café = 'ação';\n";
+
+        let hostile = vec![
+            // Past the last line.
+            vec![edit(99, 0, 99, 5, "x")],
+            // Past the end of a real line.
+            vec![edit(1, 9_000, 1, 9_001, "x")],
+            // u32::MAX, which a buggy server sends as "end of everything".
+            vec![edit(0, 0, u32::MAX, u32::MAX, "x")],
+            // Inverted: end before start.
+            vec![edit(1, 10, 1, 2, "x")],
+            // Inside the multi-byte `é` — the byte that would split a character.
+            vec![edit(1, 2, 1, 3, "x")],
+            // Zero-width at the very end.
+            vec![edit(1, 21, 1, 21, "x")],
+            // Two edits that touch at a boundary: legal, must not be refused.
+            vec![edit(0, 0, 0, 1, "A"), edit(0, 1, 0, 2, "B")],
+        ];
+
+        for (index, edits) in hostile.into_iter().enumerate() {
+            // The contract is `Option`: a malformed batch is refused, never a panic.
+            let result = std::panic::catch_unwind(|| apply_lsp_edits_to_text(text, edits));
+            assert!(
+                result.is_ok(),
+                "hostile edit batch {index} panicked; a buggy server must not crash the editor"
+            );
+        }
+    }
+
+    /// The happy path still has to work — a robustness test that also disabled the feature
+    /// would pass while making the editor useless.
+    #[test]
+    fn a_well_formed_edit_still_applies_across_multibyte_text() {
+        let text = "<?php\n$café = 'ação';\n";
+        // `$café` is 5 UTF-16 units on line 1; replace it with `$user`.
+        let applied = apply_lsp_edits_to_text(text, vec![edit(1, 0, 1, 5, "$user")])
+            .expect("a well-formed edit must apply");
+        assert_eq!(applied, "<?php\n$user = 'ação';\n");
+    }
+}

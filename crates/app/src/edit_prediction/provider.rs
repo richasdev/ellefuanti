@@ -1,10 +1,4 @@
-//! Ghost-text autocomplete (#29): the suggestion, its validity rule, and the request.
-//!
-//! # Deliberately separate from the completion popup
-//!
-//! #20's popup makes provenance claims item by item; a ghost makes exactly one claim —
-//! "a model guessed this" — and renders it dimmed so it can never be confused with an
-//! LSP answer. The two share nothing but the cursor, so they share no code.
+//! The request half of edit prediction (#29): context window, prompt, transport, cleaning.
 //!
 //! # What leaves the machine
 //!
@@ -22,8 +16,6 @@
 //! reaper thread — the same "dropping it cancels it" contract the caret blink documents.
 
 use crate::ai::{self, Provider, StreamEvent, Turn};
-use crate::editor::Document;
-use elle_text::Version;
 
 /// Lines of context before the cursor. The prefix ends exactly at the cursor byte, so
 /// the model completes from mid-token when the user pauses mid-token.
@@ -50,35 +42,6 @@ pub const MAX_TOKENS: u32 = 256;
 pub const SYSTEM_PROMPT: &str = "You are a code-completion engine. Given a code prefix \
     and suffix around a <|cursor|> marker, output ONLY the text to insert at the cursor. \
     No prose, no markdown fences, no repetition of the prefix.";
-
-/// One suggestion, pinned to the exact buffer state it was made for.
-///
-/// The stamp is the whole correctness story: a ghost is only ever *shown* or *accepted*
-/// through [`GhostSuggestion::is_valid_for`], so a stale one — the buffer edited, the
-/// cursor moved, a selection made — simply stops existing rather than inserting at an
-/// offset that now means something else.
-pub struct GhostSuggestion {
-    /// The text Tab inserts at the cursor, already cleaned.
-    pub text: String,
-    /// The cursor offset the suggestion was made at.
-    pub at_offset: usize,
-    /// The buffer version the suggestion was made against.
-    pub version: Version,
-}
-
-impl GhostSuggestion {
-    /// Whether the document is still exactly the one this suggestion was made for.
-    ///
-    /// Version covers every edit (undo included — versions only move forward); the head
-    /// check covers movement without edits; the emptiness and multi-cursor checks cover
-    /// states where "insert at the cursor" is not one well-defined place.
-    pub fn is_valid_for(&self, document: &Document) -> bool {
-        document.buffer.version() == self.version
-            && document.selection.is_empty()
-            && document.selection.head == self.at_offset
-            && !document.has_multiple_cursors()
-    }
-}
 
 /// The user turn: prefix, marker, suffix — and nothing else from the machine.
 ///
@@ -168,6 +131,27 @@ pub fn clean_completion(raw: &str, line_before_cursor: &str) -> String {
     // Trailing whitespace-only lines carry nothing Tab should insert.
     let text = text.trim_end();
     if text.trim().is_empty() { String::new() } else { text.to_string() }
+}
+
+/// Trims the completion's tail where it re-emits what already follows the cursor —
+/// Zed's `trim_completion`/`common_prefix` pair, folded into one function.
+///
+/// The model sees the suffix and often re-types it: complete inside `foo(|)` and it
+/// answers `$bar)` — accept that whole and the line reads `foo($bar))`. The longest
+/// tail of the completion that is a prefix of `after_cursor` is exactly the doubled
+/// part, so it is cut. Byte-safe by construction: candidate cuts land only on the
+/// boundaries `char_indices` yields.
+pub fn trim_suffix_overlap(completion: &str, after_cursor: &str) -> String {
+    if completion.is_empty() || after_cursor.is_empty() {
+        return completion.to_string();
+    }
+    for (index, _) in completion.char_indices() {
+        let tail = &completion[index..];
+        if after_cursor.starts_with(tail) {
+            return completion[..index].to_string();
+        }
+    }
+    completion.to_string()
 }
 
 /// Runs one completion request end to end: auth, body, `curl`, SSE accumulation.
@@ -326,37 +310,33 @@ mod tests {
         assert_eq!(clean_completion("\n    return $x;\n\n  \n", ""), "\n    return $x;");
     }
 
-    // --- the validity stamp ----------------------------------------------------------
+    // --- trim_suffix_overlap ---------------------------------------------------------
 
     #[test]
-    fn a_ghost_dies_with_any_edit_or_cursor_move() {
-        let mut document = Document::new(None, "<?php\n$a = 1;\n", true).expect("plain doc");
-        let offset = document.buffer.text().find("1;").unwrap() + 2;
-        document.move_to(offset, false);
+    fn a_re_emitted_closer_is_cut_so_accept_cannot_double_it() {
+        // Cursor inside `foo(|)`: the model answers `$bar)` — the `)` already exists.
+        assert_eq!(trim_suffix_overlap("$bar)", ")"), "$bar");
+        assert_eq!(trim_suffix_overlap("$bar);", ");"), "$bar");
+        // A longer echo: the whole tail of the line re-typed.
+        assert_eq!(trim_suffix_overlap("name'];", "'];"), "name");
+    }
 
-        let ghost = GhostSuggestion {
-            text: "\n$b = 2;".to_string(),
-            at_offset: offset,
-            version: document.buffer.version(),
-        };
-        assert!(ghost.is_valid_for(&document), "fresh ghost at the cursor is valid");
+    #[test]
+    fn a_completion_that_is_all_echo_becomes_empty() {
+        assert_eq!(trim_suffix_overlap(")", ")"), "");
+    }
 
-        // A cursor move alone invalidates…
-        document.move_to(0, false);
-        assert!(!ghost.is_valid_for(&document));
-        // …moving back revalidates (same buffer, same offset — the suggestion still
-        // describes exactly this insertion point)…
-        document.move_to(offset, false);
-        assert!(ghost.is_valid_for(&document));
-        // …a selection invalidates ("at the cursor" is no longer one place)…
-        document.move_to(0, true);
-        assert!(!ghost.is_valid_for(&document));
-        document.move_to(offset, false);
-        // …and any edit invalidates for good: versions only move forward, so even undo
-        // cannot resurrect a stale ghost.
-        document.insert("x");
-        document.undo();
-        document.move_to(offset, false);
-        assert!(!ghost.is_valid_for(&document));
+    #[test]
+    fn text_that_does_not_overlap_is_untouched() {
+        assert_eq!(trim_suffix_overlap("$bar", ")"), "$bar");
+        assert_eq!(trim_suffix_overlap("save();", ""), "save();");
+        // An overlap that is not at the very end is not an echo of the suffix.
+        assert_eq!(trim_suffix_overlap("f(x) + 1", ")"), "f(x) + 1");
+    }
+
+    #[test]
+    fn multibyte_boundaries_survive_the_trim() {
+        assert_eq!(trim_suffix_overlap("ação)", ")"), "ação");
+        assert_eq!(trim_suffix_overlap("é", "é"), "");
     }
 }

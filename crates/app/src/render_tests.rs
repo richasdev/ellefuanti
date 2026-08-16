@@ -372,6 +372,87 @@ async fn typing_discards_a_ghost_and_escape_dismisses_one(cx: &mut TestAppContex
     });
 }
 
+/// The port's centre of gravity (Zed's `interpolate_edits`): typing exactly what the
+/// ghost predicts shrinks it in place instead of killing it — the suggestion keeps up
+/// with the typist rather than flickering out on every keystroke.
+#[gpui::test]
+async fn typing_the_predicted_text_shrinks_the_ghost_instead_of_killing_it(
+    cx: &mut TestAppContext,
+) {
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("ghost4.php")), "<?php\n$user->\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        let end = editor.document.buffer.text().find("->").expect("fixture") + 2;
+        editor.document.move_to(end, false);
+        editor.set_ghost_for_test("save();");
+
+        // The user types the prediction's own prefix, one keystroke at a time.
+        editor.document.insert("sa");
+        editor.after_edit_for_test(cx);
+        assert_eq!(
+            editor.ghost_for_test().as_deref(),
+            Some("ve();"),
+            "a typed prefix interpolates instead of dismissing"
+        );
+        assert!(editor.ghost_visible_for_test(), "and the shrunk ghost is still valid");
+
+        // Divergence still kills: the user went somewhere else.
+        editor.document.insert("x");
+        editor.after_edit_for_test(cx);
+        assert!(editor.ghost_for_test().is_none(), "divergent typing dismisses");
+    });
+}
+
+/// Partial accepts, Zed's granularity: ⌃Tab takes the next word and keeps the rest
+/// showing; ⌃⇧Tab takes through the first newline; a single-line remainder falls back
+/// to the full accept.
+#[gpui::test]
+async fn partial_accepts_walk_through_the_ghost_word_and_line_at_a_time(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("ghost5.php")), "<?php\n$a\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        let end = editor.document.buffer.text().find("$a").expect("fixture") + 2;
+        editor.document.move_to(end, false);
+        editor.set_ghost_for_test("->save();\nreturn $a;");
+
+        // Word one: the punctuation run `->` (nothing alphanumeric leads).
+        assert!(editor.accept_ghost_word_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->"), "the word landed");
+        assert_eq!(editor.ghost_for_test().as_deref(), Some("save();\nreturn $a;"));
+
+        // Word two: the identifier run.
+        assert!(editor.accept_ghost_word_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->save"));
+        assert_eq!(editor.ghost_for_test().as_deref(), Some("();\nreturn $a;"));
+
+        // Line: through the first newline, remainder still showing.
+        assert!(editor.accept_ghost_line_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->save();\n"));
+        assert_eq!(editor.ghost_for_test().as_deref(), Some("return $a;"));
+
+        // Line again on a single-line remainder: the fall-back-to-full rule.
+        assert!(editor.accept_ghost_line_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->save();\nreturn $a;"));
+        assert!(editor.ghost_for_test().is_none(), "everything accepted, nothing lingers");
+
+        // With no ghost, both are no-ops that consume nothing.
+        assert!(!editor.accept_ghost_word_for_test(cx));
+        assert!(!editor.accept_ghost_line_for_test(cx));
+    });
+}
+
 #[gpui::test]
 async fn the_editor_renders_a_multi_line_ghost_suggestion(cx: &mut TestAppContext) {
     install_theme(cx);
@@ -2458,12 +2539,26 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
     panel.update(cx, |panel, cx| {
         panel.seed_turns_for_test(
             vec![
-                ChatTurn { role: Role::User, text: "what does this do?".to_string() },
+                ChatTurn {
+                    role: Role::User,
+                    text: "what does this do?".to_string(),
+                    flow: Vec::new(),
+                },
                 ChatTurn {
                     role: Role::Assistant,
                     text: "It echoes:\n```php\necho 1;\n```\nthat is all.".to_string(),
+                    flow: Vec::new(),
                 },
-                ChatTurn { role: Role::Note, text: "overloaded".to_string() },
+                ChatTurn { role: Role::Note, text: "overloaded".to_string(), flow: Vec::new() },
+                // An empty note (a CLI dying without a message) must draw as nothing —
+                // it rendered as a bare red sliver, the orphan "!".
+                ChatTurn { role: Role::Note, text: "  ".to_string(), flow: Vec::new() },
+                // And a markdown image renders as its link, with no leftover `!`.
+                ChatTurn {
+                    role: Role::Assistant,
+                    text: "See:\n![screenshot](shot.png)".to_string(),
+                    flow: Vec::new(),
+                },
             ],
             cx,
         );
@@ -2472,7 +2567,26 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
 
     workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
     workspace.read_with(cx, |workspace, _cx| {
-        assert!(workspace.ai_chat_for_test().is_none(), "the same toggle closes it");
+        assert!(!workspace.ai_chat_visible_for_test(), "the same toggle closes it");
+        // **Closed, not destroyed.** Taking the entity is what made clicking the AI icon
+        // delete the conversation ("apaga tudo"); the panel now survives being closed so
+        // reopening shows the history, and ⌃L is the explicit way to discard it.
+        assert!(
+            workspace.ai_chat_for_test().is_some(),
+            "closing must keep the conversation, not throw it away"
+        );
+    });
+    draw(cx);
+
+    // And reopening shows the same panel rather than a fresh one.
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    workspace.read_with(cx, |workspace, cx| {
+        assert!(workspace.ai_chat_visible_for_test(), "the toggle reopens it");
+        let panel = workspace.ai_chat_for_test().expect("the panel survived");
+        assert!(
+            !panel.read(cx).turns_for_test().is_empty(),
+            "the seeded conversation must still be there after a close and reopen"
+        );
     });
     draw(cx);
 }
@@ -2539,8 +2653,19 @@ async fn ai_agent_a_proposal_writes_nothing_until_it_is_applied(cx: &mut TestApp
 
     panel.update(cx, |panel, cx| panel.apply_proposal_for_test(0, cx));
 
+    // Settled means collapsed (the Zed shape): the card leaves the pinned review area and
+    // a compact record lands in the transcript flow — the applied card no longer squats
+    // over the input while the turn finishes (the owner's screenshot).
     panel.read_with(cx, |panel, _cx| {
-        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Applied);
+        assert!(panel.proposals_for_test().is_empty(), "an applied card must not linger");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, done: true }
+                    if label.starts_with("Applied hello.php")
+            ))),
+            "the transcript keeps the compact record"
+        );
     });
     assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER, "and only Apply writes it");
 }
@@ -2548,7 +2673,7 @@ async fn ai_agent_a_proposal_writes_nothing_until_it_is_applied(cx: &mut TestApp
 /// Rejecting leaves the file alone, and a second click cannot revive the decision.
 #[gpui::test]
 async fn ai_agent_rejecting_leaves_the_file_exactly_as_it_was(cx: &mut TestAppContext) {
-    use crate::ai_chat::{ChatMode, ProposalState};
+    use crate::ai_chat::ChatMode;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let file = dir.path().join("hello.php");
@@ -2563,14 +2688,234 @@ async fn ai_agent_rejecting_leaves_the_file_exactly_as_it_was(cx: &mut TestAppCo
         panel.set_mode_for_test(ChatMode::Agent);
         panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
         panel.reject_proposal_for_test(0, cx);
-        // A rejected proposal is terminal: Apply afterwards must not write it.
+        // Terminal, and now *gone*: the settled card collapses out of the list, so a
+        // late Apply click has no target at all — stronger than the old state check.
         panel.apply_proposal_for_test(0, cx);
     });
 
     panel.read_with(cx, |panel, _cx| {
-        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Rejected);
+        assert!(panel.proposals_for_test().is_empty(), "a settled card leaves the list");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, .. } if label == "Rejected hello.php"
+            ))),
+            "the rejection stays visible as a record"
+        );
     });
     assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE);
+}
+
+/// The wire itself, observed for the first time: a mixed batch (one applied, one
+/// rejected) must answer its request with exactly one `decline` — accept would authorise
+/// the CLI to write the rejected file too, and an unanswered id parks the CLI on
+/// `read_line` forever ("travou infinito").
+#[gpui::test]
+async fn ai_agent_a_mixed_batch_answers_the_cli_with_one_decline(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let kept = dir.path().join("kept.php");
+    let changed = dir.path().join("changed.php");
+    let sink = dir.path().join("replies.ndjson");
+    std::fs::write(&kept, HELLO_BEFORE).expect("write");
+    std::fs::write(&changed, HELLO_BEFORE).expect("write");
+
+    // A real child whose stdin the panel writes to, echoing into a file the test reads —
+    // `write_to_codex` is a silent no-op without a child, so without this sink a "was
+    // the reply sent?" assertion passes vacuously.
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec cat > '{}'", sink.display()))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sink");
+    let stdin = child.stdin.take().expect("sink stdin");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.set_codex_stdin_for_test(stdin);
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-mixed".to_string(),
+                    changes: vec![
+                        crate::ai::ProposedFileChange {
+                            path: changed.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                        crate::ai::ProposedFileChange {
+                            path: kept.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                    ],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 7,
+                    item_id: "item-mixed".to_string(),
+                },
+            ],
+            cx,
+        );
+        panel.apply_proposal_for_test(0, cx);
+        // Half a batch decided answers nothing yet — the request is one question.
+        panel.reject_proposal_for_test(1, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "the settled batch collapses");
+    });
+
+    // Close the pipe so the sink child sees EOF and exits, then read what was sent.
+    panel.update(cx, |panel, _cx| panel.set_codex_stdin_for_test_take());
+    let _ = child.wait();
+    let sent = std::fs::read_to_string(&sink).unwrap_or_default();
+    assert!(
+        sent.contains("\"id\":7") && sent.contains("\"decision\":\"decline\""),
+        "a mixed batch must decline, got: {sent:?}"
+    );
+    assert_eq!(sent.matches("\"decision\"").count(), 1, "one question, exactly one answer");
+    assert_eq!(std::fs::read_to_string(&changed).unwrap(), HELLO_AFTER);
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), HELLO_BEFORE);
+}
+
+/// A delete proposal is honest before the click: the card offers no Apply (this build
+/// shows deletions for review, it does not perform them) and Reject still settles it.
+#[gpui::test]
+async fn ai_agent_a_delete_proposal_offers_review_but_no_apply(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, ProposalState};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("old.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-del".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "delete".to_string(),
+                        diff: String::new(),
+                    }],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 0,
+                    item_id: "item-del".to_string(),
+                },
+            ],
+            cx,
+        );
+    });
+    panel.read_with(cx, |panel, _cx| {
+        let proposals = panel.proposals_for_test();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].kind, "delete");
+        assert_eq!(proposals[0].state, ProposalState::Pending);
+    });
+    // The Apply-less card draws.
+    draw(cx);
+
+    panel.update(cx, |panel, cx| panel.reject_proposal_for_test(0, cx));
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "reject settles the delete card");
+    });
+    assert!(file.exists(), "and the file was never touched");
+}
+
+/// Every approval kind answers on the wire with its own encoder — and answers exactly
+/// once. `Command` speaks `decision`, an MCP elicitation speaks `action`, and `Unknown`
+/// (a method this build does not recognise) is forced to `decline` even when the caller
+/// says accept: consenting to unknown semantics is not consent. An unanswered id parks
+/// the CLI on `read_line` forever, which is why every branch must write *something*.
+#[gpui::test]
+async fn ai_agent_every_approval_kind_answers_once_with_its_own_encoder(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+    use crate::ai_codex::{ApprovalKind, Decision};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let sink = dir.path().join("replies.ndjson");
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec cat > '{}'", sink.display()))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sink");
+    let stdin = child.stdin.take().expect("sink stdin");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    let ask =
+        |request_id: u64, kind: ApprovalKind| crate::ai::AgentEvent::ActionApprovalRequested {
+            request_id,
+            summary: format!("do thing {request_id}"),
+            allow_for_session: kind == ApprovalKind::Command,
+            kind,
+        };
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.set_codex_stdin_for_test(stdin);
+
+        panel.apply_events_for_test(vec![ask(1, ApprovalKind::Command)], cx);
+        panel.answer_action_for_test(1, Decision::Accept);
+
+        panel.apply_events_for_test(vec![ask(2, ApprovalKind::McpElicitation)], cx);
+        panel.answer_action_for_test(2, Decision::Accept);
+
+        panel.apply_events_for_test(vec![ask(3, ApprovalKind::Unknown)], cx);
+        assert_eq!(
+            panel.action_approval_kind_for_test(),
+            Some(ApprovalKind::Unknown),
+            "the unknown request still raises a card (it must be answerable)"
+        );
+    });
+    // The Deny-only card draws.
+    draw(cx);
+    panel.update(cx, |panel, _cx| {
+        // The caller says accept; the panel must refuse to encode it.
+        panel.answer_action_for_test(3, Decision::Accept);
+        panel.set_codex_stdin_for_test_take();
+    });
+    let _ = child.wait();
+
+    let sent = std::fs::read_to_string(&sink).unwrap_or_default();
+    let lines: Vec<&str> = sent.lines().collect();
+    assert_eq!(lines.len(), 3, "three questions, exactly three answers: {sent:?}");
+    assert!(
+        lines[0].contains("\"id\":1") && lines[0].contains("\"decision\":\"accept\""),
+        "a command speaks the decision shape: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("\"id\":2")
+            && lines[1].contains("\"action\":\"accept\"")
+            && !lines[1].contains("\"decision\""),
+        "an elicitation speaks the action shape: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("\"id\":3") && lines[2].contains("\"decision\":\"decline\""),
+        "unknown semantics can only be declined: {}",
+        lines[2]
+    );
 }
 
 /// Per-file approval: a turn touching two files is two decisions, not one.
@@ -2589,46 +2934,167 @@ async fn ai_agent_approval_is_per_file_not_all_or_nothing(cx: &mut TestAppContex
     workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
     let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
 
-    // One item carrying two files, which is how a multi-file edit arrives.
+    // One item carrying two files, which is how a multi-file edit arrives. The cards
+    // exist only once the CLI *asks* — an announcement alone stays held, because in a
+    // workspace-write turn the CLI just writes and there is nothing to click.
     panel.update(cx, |panel, cx| {
         panel.set_mode_for_test(ChatMode::Agent);
         panel.apply_events_for_test(
-            vec![crate::ai::AgentEvent::Proposed {
-                item_id: "item-1".to_string(),
-                changes: vec![
-                    crate::ai::ProposedFileChange {
-                        path: kept.display().to_string(),
-                        kind: "update".to_string(),
-                        diff: HELLO_DIFF.to_string(),
-                    },
-                    crate::ai::ProposedFileChange {
-                        path: changed.display().to_string(),
-                        kind: "update".to_string(),
-                        diff: HELLO_DIFF.to_string(),
-                    },
-                ],
-            }],
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-1".to_string(),
+                    changes: vec![
+                        crate::ai::ProposedFileChange {
+                            path: kept.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                        crate::ai::ProposedFileChange {
+                            path: changed.display().to_string(),
+                            kind: "update".to_string(),
+                            diff: HELLO_DIFF.to_string(),
+                        },
+                    ],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 7,
+                    item_id: "item-1".to_string(),
+                },
+            ],
             cx,
         );
-        // Reject the first, apply the second.
-        panel.reject_proposal_for_test(0, cx);
-        panel.apply_proposal_for_test(1, cx);
     });
 
     panel.read_with(cx, |panel, _cx| {
         let proposals = panel.proposals_for_test();
         assert_eq!(proposals.len(), 2, "two files, two rows");
-        assert_eq!(proposals[0].state, ProposalState::Rejected);
-        assert_eq!(proposals[1].state, ProposalState::Applied);
+        assert!(proposals.iter().all(|p| p.state == ProposalState::Pending));
+    });
+
+    // Reject the first, apply the second. Deciding the last file settles the batch:
+    // the cards collapse into records, and the files show the split decision.
+    panel.update(cx, |panel, cx| {
+        panel.reject_proposal_for_test(0, cx);
+        panel.apply_proposal_for_test(1, cx);
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "a settled batch collapses");
     });
     assert_eq!(std::fs::read_to_string(&kept).unwrap(), HELLO_BEFORE, "the rejected one is intact");
     assert_eq!(std::fs::read_to_string(&changed).unwrap(), HELLO_AFTER, "the applied one changed");
 }
 
+/// A workspace-write turn: the CLI writes the file itself and reports it. No card, no
+/// button — a record in the flow ("Edited hello.php (+1 −1)") is the whole ceremony,
+/// because the write has already happened and a question about it would be theatre.
+#[gpui::test]
+async fn ai_agent_a_cli_write_is_recorded_not_asked(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, FlowBlock};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_AFTER).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![
+                // The announcement, then the completion — the CLI's own order. No
+                // approval ever arrives, because the sandbox let it write.
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-1".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+                crate::ai::AgentEvent::Edited {
+                    item_id: "item-1".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+            ],
+            cx,
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "no card for a write already made");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                FlowBlock::Activity { label, done: true }
+                    if label == "Edited hello.php (+1 −1)"
+            ))),
+            "the write is recorded in the flow"
+        );
+    });
+}
+
+/// The same write while the file sits open in a tab: the buffer takes the same patch the
+/// CLI applied to disk, so the user is not reading stale text over changed bytes — the
+/// gap that made workspace-write unshippable until this closure existed.
+#[gpui::test]
+async fn ai_agent_a_cli_write_refreshes_the_open_tab(cx: &mut TestAppContext) {
+    use crate::ai_chat::ChatMode;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_argument(file.clone(), window, cx);
+        workspace.toggle_ai_chat_for_test(window, cx);
+    });
+    // The open reads the file on the background executor; the tab exists after the pump.
+    cx.run_until_parked();
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    // The CLI's write reaches the disk first, then the report reaches the panel.
+    std::fs::write(&file, HELLO_AFTER).expect("cli write");
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(
+            vec![crate::ai::AgentEvent::Edited {
+                item_id: "item-1".to_string(),
+                changes: vec![crate::ai::ProposedFileChange {
+                    path: file.display().to_string(),
+                    kind: "update".to_string(),
+                    diff: HELLO_DIFF.to_string(),
+                }],
+            }],
+            cx,
+        );
+    });
+
+    let editor = workspace
+        .read_with(cx, |workspace, _cx| workspace.active_editor_for_test())
+        .expect("the tab is open");
+    editor.read_with(cx, |editor, _cx| {
+        assert_eq!(
+            editor.document.buffer.text(),
+            HELLO_AFTER,
+            "the open buffer caught up with the CLI's write"
+        );
+    });
+}
+
 /// The denylist decides what may *enter* the user's files too, not only what leaves.
 #[gpui::test]
 async fn ai_agent_a_proposal_for_a_secret_path_is_blocked_with_its_reason(cx: &mut TestAppContext) {
-    use crate::ai_chat::{ChatMode, ProposalState};
+    use crate::ai_chat::ChatMode;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let env = dir.path().join(".env");
@@ -2648,14 +3114,20 @@ async fn ai_agent_a_proposal_for_a_secret_path_is_blocked_with_its_reason(cx: &m
     });
 
     panel.read_with(cx, |panel, _cx| {
-        let state = panel.proposals_for_test()[0].state;
+        // Collapsed like every settled card — but the *reason* must survive the collapse,
+        // or a denylisted path reads as an ordinary refusal.
+        assert!(panel.proposals_for_test().is_empty(), "a blocked card settles and leaves");
         assert!(
-            matches!(state, ProposalState::Blocked(reason) if reason.contains("credentials")),
-            "the reason travels with the refusal: {state:?}"
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, .. }
+                    if label.starts_with("Blocked .env") && label.contains("credentials")
+            ))),
+            "the reason travels with the record"
         );
     });
     assert_eq!(std::fs::read_to_string(&env).unwrap(), "APP_KEY=original\n");
-    // The blocked row renders, reason and all.
+    // The transcript row renders, reason and all.
     draw(cx);
 }
 
@@ -2695,7 +3167,7 @@ async fn ai_agent_cancel_discards_pending_proposals(cx: &mut TestAppContext) {
 /// and the change is one undo step.
 #[gpui::test]
 async fn ai_agent_an_open_tab_is_patched_through_its_buffer(cx: &mut TestAppContext) {
-    use crate::ai_chat::{ChatMode, ProposalState};
+    use crate::ai_chat::ChatMode;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let file = dir.path().join("hello.php");
@@ -2716,7 +3188,9 @@ async fn ai_agent_an_open_tab_is_patched_through_its_buffer(cx: &mut TestAppCont
     });
 
     panel.read_with(cx, |panel, _cx| {
-        assert_eq!(panel.proposals_for_test()[0].state, ProposalState::Applied);
+        // Settled → collapsed; what this test is really about is the *buffer* patching
+        // below, and the collapse is asserted in its own test.
+        assert!(panel.proposals_for_test().is_empty());
     });
 
     // The buffer carries the change; the file on disk is untouched until a save, which is
@@ -2764,14 +3238,14 @@ async fn ai_agent_a_rejection_is_reported_to_the_model_on_the_next_send(cx: &mut
         assert!(body.contains("try something else"), "alongside the new question: {body}");
     });
 
-    // The user sees the same verdict as a note in the transcript.
+    // The user sees the same verdict in the transcript — as a flow record now, not a
+    // Note turn: the "!"-labelled note was the duplicate the collapse replaced.
     panel.read_with(cx, |panel, _cx| {
         assert!(
-            panel
-                .turns_for_test()
-                .iter()
-                .any(|turn| turn.role == crate::ai_chat::Role::Note
-                    && turn.text.contains("Rejected")),
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                crate::ai_chat::FlowBlock::Activity { label, .. } if label.contains("Rejected")
+            ))),
             "the decision is on screen too"
         );
     });
@@ -5428,6 +5902,7 @@ async fn every_small_text_field_lays_out_with_and_without_text(cx: &mut TestAppC
         AiChatPanel::new(
             Box::new(|_| Default::default()),
             Box::new(|_, _, _| Err("render tests never write".to_string())),
+            Box::new(|_, _, _| crate::ai_chat::Refresh::Untouched),
             None,
             cx,
         )
@@ -5698,4 +6173,143 @@ async fn an_editor_renders_while_composing(cx: &mut TestAppContext) {
     });
 
     draw(cx);
+}
+
+/// The retry loop, replayed from a live probe against codex-cli 0.146.
+///
+/// The panel answers every fileChange approval with `decline` (it writes the file
+/// itself), and the response carries no note — so the CLI, seeing a bare decline,
+/// **re-proposes the same edit** under a fresh itemId seconds later. Before the
+/// pre-flight, that drew a second card for a change already on disk: Apply → record ✓ →
+/// the same question again, reported as "ainda meio bugado, apply e decline".
+///
+/// The re-sent patch is detectable precisely because the first copy was applied: its
+/// context no longer matches the file. This replays the probe's exact shape — apply,
+/// then the retry — and pins that the retry dies quietly: no card, a "skipped" record,
+/// and the CLI's blocked id still answered so the turn moves.
+#[gpui::test]
+async fn ai_agent_a_retried_proposal_after_apply_is_skipped_not_reshown(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, FlowBlock};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        // Turn one: the proposal, its approval, the user applying.
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.apply_proposal_for_test(0, cx);
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER);
+
+    panel.update(cx, |panel, cx| {
+        // The CLI's retry: same diff, fresh item id, new approval id — exactly what the
+        // probe transcript shows after the decline goes back.
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-2".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 1,
+                    item_id: "item-2".to_string(),
+                },
+            ],
+            cx,
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "the retry must not become a second card");
+        let flow_labels: Vec<String> = panel
+            .turns_for_test()
+            .iter()
+            .flat_map(|turn| turn.flow.iter())
+            .filter_map(|block| match block {
+                FlowBlock::Activity { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            flow_labels.iter().filter(|label| label.starts_with("Applied hello.php")).count(),
+            1,
+            "one apply, one record: {flow_labels:?}"
+        );
+        assert!(
+            flow_labels.iter().any(|label| label.contains("Skipped a stale proposal")),
+            "the retry is named, not hidden: {flow_labels:?}"
+        );
+    });
+    // And the file was written exactly once — the retry changed nothing.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_AFTER);
+    draw(cx);
+}
+
+/// The Reject half of the retry loop.
+///
+/// After a decline the file is *unchanged*, so the CLI's re-sent patch applies cleanly —
+/// the stale pre-flight (built for the Apply half) waves it through, and the user who
+/// just said no is asked the identical question again. The rejected `(path, diff)` pair
+/// is the fingerprint; within the same turn it is refused with a record. A *new send*
+/// clears the memory: re-proposing after a fresh prompt is the user changing their mind.
+#[gpui::test]
+async fn ai_agent_a_retried_proposal_after_reject_is_declined_not_reshown(cx: &mut TestAppContext) {
+    use crate::ai_chat::{ChatMode, FlowBlock};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let file = dir.path().join("hello.php");
+    std::fs::write(&file, HELLO_BEFORE).expect("write");
+
+    install_theme(cx);
+    let (workspace, cx) = cx.add_window_view(|_window, cx| WorkspaceView::new(registry(), cx));
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
+    let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.set_mode_for_test(ChatMode::Agent);
+        panel.apply_events_for_test(proposal_events("item-1", &file, HELLO_DIFF), cx);
+        panel.reject_proposal_for_test(0, cx);
+        // The retry: same edit, fresh ids — and the file still matches, so only the
+        // rejected-fingerprint check can stop it.
+        panel.apply_events_for_test(
+            vec![
+                crate::ai::AgentEvent::Proposed {
+                    item_id: "item-2".to_string(),
+                    changes: vec![crate::ai::ProposedFileChange {
+                        path: file.display().to_string(),
+                        kind: "update".to_string(),
+                        diff: HELLO_DIFF.to_string(),
+                    }],
+                },
+                crate::ai::AgentEvent::ApprovalRequested {
+                    request_id: 1,
+                    item_id: "item-2".to_string(),
+                },
+            ],
+            cx,
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.proposals_for_test().is_empty(), "no second card for a spurned edit");
+        assert!(
+            panel.turns_for_test().iter().any(|turn| turn.flow.iter().any(|block| matches!(
+                block,
+                FlowBlock::Activity { label, .. } if label.contains("Declined again")
+            ))),
+            "the rerun is named"
+        );
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), HELLO_BEFORE, "still untouched");
 }

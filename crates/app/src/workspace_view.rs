@@ -1,6 +1,6 @@
 //! The window root: activity bar, file tree, tabs, editor area, status bar, palette.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,13 +18,15 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseTab, Complete, CompleteLaravel, DecreaseFontSize, Dispatch, Find, FindInProject, FindNext,
-    FindPrev, FindReferences, FormatDocument, GoToDefinition, GoToRoute, GoToSymbol,
-    IncreaseFontSize, NavigateBack, NavigateForward, NewFile, NewTerminal, OpenFolder,
-    OpenSettings, PushToRemote, QuickFix, RenameSymbol, Replace, RerunFailedTests, ResetFontSize,
-    RunTests, RunTestsInFile, Save, ShowGitLog, SwitchBranch, ToggleAiChat, ToggleCommandPalette,
-    ToggleFullscreen, ToggleHiddenFiles, TogglePreview, ToggleQuickOpen, ToggleTerminal,
-    ToggleTestPanel, ToggleTheme, ToggleZen, context, dispatch_for,
+    CloseTab, Complete, CompleteLaravel, DebugContinue, DebugStepInto, DebugStepOut, DebugStepOver,
+    DecreaseFontSize, Dispatch, Find, FindInProject, FindNext, FindPrev, FindReferences,
+    FormatDocument, GoToDefinition, GoToRoute, GoToSymbol, IncreaseFontSize, NavigateBack,
+    NavigateForward, NewFile, NewTerminal, OpenFolder, OpenSettings, PushToRemote, QuickFix,
+    RenameSymbol, Replace, RerunFailedTests, ResetFontSize, RunTests, RunTestsInFile, Save,
+    ShowGitLog, StartDebugging, StopDebugging, SwitchBranch, ToggleAiChat, ToggleBreakpoint,
+    ToggleCommandPalette, ToggleDebugPanel, ToggleFullscreen, ToggleHiddenFiles, TogglePreview,
+    ToggleQuickOpen, ToggleTerminal, ToggleTestPanel, ToggleTheme, ToggleZen, context,
+    dispatch_for,
 };
 use crate::ai_chat::AiChatPanel;
 use crate::completion::{
@@ -32,6 +34,8 @@ use crate::completion::{
     word_before,
 };
 use crate::context_menu::{self, MenuAction, Overlay, OverlayEvent};
+use crate::debug_session::{SessionConfig, run_session};
+use crate::debug_view::{DebugCommand, DebugEvent, DebugView};
 use crate::editor::{Document, EditorEvent, EditorView, search_project};
 use crate::file_cache;
 use crate::find_bar::{FindBar, FindEvent, Status};
@@ -194,6 +198,12 @@ enum Job {
     /// Starting a second run *does* supersede the first, which is what the slot is for: two
     /// concurrent suites would fight over the same database and report interleaved results.
     TestRun,
+    /// The Xdebug session: listening, then driving one connected request (#30).
+    ///
+    /// Its own slot, and superseding is exactly right: starting the debugger twice must
+    /// replace the first listener rather than race it for the port, which would leave the
+    /// second failing to bind against the first.
+    DebugSession,
     /// Waiting for a completion the language server is computing (#61).
     ///
     /// Its own slot rather than `LspQuery`'s, for the reason `completion_query` documents:
@@ -641,6 +651,18 @@ pub struct WorkspaceView {
     /// takes minutes and closing the panel to read some code is not a request to abandon
     /// it. Cancelling is a separate, explicit thing — [`Job::TestRun`] plus the flag below.
     tests: Option<Entity<TestView>>,
+    /// The debugger panel (#30). `Some` while it is open, like every other bottom panel.
+    debug: Option<Entity<DebugView>>,
+    /// Breakpoints the user has set, whether or not anything is connected.
+    ///
+    /// Owned by the workspace rather than by the panel or the session, because it outlives
+    /// both: breakpoints are set before the debugger is started, survive the panel being
+    /// closed, and must still be there for the *next* request after a session ends. The
+    /// gutter reads it every frame, so it lives where the gutter can see it.
+    breakpoints: elle_debug::BreakpointStore,
+    /// Sends commands to the running session, if there is one. `None` means the debugger
+    /// is not listening, which is what makes every step action a no-op rather than an error.
+    debug_commands: Option<smol::channel::Sender<DebugCommand>>,
     /// The Laravel log panel (#25). Same lifecycle as the terminal: an entity while
     /// open, dropped when closed, re-read on refocus while up.
     logs: Option<Entity<crate::log_view::LogView>>,
@@ -730,10 +752,17 @@ pub struct WorkspaceView {
     ai_chat_width: Pixels,
     /// Where the pointer was when the current divider drag began. `None` between drags.
     divider_origin: Option<Pixels>,
-    /// The AI chat panel (#99). `Some` only while it is open, like the terminal: a
-    /// closed panel is absent, so a reply still streaming when it closes is cancelled
-    /// by the drop rather than narrating to nobody.
+    /// The AI chat panel (#99). `Some` once it has been opened, **and it stays `Some`
+    /// after it is closed** — see `ai_chat_visible`.
+    ///
+    /// It used to be taken on close, which cancelled a streaming reply as a side effect of
+    /// the drop. It also deleted the conversation: the owner's report was that clicking the
+    /// AI icon "apaga tudo". Closing a panel is not the same act as discarding what is in
+    /// it, and only one of those should need a click.
     ai_chat: Option<Entity<AiChatPanel>>,
+    /// Whether the panel is on screen. Separate from `ai_chat` being `Some` so closing
+    /// hides the panel and keeps its history; the entity is only dropped with the window.
+    ai_chat_visible: bool,
     /// Which Keychain account the open API-key prompt writes to (#99): `Some` between
     /// the settings panel's "Set API key…" and the prompt's confirm or dismissal.
     /// Cleared on dismissal so a stale arm cannot route a later prompt's text — which
@@ -856,6 +885,9 @@ impl WorkspaceView {
             search_cancel: None,
             terminal: None,
             tests: None,
+            debug: None,
+            breakpoints: elle_debug::BreakpointStore::new(),
+            debug_commands: None,
             logs: None,
             preview: None,
             test_cancel: None,
@@ -880,6 +912,7 @@ impl WorkspaceView {
             ai_chat_width: Metrics::AI_CHAT_WIDTH,
             divider_origin: None,
             ai_chat: None,
+            ai_chat_visible: false,
             pending_api_key: None,
             git_cancel: None,
             git_diff: None,
@@ -1340,8 +1373,35 @@ impl WorkspaceView {
     /// ⌘⇧A (#99): the AI chat panel on the right. Absent when closed, like the terminal —
     /// dropping the entity is also what cancels a reply still streaming into it.
     fn toggle_ai_chat(&mut self, _: &ToggleAiChat, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ai_chat.take().is_some() {
+        if self.ai_chat_visible {
+            // Hidden, not dropped — and the turn **keeps running**. The first version
+            // cancelled here, carried over from the era when closing destroyed the panel;
+            // the owner hit it immediately ("quando minimiza ele cancela a execução").
+            // The entity survives a hide, its drain keeps draining, so a running turn
+            // finishes into the hidden transcript and is simply *there* on reopen — Zed's
+            // behaviour, and the only one that respects work already paid for.
+            self.ai_chat_visible = false;
             self.focus_editor_or_workspace(window, cx);
+            cx.notify();
+            return;
+        }
+        // Reopening an existing panel: show it again, history intact, and do not rebuild
+        // the closures below — the ones it already holds are still correct.
+        // The settings modal covers the whole window, and its own text points here with
+        // "use Sign in, in the AI panel (⌘⇧A)". Without this, following that advice
+        // toggled a panel *behind* the modal — dispatched, rendered, and invisible, which
+        // from the user's chair is "nada acontece". Opening the chat is leaving settings.
+        self.settings_panel = None;
+
+        if self.ai_chat.is_some() {
+            self.ai_chat_visible = true;
+            if let Some(panel) = self.ai_chat.clone() {
+                window.focus(&panel.focus_handle(cx));
+                // The status may have moved while the panel was hidden — a sign-out from
+                // its own header, a `codex login` in a terminal. Stale `Ready` here is how
+                // "não aparece nenhum sign in" happens while settings says "not logged in".
+                panel.update(cx, |panel, cx| panel.refresh_codex_status(cx));
+            }
             cx.notify();
             return;
         }
@@ -1416,12 +1476,44 @@ impl WorkspaceView {
             })
         });
 
+        // How a tab catches up with a file the CLI wrote itself (a workspace-write
+        // turn). The tab branch of `apply`, alone: the disk is already the truth, so a
+        // closed file needs nothing, and the buffer takes the same patch the CLI applied
+        // — one undo step. A buffer whose unsaved edits the patch no longer fits is
+        // reported as the conflict it is, and left alone.
+        let workspace = cx.entity().downgrade();
+        let refresh: crate::ai_chat::RefreshFn = Box::new(move |path, patch, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return crate::ai_chat::Refresh::Untouched;
+            };
+            workspace.update(cx, |workspace, cx| {
+                let open = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.path.as_deref() == Some(path))
+                    .map(|tab| tab.editor.clone());
+                let Some(editor) = open else { return crate::ai_chat::Refresh::Untouched };
+                editor.update(cx, |editor, cx| {
+                    let current = editor.document.buffer.text();
+                    match patch(&current) {
+                        Ok(updated) => {
+                            editor.document.apply_edits(vec![(0..current.len(), updated)]);
+                            cx.notify();
+                            crate::ai_chat::Refresh::Reloaded
+                        }
+                        Err(_) => crate::ai_chat::Refresh::Conflict,
+                    }
+                })
+            })
+        });
+
         // The open folder, so a Codex thread can be rooted at the project the user is
         // looking at (#99) — that is how the CLI gets to read the code it is asked about.
         let project_root = self.tree.as_ref().map(|tree| tree.root().to_path_buf());
-        let panel = cx.new(|cx| AiChatPanel::new(snapshot, apply, project_root, cx));
+        let panel = cx.new(|cx| AiChatPanel::new(snapshot, apply, refresh, project_root, cx));
         window.focus(&panel.read(cx).focus_handle(cx));
         self.ai_chat = Some(panel);
+        self.ai_chat_visible = true;
         cx.notify();
     }
 
@@ -1704,6 +1796,14 @@ impl WorkspaceView {
     #[cfg(test)]
     pub fn toggle_ai_chat_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_ai_chat(&ToggleAiChat, window, cx);
+    }
+
+    #[cfg(test)]
+    /// Whether the panel is on screen. Distinct from it *existing*: closing hides it and
+    /// keeps the conversation, so a test asking "is it closed" must ask this.
+    #[cfg(test)]
+    pub fn ai_chat_visible_for_test(&self) -> bool {
+        self.ai_chat_visible
     }
 
     #[cfg(test)]
@@ -3030,6 +3130,255 @@ impl WorkspaceView {
         self.jobs.start(Job::TestRun, task);
     }
 
+    // --- the Xdebug debugger (#30) --------------------------------------------------
+
+    fn toggle_debug_panel(
+        &mut self,
+        _: &ToggleDebugPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.debug.take() {
+            // Closing the panel does not stop the session, for the test panel's reason: a
+            // debug session is minutes of work, and closing a panel to read some code is
+            // not a request to abandon it.
+            Some(_) => self.focus_editor_or_workspace(window, cx),
+            None => self.debug = Some(self.new_debug_panel(cx)),
+        }
+        cx.notify();
+    }
+
+    /// Builds the panel and wires its controls and stack clicks back to the workspace.
+    fn new_debug_panel(&mut self, cx: &mut Context<Self>) -> Entity<DebugView> {
+        let panel = cx.new(DebugView::new);
+        let workspace = cx.entity();
+
+        panel.update(cx, |panel, _| {
+            let commander = workspace.clone();
+            panel.on_command(move |command, _window, cx| {
+                commander.update(cx, |workspace, _cx| workspace.send_debug(command));
+            });
+
+            let jumper = workspace.clone();
+            panel.on_jump(move |frame, window, cx| {
+                // A frame in vendor code, or an `eval`'d one, has no local file to open.
+                // Saying nothing beats opening a plausible-looking neighbour (RISKS.md #4).
+                let Some(path) = elle_debug::uri_to_path(&frame.file_uri) else { return };
+                if !path.is_file() {
+                    return;
+                }
+                // 1-based on the wire, 0-based here. One jump path for the whole app (#88).
+                let point = Point::new((frame.line.saturating_sub(1)) as usize, 0);
+                jumper.update(cx, |workspace, cx| {
+                    workspace.open_path_at(path, Some(point), window, cx);
+                });
+            });
+        });
+        panel
+    }
+
+    /// Sends a command to the session thread, if one is listening.
+    ///
+    /// A closed channel means the session ended between the click and here, which is
+    /// ordinary rather than exceptional — the script may have finished on its own.
+    fn send_debug(&mut self, command: DebugCommand) {
+        let Some(sender) = &self.debug_commands else { return };
+        if sender.send_blocking(command).is_err() {
+            self.debug_commands = None;
+        }
+    }
+
+    fn start_debugging(&mut self, _: &StartDebugging, window: &mut Window, cx: &mut Context<Self>) {
+        // Starting opens the panel by itself: something has to show that the IDE is now
+        // waiting, or the user has no way to tell the debugger is armed.
+        let panel = match self.debug.clone() {
+            Some(panel) => panel,
+            None => {
+                let panel = self.new_debug_panel(cx);
+                self.debug = Some(panel.clone());
+                panel
+            }
+        };
+
+        // A second start supersedes the first, which is what `Job::DebugSession` is for:
+        // two listeners would fight over one port and the second would simply fail to bind.
+        self.stop_debugging(&StopDebugging, window, cx);
+
+        let port = elle_debug::DEFAULT_PORT;
+        let breakpoints: Vec<(PathBuf, usize)> = self
+            .breakpoints
+            .files()
+            .flat_map(|(path, rows)| {
+                rows.iter().map(move |breakpoint| (path.clone(), breakpoint.row))
+            })
+            .collect();
+
+        let (command_sender, command_receiver) = smol::channel::unbounded();
+        self.debug_commands = Some(command_sender);
+
+        let task = cx.spawn(async move |this, cx| {
+            // The same channel shape as the test runner: the session thread cannot touch an
+            // `Entity`, so it sends events and this task marshals them onto the foreground.
+            // Unbounded and async, so an idle debugger — the common state, waiting for a
+            // request — parks rather than polling (#79, #93).
+            let (event_sender, event_receiver) = smol::channel::unbounded();
+            let config = SessionConfig { port, breakpoints };
+            let session = cx.background_spawn(async move {
+                run_session(config, command_receiver, event_sender);
+            });
+
+            while let Ok(event) = event_receiver.recv().await {
+                // The gutter needs the stop position, and it lives on the workspace rather
+                // than in the panel, so both are told.
+                this.update(cx, |this, cx| this.on_debug_event(&event, cx)).ok();
+                panel.update(cx, |panel, cx| panel.push(event, cx)).ok();
+            }
+
+            session.await;
+            this.update(cx, |this, cx| {
+                this.debug_commands = None;
+                // The engine ids belonged to the session that just ended; the user's
+                // breakpoints did not.
+                this.breakpoints.unbind_all();
+                cx.notify();
+            })
+            .ok();
+        });
+        self.jobs.start(Job::DebugSession, task);
+        cx.notify();
+    }
+
+    /// Records what the gutter needs from a session event.
+    fn on_debug_event(&mut self, event: &DebugEvent, cx: &mut Context<Self>) {
+        match event {
+            DebugEvent::BreakpointBound { file_uri, line, engine_id } => {
+                if let Some(path) = elle_debug::uri_to_path(file_uri) {
+                    let row = (line.saturating_sub(1)) as usize;
+                    self.breakpoints.bind(&path, row, engine_id.clone());
+                }
+            }
+            DebugEvent::Paused { file_uri, line } => {
+                // 1-based on the wire, 0-based in the editor.
+                let row = (line.saturating_sub(1)) as usize;
+                let stopped_in = elle_debug::uri_to_path(file_uri);
+                self.mark_debug_row(stopped_in.as_deref(), row, cx);
+            }
+            DebugEvent::Finished | DebugEvent::Failed { .. } => {
+                self.breakpoints.unbind_all();
+                // Execution is nowhere now. An arrow left behind would point at a line that
+                // is no longer running and read as if it still were.
+                self.clear_debug_row(cx);
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Puts the execution arrow on `row` of `path`, and nowhere else.
+    ///
+    /// Every other open editor is cleared in the same pass: only one line in one file can
+    /// be the current statement, and an arrow left in a file stepped out of would claim
+    /// two places are running at once.
+    fn mark_debug_row(&mut self, path: Option<&Path>, row: usize, cx: &mut Context<Self>) {
+        for index in 0..self.tabs.len() {
+            let is_stopped_file =
+                path.is_some_and(|path| self.tabs[index].path.as_deref() == Some(path));
+            let editor = self.tabs[index].editor.clone();
+            let marker = is_stopped_file.then_some(row);
+            editor.update(cx, |editor, cx| editor.set_debug_row(marker, cx));
+        }
+    }
+
+    fn clear_debug_row(&mut self, cx: &mut Context<Self>) {
+        self.mark_debug_row(None, 0, cx);
+    }
+
+    fn stop_debugging(&mut self, _: &StopDebugging, _window: &mut Window, cx: &mut Context<Self>) {
+        self.send_debug(DebugCommand::Stop);
+        // Dropping the sender closes the channel, which is what ends the session loop even
+        // if it is parked waiting for a connection that never came.
+        self.debug_commands = None;
+        self.jobs.cancel(Job::DebugSession);
+        self.breakpoints.unbind_all();
+        cx.notify();
+    }
+
+    /// Toggles a breakpoint on the cursor's line.
+    ///
+    /// Works with no session running, which is the point: marking a line and *then* loading
+    /// the page is how debugging usually starts.
+    fn toggle_breakpoint(
+        &mut self,
+        _: &ToggleBreakpoint,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()) else {
+            // An unsaved buffer has no path for the engine to name, and Xdebug breakpoints
+            // are addressed by file.
+            return;
+        };
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let row = editor.read(cx).cursor_row();
+
+        // The engine id, before the toggle removes the entry that holds it.
+        let engine_id = self.breakpoints.engine_id(&path, row).map(str::to_string);
+
+        if self.breakpoints.toggle(&path, row) {
+            // 0-based row here, 1-based line on the wire.
+            self.send_debug(DebugCommand::SetBreakpoint {
+                file_uri: elle_debug::path_to_uri(&path),
+                line: (row as u32).saturating_add(1),
+            });
+        } else if let Some(engine_id) = engine_id {
+            self.send_debug(DebugCommand::ClearBreakpoint { engine_id });
+        }
+
+        self.sync_breakpoints_to_editors(cx);
+        cx.notify();
+    }
+
+    /// Hands every open editor the breakpoint rows for its own file.
+    ///
+    /// Pushed rather than pulled: the editor is not allowed to know about the debugger
+    /// (it renders rows, and a lookup into a session would be a layering violation), so
+    /// the workspace tells it what to draw, exactly as it does for diagnostics.
+    fn sync_breakpoints_to_editors(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.tabs.len() {
+            let Some(path) = self.tabs[index].path.clone() else { continue };
+            let rows: Vec<usize> =
+                self.breakpoints.rows(&path).map(|breakpoint| breakpoint.row).collect();
+            let editor = self.tabs[index].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_breakpoints(rows, cx));
+        }
+    }
+
+    fn debug_continue(&mut self, _: &DebugContinue, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.send_debug(DebugCommand::Run);
+    }
+
+    fn debug_step_over(
+        &mut self,
+        _: &DebugStepOver,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.send_debug(DebugCommand::StepOver);
+    }
+
+    fn debug_step_into(
+        &mut self,
+        _: &DebugStepInto,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.send_debug(DebugCommand::StepInto);
+    }
+
+    fn debug_step_out(&mut self, _: &DebugStepOut, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.send_debug(DebugCommand::StepOut);
+    }
+
     // --- find and replace (#80) ----------------------------------------------------
 
     fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
@@ -3794,7 +4143,17 @@ impl WorkspaceView {
         let source = document.buffer.text();
         let offset = document.selection.head;
 
-        let Some(reference) = elle_laravel::reference_at(&source, offset, blade) else { return };
+        // The document's own tree, not a fresh parse. This runs on **every keystroke**
+        // inside `route('…')`, and `reference_at` parses the whole file: measured at 3 ms
+        // on a real 22 KB `routes/web.php`, per character typed. The editor already keeps
+        // this tree up to date incrementally, so reusing it is the difference between
+        // typing that stutters and typing that does not.
+        let reference = match document.syntax.tree() {
+            Some(tree) => elle_laravel::reference_at_in_tree(&source, offset, blade, tree),
+            // No tree only when the grammar failed to load; the parsing path still answers.
+            None => elle_laravel::reference_at(&source, offset, blade),
+        };
+        let Some(reference) = reference else { return };
         if reference.kind != elle_laravel::ReferenceKind::Route {
             return;
         }
@@ -3861,7 +4220,13 @@ impl WorkspaceView {
         // claim (the literal names a column of *that* class), and running both would put
         // every column in the list twice. Only when no context holds does "the file is a
         // model" offer the whole surface.
-        if let Some(context) = elle_laravel::column_context_at(&text, offset) {
+        // The document's tree, for `request_route_completions`' reason: this also runs on
+        // every keystroke, and parsing here cost 1.98 ms on a real 22 KB source.
+        let column_context = match editor.read(cx).document.syntax.tree() {
+            Some(tree) => elle_laravel::column_context_in_tree(tree, &text, offset),
+            None => elle_laravel::column_context_at(&text, offset),
+        };
+        if let Some(context) = column_context {
             let class = match context.target {
                 elle_laravel::ColumnTarget::Class(name) => name,
                 // `$this->where(` — the class is whatever model this file declares; a
@@ -3894,7 +4259,12 @@ impl WorkspaceView {
         // `User::ac` mid-typing: the scanner reads the class off the prefix, and the
         // items are the scopes by *call* name — the one list where the declared method
         // name (the server's answer) is exactly what the user must not type.
-        if let Some((class, _)) = elle_laravel::scope_context_at(&text, offset) {
+        // The document's tree, like the two sources above: also per keystroke.
+        let scope_context = match editor.read(cx).document.syntax.tree() {
+            Some(tree) => elle_laravel::scope_context_in_tree(tree, &text, offset),
+            None => elle_laravel::scope_context_at(&text, offset),
+        };
+        if let Some((class, _)) = scope_context {
             let task = cx.background_spawn(async move {
                 let path = crate::file_cache::index_path(&root)?;
                 let (index, _) = elle_index::Index::open(&path).ok()?;
@@ -7100,6 +7470,14 @@ xattr -dr com.apple.quarantine "/Applications/ellefuanti.app" || true
                             editor.update(cx, |editor, cx| editor.unfold_all(cx));
                         }
                     }
+                    Dispatch::ToggleDebugPanel => {
+                        self.toggle_debug_panel(&ToggleDebugPanel, window, cx)
+                    }
+                    Dispatch::StartDebugging => self.start_debugging(&StartDebugging, window, cx),
+                    Dispatch::StopDebugging => self.stop_debugging(&StopDebugging, window, cx),
+                    Dispatch::ToggleBreakpoint => {
+                        self.toggle_breakpoint(&ToggleBreakpoint, window, cx)
+                    }
                     Dispatch::Quit => cx.quit(),
                     Dispatch::Unhandled => {
                         self.status = Some(format!("{id} is not implemented yet").into());
@@ -7600,6 +7978,14 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_hidden_files))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::toggle_debug_panel))
+            .on_action(cx.listener(Self::start_debugging))
+            .on_action(cx.listener(Self::stop_debugging))
+            .on_action(cx.listener(Self::toggle_breakpoint))
+            .on_action(cx.listener(Self::debug_continue))
+            .on_action(cx.listener(Self::debug_step_over))
+            .on_action(cx.listener(Self::debug_step_into))
+            .on_action(cx.listener(Self::debug_step_out))
             .on_action(cx.listener(Self::toggle_test_panel))
             .on_action(cx.listener(Self::run_tests))
             .on_action(cx.listener(Self::run_tests_in_file))
@@ -7702,6 +8088,10 @@ impl Render for WorkspaceView {
                             // reasoning. Both can be open at once: a run and the shell you
                             // started it from are things people look at together.
                             .children(self.tests.clone())
+                            // The debugger under those, same column, same reasoning: while
+                            // stepping through code, the panel and the terminal that made
+                            // the request are things people look at together (#30).
+                            .children(self.debug.clone())
                             // And the log under those, same column, same reasoning.
                             .children(self.logs.clone()),
                     )
@@ -7726,12 +8116,17 @@ impl Render for WorkspaceView {
                     // and the window edge, full height under the titlebar. Chrome, so
                     // zen hides it with the rest — the conversation survives, hidden,
                     // because the entity is only dropped by the toggle.
-                    .when(!zen && self.ai_chat.is_some(), |el| {
+                    .when(!zen && self.ai_chat_visible, |el| {
                         // Divider first: it sits between the editor and the panel, and
                         // the panel grows leftwards, hence the -1.
                         el.child(self.render_divider("divider-ai-chat", -1.0, &theme, cx))
                     })
-                    .when(!zen, |el| {
+                    // `ai_chat_visible`, not just `!zen` — the owner's "a aba não
+                    // minimiza". When closing dropped the entity, `!zen` was enough: no
+                    // entity, nothing to mount. Hide-don't-drop broke that silently — the
+                    // divider got the visibility gate, the panel itself kept the old one,
+                    // and a hidden panel rendered forever with only its divider gone.
+                    .when(!zen && self.ai_chat_visible, |el| {
                         el.children(self.ai_chat.clone().map(|panel| {
                             div().w(self.ai_chat_width).flex_none().h_full().child(panel)
                         }))
@@ -7843,7 +8238,15 @@ impl Render for WorkspaceView {
                             .line_height(fonts.line_height())
                             .text_color(theme.text_muted)
                             .children(lines.into_iter().map(|line| {
-                                div().h(fonts.line_height()).whitespace_nowrap().child(line)
+                                // The splice's whitespace rule, kept here too: an
+                                // indentation-only continuation line is invisible when
+                                // dimmed, so it gets the same faint wash.
+                                let indent_only = !line.is_empty() && line.trim().is_empty();
+                                div()
+                                    .h(fonts.line_height())
+                                    .whitespace_nowrap()
+                                    .when(indent_only, |el| el.bg(theme.accent.opacity(0.12)))
+                                    .child(line)
                             })),
                     ),
                 )
@@ -9073,7 +9476,9 @@ impl WorkspaceView {
     /// already there?" — the state the keyboard shortcut alone never showed.
     fn render_ai_chat_button(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
-        let open = self.ai_chat.is_some();
+        // Visibility, not existence: the entity outlives a close now, so `is_some()` is
+        // permanently true after the first open and the button would read "Close" forever.
+        let open = self.ai_chat_visible;
         div()
             .id("titlebar-ai-chat")
             .size(px(22.0))
@@ -9614,6 +10019,11 @@ impl WorkspaceView {
         // same rule `lsp_label` follows for a project with no language server (§24).
         let tests = self.tests.as_ref().map(|tests| tests.read(cx).summary()).unwrap_or_default();
 
+        // Unlike the tests cell, this is read whether or not the panel is open: a session
+        // stays live with the panel closed, and "paused at User.php:24" is exactly what
+        // someone who closed the panel to read code needs in order to find their way back.
+        let debug = self.debug.as_ref().map(|debug| debug.read(cx).summary()).unwrap_or_default();
+
         // A squiggle the user cannot read only says "something is wrong near here". Putting
         // the cursor on it spells it out, which is the cheapest thing that makes the
         // underlines actually useful — a hover card or a problems panel is a bigger feature
@@ -9664,6 +10074,12 @@ impl WorkspaceView {
             })
             .child(SharedString::from(diagnostics))
             .child(SharedString::from(tests))
+            // The debugger's cell, by the same rule as the tests one above: a project that
+            // is not being debugged says nothing here at all. It earns the space only while
+            // something is listening, connected or stopped — and while stopped it is the
+            // one cell that says *where*, which is what makes the arrow findable after
+            // scrolling away from it.
+            .child(SharedString::from(debug))
             .child(SharedString::from(terminals))
             .child(SharedString::from(position))
             // #127. The language cell is a button, which is where every comparable editor

@@ -225,7 +225,12 @@ pub fn run(
     if cancel.is_cancelled() || killed_by_watcher {
         // The watcher may have killed it already; doing it again is harmless, and it is
         // what handles a run cancelled before the watcher noticed.
-        let mut child = child.lock().expect("the child mutex");
+        //
+        // Poison-tolerant because the watcher shares this mutex and `join` above already
+        // tolerates it having panicked: `.expect()` here would take a panicked watcher and
+        // turn it into a panicked *caller*, leaving the child process alive and unkilled —
+        // the opposite of what this branch exists to do.
+        let mut child = child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         kill_tree(&mut child);
         let _ = child.wait();
         let _ = errors.join();
@@ -233,7 +238,9 @@ pub fn run(
     }
 
     let status = {
-        let mut child = child.lock().expect("the child mutex");
+        // Poison-tolerant for the reason above: reaping the child must not depend on the
+        // watcher having exited cleanly, or a panicked watcher leaves a zombie process.
+        let mut child = child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         child.wait().context("waiting for the test runner")?
     };
     // Whatever the runner said on stderr reaches the user verbatim. Joined after `wait` so

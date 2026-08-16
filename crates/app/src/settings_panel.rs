@@ -62,7 +62,7 @@ pub struct SettingsPanel {
     /// Codex availability (#99), resolved once off the main thread and cached. `None`
     /// while the probe runs. It lives here rather than being read per-render because the
     /// check spawns `codex --version`, and a render must never spawn a process.
-    codex_status: Option<Result<(), String>>,
+    codex_status: Option<crate::ai_codex::Availability>,
 }
 
 impl EventEmitter<SettingsPanelEvent> for SettingsPanel {}
@@ -73,7 +73,7 @@ impl SettingsPanel {
         // and an answer that only arrives after the user lands there reads as a stall.
         #[cfg(not(test))]
         cx.spawn(async move |this, cx| {
-            let status = cx.background_spawn(async { crate::ai_codex::availability() }).await;
+            let status = cx.background_spawn(async { crate::ai_codex::status() }).await;
             this.update(cx, |this, cx| {
                 this.codex_status = Some(status);
                 cx.notify();
@@ -131,11 +131,26 @@ impl SettingsPanel {
         } else {
             settings.ai_provider()
         });
-        let mut next = current.next();
+        // The autocomplete cycler skips Codex *unless* `ai.codex_autocomplete` opted in:
+        // ghost text is HTTP (`resolve_auth`), Codex has no wire, and a provider the
+        // cycler offers but the feature cannot use is a setting that kills autocomplete
+        // silently — the owner's "sugestão estilo copilot não tá funcionando" was
+        // exactly this, set from this very row. The opt-in unlocks the experimental
+        // turn-based path (`edit_prediction::codex_provider`), which polices itself
+        // with a latency gate. Chat keeps the full ring either way.
+        let codex_ok = chat || settings.ai_codex_autocomplete_enabled();
+        let step = |from: crate::ai::Provider| {
+            let mut candidate = from.next();
+            if !codex_ok && candidate == crate::ai::Provider::Codex {
+                candidate = candidate.next();
+            }
+            candidate
+        };
+        let mut next = step(current);
         if !forward {
             // Backward: keep stepping until the *next* step would come home.
-            while next.next() != current {
-                next = next.next();
+            while step(next) != current {
+                next = step(next);
             }
         }
         crate::settings::update_settings(cx, |settings| {
@@ -328,20 +343,61 @@ impl Render for SettingsPanel {
                 &theme,
                 &entity,
             ),
-            row_readonly("Chat model", settings.ai_chat_model().to_string(), &theme),
-            row_readonly("Autocomplete model", settings.ai_completion_model().to_string(), &theme),
+            // Under Codex the model rows must not echo `ai.chat_model`: Codex ignores
+            // that key entirely (the subscription decides), and showing "claude-opus-5"
+            // beside "provider: codex" reads as an Anthropic model being forced with no
+            // way to change it — the owner's screenshot, verbatim. Say who decides.
+            row_readonly(
+                "Chat model",
+                if chat_provider == crate::ai::Provider::Codex {
+                    "chosen by your Codex subscription".to_string()
+                } else {
+                    settings.ai_chat_model().to_string()
+                },
+                &theme,
+            ),
+            row_readonly(
+                "Autocomplete model",
+                if crate::ai::Provider::from_setting(settings.ai_provider())
+                    == crate::ai::Provider::Codex
+                {
+                    if !settings.ai_codex_autocomplete_enabled() {
+                        // A configured impossibility (older builds' cycler allowed it):
+                        // name the problem in the row that caused it, and the fix.
+                        "codex can't autocomplete — cycle the provider above".to_string()
+                    } else if let Some(reason) =
+                        crate::edit_prediction::codex_provider::disabled_reason()
+                    {
+                        // The latency gate tripped: the honest sentence, not silence.
+                        reason
+                    } else {
+                        "experimental — your Codex subscription, on typing pauses".to_string()
+                    }
+                } else {
+                    settings.ai_completion_model().to_string()
+                },
+                &theme,
+            ),
         ];
 
         // Codex's state, shown only when it is selected: whether the CLI is there and
         // logged in, or the command that would fix it. Cached by the panel rather than
         // probed here — a render must not spawn a process.
         let codex_row = (chat_provider == crate::ai::Provider::Codex).then(|| {
+            use crate::ai_codex::Availability;
+            // Sentences sized for the row they live in. The old text ended "— run `codex
+            // login` in a terminal", which the row's truncation cut to "run `c" — advice
+            // that was unreadable *and* stale, since sign-in is a button in the AI panel
+            // now. A message that must fit its row is also a message short enough to act on.
             let status = match &self.codex_status {
                 None => "checking…".to_string(),
-                Some(Ok(())) => "installed, logged in".to_string(),
-                Some(Err(reason)) => reason.clone(),
+                Some(Availability::Ready) => "installed, logged in".to_string(),
+                Some(Availability::NotLoggedIn) => {
+                    "not logged in — use Sign in, in the AI panel (⌘⇧A)".to_string()
+                }
+                Some(Availability::NotInstalled) => "CLI not installed".to_string(),
             };
-            row_readonly("Codex", status, &theme)
+            row_wrapping("Codex", status, &theme)
         });
 
         // "Set API key…" is meaningless for a provider that holds its own login, and a
@@ -534,6 +590,28 @@ fn row_toggle(
 }
 
 /// A row that only shows a value — the models (#99), whose edit path is the JSON file.
+/// A read-only row whose value is a sentence: wraps instead of truncating.
+///
+/// `row` truncates deliberately (a long font-family name must not wrap the row), but that
+/// same truncation cut the Codex status to "run `c" — unreadable, reported by screenshot.
+/// A status is prose; prose wraps. `min_h` instead of `h`, so a second line grows the row
+/// rather than being clipped by it.
+fn row_wrapping(
+    label: &'static str,
+    value: String,
+    theme: &crate::theme::Theme,
+) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .min_h(Metrics::ROW_HEIGHT)
+        .py_1()
+        .gap_2()
+        .child(div().w(px(140.0)).flex_none().text_color(theme.text_muted).child(label))
+        .child(div().flex_1().child(SharedString::from(value)))
+        .into_any_element()
+}
+
 fn row_readonly(
     label: &'static str,
     value: String,

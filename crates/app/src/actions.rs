@@ -25,6 +25,8 @@ actions!(
         Delete,
         Newline,
         Tab,
+        AcceptPredictionWord,
+        AcceptPredictionLine,
         MoveLeft,
         MoveRight,
         MoveUp,
@@ -80,6 +82,9 @@ actions!(
         // The AI chat panel (#99). Workspace-scoped like the terminal toggle, and for the
         // same reason: the chord must also *close* the panel while the panel has focus.
         ToggleAiChat,
+        /// Clears the AI chat transcript (⌃L), the shell's own chord for the same act.
+        /// Explicit, because closing the panel no longer discards anything.
+        ClearAiChat,
         // The preview pane (#31). Workspace-scoped for the same reason as the two above:
         // the chord closes the pane while the pane has focus.
         TogglePreview,
@@ -144,6 +149,18 @@ actions!(
         // focuses its query field; pressing it again with the panel already open returns
         // to the file tree, which is what the activity bar's Search icon does too.
         FindInProject,
+        // The Xdebug debugger (#30). `ToggleBreakpoint` is the only one that does anything
+        // without a session: breakpoints are set before the page is loaded, which is how
+        // debugging usually starts. The rest are no-ops unless execution is paused, and the
+        // panel shows its controls as unavailable to match (§24).
+        ToggleDebugPanel,
+        StartDebugging,
+        StopDebugging,
+        ToggleBreakpoint,
+        DebugContinue,
+        DebugStepOver,
+        DebugStepInto,
+        DebugStepOut,
     ]
 );
 
@@ -165,6 +182,12 @@ pub mod context {
     /// The test results panel (#25). Its own context so a rerun key means "rerun" only
     /// while the panel has focus, and does not shadow anything in the editor.
     pub const TESTS: &str = "Tests";
+    /// The debugger panel (#30). Its own context for the test panel's reason, though the
+    /// step keys are deliberately bound in `WORKSPACE` rather than here: F5 and F10 must
+    /// work while the caret is in the editor, which is where someone stepping through code
+    /// actually is. This context exists for keys that only make sense with the panel
+    /// focused, and to keep the panel's element consistent with every other one.
+    pub const DEBUG: &str = "Debug";
     /// The completion popup (#61). **Its own context is the entire reason arrows are not
     /// stolen from the document**: `up` and `down` are bound here and in `Editor`, and gpui
     /// dispatches to the innermost context that has a binding. With no popup open there is
@@ -212,9 +235,20 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         // chord, and macOS's symbolic-hotkey table (read for the ⌥⌘I decision above)
         // does not either.
         KeyBinding::new("cmd-shift-a", ToggleAiChat, Some(context::WORKSPACE)),
-        // ⌘⇧P. Not ⌘P (quick open) and not ⌘⇧O (route search); ⌘⇧P is free here because this
-        // app puts the command palette on ⌘K.
-        KeyBinding::new("cmd-shift-p", TogglePreview, Some(context::WORKSPACE)),
+        // ⌘⇧V, VS Code's markdown-preview chord.
+        //
+        // This was ⌘⇧P until it was found to be the command palette's chord, fourteen lines
+        // above, in the same `WORKSPACE` context. The comment here claimed "⌘⇧P is free
+        // because this app puts the command palette on ⌘K" — it does not, and never did.
+        // gpui resolves the later binding, so shipping the preview pane silently took the
+        // palette away: pressing ⌘⇧P opened a WKWebView. The lesson is not "check twice"
+        // but that a keymap this size cannot be checked by reading, which is why
+        // `no_duplicate_bindings_within_a_context` now fails the build instead.
+        //
+        // ⌘⇧V checked the way ⌥⌘I was, against `com.apple.symbolichotkeys` rather than by
+        // eye: no system hotkey binds keycode 9 (`v`) under any modifier mask, and nothing
+        // in this keymap claims it.
+        KeyBinding::new("cmd-shift-v", TogglePreview, Some(context::WORKSPACE)),
         // #82 stage 1: ⌘D grows a cursor per occurrence; Escape (the editor's existing
         // Cancel) collapses back to one.
         KeyBinding::new("cmd-d", SelectNextOccurrence, Some(context::EDITOR)),
@@ -301,6 +335,21 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("ctrl-shift-t", ToggleTestPanel, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-r", RunTests, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-f", RunTestsInFile, Some(context::WORKSPACE)),
+        //
+        // The debugger (#30). F5/F8/F7/⇧F8 and ⌘F8 are PhpStorm's; F5/F10/F11/⇧F11 and F9
+        // are VS Code's. The F-keys chosen here are the ones the two agree on or leave
+        // free, so neither audience has to unlearn a reflex: F5 continues in both, and
+        // F9 toggles a breakpoint in VS Code while PhpStorm's ⌘F8 is bound alongside it.
+        //
+        // All of them are `WORKSPACE`-scoped, not `DEBUG`-scoped: someone stepping through
+        // code has the caret in the editor, and a step key that only works while the panel
+        // has focus is a step key nobody can reach without the mouse.
+        KeyBinding::new("f5", DebugContinue, Some(context::WORKSPACE)),
+        KeyBinding::new("f10", DebugStepOver, Some(context::WORKSPACE)),
+        KeyBinding::new("f11", DebugStepInto, Some(context::WORKSPACE)),
+        KeyBinding::new("shift-f11", DebugStepOut, Some(context::WORKSPACE)),
+        KeyBinding::new("f9", ToggleBreakpoint, Some(context::WORKSPACE)),
+        KeyBinding::new("cmd-f8", ToggleBreakpoint, Some(context::WORKSPACE)),
         KeyBinding::new("ctrl-shift-e", RerunFailedTests, Some(context::WORKSPACE)),
         // `ToggleTheme` is deliberately unbound: it reaches the user through the palette.
         // Every obvious chord (cmd-k, cmd-t) is a prefix or a tab command elsewhere, and
@@ -366,6 +415,10 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("enter", Confirm, Some(context::AI_CHAT)),
         KeyBinding::new("escape", Cancel, Some(context::AI_CHAT)),
         KeyBinding::new("backspace", Backspace, Some(context::AI_CHAT)),
+        // ⌃L is what a terminal uses to clear, and this panel is read as one. Scoped to the
+        // chat so it cannot shadow anything elsewhere; nothing else in this keymap claims
+        // it, and macOS's symbolic-hotkey table does not either (checked as ⌥⌘I was).
+        KeyBinding::new("ctrl-l", ClearAiChat, Some(context::AI_CHAT)),
         //
         // The completion popup (#61). These exist *only* while the popup is on screen,
         // because the context comes from the popup's own element — which is what makes
@@ -396,6 +449,11 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("delete", Delete, Some(context::EDITOR)),
         KeyBinding::new("enter", Newline, Some(context::EDITOR)),
         KeyBinding::new("tab", Tab, Some(context::EDITOR)),
+        // Partial accepts for the AI ghost (#29, Zed's granularity): word, then line.
+        // ⌃Tab is free here (the OS keeps ⌘Tab; in-app tab cycling is ⌘⇧[ ]), and both
+        // are no-ops without a visible ghost, so the keys cost nothing when idle.
+        KeyBinding::new("ctrl-tab", AcceptPredictionWord, Some(context::EDITOR)),
+        KeyBinding::new("ctrl-shift-tab", AcceptPredictionLine, Some(context::EDITOR)),
         KeyBinding::new("left", MoveLeft, Some(context::EDITOR)),
         KeyBinding::new("right", MoveRight, Some(context::EDITOR)),
         KeyBinding::new("up", MoveUp, Some(context::EDITOR)),
@@ -509,6 +567,10 @@ pub enum Dispatch {
     RunTestsInFile,
     RerunFailedTests,
     FindInProject,
+    ToggleDebugPanel,
+    StartDebugging,
+    StopDebugging,
+    ToggleBreakpoint,
     Artisan,
     FormatDocument,
     GoToWorkspaceSymbol,
@@ -566,6 +628,10 @@ pub fn dispatch_for(id: CommandId) -> Dispatch {
         "tests.run_file" => Dispatch::RunTestsInFile,
         "tests.rerun_failed" => Dispatch::RerunFailedTests,
         "editor.find_in_project" => Dispatch::FindInProject,
+        "debug.toggle_panel" => Dispatch::ToggleDebugPanel,
+        "debug.start" => Dispatch::StartDebugging,
+        "debug.stop" => Dispatch::StopDebugging,
+        "debug.toggle_breakpoint" => Dispatch::ToggleBreakpoint,
         "laravel.artisan" => Dispatch::Artisan,
         "editor.format" => Dispatch::FormatDocument,
         "navigate.workspace_symbol" => Dispatch::GoToWorkspaceSymbol,
@@ -775,6 +841,66 @@ mod tests {
                  ships the popup unreachable by keyboard: {binding}"
             );
         }
+    }
+
+    #[test]
+    fn no_duplicate_bindings_within_a_context() {
+        // The bug this exists to keep fixed: the preview pane (#31) bound ⌘⇧P in
+        // `WORKSPACE`, which the command palette had already claimed fourteen lines above.
+        // gpui resolves the later binding, so the palette became unreachable and ⌘⇧P opened
+        // a WKWebView instead. It shipped, and the owner reported it as "⌘⇧P agora abre o
+        // navegador".
+        //
+        // Nothing caught it: 1661 tests passed, the build was clean, and the binding's own
+        // comment asserted the chord was free. That is the real finding — a keymap with 135
+        // bindings is past the size where reading it proves anything, so the check has to be
+        // mechanical.
+        //
+        // Same chord in *different* contexts is correct and common: `enter` confirms in the
+        // palette and inserts a newline in the editor. Only a collision within one context
+        // is a bug, because only then does one binding silently shadow the other.
+        use std::collections::HashMap;
+
+        let source = keymap_source();
+        let mut seen: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+
+        for line in source.lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("KeyBinding::new(\"") else { continue };
+            let Some((chord, rest)) = rest.split_once("\", ") else { continue };
+            let Some((action, rest)) = rest.split_once(',') else { continue };
+            // `Some(context::WORKSPACE)),` -> `WORKSPACE`. Trimming to the identifier rather
+            // than stripping known suffixes: the trailing punctuation varies with
+            // formatting, and a context key that silently carries `)),` would compare
+            // unequal to the same context written differently — a collision this test
+            // exists to catch would slip through as two distinct keys.
+            let Some(context) = rest
+                .split("context::")
+                .nth(1)
+                .map(|c| c.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+            else {
+                continue;
+            };
+            seen.entry((chord, context)).or_default().push(action.trim());
+        }
+
+        assert!(
+            seen.len() > 100,
+            "the keymap parser matched only {} bindings — it has drifted from the source it reads",
+            seen.len()
+        );
+
+        let collisions: Vec<_> = seen
+            .iter()
+            .filter(|(_, actions)| actions.len() > 1)
+            .map(|((chord, context), actions)| format!("  {chord} in {context} -> {actions:?}"))
+            .collect();
+
+        assert!(
+            collisions.is_empty(),
+            "one chord cannot mean two things in the same context — the later binding wins \
+             and the earlier one silently stops working:\n{}",
+            collisions.join("\n")
+        );
     }
 
     #[test]

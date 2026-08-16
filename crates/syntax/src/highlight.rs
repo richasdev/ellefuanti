@@ -522,19 +522,39 @@ fn collect_text_regions(
 /// - Everything else is prose and stays plain — colouring text content is not the job,
 ///   the same rule the real HTML grammar's test pins.
 fn html_markup_spans(buffer: &Buffer, region: Range<usize>) -> Vec<HighlightSpan> {
-    let base = region.start;
-    let text = buffer.slice(region.clone());
+    // Snapped for `blade_spans`'s reason: `slice` rounds to a char boundary internally, so
+    // an unsnapped `base` would label every span a few bytes off and produce ranges that
+    // split characters.
+    let base = buffer.round_to_boundary(region.start);
+    let text = buffer.slice(base..buffer.round_to_boundary(region.end));
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
 
     // The Blade openers, longest first, shared by both scanning positions.
-    fn blade_skip(text: &str, i: usize) -> Option<usize> {
-        for (open, close) in [("{{--", "--}}"), ("{!!", "!!}"), ("{{", "}}")] {
-            if text[i..].starts_with(open) {
-                let end = text[i + open.len()..]
-                    .find(close)
-                    .map_or(text.len(), |p| i + open.len() + p + close.len());
+    /// Matches on **bytes**, never on `&str`.
+    ///
+    /// This is the 2026-08-14 crash: the scan walks `i` over `bytes`, so `i` routinely
+    /// lands inside a multi-byte character, and the previous `text[i..]` panicked with
+    /// "byte index N is not a char boundary" — during *render*, so merely opening a Blade
+    /// template with an accent in it killed the window. `<div>Configuração</div>` was
+    /// enough.
+    ///
+    /// Byte matching is correct here rather than merely panic-free: every delimiter
+    /// (`{{--`, `{!!`, `{{`, and their closers) is pure ASCII, and UTF-8 guarantees an
+    /// ASCII byte never appears inside a multi-byte character. So a byte-level match finds
+    /// exactly the same delimiters a char-level one would, and the returned offsets always
+    /// land on boundaries — the `assert` in the caller's tests pins that.
+    fn blade_skip(bytes: &[u8], i: usize) -> Option<usize> {
+        for (open, close) in
+            [(&b"{{--"[..], &b"--}}"[..]), (&b"{!!"[..], &b"!!}"[..]), (&b"{{"[..], &b"}}"[..])]
+        {
+            if bytes[i..].starts_with(open) {
+                let from = i + open.len();
+                let end = bytes[from..]
+                    .windows(close.len())
+                    .position(|w| w == close)
+                    .map_or(bytes.len(), |p| from + p + close.len());
                 return Some(end);
             }
         }
@@ -542,12 +562,18 @@ fn html_markup_spans(buffer: &Buffer, region: Range<usize>) -> Vec<HighlightSpan
     }
 
     while i < bytes.len() {
-        if let Some(end) = blade_skip(&text, i) {
+        if let Some(end) = blade_skip(bytes, i) {
             i = end;
             continue;
         }
-        if text[i..].starts_with("<!--") {
-            let end = text[i + 4..].find("-->").map_or(text.len(), |p| i + 4 + p + 3);
+        // Bytes, not `&str`, for `blade_skip`'s reason: `i` is a byte cursor that lands
+        // inside multi-byte characters, and `<!--`/`-->` are ASCII so the match is
+        // identical either way.
+        if bytes[i..].starts_with(b"<!--") {
+            let end = bytes[i + 4..]
+                .windows(3)
+                .position(|w| w == b"-->")
+                .map_or(bytes.len(), |p| i + 4 + p + 3);
             spans.push(HighlightSpan {
                 range: base + i..base + end,
                 style: HighlightStyle::Comment,
@@ -572,7 +598,7 @@ fn html_markup_spans(buffer: &Buffer, region: Range<usize>) -> Vec<HighlightSpan
 
             // Inside the tag until `>`: attributes and values.
             while i < bytes.len() && bytes[i] != b'>' {
-                if let Some(end) = blade_skip(&text, i) {
+                if let Some(end) = blade_skip(bytes, i) {
                     i = end;
                     continue;
                 }
@@ -606,7 +632,7 @@ fn html_markup_spans(buffer: &Buffer, region: Range<usize>) -> Vec<HighlightSpan
                             i = bytes.len();
                             break;
                         }
-                        if let Some(end) = blade_skip(&text, j) {
+                        if let Some(end) = blade_skip(bytes, j) {
                             if seg_start < j {
                                 spans.push(HighlightSpan {
                                     range: base + seg_start..base + j,
@@ -656,8 +682,13 @@ fn html_markup_spans(buffer: &Buffer, region: Range<usize>) -> Vec<HighlightSpan
 fn blade_spans(buffer: &Buffer, range: &Range<usize>) -> Vec<HighlightSpan> {
     // Widen slightly so a construct straddling the viewport edge still highlights.
     const PAD: usize = 256;
-    let start = range.start.saturating_sub(PAD);
-    let end = (range.end + PAD).min(buffer.len_bytes());
+    // Snapped to char boundaries before use, not after: `slice` rounds internally, so an
+    // unsnapped `start` gives text that begins a few bytes later than `start` claims. The
+    // spans below are labelled `start + i`, and that mismatch shipped ranges that split
+    // characters — which panics the renderer slicing the line to paint it. Found by
+    // scrolling an accented template, not by reading (2026-08-14).
+    let start = buffer.round_to_boundary(range.start.saturating_sub(PAD));
+    let end = buffer.round_to_boundary((range.end + PAD).min(buffer.len_bytes()));
     let text = buffer.slice(start..end);
 
     let mut spans = Vec::new();
@@ -1483,5 +1514,99 @@ mod tests {
         // The `PlainText` fallback is deliberate (#53) and adding four languages must not
         // have turned an unrecognised file into a parse error.
         assert!(spans_of(Language::PlainText, "{ \"a\": 1 }").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod blade_utf8_tests {
+    use super::*;
+
+    /// The viewport path, where the 256-byte `PAD` can begin mid-character.
+    ///
+    /// `blade_spans` widens the requested range by `PAD` before slicing the buffer, so the
+    /// slice boundary is arbitrary — with accented prose it lands inside a character
+    /// roughly one time in two. Scrolling a long Portuguese or Japanese template is
+    /// therefore its own crash path, separate from `blade_skip`'s, and it only shows up
+    /// once the file is longer than the padding.
+    #[test]
+    fn scrolling_an_accented_template_does_not_panic() {
+        // Long enough that the requested range is deep inside the buffer, and dense with
+        // multi-byte characters so the padded edge lands mid-character.
+        let line = "<div class=\"caixa\">Configuração {{ $índice }} 日本語</div>\n";
+        let source: String = std::iter::repeat(line).take(200).collect();
+
+        let buffer = Buffer::new(&source);
+        let tree = SyntaxTree::new(Language::Blade, &buffer).expect("grammar");
+
+        // Walk a viewport across the whole file, one byte at a time near the start, then
+        // in strides — every offset is a place the user can scroll to.
+        let len = source.len();
+        let offsets = (0..600).chain((600..len).step_by(97));
+        for at in offsets {
+            let end = (at + 400).min(len);
+            let spans = tree.highlights(&buffer, at..end);
+            for span in &spans {
+                assert!(
+                    source.is_char_boundary(span.range.start)
+                        && source.is_char_boundary(span.range.end),
+                    "span {:?} splits a character (viewport {at}..{end})",
+                    span.range
+                );
+            }
+        }
+    }
+
+    /// A Blade template with accented text — the crash reported on 2026-08-14.
+    ///
+    /// The macOS report named it exactly: `core::str::slice_error_fail` inside
+    /// `html_markup_spans::blade_skip`, reached from `SyntaxTree::highlights` and
+    /// `EditorView::render_rows`. The scanner walks `i` over **bytes** but calls
+    /// `text[i..]`, a **string** slice, at every position; when `i` lands inside a
+    /// multi-byte character the slice panics and takes the window with it.
+    ///
+    /// Rendering is the trigger, so the file only has to be *shown* — a Portuguese or
+    /// Japanese Blade template crashed the editor on open, which is most templates in
+    /// this owner's projects.
+    #[test]
+    fn accented_blade_templates_do_not_panic_while_highlighting() {
+        let sources = [
+            // The reported shape: prose with accents beside markup.
+            "<div>Configuração</div>\n",
+            // Accents immediately before a Blade opener, so `i` lands mid-character
+            // exactly where `blade_skip` looks.
+            "<p>ação{{ $x }}</p>\n",
+            // Inside a quoted attribute value, the other `blade_skip` call site.
+            "<div class=\"caixa-ção {{ $c }}\">olá</div>\n",
+            // Multi-byte inside the Blade construct itself.
+            "{{ $café }}\n",
+            "{{-- comentário em português --}}\n",
+            "{!! $conteúdo !!}\n",
+            // Non-Latin and emoji, four bytes each.
+            "<span>日本語のテキスト</span>\n",
+            "<div title=\"👨‍👩‍👧‍👦\">{{ $familia }}</div>\n",
+            // An unterminated construct after multi-byte text: the `map_or(text.len())`
+            // fallback path.
+            "<p>ação{{ $x\n",
+            // A combining mark, where the char boundary is not where it looks.
+            "<div>e\u{0301}poca {{ $n }}</div>\n",
+        ];
+
+        for source in sources {
+            let buffer = Buffer::new(source);
+            let tree = SyntaxTree::new(Language::Blade, &buffer)
+                .expect("the blade grammar must load");
+            // The panic was in here, during render.
+            let spans = tree.highlights(&buffer, 0..source.len());
+            // Spans must also stay on char boundaries: a range that splits a character
+            // panics later, when the renderer slices the line to paint it.
+            for span in &spans {
+                assert!(
+                    source.is_char_boundary(span.range.start)
+                        && source.is_char_boundary(span.range.end),
+                    "span {:?} splits a character in {source:?}",
+                    span.range
+                );
+            }
+        }
     }
 }

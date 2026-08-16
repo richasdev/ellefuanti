@@ -177,7 +177,12 @@ impl Buffer {
     /// a click resolved to a byte column). Note that ropey's `try_byte_to_char` is *not*
     /// a boundary check — it returns `Ok` for a mid-codepoint byte, silently rounding
     /// down — so the round trip through char space below is what actually normalises.
-    fn round_to_boundary(&self, offset: usize) -> usize {
+    /// Public because a caller that slices *and* reports offsets into the result needs the
+    /// same snapped value the slice used. `blade_spans` widens a viewport by a fixed byte
+    /// padding and then labels its spans `start + i`; when the unsnapped `start` sat inside
+    /// a character, `slice` silently rounded but the labels did not, and the spans came out
+    /// a few bytes off — splitting characters and panicking the renderer that painted them.
+    pub fn round_to_boundary(&self, offset: usize) -> usize {
         let offset = offset.min(self.rope.len_bytes());
         self.rope.char_to_byte(self.rope.byte_to_char(offset))
     }

@@ -5,6 +5,37 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Edit prediction na forma do Zed.** Digitar o prefixo previsto encolhe a sugestão no
+  lugar em vez de apagá-la (interpolação); `⌃Tab` aceita a próxima palavra e `⌃⇧Tab` a
+  próxima linha, com o resto continuando visível; o eco do fechador já presente é cortado
+  (`foo(|)` + `$bar)` nunca duplica o `)`); sugestão só-de-indentação ganha um wash de
+  fundo para ser visível. `editor/ghost.rs` virou `edit_prediction/{state,provider}.rs`.
+- **Autocomplete via Codex (experimental).** Opt-in por `ai.codex_autocomplete`: um child
+  `codex app-server` próprio (nunca o do chat), thread read-only sem `cwd`, debounce de
+  1s, e um gate de latência — mediana acima de 3s desliga o recurso e a settings row diz
+  o porquê.
+- **Histórico do chat sobrevive ao restart.** `chat_history.json` ao lado do settings,
+  escrito atomicamente, últimos 200 turns; com Codex o painel avisa que o contexto do
+  agente recomeça (a thread vive no CLI).
+- **Streaming suave no chat.** Deltas revelam a ~60fps com taxa adaptativa (~200ms de
+  backlog), em vez de saltar um parágrafo por lote.
+- **Backspace desfaz o par do auto-close.** Entre um par vazio, apaga os dois num undo
+  step.
+
+### Fixed
+
+- Cartão de proposal aplicado colapsa mesmo quando o CLI nunca pergunta (providers HTTP,
+  turns workspace-write); decisão é lembrada para responder pergunta tardia do CLI.
+- `ApprovalKind::Unknown` só oferece Deny e sempre responde no wire — um request sem
+  resposta parava o CLI para sempre.
+- Nota vazia não renderiza mais o "!" órfão; `![imagem](url)` renderiza como link.
+- Proposta de delete não é mais engolida pelo pre-flight de staleness, e o cartão diz
+  antes do clique que este build não aplica deletes.
+
 ## [0.4.0] — 2026-08-13
 
 Menor, não correção: três das quatro entregas são funcionalidades visíveis.

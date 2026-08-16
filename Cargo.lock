@@ -1617,6 +1617,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "elle-debug"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+]
+
+[[package]]
 name = "elle-docker"
 version = "0.1.0"
 dependencies = [
@@ -1764,6 +1772,7 @@ dependencies = [
  "anyhow",
  "elle-core",
  "elle-db",
+ "elle-debug",
  "elle-docker",
  "elle-git",
  "elle-index",
@@ -1788,6 +1797,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "smol",
  "tempfile",

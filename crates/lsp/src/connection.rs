@@ -48,6 +48,31 @@ pub enum RequestOutcome {
     Cancelled,
 }
 
+/// Locks a mutex, keeping the data even if a previous holder panicked.
+///
+/// # Why this is not `lock().unwrap()`
+///
+/// A `Mutex` lock fails for exactly one reason: some thread panicked while holding it, and
+/// Rust marks it poisoned so the next caller learns the data may be half-updated.
+/// `unwrap()` there turns *someone else's* panic into *this* thread's panic, which is how
+/// issue #43 killed a whole session — the shared condvar panicked one waiter while it held
+/// `inbox`, and the reader thread then died on the next `inbox.lock().unwrap()`. One bug
+/// became a dead language server for the rest of the session.
+///
+/// Continuing is the right call for this connection's state specifically, because none of
+/// it has an invariant that spans two fields: `pending` is a map of replies, `inbox` a
+/// queue of messages, `failure` a string. A panic mid-update can leave a stale entry — it
+/// cannot leave two fields disagreeing. The worst case is one request that times out
+/// (`wait` has a deadline for exactly this) against a session that keeps working, and that
+/// trade is what §24 asks for: a misbehaving server must not stop the user editing.
+///
+/// The panic itself is not swallowed — `install_panic_logger` in the app crate writes it to
+/// `crash.log` with its real location, so the cause stays visible instead of being
+/// reported as whatever the cascade touched last.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// State shared between the caller and the reader thread.
 struct Shared {
     /// Requests awaiting a reply, keyed by id. Removing an entry cancels the wait.
@@ -84,7 +109,7 @@ impl Shared {
     /// reported error and being a frozen editor (§24).
     fn close(&self, reason: Option<String>) {
         if let Some(reason) = reason {
-            *self.failure.lock().unwrap() = Some(reason);
+            *lock(&self.failure) = Some(reason);
         }
         self.closed.store(true, Ordering::SeqCst);
 
@@ -94,11 +119,11 @@ impl Shared {
         // `closed` but has not yet started waiting; missing that wakeup would leave it
         // blocked on a connection that is already dead.
         {
-            let _pending = self.pending.lock().unwrap();
+            let _pending = lock(&self.pending);
             self.replied.notify_all();
         }
         {
-            let _inbox = self.inbox.lock().unwrap();
+            let _inbox = lock(&self.inbox);
             self.pushed.notify_all();
         }
     }
@@ -159,7 +184,7 @@ impl Connection {
 
     /// Why the connection ended, if it ended badly.
     pub fn failure(&self) -> Option<String> {
-        self.shared.failure.lock().unwrap().clone()
+        lock(&self.shared.failure).clone()
     }
 
     /// Sends a notification. Fire and forget: there is no reply to wait for.
@@ -183,11 +208,11 @@ impl Connection {
 
         // Registered *before* the write, so a reply that arrives while we are still in
         // `write` has somewhere to land instead of being dropped as unknown.
-        self.shared.pending.lock().unwrap().insert(id.clone(), None);
+        lock(&self.shared.pending).insert(id.clone(), None);
 
         let body = serde_json::to_vec(&Request::new(id.clone(), method, params))?;
         if let Err(err) = self.write(&body) {
-            self.shared.pending.lock().unwrap().remove(&id);
+            lock(&self.shared.pending).remove(&id);
             return Err(err);
         }
         Ok(id)
@@ -200,7 +225,7 @@ impl Connection {
     /// forever, because §24 says a misbehaving server may not stop the user editing.
     pub fn wait(&self, id: &RequestId, timeout: Duration) -> Result<RequestOutcome> {
         let deadline = Instant::now() + timeout;
-        let mut pending = self.shared.pending.lock().unwrap();
+        let mut pending = lock(&self.shared.pending);
 
         loop {
             match pending.get(id) {
@@ -227,11 +252,7 @@ impl Connection {
 
             if self.shared.closed.load(Ordering::SeqCst) {
                 pending.remove(id);
-                let reason = self
-                    .shared
-                    .failure
-                    .lock()
-                    .unwrap()
+                let reason = lock(&self.shared.failure)
                     .clone()
                     .unwrap_or_else(|| "the language server exited".to_string());
                 bail!("{reason}");
@@ -243,7 +264,14 @@ impl Connection {
                 bail!("the language server did not answer within {timeout:?}");
             }
 
-            let (guard, _) = self.shared.replied.wait_timeout(pending, remaining).unwrap();
+            // Poison-tolerant for `lock`'s reasons: waiting on a reply must not turn another
+            // thread's panic into this one's. The guard is inside the error, so it is
+            // recovered rather than unwrapped.
+            let (guard, _) = self
+                .shared
+                .replied
+                .wait_timeout(pending, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending = guard;
         }
     }
@@ -264,7 +292,7 @@ impl Connection {
     /// A closed connection reports the failure rather than pending forever, so a caller
     /// looping on this cannot spin after the server has died.
     pub fn poll(&self, id: &RequestId) -> Result<Option<RequestOutcome>> {
-        let mut pending = self.shared.pending.lock().unwrap();
+        let mut pending = lock(&self.shared.pending);
 
         match pending.get(id) {
             Some(Some(_)) => {
@@ -322,7 +350,7 @@ impl Connection {
             // a waiter re-check its condition and start waiting in the gap, missing the
             // wakeup and then blocking until its timeout — a cancel that appears to
             // hang, which is the exact symptom cancellation exists to prevent.
-            let mut pending = self.shared.pending.lock().unwrap();
+            let mut pending = lock(&self.shared.pending);
             if pending.remove(id).is_none() {
                 // Already answered or already cancelled; sending `$/cancelRequest` for
                 // an unknown id just makes noise in the server's log.
@@ -338,7 +366,7 @@ impl Connection {
 
     /// Takes everything the server has sent that was not a reply.
     pub fn drain_inbox(&self) -> Vec<ServerMessage> {
-        std::mem::take(&mut *self.shared.inbox.lock().unwrap())
+        std::mem::take(&mut *lock(&self.shared.inbox))
     }
 
     /// Blocks until at least one server message is available, or the timeout elapses.
@@ -352,7 +380,7 @@ impl Connection {
     /// condvar between the two mutexes is what caused #43 — see [`Shared::pushed`].
     pub fn wait_for_inbox(&self, timeout: Duration) -> Vec<ServerMessage> {
         let deadline = Instant::now() + timeout;
-        let mut inbox = self.shared.inbox.lock().unwrap();
+        let mut inbox = lock(&self.shared.inbox);
 
         loop {
             if !inbox.is_empty() {
@@ -369,7 +397,12 @@ impl Connection {
                 return Vec::new();
             }
 
-            let (guard, _) = self.shared.pushed.wait_timeout(inbox, remaining).unwrap();
+            // Poison-tolerant, as on the `replied` wait above.
+            let (guard, _) = self
+                .shared
+                .pushed
+                .wait_timeout(inbox, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             inbox = guard;
         }
     }
@@ -380,7 +413,7 @@ impl Connection {
                 self.failure().unwrap_or_else(|| "the language server exited".to_string())
             ));
         }
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = lock(&self.writer);
         write_message(&mut *writer, body)
     }
 
@@ -388,7 +421,7 @@ impl Connection {
     ///
     /// This is what makes a server exit after `exit`: most read stdin to EOF.
     pub fn close_writer(&self) {
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = lock(&self.writer);
         *writer = Box::new(std::io::sink());
     }
 
@@ -397,7 +430,7 @@ impl Connection {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if self.is_closed() {
-                if let Some(handle) = self.reader.lock().unwrap().take() {
+                if let Some(handle) = lock(&self.reader).take() {
                     let _ = handle.join();
                 }
                 return true;
@@ -423,7 +456,7 @@ fn read_loop(input: impl Read, shared: &Arc<Shared>) {
 
                 match message {
                     Incoming::Response { id, result } => {
-                        let mut pending = shared.pending.lock().unwrap();
+                        let mut pending = lock(&shared.pending);
                         // `get_mut` rather than `insert`: if the entry is gone the
                         // request was cancelled, and resurrecting it would leak an
                         // entry nobody will ever collect.
@@ -438,12 +471,12 @@ fn read_loop(input: impl Read, shared: &Arc<Shared>) {
                     // re-checked and started waiting in the gap would otherwise sleep
                     // through the very message it was waiting for.
                     Incoming::Notification { method, params } => {
-                        let mut inbox = shared.inbox.lock().unwrap();
+                        let mut inbox = lock(&shared.inbox);
                         inbox.push(ServerMessage::Notification { method, params });
                         shared.pushed.notify_all();
                     }
                     Incoming::Request { id, method, params } => {
-                        let mut inbox = shared.inbox.lock().unwrap();
+                        let mut inbox = lock(&shared.inbox);
                         inbox.push(ServerMessage::Request { id, method, params });
                         shared.pushed.notify_all();
                     }

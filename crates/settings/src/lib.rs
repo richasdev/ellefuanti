@@ -36,7 +36,7 @@ mod file;
 mod paths;
 
 pub use file::{Load, Settings, SettingsError};
-pub use paths::{settings_path, support_dir};
+pub use paths::{crash_log_path, settings_path, support_dir};
 
 /// Bumped when a *readable* older file would be understood wrongly by this build — a key
 /// whose meaning changed, not a key that was added.
