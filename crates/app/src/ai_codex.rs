@@ -853,7 +853,11 @@ mod tests {
         assert!(changes[0].diff.contains("+    return 'shape';"));
 
         let failed = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"x","changes":[{"path":"/a","kind":{"type":"update"},"diff":"d"}],"status":"failed"}}}"#;
-        assert_eq!(parse_line(failed), Some(CodexEvent::ActivityEnded), "a failed write wrote nothing");
+        assert_eq!(
+            parse_line(failed),
+            Some(CodexEvent::ActivityEnded),
+            "a failed write wrote nothing"
+        );
     }
 
     #[test]
@@ -1082,7 +1086,7 @@ mod binary_resolution_tests {
 
         // With the fallback directory supplied, exactly as `search_dirs` supplies it.
         assert_eq!(
-            crate::lsp_session::resolve_binary("codex-probe", &[dir.clone()]),
+            crate::lsp_session::resolve_binary("codex-probe", std::slice::from_ref(&dir)),
             Some(fake.clone()),
             "the resolver must find a CLI that PATH does not mention"
         );
@@ -1131,7 +1135,10 @@ mod approval_kind_tests {
             Some(CodexEvent::ActionApprovalRequested { request_id, kind, summary }) => {
                 assert_eq!(request_id, 9);
                 assert_eq!(kind, ApprovalKind::Permissions);
-                assert!(summary.contains("docs server"), "the reason must reach the user: {summary}");
+                assert!(
+                    summary.contains("docs server"),
+                    "the reason must reach the user: {summary}"
+                );
             }
             other => panic!("a permissions approval must be answerable, got {other:?}"),
         }
@@ -1163,10 +1170,7 @@ mod approval_kind_tests {
         let file = r#"{"jsonrpc":"2.0","id":0,"method":"item/fileChange/requestApproval","params":{"itemId":"exec-10e2"}}"#;
         assert_eq!(
             parse_line(file),
-            Some(CodexEvent::ApprovalRequested {
-                request_id: 0,
-                item_id: "exec-10e2".to_string()
-            })
+            Some(CodexEvent::ApprovalRequested { request_id: 0, item_id: "exec-10e2".to_string() })
         );
     }
 

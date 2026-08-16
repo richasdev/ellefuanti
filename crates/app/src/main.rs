@@ -11,6 +11,7 @@ mod completion;
 mod context_menu;
 mod debug_session;
 mod debug_view;
+mod edit_prediction;
 mod editor;
 mod file_cache;
 mod file_icons;
@@ -70,10 +71,7 @@ fn path_argument() -> Option<std::path::PathBuf> {
     // The first argument that is not a flag. `nth(1)` broke the moment `-w` existed:
     // `ellefuanti -w .` put the path second, and the old read found the flag, skipped it
     // as a `-psn`-style non-path, and opened an empty window.
-    std::env::args()
-        .skip(1)
-        .find(|raw| !raw.starts_with('-'))
-        .map(std::path::PathBuf::from)
+    std::env::args().skip(1).find(|raw| !raw.starts_with('-')).map(std::path::PathBuf::from)
 }
 
 /// `-w` / `--wait`: hold the terminal until the window closes, vim's working rhythm.
@@ -171,10 +169,7 @@ fn crash_report(
     thread: &str,
     when: std::time::SystemTime,
 ) -> String {
-    let secs = when
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = when.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!(
         "\n===== ellefuanti panic =====\n\
          when:     {secs} (unix seconds)\n\
@@ -237,9 +232,7 @@ fn install_panic_logger() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut file) =
-            std::fs::OpenOptions::new().create(true).append(true).open(&path)
-        {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             use std::io::Write as _;
             let _ = file.write_all(report.as_bytes());
             let _ = file.flush();
@@ -437,11 +430,8 @@ mod tests {
         let sink = path.clone();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let payload = info
-                .payload()
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .unwrap_or_default();
+            let payload =
+                info.payload().downcast_ref::<&str>().map(|s| (*s).to_string()).unwrap_or_default();
             let report = crash_report(
                 &payload,
                 info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())),
@@ -465,4 +455,3 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-

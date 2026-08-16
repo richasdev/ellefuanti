@@ -85,6 +85,10 @@ impl From<StoredTurn> for ChatTurn {
 }
 
 /// `~/Library/Application Support/ellefuanti/chat_history.json`.
+///
+/// Callers live behind `cfg(not(test))` — a test must never read or overwrite the
+/// owner's real history — so the test build sees this as dead code. It is not.
+#[cfg_attr(test, allow(dead_code))]
 pub fn history_path() -> Option<PathBuf> {
     Some(elle_settings::support_dir()?.join("chat_history.json"))
 }
@@ -137,7 +141,10 @@ mod tests {
                 text: "Feito — ação concluída.".to_string(),
                 flow: vec![
                     FlowBlock::Text("Feito — ".to_string()),
-                    FlowBlock::Activity { label: "Applied web.php (+3 −1)".to_string(), done: true },
+                    FlowBlock::Activity {
+                        label: "Applied web.php (+3 −1)".to_string(),
+                        done: true,
+                    },
                     FlowBlock::Text("ação concluída.".to_string()),
                 ],
             },

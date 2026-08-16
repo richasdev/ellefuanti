@@ -25,6 +25,8 @@ actions!(
         Delete,
         Newline,
         Tab,
+        AcceptPredictionWord,
+        AcceptPredictionLine,
         MoveLeft,
         MoveRight,
         MoveUp,
@@ -447,6 +449,11 @@ pub fn init(cx: &mut App) -> CommandRegistry {
         KeyBinding::new("delete", Delete, Some(context::EDITOR)),
         KeyBinding::new("enter", Newline, Some(context::EDITOR)),
         KeyBinding::new("tab", Tab, Some(context::EDITOR)),
+        // Partial accepts for the AI ghost (#29, Zed's granularity): word, then line.
+        // ⌃Tab is free here (the OS keeps ⌘Tab; in-app tab cycling is ⌘⇧[ ]), and both
+        // are no-ops without a visible ghost, so the keys cost nothing when idle.
+        KeyBinding::new("ctrl-tab", AcceptPredictionWord, Some(context::EDITOR)),
+        KeyBinding::new("ctrl-shift-tab", AcceptPredictionLine, Some(context::EDITOR)),
         KeyBinding::new("left", MoveLeft, Some(context::EDITOR)),
         KeyBinding::new("right", MoveRight, Some(context::EDITOR)),
         KeyBinding::new("up", MoveUp, Some(context::EDITOR)),
@@ -876,7 +883,11 @@ mod tests {
             seen.entry((chord, context)).or_default().push(action.trim());
         }
 
-        assert!(seen.len() > 100, "the keymap parser matched only {} bindings — it has drifted from the source it reads", seen.len());
+        assert!(
+            seen.len() > 100,
+            "the keymap parser matched only {} bindings — it has drifted from the source it reads",
+            seen.len()
+        );
 
         let collisions: Vec<_> = seen
             .iter()

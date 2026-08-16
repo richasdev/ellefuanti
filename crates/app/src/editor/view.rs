@@ -16,15 +16,16 @@ use gpui::{
 };
 
 use crate::actions::{
-    Backspace, Copy, Cut, Delete, DeleteLine, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
-    DeleteWordRight, DuplicateLineDown, DuplicateLineUp, FoldBlock, Indent, MoveDocumentEnd,
-    MoveDocumentStart, MoveDown, MoveLeft, MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp,
-    MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent,
-    Paste, Redo, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft,
-    SelectLineEnd, SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab,
-    ToggleComment, Undo, UnfoldBlock, context,
+    AcceptPredictionLine, AcceptPredictionWord, Backspace, Copy, Cut, Delete, DeleteLine,
+    DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft, DeleteWordRight, DuplicateLineDown,
+    DuplicateLineUp, FoldBlock, Indent, MoveDocumentEnd, MoveDocumentStart, MoveDown, MoveLeft,
+    MoveLineDown, MoveLineEnd, MoveLineStart, MoveLineUp, MoveRight, MoveUp, MoveWordLeft,
+    MoveWordRight, Newline, OpenLineAbove, OpenLineBelow, Outdent, Paste, Redo, SelectAll,
+    SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineStart,
+    SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Tab, ToggleComment, Undo, UnfoldBlock,
+    context,
 };
-use crate::editor::ghost::{self, GhostSuggestion};
+use crate::edit_prediction::{provider, state::Prediction};
 use crate::editor::ime;
 use crate::editor::inlay::{HintKind, ResolvedHint, hints_on_line};
 use crate::editor::input_element::InputHandlerElement;
@@ -154,17 +155,17 @@ pub struct EditorView {
     /// The AI ghost suggestion, if one is showing (#29).
     ///
     /// Stamped with the buffer version and cursor offset it was made for, and only ever
-    /// consulted through its validity check — see [`GhostSuggestion::is_valid_for`]. The
+    /// consulted through its validity check — see [`Prediction::is_valid_for`]. The
     /// stamp is what makes stale state harmless: paths that move the cursor without
     /// passing through a dismissal leave a ghost that simply never renders or accepts.
-    ghost: Option<GhostSuggestion>,
+    ghost: Option<Prediction>,
     /// The 400ms pause-then-request timer (#29). Dropping it cancels it — the blink's
     /// contract — so every keystroke replaces the task rather than stacking timers, and
     /// no timer exists at all while the feature is off or the editor sits unedited (#93).
     ghost_debounce: Option<gpui::Task<()>>,
     /// The completion request in flight, at most one (#93). The task owns the `curl`
     /// child via `kill_on_drop`, so replacing or clearing this slot kills the process —
-    /// see `editor::ghost`'s module doc for the full cancellation chain.
+    /// see `edit_prediction::provider`'s module doc for the full cancellation chain.
     ghost_request: Option<gpui::Task<()>>,
     /// Bumped by every dismissal; a request result whose epoch no longer matches is
     /// discarded. Belt to the version-stamp's braces: the stamp proves the *document*
@@ -751,6 +752,26 @@ impl EditorView {
         self.tab_impl(cx);
     }
 
+    /// ⌃Tab / ⌃⇧Tab do nothing without a visible ghost — a partial accept of nothing is
+    /// not a keystroke worth stealing, so the keys stay free for whatever comes later.
+    fn accept_prediction_word(
+        &mut self,
+        _: &AcceptPredictionWord,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.accept_ghost_word(cx);
+    }
+
+    fn accept_prediction_line(
+        &mut self,
+        _: &AcceptPredictionLine,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.accept_ghost_line(cx);
+    }
+
     /// Split from the handler so tests can drive it without a `Window` (unused anyway).
     fn tab_impl(&mut self, cx: &mut Context<Self>) {
         // A visible ghost claims Tab first (#29): accepting is what the dimmed text has
@@ -1072,7 +1093,7 @@ impl EditorView {
     //   - any edit or cursor move discards; Tab accepts; Escape dismisses.
 
     /// The ghost, if it is showing *right now* — stamped for exactly this buffer state.
-    fn visible_ghost(&self) -> Option<&GhostSuggestion> {
+    fn visible_ghost(&self) -> Option<&Prediction> {
         self.ghost.as_ref().filter(|ghost| ghost.is_valid_for(&self.document))
     }
 
@@ -1088,8 +1109,19 @@ impl EditorView {
         self.ghost = None;
     }
 
-    /// The edit half of the lifecycle: discard, then re-arm the debounce while enabled.
+    /// The edit half of the lifecycle: interpolate if the user typed the prediction's
+    /// own prefix, otherwise discard and re-arm the debounce while enabled.
     fn ghost_after_edit(&mut self, cx: &mut Context<Self>) {
+        // Zed's `interpolate_edits`, the single biggest quality jump over the first
+        // ghost: typing through the suggestion shrinks it in place — no flicker, no new
+        // request, no 400ms wait. Divergence falls through to the ordinary dismiss.
+        if let Some(ghost) = self.ghost.take()
+            && let Some(shrunk) = ghost.interpolated(&self.document)
+        {
+            self.ghost = Some(shrunk);
+            cx.notify();
+            return;
+        }
         self.dismiss_ghost();
         // Tests drive edits by the thousand and must never find a timer or a subprocess
         // behind one — the same blanket guard the update check uses.
@@ -1103,12 +1135,20 @@ impl EditorView {
         self.ghost_debounce = Some(cx.spawn(async move |this, cx| {
             // An edit inside this window drops the task and starts a new one, so a burst
             // of typing costs zero requests — the tree watcher's latest-wins shape.
-            cx.background_executor().timer(ghost::DEBOUNCE).await;
+            cx.background_executor().timer(provider::DEBOUNCE).await;
             let _ = this.update(cx, |this, cx| this.ghost_fire(epoch, cx));
         }));
     }
 
     /// The debounce elapsed with no further edits: snapshot the context and go.
+    ///
+    /// ponytail: no coordination with the completion popup — the popup owns focus and
+    /// therefore Tab (`context::COMPLETION` beats `context::EDITOR`, Zed's
+    /// `!showing_completions` arbitration for free), so the worst case is a dim ghost
+    /// visible under an open menu. Zed also suppresses the request while an LSP
+    /// completion is in flight; wire that through the workspace if the flicker ever
+    /// bothers anyone. Same rung: no gutter "requesting…" pulse — the rows are shaped
+    /// `Line`s, not divs, and an animated element per row is not cheap to add.
     fn ghost_fire(&mut self, epoch: u64, cx: &mut Context<Self>) {
         self.ghost_debounce = None;
         if epoch != self.ghost_epoch {
@@ -1137,17 +1177,20 @@ impl EditorView {
         let offset = self.document.selection.head;
         let version = self.document.buffer.version();
         let text = self.document.buffer.text();
-        let user_turn = ghost::build_user_turn(&text, offset);
-        // The cursor line's tail, for the echo-stripping half of `clean_completion`.
+        let user_turn = provider::build_user_turn(&text, offset);
+        // The cursor line's two halves: the tail before it for the echo-stripping half
+        // of `clean_completion`, the rest after it for the doubled-closer trim.
         let cursor = self.document.cursor_point();
         let line = self.document.buffer.line(cursor.row);
-        let line_before_cursor = line[..cursor.column.min(line.len())].to_string();
+        let split = cursor.column.min(line.len());
+        let line_before_cursor = line[..split].to_string();
+        let line_after_cursor = line[split..].to_string();
 
         // Replacing the slot cancels any older request and kills its curl — at most one
         // in flight, which is the #93 budget for a feature that runs between keystrokes.
         self.ghost_request = Some(cx.spawn(async move |this, cx| {
             let outcome = cx
-                .background_spawn(ghost::fetch_completion(provider, base_url, model, user_turn))
+                .background_spawn(provider::fetch_completion(provider, base_url, model, user_turn))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.ghost_request = None;
@@ -1163,7 +1206,10 @@ impl EditorView {
                         return;
                     }
                 };
-                let cleaned = ghost::clean_completion(&raw, &line_before_cursor);
+                let cleaned = provider::clean_completion(&raw, &line_before_cursor);
+                // Models re-type the closer that already follows the cursor (`foo(|)` →
+                // `$bar)`); the trim is what keeps Tab from doubling it.
+                let cleaned = provider::trim_suffix_overlap(&cleaned, &line_after_cursor);
                 if cleaned.is_empty() {
                     return;
                 }
@@ -1177,7 +1223,7 @@ impl EditorView {
                 if !unchanged {
                     return;
                 }
-                this.ghost = Some(GhostSuggestion { text: cleaned, at_offset: offset, version });
+                this.ghost = Some(Prediction::stamped(cleaned, &this.document));
                 cx.notify();
             });
         }));
@@ -1197,6 +1243,49 @@ impl EditorView {
         self.dismiss_ghost();
         self.document.insert(&ghost.text);
         self.after_edit(cx);
+        true
+    }
+
+    /// ⌃Tab: accept only the prediction's next word — Zed's partial accept. The
+    /// remainder keeps showing, re-stamped, so a chain of ⌃Tabs walks through the
+    /// suggestion one step at a time.
+    fn accept_ghost_word(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_partial(Prediction::word_len, cx)
+    }
+
+    /// ⌃⇧Tab: accept through the prediction's first newline; single-line falls back to
+    /// accepting everything (Zed's rule — a "line" of a one-line suggestion is all of it).
+    fn accept_ghost_line(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_partial(Prediction::line_len, cx)
+    }
+
+    fn accept_ghost_partial(
+        &mut self,
+        step: impl Fn(&Prediction) -> usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.visible_ghost().is_none() {
+            return false;
+        }
+        let ghost = self.ghost.take().expect("visible_ghost checked");
+        let take = step(&ghost).min(ghost.text.len());
+        if take == 0 || take >= ghost.text.len() {
+            // Nothing partial about it: fall back to the full accept.
+            self.dismiss_ghost();
+            self.document.insert(&ghost.text);
+            self.after_edit(cx);
+            return true;
+        }
+        let head = ghost.text[..take].to_string();
+        let rest = ghost.text[take..].to_string();
+        self.dismiss_ghost();
+        self.document.insert(&head);
+        self.after_edit(cx);
+        // The rest keeps showing, stamped for the document as it now stands. The
+        // debounce `after_edit` armed stays armed on purpose: a refresh may improve the
+        // remainder (Zed's `PredictionPartiallyAccepted` re-request).
+        self.ghost = Some(Prediction::stamped(rest, &self.document));
+        cx.notify();
         true
     }
 
@@ -1241,11 +1330,17 @@ impl EditorView {
     /// Plants a suggestion at the current cursor, stamped as a fresh request would be.
     #[cfg(test)]
     pub fn set_ghost_for_test(&mut self, text: &str) {
-        self.ghost = Some(GhostSuggestion {
-            text: text.to_string(),
-            at_offset: self.document.selection.head,
-            version: self.document.buffer.version(),
-        });
+        self.ghost = Some(Prediction::stamped(text.to_string(), &self.document));
+    }
+
+    #[cfg(test)]
+    pub fn accept_ghost_word_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_word(cx)
+    }
+
+    #[cfg(test)]
+    pub fn accept_ghost_line_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.accept_ghost_line(cx)
     }
 
     /// The stored ghost's text, valid or not — `None` proves a dismissal actually
@@ -1890,6 +1985,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::accept_prediction_word))
+            .on_action(cx.listener(Self::accept_prediction_line))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::move_left))
@@ -2477,7 +2574,10 @@ fn styled_line(
             len: ghost_text.len(),
             font: fonts.font(),
             color: theme.text_muted,
-            background_color: None,
+            // Zed's whitespace rule: a dimmed *space* is invisible, so a suggestion that
+            // is only indentation gets a faint background wash instead — the user can
+            // see that whitespace is being proposed at all.
+            background_color: ghost_text.trim().is_empty().then(|| theme.accent.opacity(0.12)),
             underline: None,
             strikethrough: None,
         };

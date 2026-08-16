@@ -583,9 +583,9 @@ impl AiChatPanel {
         #[cfg(not(test))]
         let panel = {
             let mut panel = panel;
-            let is_codex = ai::Provider::from_setting(
-                crate::settings::current(cx).ai_chat_provider(),
-            ) == ai::Provider::Codex;
+            let is_codex =
+                ai::Provider::from_setting(crate::settings::current(cx).ai_chat_provider())
+                    == ai::Provider::Codex;
             if let Some(path) = crate::ai_history::history_path() {
                 let restored = crate::ai_history::load_from(&path);
                 if !restored.is_empty() {
@@ -952,8 +952,7 @@ impl AiChatPanel {
                 timer.timer(crate::ai_stream::REVEAL_TICK).await;
                 let done = this
                     .update(cx, |this, cx| {
-                        if let Some(part) = this.reveal.take_reveal(crate::ai_stream::REVEAL_TICK)
-                        {
+                        if let Some(part) = this.reveal.take_reveal(crate::ai_stream::REVEAL_TICK) {
                             this.append_reply_text(&part);
                             this.scroll.scroll_to_bottom();
                             cx.notify();
@@ -1048,7 +1047,9 @@ impl AiChatPanel {
                     allow_for_session,
                     kind,
                 } => {
-                    if self.mode == ChatMode::Agent || kind == crate::ai_codex::ApprovalKind::McpElicitation {
+                    if self.mode == ChatMode::Agent
+                        || kind == crate::ai_codex::ApprovalKind::McpElicitation
+                    {
                         // Shown as a note as well as a prompt: the row scrolls with the
                         // conversation, so the question stays in the transcript after it is
                         // answered rather than vanishing without trace.
@@ -1142,11 +1143,8 @@ impl AiChatPanel {
     /// turn may be parked waiting for an approval that will now never come, so a cancel
     /// that waits for the lock waits forever.
     fn interrupt_codex(&mut self) {
-        let thread_id = self
-            .codex_thread_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        let thread_id =
+            self.codex_thread_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         if let Some(thread_id) = thread_id {
             write_to_codex(&self.codex_stdin, &crate::ai_codex::interrupt_request(&thread_id));
         }
@@ -1227,10 +1225,8 @@ impl AiChatPanel {
             // The Reject half: the file is unchanged after a decline, so the retry passes
             // the stale check — but its `(path, diff)` matches what the user just said no
             // to, and a question answered seconds ago is not asked again.
-            let rerun_of_rejected = self
-                .rejected_this_turn
-                .iter()
-                .any(|(rejected_path, rejected_diff)| {
+            let rerun_of_rejected =
+                self.rejected_this_turn.iter().any(|(rejected_path, rejected_diff)| {
                     *rejected_path == path && *rejected_diff == change.diff
                 });
             if rerun_of_rejected {
@@ -1827,8 +1823,7 @@ impl AiChatPanel {
             return;
         }
         let item_id = proposal.item_id.clone();
-        self.rejected_this_turn
-            .push((proposal.path.clone(), proposal.diff.clone()));
+        self.rejected_this_turn.push((proposal.path.clone(), proposal.diff.clone()));
         self.proposals[index].state = ProposalState::Rejected;
         self.settle_item(&item_id);
         cx.notify();
@@ -2040,9 +2035,11 @@ impl AiChatPanel {
         // Drop the trailing scalar, plus any marks it carried…
         while let Some(last) = self.input.chars().next_back() {
             self.input.pop();
-            let carried_by_the_previous = matches!(last,
-                '\u{0300}'..='\u{036F}'   // combining diacritical marks
-                | '\u{FE0F}'              // variation selector-16 (emoji presentation)
+            let carried_by_the_previous = matches!(
+                last,
+                '\u{0300}'
+                    ..='\u{036F}'   // combining diacritical marks
+                | '\u{FE0F}' // variation selector-16 (emoji presentation)
             );
             if !carried_by_the_previous {
                 break;
@@ -2206,11 +2203,7 @@ impl AiChatPanel {
     }
 
     /// The button click, minus the button: answers the pending action approval.
-    pub fn answer_action_for_test(
-        &mut self,
-        request_id: u64,
-        decision: crate::ai_codex::Decision,
-    ) {
+    pub fn answer_action_for_test(&mut self, request_id: u64, decision: crate::ai_codex::Decision) {
         self.answer_action(request_id, decision);
     }
 
@@ -2264,7 +2257,10 @@ impl Attachment {
 pub enum Segment {
     Text(String),
     /// A fenced block, with whatever language tag the fence carried (```php -> "php").
-    Code { language: Option<String>, code: String },
+    Code {
+        language: Option<String>,
+        code: String,
+    },
 }
 
 /// Splits reply text on ``` fences. No markdown beyond that — #99's scope is "plain text
@@ -2776,6 +2772,12 @@ fn write_to_codex(stdin: &Arc<Mutex<Option<ChildStdin>>>, message: &str) -> bool
 ///
 /// The child is *not* killed on the way out — that is the whole point of a session. It is
 /// killed by a cancel, or when the panel drops and takes the `Arc` with it.
+///
+/// Nine arguments because each shared handle must arrive *individually cloned* out of
+/// the panel (see the field docs on `codex_stdin`/`codex_thread_id`/`codex_model` — what
+/// `render` touches must never wait on the turn); bundling them into a struct would
+/// re-invite the very lock-sharing the split exists to prevent.
+#[allow(clippy::too_many_arguments)]
 fn codex_turn(
     codex: &Arc<Mutex<CodexState>>,
     kill: &Arc<Mutex<Option<Child>>>,
@@ -2922,9 +2924,8 @@ fn codex_turn(
 
     *shared_model.lock().unwrap_or_else(|p| p.into_inner()) = model.clone();
     state.model = model;
-    let session = state
-        .session
-        .insert(CodexSession { stdin: Arc::clone(shared_stdin), stdout, thread_id });
+    let session =
+        state.session.insert(CodexSession { stdin: Arc::clone(shared_stdin), stdout, thread_id });
     read_codex_turn(session, tx);
 }
 
@@ -3348,7 +3349,9 @@ impl AiChatPanel {
                         .text_color(if done { theme.diff_added() } else { theme.accent })
                         .child(if done { "✓" } else { "●" }),
                 )
-                .child(div().text_color(theme.text_muted).child(SharedString::from(label.to_string())))
+                .child(
+                    div().text_color(theme.text_muted).child(SharedString::from(label.to_string())),
+                )
                 .into_any_element()
         };
         if !turn.flow.is_empty() {
@@ -3590,10 +3593,7 @@ impl AiChatPanel {
             .py_1()
             .child(button)
             .children(failure.map(|message| {
-                div()
-                    .text_size(px(10.0))
-                    .text_color(theme.error)
-                    .child(SharedString::from(message))
+                div().text_size(px(10.0)).text_color(theme.error).child(SharedString::from(message))
             }))
             .into_any_element()
     }
@@ -3710,14 +3710,11 @@ impl AiChatPanel {
                     .child(SharedString::from(approval.summary.clone())),
             )
             .when(unknown, |el| {
-                el.child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(
-                            "This build does not recognise this request — Deny is the only safe answer",
-                        )),
-                )
+                el.child(div().text_size(px(10.0)).text_color(theme.text_muted).child(
+                    SharedString::from(
+                        "This build does not recognise this request — Deny is the only safe answer",
+                    ),
+                ))
             })
             .child(buttons)
             .into_any_element()
@@ -4025,14 +4022,12 @@ impl AiChatPanel {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div().text_size(px(10.0)).text_color(theme.text_muted).child(
-                                    SharedString::from(format!(
-                                        "{} · {model}",
-                                        provider.setting_name()
-                                    )),
-                                ),
-                            )
+                            .child(div().text_size(px(10.0)).text_color(theme.text_muted).child(
+                                SharedString::from(format!(
+                                    "{} · {model}",
+                                    provider.setting_name()
+                                )),
+                            ))
                             .child(self.render_send_button(theme, cx)),
                     ),
             )
@@ -4220,7 +4215,12 @@ fn render_prose(seed: usize, text: &str, theme: &Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn render_prose_line(seed: usize, line_index: usize, line: &str, theme: &Theme) -> gpui::AnyElement {
+fn render_prose_line(
+    seed: usize,
+    line_index: usize,
+    line: &str,
+    theme: &Theme,
+) -> gpui::AnyElement {
     if line.is_empty() {
         return div().child(SharedString::from(" ".to_string())).into_any_element();
     }
@@ -4231,11 +4231,7 @@ fn render_prose_line(seed: usize, line_index: usize, line: &str, theme: &Theme) 
     if trimmed.len() >= 3 {
         for marker in ['-', '*', '_'] {
             if trimmed.chars().all(|c| c == marker) {
-                return div()
-                    .my_1()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .into_any_element();
+                return div().my_1().border_b_1().border_color(theme.border).into_any_element();
             }
         }
     }
@@ -4285,22 +4281,22 @@ fn render_prose_line(seed: usize, line_index: usize, line: &str, theme: &Theme) 
 
     // Ordered list item: `12. rest` — the number is kept, muted like the bullet.
     let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
-    if digits > 0 {
-        if let Some(rest) = trimmed[digits..].strip_prefix(". ") {
-            return div()
-                .flex()
-                .items_start()
-                .gap_1()
-                .pl(px(8.0 + indent as f32 * 6.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(trimmed[..digits + 1].to_string())),
-                )
-                .child(div().flex_1().child(inline_text(seed, line_index, rest, theme)))
-                .into_any_element();
-        }
+    if digits > 0
+        && let Some(rest) = trimmed[digits..].strip_prefix(". ")
+    {
+        return div()
+            .flex()
+            .items_start()
+            .gap_1()
+            .pl(px(8.0 + indent as f32 * 6.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(trimmed[..digits + 1].to_string())),
+            )
+            .child(div().flex_1().child(inline_text(seed, line_index, rest, theme)))
+            .into_any_element();
     }
 
     // A markdown image: there is nothing to draw it *as* (the panel embeds no remote
@@ -4419,11 +4415,8 @@ enum InlineStyle {
 /// ambiguous with multiplication in the code-adjacent prose these replies are made of.
 /// An unclosed marker renders literally — mid-stream text must not flicker between
 /// styled and plain as delimiters arrive.
-type InlineSpans = (
-    String,
-    Vec<(std::ops::Range<usize>, InlineStyle)>,
-    Vec<(std::ops::Range<usize>, String)>,
-);
+type InlineSpans =
+    (String, Vec<(std::ops::Range<usize>, InlineStyle)>, Vec<(std::ops::Range<usize>, String)>);
 
 fn parse_inline_markdown(line: &str) -> InlineSpans {
     // A header line is the whole line bold, markers stripped.
@@ -4444,49 +4437,49 @@ fn parse_inline_markdown(line: &str) -> InlineSpans {
     while !rest.is_empty() {
         // Backticks first: markdown gives code spans precedence, and a `**` inside one is
         // literal asterisks.
-        if let Some(after_open) = rest.strip_prefix('`') {
-            if let Some(end) = after_open.find('`') {
-                let start = clean.len();
-                clean.push_str(&after_open[..end]);
-                spans.push((start..clean.len(), InlineStyle::Code));
-                rest = &after_open[end + 1..];
-                continue;
-            }
+        if let Some(after_open) = rest.strip_prefix('`')
+            && let Some(end) = after_open.find('`')
+        {
+            let start = clean.len();
+            clean.push_str(&after_open[..end]);
+            spans.push((start..clean.len(), InlineStyle::Code));
+            rest = &after_open[end + 1..];
+            continue;
         }
-        if let Some(after_open) = rest.strip_prefix("**") {
-            if let Some(end) = after_open.find("**") {
-                let start = clean.len();
-                clean.push_str(&after_open[..end]);
-                spans.push((start..clean.len(), InlineStyle::Bold));
-                rest = &after_open[end + 2..];
-                continue;
-            }
+        if let Some(after_open) = rest.strip_prefix("**")
+            && let Some(end) = after_open.find("**")
+        {
+            let start = clean.len();
+            clean.push_str(&after_open[..end]);
+            spans.push((start..clean.len(), InlineStyle::Bold));
+            rest = &after_open[end + 2..];
+            continue;
         }
-        if let Some(after_open) = rest.strip_prefix("~~") {
-            if let Some(end) = after_open.find("~~") {
-                let start = clean.len();
-                clean.push_str(&after_open[..end]);
-                spans.push((start..clean.len(), InlineStyle::Strike));
-                rest = &after_open[end + 2..];
-                continue;
-            }
+        if let Some(after_open) = rest.strip_prefix("~~")
+            && let Some(end) = after_open.find("~~")
+        {
+            let start = clean.len();
+            clean.push_str(&after_open[..end]);
+            spans.push((start..clean.len(), InlineStyle::Strike));
+            rest = &after_open[end + 2..];
+            continue;
         }
         // `[text](url)` — the label lands in the clean text, the URL rides beside it.
         // Both halves must close on this line or the bracket is literal (mid-stream rule).
-        if let Some(after_open) = rest.strip_prefix('[') {
-            if let Some(label_end) = after_open.find("](") {
-                let after_label = &after_open[label_end + 2..];
-                if let Some(url_end) = after_label.find(')') {
-                    let url = &after_label[..url_end];
-                    // A "link" with an empty label or URL is literal punctuation.
-                    if label_end > 0 && !url.is_empty() {
-                        let start = clean.len();
-                        clean.push_str(&after_open[..label_end]);
-                        spans.push((start..clean.len(), InlineStyle::Link));
-                        links.push((start..clean.len(), url.to_string()));
-                        rest = &after_label[url_end + 1..];
-                        continue;
-                    }
+        if let Some(after_open) = rest.strip_prefix('[')
+            && let Some(label_end) = after_open.find("](")
+        {
+            let after_label = &after_open[label_end + 2..];
+            if let Some(url_end) = after_label.find(')') {
+                let url = &after_label[..url_end];
+                // A "link" with an empty label or URL is literal punctuation.
+                if label_end > 0 && !url.is_empty() {
+                    let start = clean.len();
+                    clean.push_str(&after_open[..label_end]);
+                    spans.push((start..clean.len(), InlineStyle::Link));
+                    links.push((start..clean.len(), url.to_string()));
+                    rest = &after_label[url_end + 1..];
+                    continue;
                 }
             }
         }
@@ -5011,7 +5004,10 @@ mod agent_diff_utf8_tests {
             let outcome = std::panic::catch_unwind(|| {
                 super::diff_file_from_unified("app/Models/Configuração.php", diff)
             });
-            assert!(outcome.is_ok(), "rendering {diff:?} panicked; a malformed patch must draw, not crash");
+            assert!(
+                outcome.is_ok(),
+                "rendering {diff:?} panicked; a malformed patch must draw, not crash"
+            );
         }
     }
 
@@ -5242,10 +5238,7 @@ mod batch_decision_tests {
     /// authorisation for every change in the item, including the ones the user refused.
     #[test]
     fn a_mixed_batch_is_declined() {
-        assert!(!batch_decision(&[
-            file(ProposalState::Applied),
-            file(ProposalState::Rejected)
-        ]));
+        assert!(!batch_decision(&[file(ProposalState::Applied), file(ProposalState::Rejected)]));
     }
 
     /// A denylisted path must never ride out on an accept — the CLI would write the file
@@ -5276,10 +5269,7 @@ mod inline_markdown_tests {
     fn bold_and_code_spans_strip_their_markers() {
         let (clean, spans, _) = parse_inline_markdown("use **artisan** and `php -v` here");
         assert_eq!(clean, "use artisan and php -v here");
-        assert_eq!(
-            spans,
-            vec![(4..11, InlineStyle::Bold), (16..22, InlineStyle::Code)]
-        );
+        assert_eq!(spans, vec![(4..11, InlineStyle::Bold), (16..22, InlineStyle::Code)]);
         assert_eq!(&clean[4..11], "artisan");
         assert_eq!(&clean[16..22], "php -v");
     }
@@ -5375,10 +5365,7 @@ mod login_row_reachability_tests {
     #[test]
     fn the_sign_in_row_is_mounted_outside_the_ready_gate() {
         let source = include_str!("ai_chat.rs");
-        let body = source
-            .split("fn render(")
-            .nth(1)
-            .expect("the render body must exist");
+        let body = source.split("fn render(").nth(1).expect("the render body must exist");
 
         let mount = body
             .find(".child(self.render_codex_login")
@@ -5472,17 +5459,11 @@ mod flow_tests {
             flow,
             vec![
                 FlowBlock::Activity { label: "Thinking…".to_string(), done: true },
-                FlowBlock::Activity {
-                    label: "Running: composer install".to_string(),
-                    done: false
-                },
+                FlowBlock::Activity { label: "Running: composer install".to_string(), done: false },
             ]
         );
 
         flow_finish_activities(&mut flow);
-        assert!(flow.iter().all(|block| !matches!(
-            block,
-            FlowBlock::Activity { done: false, .. }
-        )));
+        assert!(flow.iter().all(|block| !matches!(block, FlowBlock::Activity { done: false, .. })));
     }
 }

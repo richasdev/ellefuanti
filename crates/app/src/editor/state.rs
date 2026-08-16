@@ -4425,13 +4425,14 @@ mod utf8_robustness_tests {
     /// Text that has broken editors before: accents, CJK, emoji with a ZWJ sequence, a
     /// combining mark, and an RTL run. Every one is multi-byte, so any code that treats a
     /// byte offset as a character offset panics somewhere in here.
-    const HOSTILE: &str = "<?php\n$café = 'ação';\n// 日本語のコメント\n$x = '👨‍👩‍👧‍👦';\n$e\u{0301} = 1;\n// مرحبا\n";
+    const HOSTILE: &str =
+        "<?php\n$café = 'ação';\n// 日本語のコメント\n$x = '👨‍👩‍👧‍👦';\n$e\u{0301} = 1;\n// مرحبا\n";
 
     /// Every byte offset, including the ones inside a character, on every API that takes
     /// one. A user reaches these by clicking, and a click lands wherever it lands.
     #[test]
     fn byte_offsets_inside_characters_never_panic() {
-        let mut doc = Document::new(None, HOSTILE, false).expect("plain text parses");
+        let doc = Document::new(None, HOSTILE, false).expect("plain text parses");
 
         for offset in 0..=HOSTILE.len() + 4 {
             // Read-only queries first: these run on hover and on render.
@@ -4456,7 +4457,10 @@ mod utf8_robustness_tests {
             let mut doc = Document::new(None, HOSTILE, false).expect("plain text parses");
             doc.move_to(offset, false);
             doc.insert("ç");
-            assert!(doc.text_for_save().contains('ç'), "the insert must have landed at offset {offset}");
+            assert!(
+                doc.text_for_save().contains('ç'),
+                "the insert must have landed at offset {offset}"
+            );
         }
     }
 }

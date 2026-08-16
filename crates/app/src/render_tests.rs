@@ -372,6 +372,87 @@ async fn typing_discards_a_ghost_and_escape_dismisses_one(cx: &mut TestAppContex
     });
 }
 
+/// The port's centre of gravity (Zed's `interpolate_edits`): typing exactly what the
+/// ghost predicts shrinks it in place instead of killing it — the suggestion keeps up
+/// with the typist rather than flickering out on every keystroke.
+#[gpui::test]
+async fn typing_the_predicted_text_shrinks_the_ghost_instead_of_killing_it(
+    cx: &mut TestAppContext,
+) {
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("ghost4.php")), "<?php\n$user->\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        let end = editor.document.buffer.text().find("->").expect("fixture") + 2;
+        editor.document.move_to(end, false);
+        editor.set_ghost_for_test("save();");
+
+        // The user types the prediction's own prefix, one keystroke at a time.
+        editor.document.insert("sa");
+        editor.after_edit_for_test(cx);
+        assert_eq!(
+            editor.ghost_for_test().as_deref(),
+            Some("ve();"),
+            "a typed prefix interpolates instead of dismissing"
+        );
+        assert!(editor.ghost_visible_for_test(), "and the shrunk ghost is still valid");
+
+        // Divergence still kills: the user went somewhere else.
+        editor.document.insert("x");
+        editor.after_edit_for_test(cx);
+        assert!(editor.ghost_for_test().is_none(), "divergent typing dismisses");
+    });
+}
+
+/// Partial accepts, Zed's granularity: ⌃Tab takes the next word and keeps the rest
+/// showing; ⌃⇧Tab takes through the first newline; a single-line remainder falls back
+/// to the full accept.
+#[gpui::test]
+async fn partial_accepts_walk_through_the_ghost_word_and_line_at_a_time(cx: &mut TestAppContext) {
+    install_theme(cx);
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let document =
+            Document::new(Some(std::path::PathBuf::from("ghost5.php")), "<?php\n$a\n", true)
+                .expect("php grammar loads");
+        EditorView::new(document, cx)
+    });
+
+    view.update(cx, |editor, cx| {
+        let end = editor.document.buffer.text().find("$a").expect("fixture") + 2;
+        editor.document.move_to(end, false);
+        editor.set_ghost_for_test("->save();\nreturn $a;");
+
+        // Word one: the punctuation run `->` (nothing alphanumeric leads).
+        assert!(editor.accept_ghost_word_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->"), "the word landed");
+        assert_eq!(editor.ghost_for_test().as_deref(), Some("save();\nreturn $a;"));
+
+        // Word two: the identifier run.
+        assert!(editor.accept_ghost_word_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->save"));
+        assert_eq!(editor.ghost_for_test().as_deref(), Some("();\nreturn $a;"));
+
+        // Line: through the first newline, remainder still showing.
+        assert!(editor.accept_ghost_line_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->save();\n"));
+        assert_eq!(editor.ghost_for_test().as_deref(), Some("return $a;"));
+
+        // Line again on a single-line remainder: the fall-back-to-full rule.
+        assert!(editor.accept_ghost_line_for_test(cx));
+        assert!(editor.document.buffer.text().contains("$a->save();\nreturn $a;"));
+        assert!(editor.ghost_for_test().is_none(), "everything accepted, nothing lingers");
+
+        // With no ghost, both are no-ops that consume nothing.
+        assert!(!editor.accept_ghost_word_for_test(cx));
+        assert!(!editor.accept_ghost_line_for_test(cx));
+    });
+}
+
 #[gpui::test]
 async fn the_editor_renders_a_multi_line_ghost_suggestion(cx: &mut TestAppContext) {
     install_theme(cx);
@@ -2458,7 +2539,11 @@ async fn the_ai_chat_panel_toggles_and_draws(cx: &mut TestAppContext) {
     panel.update(cx, |panel, cx| {
         panel.seed_turns_for_test(
             vec![
-                ChatTurn { role: Role::User, text: "what does this do?".to_string(), flow: Vec::new() },
+                ChatTurn {
+                    role: Role::User,
+                    text: "what does this do?".to_string(),
+                    flow: Vec::new(),
+                },
                 ChatTurn {
                     role: Role::Assistant,
                     text: "It echoes:\n```php\necho 1;\n```\nthat is all.".to_string(),
@@ -2588,7 +2673,7 @@ async fn ai_agent_a_proposal_writes_nothing_until_it_is_applied(cx: &mut TestApp
 /// Rejecting leaves the file alone, and a second click cannot revive the decision.
 #[gpui::test]
 async fn ai_agent_rejecting_leaves_the_file_exactly_as_it_was(cx: &mut TestAppContext) {
-    use crate::ai_chat::{ChatMode, ProposalState};
+    use crate::ai_chat::ChatMode;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let file = dir.path().join("hello.php");
@@ -2758,9 +2843,7 @@ async fn ai_agent_a_delete_proposal_offers_review_but_no_apply(cx: &mut TestAppC
 /// says accept: consenting to unknown semantics is not consent. An unanswered id parks
 /// the CLI on `read_line` forever, which is why every branch must write *something*.
 #[gpui::test]
-async fn ai_agent_every_approval_kind_answers_once_with_its_own_encoder(
-    cx: &mut TestAppContext,
-) {
+async fn ai_agent_every_approval_kind_answers_once_with_its_own_encoder(cx: &mut TestAppContext) {
     use crate::ai_chat::ChatMode;
     use crate::ai_codex::{ApprovalKind, Decision};
 
@@ -2779,12 +2862,13 @@ async fn ai_agent_every_approval_kind_answers_once_with_its_own_encoder(
     workspace.update_in(cx, |workspace, window, cx| workspace.toggle_ai_chat_for_test(window, cx));
     let panel = workspace.read_with(cx, |workspace, _cx| workspace.ai_chat_for_test()).unwrap();
 
-    let ask = |request_id: u64, kind: ApprovalKind| crate::ai::AgentEvent::ActionApprovalRequested {
-        request_id,
-        summary: format!("do thing {request_id}"),
-        allow_for_session: kind == ApprovalKind::Command,
-        kind,
-    };
+    let ask =
+        |request_id: u64, kind: ApprovalKind| crate::ai::AgentEvent::ActionApprovalRequested {
+            request_id,
+            summary: format!("do thing {request_id}"),
+            allow_for_session: kind == ApprovalKind::Command,
+            kind,
+        };
 
     panel.update(cx, |panel, cx| {
         panel.set_mode_for_test(ChatMode::Agent);
@@ -3010,7 +3094,7 @@ async fn ai_agent_a_cli_write_refreshes_the_open_tab(cx: &mut TestAppContext) {
 /// The denylist decides what may *enter* the user's files too, not only what leaves.
 #[gpui::test]
 async fn ai_agent_a_proposal_for_a_secret_path_is_blocked_with_its_reason(cx: &mut TestAppContext) {
-    use crate::ai_chat::{ChatMode, ProposalState};
+    use crate::ai_chat::ChatMode;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let env = dir.path().join(".env");
@@ -3083,7 +3167,7 @@ async fn ai_agent_cancel_discards_pending_proposals(cx: &mut TestAppContext) {
 /// and the change is one undo step.
 #[gpui::test]
 async fn ai_agent_an_open_tab_is_patched_through_its_buffer(cx: &mut TestAppContext) {
-    use crate::ai_chat::{ChatMode, ProposalState};
+    use crate::ai_chat::ChatMode;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let file = dir.path().join("hello.php");
@@ -6147,10 +6231,7 @@ async fn ai_agent_a_retried_proposal_after_apply_is_skipped_not_reshown(cx: &mut
     });
 
     panel.read_with(cx, |panel, _cx| {
-        assert!(
-            panel.proposals_for_test().is_empty(),
-            "the retry must not become a second card"
-        );
+        assert!(panel.proposals_for_test().is_empty(), "the retry must not become a second card");
         let flow_labels: Vec<String> = panel
             .turns_for_test()
             .iter()
@@ -6183,9 +6264,7 @@ async fn ai_agent_a_retried_proposal_after_apply_is_skipped_not_reshown(cx: &mut
 /// is the fingerprint; within the same turn it is refused with a record. A *new send*
 /// clears the memory: re-proposing after a fresh prompt is the user changing their mind.
 #[gpui::test]
-async fn ai_agent_a_retried_proposal_after_reject_is_declined_not_reshown(
-    cx: &mut TestAppContext,
-) {
+async fn ai_agent_a_retried_proposal_after_reject_is_declined_not_reshown(cx: &mut TestAppContext) {
     use crate::ai_chat::{ChatMode, FlowBlock};
 
     let dir = tempfile::TempDir::new().expect("tempdir");

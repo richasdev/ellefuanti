@@ -8238,7 +8238,15 @@ impl Render for WorkspaceView {
                             .line_height(fonts.line_height())
                             .text_color(theme.text_muted)
                             .children(lines.into_iter().map(|line| {
-                                div().h(fonts.line_height()).whitespace_nowrap().child(line)
+                                // The splice's whitespace rule, kept here too: an
+                                // indentation-only continuation line is invisible when
+                                // dimmed, so it gets the same faint wash.
+                                let indent_only = !line.is_empty() && line.trim().is_empty();
+                                div()
+                                    .h(fonts.line_height())
+                                    .whitespace_nowrap()
+                                    .when(indent_only, |el| el.bg(theme.accent.opacity(0.12)))
+                                    .child(line)
                             })),
                     ),
                 )

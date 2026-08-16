@@ -45,8 +45,8 @@ impl RevealBuffer {
             return None;
         }
         let fraction = tick.as_millis() as f32 / REVEAL_WINDOW.as_millis().max(1) as f32;
-        let mut cut = ((self.pending.len() as f32 * fraction).ceil() as usize)
-            .clamp(1, self.pending.len());
+        let mut cut =
+            ((self.pending.len() as f32 * fraction).ceil() as usize).clamp(1, self.pending.len());
         while !self.pending.is_char_boundary(cut) {
             cut += 1;
         }
