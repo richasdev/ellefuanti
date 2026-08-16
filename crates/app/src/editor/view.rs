@@ -1132,14 +1132,23 @@ impl EditorView {
         if cfg!(test) {
             return;
         }
-        if !crate::settings::current(cx).ai_autocomplete_enabled() {
+        let settings = crate::settings::current(cx);
+        if !settings.ai_autocomplete_enabled() {
             return;
         }
+        // Codex pays per-turn latency, so it waits for a real pause, not a fast one.
+        let debounce = if crate::ai::Provider::from_setting(settings.ai_provider())
+            == crate::ai::Provider::Codex
+        {
+            crate::edit_prediction::codex_provider::DEBOUNCE
+        } else {
+            provider::DEBOUNCE
+        };
         let epoch = self.ghost_epoch;
         self.ghost_debounce = Some(cx.spawn(async move |this, cx| {
             // An edit inside this window drops the task and starts a new one, so a burst
             // of typing costs zero requests — the tree watcher's latest-wins shape.
-            cx.background_executor().timer(provider::DEBOUNCE).await;
+            cx.background_executor().timer(debounce).await;
             let _ = this.update(cx, |this, cx| this.ghost_fire(epoch, cx));
         }));
     }
@@ -1175,6 +1184,15 @@ impl EditorView {
             return; // switched off during the debounce
         }
         let provider = crate::ai::Provider::from_setting(settings.ai_provider());
+        // The experimental Codex path: opt-in, and silent once its latency gate has
+        // tripped — `edit_prediction::codex_provider` owns both rules.
+        let use_codex = provider == crate::ai::Provider::Codex;
+        if use_codex
+            && (!settings.ai_codex_autocomplete_enabled()
+                || crate::edit_prediction::codex_provider::disabled_reason().is_some())
+        {
+            return;
+        }
         let base_url = settings.ai_base_url().to_string();
         let model = settings.ai_completion_model().to_string();
 
@@ -1193,9 +1211,17 @@ impl EditorView {
         // Replacing the slot cancels any older request and kills its curl — at most one
         // in flight, which is the #93 budget for a feature that runs between keystrokes.
         self.ghost_request = Some(cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_spawn(provider::fetch_completion(provider, base_url, model, user_turn))
-                .await;
+            let outcome = if use_codex {
+                cx.background_spawn(async move {
+                    crate::edit_prediction::codex_provider::complete(user_turn)
+                })
+                .await
+            } else {
+                cx.background_spawn(provider::fetch_completion(
+                    provider, base_url, model, user_turn,
+                ))
+                .await
+            };
             let _ = this.update(cx, |this, cx| {
                 this.ghost_request = None;
                 if this.ghost_epoch != epoch {

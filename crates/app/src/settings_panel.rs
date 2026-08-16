@@ -131,14 +131,17 @@ impl SettingsPanel {
         } else {
             settings.ai_provider()
         });
-        // The autocomplete cycler must never land on Codex: ghost text is HTTP
-        // (`resolve_auth`), Codex has no wire, and a provider the cycler offers but the
-        // feature cannot use is a setting that kills autocomplete silently — the owner's
-        // "sugestão estilo copilot não tá funcionando" was exactly this, set from this
-        // very row. Chat keeps the full ring; only the per-keystroke path excludes it.
+        // The autocomplete cycler skips Codex *unless* `ai.codex_autocomplete` opted in:
+        // ghost text is HTTP (`resolve_auth`), Codex has no wire, and a provider the
+        // cycler offers but the feature cannot use is a setting that kills autocomplete
+        // silently — the owner's "sugestão estilo copilot não tá funcionando" was
+        // exactly this, set from this very row. The opt-in unlocks the experimental
+        // turn-based path (`edit_prediction::codex_provider`), which polices itself
+        // with a latency gate. Chat keeps the full ring either way.
+        let codex_ok = chat || settings.ai_codex_autocomplete_enabled();
         let step = |from: crate::ai::Provider| {
             let mut candidate = from.next();
-            if !chat && candidate == crate::ai::Provider::Codex {
+            if !codex_ok && candidate == crate::ai::Provider::Codex {
                 candidate = candidate.next();
             }
             candidate
@@ -358,9 +361,18 @@ impl Render for SettingsPanel {
                 if crate::ai::Provider::from_setting(settings.ai_provider())
                     == crate::ai::Provider::Codex
                 {
-                    // A configured impossibility (older builds' cycler allowed it): name
-                    // the problem in the row that caused it, and the fix.
-                    "codex can't autocomplete — cycle the provider above".to_string()
+                    if !settings.ai_codex_autocomplete_enabled() {
+                        // A configured impossibility (older builds' cycler allowed it):
+                        // name the problem in the row that caused it, and the fix.
+                        "codex can't autocomplete — cycle the provider above".to_string()
+                    } else if let Some(reason) =
+                        crate::edit_prediction::codex_provider::disabled_reason()
+                    {
+                        // The latency gate tripped: the honest sentence, not silence.
+                        reason
+                    } else {
+                        "experimental — your Codex subscription, on typing pauses".to_string()
+                    }
                 } else {
                     settings.ai_completion_model().to_string()
                 },

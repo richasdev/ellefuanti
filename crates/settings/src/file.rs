@@ -376,6 +376,16 @@ impl Settings {
         self.bool_or("ai.autocomplete", false)
     }
 
+    /// The experimental Codex ghost-text path. Off by default, and gated *twice*: this
+    /// switch, and a live latency check that silently disables it when the subscription
+    /// turn round-trip is too slow to feel like completion (see
+    /// `edit_prediction::codex_provider`). A turn-based CLI is the wrong transport for a
+    /// between-keystrokes feature, so this exists as an opt-in for owners whose only
+    /// working provider is their Codex subscription.
+    pub fn ai_codex_autocomplete_enabled(&self) -> bool {
+        self.bool_or("ai.codex_autocomplete", false)
+    }
+
     pub fn set_ai_autocomplete_enabled(&mut self, enabled: bool) {
         self.document.insert("ai.autocomplete".to_string(), Value::Bool(enabled));
     }

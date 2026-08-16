@@ -14,5 +14,6 @@
 //! Rendering is unchanged: first line spliced into the cursor row, continuation lines as
 //! a workspace overlay. What changed is the state machine underneath it.
 
+pub mod codex_provider;
 pub mod provider;
 pub mod state;
