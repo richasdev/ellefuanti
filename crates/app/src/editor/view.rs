@@ -692,7 +692,9 @@ impl EditorView {
     // keymap. Not worth it at this size.
 
     fn backspace(&mut self, _: &Backspace, _w: &mut Window, cx: &mut Context<Self>) {
-        self.document.backspace_at_all_cursors();
+        if !self.document.backspace_with_pairs() {
+            self.document.backspace_at_all_cursors();
+        }
         self.after_edit(cx);
     }
 
@@ -1051,7 +1053,9 @@ impl EditorView {
 
     /// Deletes backwards for a backspace the popup received, for the same reason.
     pub fn backspace_typed(&mut self, cx: &mut Context<Self>) {
-        self.document.backspace();
+        if !self.document.backspace_with_pairs() {
+            self.document.backspace();
+        }
         self.after_edit(cx);
     }
 
